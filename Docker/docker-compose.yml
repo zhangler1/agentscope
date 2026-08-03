@@ -1,0 +1,55 @@
+services:
+  redis:
+    image: redis:7-bookworm
+    ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
+
+  agentscope:
+    build:
+      context: ..
+      dockerfile: examples/agent_service/Dockerfile
+    ports: ["8000:8000"]
+    environment:
+      - DASHSCOPE_API_KEY
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      - REDIS_HOST=redis
+    depends_on: [redis]
+    volumes:
+      # 挂载源码（可编辑模式）
+      - ../src:/app/src:ro
+      - ../examples/agent_service/main.py:/app/main.py:ro
+      - ../pyproject.toml:/app/pyproject.toml:ro
+      - ../README.md:/app/README.md:ro
+      # 工作区数据持久化
+      - workspace-data:/app/workspaces
+      # Docker Socket（支持 Docker 工作区沙箱）
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  webui-backend:
+    build:
+      context: ../examples/web_ui/backend
+      dockerfile: Dockerfile
+    ports: ["3000:3000"]
+    environment:
+      - AGENTSCOPE_API_URL=http://agentscope:8000
+    depends_on: [agentscope]
+    volumes:
+      # 挂载源码
+      - ../examples/web_ui/backend/src:/app/src
+      - ../examples/web_ui/backend/package.json:/app/package.json
+      - ../examples/web_ui/backend/tsconfig.json:/app/tsconfig.json
+
+  webui-frontend:
+    build:
+      context: ../examples/web_ui/frontend
+      dockerfile: Dockerfile
+    ports: ["80:80"]
+    environment:
+      - VITE_API_URL=http://localhost:3000
+    depends_on: [webui-backend]
+
+volumes:
+  redis-data:
+  workspace-data:
