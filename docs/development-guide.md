@@ -1,10 +1,124 @@
 # AgentScope 开发指南
 
-本文档介绍如何在本地和容器化环境中搭建 AgentScope 的开发环境并启动服务。
+本文档介绍如何在容器化和本地环境中搭建 AgentScope 的开发环境并启动服务。
 
-## 1. 本地开发
+## 1. Docker Compose 容器化开发（全栈一键启动）
 
-### 1.1 环境要求
+仓库内置了 `Docker/docker-compose.yml`，可一键拉起 **Redis + Agent Service + Web UI 后端 + Web UI 前端** 的完整技术栈，并通过源码挂载支持热修改开发，适合容器化开发、联调与快速体验。
+
+### 1.1 架构总览
+
+```
+浏览器 ──▶ webui-frontend (:80, nginx 静态资源)
+               │ VITE_API_URL=http://localhost:3000
+               ▼
+           webui-backend (:3000, Node.js)
+               │ AGENTSCOPE_API_URL=http://agentscope:8000
+               ▼
+           agentscope (:8000, FastAPI) ──▶ redis (:6379)
+               │ /var/run/docker.sock
+               ▼
+           Docker 工作区沙箱容器（可选）
+```
+
+| 服务 | 镜像 / 构建来源 | 端口 | 说明 |
+| --- | --- | --- | --- |
+| `redis` | `redis:7-bookworm` | 6379 | 服务存储后端，数据持久化到 `redis-data` 卷 |
+| `agentscope` | `examples/agent_service/Dockerfile`（构建上下文为仓库根目录） | 8000 | FastAPI Agent 服务，源码只读挂载 |
+| `webui-backend` | `examples/web_ui/backend/Dockerfile` | 3000 | Web UI 的 Node.js 后端，源码读写挂载 |
+| `webui-frontend` | `examples/web_ui/frontend/Dockerfile` | 80 | pnpm 构建 + nginx 托管静态产物 |
+
+依赖链为 `webui-frontend → webui-backend → agentscope → redis`，`docker compose up` 会按序启动。
+
+### 1.2 快速开始
+
+**第一步：导出模型 API Key**
+
+compose 文件中 API Key 采用无默认值的透传写法（`- DASHSCOPE_API_KEY`），必须先在宿主机导出，否则容器内为空：
+
+```bash
+export DASHSCOPE_API_KEY="your-key"    # 通义千问
+export OPENAI_API_KEY="your-key"       # OpenAI（可选）
+export ANTHROPIC_API_KEY="your-key"    # Anthropic（可选）
+```
+
+也可以在同目录创建 `.env` 文件写入上述变量，`docker compose` 会自动读取。
+
+**第二步：构建并启动**
+
+```bash
+cd Docker
+docker compose up -d --build
+
+# 跟踪 Agent Service 启动日志
+docker compose logs -f agentscope
+```
+
+**第三步：访问**
+
+| 地址 | 内容 |
+| --- | --- |
+| `http://localhost` | Web UI 前端（80 端口） |
+| `http://localhost:3000` | Web UI 后端 API |
+| `http://localhost:8000/docs` | Agent Service 的 FastAPI 交互文档 |
+
+前端已在构建时注入 `VITE_API_URL=http://localhost:3000`，后端通过 `AGENTSCOPE_API_URL=http://agentscope:8000` 连接服务，**无需在页面上手动配置 endpoint**。
+
+### 1.3 基于源码挂载的热修改开发
+
+compose 将宿主机源码挂载进容器，配合镜像内的可编辑安装实现"改代码即生效"：
+
+- **Agent Service（Python）**：`src/`、`main.py`、`pyproject.toml` 以只读（`:ro`）方式挂载，服务以热重载模式启动，**修改 Python 源码保存后自动重载，无需重建镜像**。若修改了 `pyproject.toml` 中的依赖，则需重建：`docker compose build agentscope && docker compose up -d agentscope`。
+- **Web UI 后端（Node.js）**：`src/`、`package.json`、`tsconfig.json` 读写挂载，修改后重启该服务即可：`docker compose restart webui-backend`；修改 `package.json` 依赖后需 `docker compose build webui-backend` 重建。
+- **Web UI 前端（React）**：前端是构建期生成的静态产物，修改前端代码需重建镜像：`docker compose up -d --build webui-frontend`。
+
+### 1.4 数据持久化
+
+compose 声明了两个命名卷：
+
+| 卷 | 挂载点 | 内容 |
+| --- | --- | --- |
+| `redis-data` | 容器内 `/data` | Redis 持久化数据（会话、团队等存储） |
+| `workspace-data` | 容器内 `/app/workspaces` | Agent 工作区文件 |
+
+`docker compose down` 不会删除卷；如需彻底清理数据，使用 `docker compose down -v`。
+
+### 1.5 与 Docker 工作区沙箱的配合
+
+`agentscope` 服务已挂载 `/var/run/docker.sock`，容器内的服务可以直接调用宿主机 Docker daemon 创建 Docker 工作区沙箱容器（参见 §3.1），把 `main.py` 中的 `LocalWorkspaceManager` 换成 `DockerWorkspaceManager` 即可，无需额外配置。
+
+### 1.6 常用操作
+
+```bash
+cd Docker
+
+# 查看全部服务状态
+docker compose ps
+
+# 查看某个服务的日志
+docker compose logs -f webui-backend
+
+# 只重建并重启单个服务（如改了后端代码）
+docker compose up -d --build webui-backend
+
+# 进入服务容器调试
+docker compose exec agentscope /bin/bash
+
+# 停止全部服务（保留数据卷）
+docker compose down
+```
+
+### 1.7 注意事项
+
+- **Redis 连接**：compose 已通过 `REDIS_HOST=redis` 环境变量注入，`main.py` 会从环境变量读取（默认 `localhost`），容器内开发无需改代码。
+- **API Key 为空**：服务能启动但模型调用会失败，请确认宿主机已导出对应环境变量后再 `up`。
+- **生产部署**：示例以 `reload=True` 单进程启动，生产环境建议关闭热重载并使用 `uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4`，同时将 `InMemoryMessageBus` 换成 `RedisMessageBus`（`main.py` 中已附注切换方法）。
+
+---
+
+## 2. 本地开发
+
+### 2.1 环境要求
 
 | 依赖 | 版本 |
 | --- | --- |
@@ -13,7 +127,7 @@
 | Redis（可选，服务存储后端） | ≥ 7 |
 | pnpm（Web UI 前端） | ≥ 8 |
 
-### 1.2 安装 AgentScope
+### 2.2 安装 AgentScope
 
 ```bash
 # 克隆仓库
@@ -30,7 +144,7 @@ uv pip install -e ".[dev]"
 
 `dev` extra 会拉入 `pre-commit`、`pytest`、文档工具链以及 `full` extra（包含 `models`、`service`、`storage`）。
 
-### 1.3 启用 pre-commit 钩子
+### 2.3 启用 pre-commit 钩子
 
 ```bash
 pre-commit install
@@ -38,7 +152,7 @@ pre-commit install
 
 pre-commit 会在每次 commit 时自动执行代码格式化（black、flake8、pylint）与基础检查（AST、YAML、TOML 等）。
 
-### 1.4 运行测试
+### 2.4 运行测试
 
 ```bash
 # 运行全部单元测试
@@ -50,7 +164,7 @@ pytest tests/agent_basic_test.py
 
 依赖可选 extra 的测试（如 Redis、Ollama）在该 extra 未安装时会自动 skip。
 
-### 1.5 启动 Agent Service
+### 2.5 启动 Agent Service
 
 Agent Service 是基于 FastAPI 的多租户多会话服务，需要 Redis 作为存储后端。
 
@@ -89,7 +203,7 @@ python main.py
 
 服务默认监听 `http://0.0.0.0:8000`，开启热重载。
 
-### 1.6 启动 Web UI
+### 2.6 启动 Web UI
 
 Web UI 采用前后端分离架构（React + Node.js），需要单独启动。
 
@@ -105,7 +219,7 @@ pnpm dev
 
 启动后在浏览器中访问 Web UI，将 API endpoint 设置为 `http://localhost:8000` 即可开始使用。
 
-### 1.7 本地开发目录结构
+### 2.7 本地开发目录结构
 
 ```
 agentscope/
@@ -128,11 +242,11 @@ agentscope/
 
 ---
 
-## 2. 容器化开发
+## 3. 工作区沙箱后端
 
 AgentScope 提供多种容器化工作区后端，用于在隔离的沙箱环境中运行 Agent 的工具调用。以下分别介绍各后端的配置与启动方式。
 
-### 2.1 Docker 工作区
+### 3.1 Docker 工作区
 
 Docker 工作区是 AgentScope 最常用的容器化方案。它的核心思想是：**每个 Agent 会话的工具执行都在一个独立的 Docker 容器中进行**，与宿主机完全隔离。
 
@@ -175,7 +289,7 @@ app = create_app(
 
 Docker 工作区会在首次使用时自动构建沙箱镜像（基于 `Dockerfile.template`），后续复用已构建的镜像。
 
-### 2.2 Kubernetes (K8s) 工作区
+### 3.2 Kubernetes (K8s) 工作区
 
 K8s 工作区适用于需要集群级隔离的生产场景。
 
@@ -214,7 +328,7 @@ app = create_app(
 )
 ```
 
-### 2.3 E2B 工作区
+### 3.3 E2B 工作区
 
 E2B 提供云端沙箱环境，无需本地 Docker。
 
@@ -238,7 +352,7 @@ app = create_app(
 )
 ```
 
-### 2.4 Daytona 工作区
+### 3.4 Daytona 工作区
 
 Daytona 提供远程开发环境管理。
 
@@ -262,7 +376,7 @@ app = create_app(
 )
 ```
 
-### 2.5 OpenSandbox 工作区
+### 3.5 OpenSandbox 工作区
 
 ```bash
 uv pip install -e ".[workspace-opensandbox]"
@@ -272,7 +386,7 @@ uv pip install -e ".[workspace-opensandbox]"
 from agentscope.app.workspace_manager import OpenSandboxWorkspaceManager
 ```
 
-### 2.6 容器化开发调试技巧
+### 3.6 沙箱容器调试技巧
 
 **查看沙箱容器日志：**
 
@@ -300,120 +414,6 @@ docker container prune --filter "label=agentscope"
 **跳过镜像构建（加速开发迭代）：**
 
 对于 K8s 测试镜像，预装所有依赖可跳过 bootstrap 阶段，将初始化时间从 ~5 分钟缩短到 ~10 秒。参见 `tests/docker/k8s_workspace_test.Dockerfile` 中的注释说明。
-
----
-
-## 3. Docker Compose 容器化开发（全栈一键启动）
-
-仓库内置了 `Docker/docker-compose.yml`，可一键拉起 **Redis + Agent Service + Web UI 后端 + Web UI 前端** 的完整技术栈，并通过源码挂载支持热修改开发，适合容器化开发、联调与快速体验。
-
-### 3.1 架构总览
-
-```
-浏览器 ──▶ webui-frontend (:80, nginx 静态资源)
-               │ VITE_API_URL=http://localhost:3000
-               ▼
-           webui-backend (:3000, Node.js)
-               │ AGENTSCOPE_API_URL=http://agentscope:8000
-               ▼
-           agentscope (:8000, FastAPI) ──▶ redis (:6379)
-               │ /var/run/docker.sock
-               ▼
-           Docker 工作区沙箱容器（可选）
-```
-
-| 服务 | 镜像 / 构建来源 | 端口 | 说明 |
-| --- | --- | --- | --- |
-| `redis` | `redis:7-bookworm` | 6379 | 服务存储后端，数据持久化到 `redis-data` 卷 |
-| `agentscope` | `examples/agent_service/Dockerfile`（构建上下文为仓库根目录） | 8000 | FastAPI Agent 服务，源码只读挂载 |
-| `webui-backend` | `examples/web_ui/backend/Dockerfile` | 3000 | Web UI 的 Node.js 后端，源码读写挂载 |
-| `webui-frontend` | `examples/web_ui/frontend/Dockerfile` | 80 | pnpm 构建 + nginx 托管静态产物 |
-
-依赖链为 `webui-frontend → webui-backend → agentscope → redis`，`docker compose up` 会按序启动。
-
-### 3.2 快速开始
-
-**第一步：导出模型 API Key**
-
-compose 文件中 API Key 采用无默认值的透传写法（`- DASHSCOPE_API_KEY`），必须先在宿主机导出，否则容器内为空：
-
-```bash
-export DASHSCOPE_API_KEY="your-key"    # 通义千问
-export OPENAI_API_KEY="your-key"       # OpenAI（可选）
-export ANTHROPIC_API_KEY="your-key"    # Anthropic（可选）
-```
-
-也可以在同目录创建 `.env` 文件写入上述变量，`docker compose` 会自动读取。
-
-**第二步：构建并启动**
-
-```bash
-cd Docker
-docker compose up -d --build
-
-# 跟踪 Agent Service 启动日志
-docker compose logs -f agentscope
-```
-
-**第三步：访问**
-
-| 地址 | 内容 |
-| --- | --- |
-| `http://localhost` | Web UI 前端（80 端口） |
-| `http://localhost:3000` | Web UI 后端 API |
-| `http://localhost:8000/docs` | Agent Service 的 FastAPI 交互文档 |
-
-前端已在构建时注入 `VITE_API_URL=http://localhost:3000`，后端通过 `AGENTSCOPE_API_URL=http://agentscope:8000` 连接服务，**无需在页面上手动配置 endpoint**。
-
-### 3.3 基于源码挂载的热修改开发
-
-compose 将宿主机源码挂载进容器，配合镜像内的可编辑安装实现"改代码即生效"：
-
-- **Agent Service（Python）**：`src/`、`main.py`、`pyproject.toml` 以只读（`:ro`）方式挂载，服务以热重载模式启动，**修改 Python 源码保存后自动重载，无需重建镜像**。若修改了 `pyproject.toml` 中的依赖，则需重建：`docker compose build agentscope && docker compose up -d agentscope`。
-- **Web UI 后端（Node.js）**：`src/`、`package.json`、`tsconfig.json` 读写挂载，修改后重启该服务即可：`docker compose restart webui-backend`；修改 `package.json` 依赖后需 `docker compose build webui-backend` 重建。
-- **Web UI 前端（React）**：前端是构建期生成的静态产物，修改前端代码需重建镜像：`docker compose up -d --build webui-frontend`。
-
-### 3.4 数据持久化
-
-compose 声明了两个命名卷：
-
-| 卷 | 挂载点 | 内容 |
-| --- | --- | --- |
-| `redis-data` | 容器内 `/data` | Redis 持久化数据（会话、团队等存储） |
-| `workspace-data` | 容器内 `/app/workspaces` | Agent 工作区文件 |
-
-`docker compose down` 不会删除卷；如需彻底清理数据，使用 `docker compose down -v`。
-
-### 3.5 与 Docker 工作区沙箱的配合
-
-`agentscope` 服务已挂载 `/var/run/docker.sock`，容器内的服务可以直接调用宿主机 Docker daemon 创建 Docker 工作区沙箱容器（参见 §2.1），把 `main.py` 中的 `LocalWorkspaceManager` 换成 `DockerWorkspaceManager` 即可，无需额外配置。
-
-### 3.6 常用操作
-
-```bash
-cd Docker
-
-# 查看全部服务状态
-docker compose ps
-
-# 查看某个服务的日志
-docker compose logs -f webui-backend
-
-# 只重建并重启单个服务（如改了后端代码）
-docker compose up -d --build webui-backend
-
-# 进入服务容器调试
-docker compose exec agentscope /bin/bash
-
-# 停止全部服务（保留数据卷）
-docker compose down
-```
-
-### 3.7 注意事项
-
-- **Redis 连接**：compose 已通过 `REDIS_HOST=redis` 环境变量注入，`main.py` 会从环境变量读取（默认 `localhost`），容器内开发无需改代码。
-- **API Key 为空**：服务能启动但模型调用会失败，请确认宿主机已导出对应环境变量后再 `up`。
-- **生产部署**：示例以 `reload=True` 单进程启动，生产环境建议关闭热重载并使用 `uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4`，同时将 `InMemoryMessageBus` 换成 `RedisMessageBus`（`main.py` 中已附注切换方法）。
 
 ---
 
@@ -456,4 +456,4 @@ AgentScope 遵循惰性导入原则，可选依赖未安装时不会在 `import 
 
 ### Q: 如何切换工作区后端？
 
-在 `create_app()` 中传入不同的 `WorkspaceManager` 实现即可，所有后端共享相同的接口。详见上方 §2 各后端说明。
+在 `create_app()` 中传入不同的 `WorkspaceManager` 实现即可，所有后端共享相同的接口。详见上方 §3 各后端说明。
