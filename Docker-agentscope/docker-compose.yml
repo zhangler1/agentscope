@@ -1,18 +1,17 @@
 services:
   redis:
     image: redis:7-bookworm
-    ports: ["6379:6379"]
     volumes:
       - redis-data:/data
 
   postgres:
     image: postgres:16-alpine
-    ports: ["5432:5432"]
     environment:
       # 与 config.yaml db.url 中的凭据保持一致
       - POSTGRES_USER=agentscope
       - POSTGRES_PASSWORD=agentscope
       - POSTGRES_DB=agentscope
+    ports: ["5433:5432"]
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
