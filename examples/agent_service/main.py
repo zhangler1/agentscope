@@ -32,6 +32,7 @@ Run::
 import logging
 import os
 from contextlib import asynccontextmanager
+from logging.handlers import TimedRotatingFileHandler
 from typing import Any
 
 import uvicorn
@@ -59,8 +60,10 @@ from bocomadp.config import (
     load_models_from_yaml,
     build_model_instance,
 )
+from bocomadp.concurrency.guard import ConcurrencyGuard
 from bocomadp.logging.logging_config import configure_logging
 from bocomadp.logging.trace_middleware import TraceMiddleware
+from bocomadp.middleware.concurrency_guard import ConcurrencyGuardMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
 from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
@@ -80,6 +83,7 @@ from bocomadp.routers.platform_health import platform_health_router
 from bocomadp.routers.skill_router import skill_router
 from bocomadp.routers.stats import stats_router
 from bocomadp.routers.workspace_files import workspace_files_router
+from bocomadp.routers.oss_download import oss_download_router
 from bocomadp.routers.session_usage import session_usage_router
 from bocomadp.routers.agent_tools import agent_tools_router
 from bocomadp.routers.agent_tools import (
@@ -108,19 +112,57 @@ from bocomadp.workspace import (
 # 以便它们使用的 ``as`` logger 自动拥有文件 handler。
 _LOG_DIR = os.getenv("AGENTSCOPE_LOG_DIR", "/app/logs")
 _LOG_FILE = os.path.join(_LOG_DIR, "events.log")
+# 每日滚动的历史文件保留天数（backupCount；0 = 永不自动清理）
+_LOG_BACKUP_COUNT = int(os.getenv("AGENTSCOPE_LOG_BACKUP_COUNT", "30"))
 os.makedirs(_LOG_DIR, exist_ok=True)
-setup_logger("INFO", filepath=_LOG_FILE)
+setup_logger("INFO")  # 只挂 StreamHandler；文件 handler 由下方共享实例接管
+
+
+class _EventsFormatter(logging.Formatter):
+    """单个滚动 handler 同时服务 ``as`` 与 ``uvicorn.access``，
+    按 logger 名保持各自原有行格式。"""
+
+    _FORMATS = {
+        "as": (
+            "%(asctime)s | %(levelname)-7s | "
+            "%(module)s:%(funcName)s:%(lineno)s - %(message)s"
+        ),
+        "uvicorn.access": (
+            "%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"
+        ),
+    }
+
+    def __init__(self) -> None:
+        super().__init__(self._FORMATS["as"])
+        self._sub_formatters = {
+            name: logging.Formatter(fmt) for name, fmt in self._FORMATS.items()
+        }
+
+    def format(self, record: logging.LogRecord) -> str:
+        sub = self._sub_formatters.get(record.name)
+        return sub.format(record) if sub is not None else super().format(record)
+
+
+# 每日滚动文件 handler：当天写 events.log，次日零点第一条日志触发滚动，
+# 旧文件重命名为 events.log.<前一天日期>（如 events.log.2026-08-13），
+# 超出 _LOG_BACKUP_COUNT 天的历史文件自动删除。
+# 注意：``as`` 与 ``uvicorn.access`` 必须共享同一个 handler 实例 ——
+# 若各自持有独立实例，两个实例会在同一天各自执行 rename，
+# 后执行者会覆盖先滚动出的旧文件（os.rename 静默覆盖），当天日志丢失。
+_events_file_handler = TimedRotatingFileHandler(
+    _LOG_FILE,
+    when="midnight",
+    interval=1,
+    backupCount=_LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
+_events_file_handler.suffix = "%Y-%m-%d"
+_events_file_handler.setFormatter(_EventsFormatter())
+logging.getLogger("as").addHandler(_events_file_handler)
 
 # 把 uvicorn 的 HTTP 访问日志（``uvicorn.access``）也并入同一个文件，
 # 便于在一个文件中对照"客户端请求 → 后端处理 → 模型调用 → 工具调用"时间线。
-_access_logger = logging.getLogger("uvicorn.access")
-_access_file_handler = logging.FileHandler(_LOG_FILE)
-_access_file_handler.setFormatter(
-    logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s - %(message)s",
-    ),
-)
-_access_logger.addHandler(_access_file_handler)
+logging.getLogger("uvicorn.access").addHandler(_events_file_handler)
 
 default_mcps = [
     MCPClient(
@@ -553,12 +595,30 @@ else:
         default_mcps=build_default_mcps(),
     )
 
+# 并发控制仅在生产 Redis 模式生效(InMemory 本地/测试模式零日志噪声)
+from agentscope.app.message_bus import RedisMessageBus as _RedisMessageBus
+
+_concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
 workspace_manager = WhitelistWorkspaceManager(workspace_manager)
 
 runtime.workspace_manager = workspace_manager
+
+# ---------------------------------------------------------------------------
+# 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
+# ---------------------------------------------------------------------------
+# Redis 客户端惰性获取:连接池由框架 lifespan 进入 message_bus 时创建,
+# get_client() 在进入前不可用,中间件运行期调用,失败即 fail-open。
+def _get_redis_client():
+    return message_bus.get_client()
+
+concurrency_guard = ConcurrencyGuard(
+    _get_redis_client,
+    max_running=config.run_concurrency.max_running,
+    max_running_per_user=config.run_concurrency.max_running_per_user,
+)
 
 # ---------------------------------------------------------------------------
 # 5. 构建 App —— create_app 自动注册 12 个内置路由
@@ -592,7 +652,7 @@ class TokenCaptureMiddleware:
 
 
 def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
-    """构建 ASGI 中间件栈（由内到外）。"""
+    """构建 ASGI 中间件栈(先注册者最外层)。"""
     return [
         # 最内层：捕获 guwpToken 到 ContextVar，随请求上下文透传给
         # 框架 chat-run 后台任务（agent-creator 工厂工具使用）。
@@ -605,6 +665,17 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
             allow_origins=["*"],
             allow_methods=["*"],
             allow_headers=["*"],
+        ),
+        Middleware(
+            ConcurrencyGuardMiddleware,
+            guard=concurrency_guard,
+            grace_secs=config.run_concurrency.grace_secs,
+            enabled=config.run_concurrency.enabled
+            and (
+                config.run_concurrency.max_running > 0
+                or config.run_concurrency.max_running_per_user > 0
+            )
+            and _concurrency_active,
         ),
     ]
 
@@ -746,6 +817,8 @@ app.include_router(platform_health_router)
 app.include_router(skill_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
+# OSS 打包下载（/workspace/file-download）
+app.include_router(oss_download_router)
 # 按凭证查询模型（含单模型绑定过滤）
 app.include_router(credential_model_router)
 
