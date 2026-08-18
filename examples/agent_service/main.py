@@ -94,6 +94,7 @@ from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
@@ -870,6 +871,9 @@ app.state.bus_bridge = BusBridge(message_bus)
 # ---------------------------------------------------------------------------
 # 7. 在 12 个内置路由之上挂载自定义路由
 # ---------------------------------------------------------------------------
+# 智能体记忆字段包裹路由：覆盖框架 /agent/ 的 4 个端点（创建/查询/更新/删除），
+# 增加记忆字段（侧边 PG 表 agent_memory_configs 持久化）。
+install_agent_memory_router(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
