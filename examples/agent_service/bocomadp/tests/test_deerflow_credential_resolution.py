@@ -11,8 +11,8 @@ Contract under test:
   provider 的 config 条目，继续走「用户优先、默认复制」：default 凭证
   id → 复制出用户维度凭证并引用（复制保留 scene_code / api_key_url 等
   刷新元数据）；本用户凭证 id → 直接引用既有凭证，不重复复制。
-- 模型名 / provider_id hint 走既有 config.yaml 双键匹配路径不变；场景
-  绑定 provider 兜底不变。
+- 模型名 / provider_id hint 走既有 config.yaml 双键匹配路径不变；无
+  hint 时回退全局 active provider。
 - ELLM 条目 api_key 空放行（key 动态获取），非 ELLM 条目 api_key 空仍
   返回 None。
 """
@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
 
 from agentscope.app.storage import ChatModelConfig, CredentialRecord
 
-from bocomadp.config.app_config import AgentEntry, ModelEntry
+from bocomadp.config.app_config import ModelEntry
 from bocomadp.credential import (  # noqa: F401 — 导入即注册，from_dict 反序列化需要
     ELLMCredential,
 )
@@ -53,20 +54,6 @@ def _deepseek_entry(api_key: str) -> ModelEntry:
         provider_type="deepseek",
         model_name="deepseek-chat",
         api_key=api_key,
-    )
-
-
-def _agent_entry(provider_id: str = _ELLM_PROVIDER) -> AgentEntry:
-    """场景条目，model_provider 绑定 provider（hint 未命中时兜底用）。"""
-    return AgentEntry(
-        agent_id="assistant",
-        name="assistant",
-        model_provider=provider_id,
-        model_name=(
-            "deepseek-v4-flash"
-            if provider_id == _ELLM_PROVIDER
-            else "deepseek-chat"
-        ),
     )
 
 
@@ -135,11 +122,13 @@ class _FakeStorage:
 
 
 class _FakeRequest:
-    """``app.state.provider_manager`` 为 None 的最小 Request stand-in。"""
+    """``app.state.provider_manager`` 可配置的最小 Request stand-in。"""
 
-    def __init__(self) -> None:
+    def __init__(self, active: SimpleNamespace | None = None) -> None:
         class _State:
-            provider_manager = None
+            provider_manager = SimpleNamespace(
+                get_active_model=lambda: active,
+            )
 
         class _App:
             state = _State()
@@ -151,13 +140,13 @@ def _resolve(
     storage: _FakeStorage,
     user_id: str,
     hint: str = "",
+    request: _FakeRequest | None = None,
 ) -> ChatModelConfig | None:
     return asyncio.run(
         chat_mod._resolve_chat_model_config(
             storage,
-            _FakeRequest(),
+            request or _FakeRequest(),
             user_id,
-            "assistant",
             hint,
         ),
     )
@@ -221,10 +210,8 @@ class TestResolveChatModelConfig:
         self,
         monkeypatch,
         models: list[ModelEntry],
-        agents: list[AgentEntry],
     ) -> None:
         monkeypatch.setattr(chat_mod, "load_models_from_yaml", lambda: models)
-        monkeypatch.setattr(chat_mod, "load_agents_from_yaml", lambda: agents)
 
     def test_default_credential_id_copied_to_user(self, monkeypatch) -> None:
         """hint 为 default 凭证 id → 解析 provider → 复制出用户维度凭证
@@ -238,7 +225,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_ellm_entry(api_key="")],
-            agents=[_agent_entry()],
         )
 
         config = _resolve(
@@ -276,7 +262,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_ellm_entry(api_key="")],
-            agents=[_agent_entry()],
         )
 
         config = _resolve(
@@ -300,7 +285,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_deepseek_entry("sk-test")],
-            agents=[_agent_entry(_DEEPSEEK_PROVIDER)],
         )
 
         config = _resolve(storage, "user-1", hint="deepseek-chat")
@@ -324,7 +308,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_deepseek_entry("sk-test")],
-            agents=[_agent_entry(_DEEPSEEK_PROVIDER)],
         )
 
         config = _resolve(storage, "user-1", hint=_DEEPSEEK_PROVIDER)
@@ -340,7 +323,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_deepseek_entry("")],
-            agents=[_agent_entry(_DEEPSEEK_PROVIDER)],
         )
 
         config = _resolve(storage, "user-1", hint="deepseek-chat")
@@ -348,8 +330,8 @@ class TestResolveChatModelConfig:
         assert config is None
         assert storage.upserts == []
 
-    def test_scenario_provider_fallback(self, monkeypatch) -> None:
-        """hint 为空时回退场景绑定 provider（现有逻辑不动）。"""
+    def test_active_provider_fallback(self, monkeypatch) -> None:
+        """hint 为空时回退全局 active provider。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -359,10 +341,18 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_deepseek_entry("sk-test")],
-            agents=[_agent_entry(_DEEPSEEK_PROVIDER)],
         )
 
-        config = _resolve(storage, "user-1")
+        config = _resolve(
+            storage,
+            "user-1",
+            request=_FakeRequest(
+                active=SimpleNamespace(
+                    provider_id=_DEEPSEEK_PROVIDER,
+                    model_name="deepseek-chat",
+                ),
+            ),
+        )
 
         assert config is not None
         assert config.credential_id == (
@@ -370,44 +360,21 @@ class TestResolveChatModelConfig:
         )
 
     def test_no_hint_no_provider_returns_none(self, monkeypatch) -> None:
-        """hint 空 + 无场景 provider + 无 active → None（原生 404 兜底）。"""
+        """hint 空 + 无 active → None（原生 404 兜底）。"""
         storage = _FakeStorage()
-        self._patch_loaders(monkeypatch, models=[], agents=[])
+        self._patch_loaders(monkeypatch, models=[])
 
         config = _resolve(storage, "user-1")
 
         assert config is None
         assert storage.upserts == []
 
-    def test_dynamic_hint_routes_to_bound_ellm(self, monkeypatch) -> None:
-        """hint 为真实模型 ID（未静态命中）+ 场景绑定 ELLM → 动态路由
-        到 ELLM，config.model == hint，default 凭证复制正常。"""
-        storage = _FakeStorage()
-        storage.seed(
-            "default",
-            f"deerflow-default-{_ELLM_PROVIDER}",
-            _ellm_record_data(),
-        )
-        self._patch_loaders(
-            monkeypatch,
-            models=[_ellm_entry(api_key="")],
-            agents=[_agent_entry(_ELLM_PROVIDER)],
-        )
-
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
-
-        assert config is not None
-        assert config.type == "bocom_ellm"
-        assert config.model == "Qwen3-235B-A22B"
-        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert len(storage.upserts) == 1  # 从 default 复制
-
     def test_dynamic_hint_routes_to_unique_ellm_entry(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为真实模型 ID + 无场景绑定（provider_manager=None）+
-        config.yaml 唯一 ELLM 条目 → 动态路由，config.model == hint。"""
+        """hint 为真实模型 ID + 无 active provider + config.yaml 唯一
+        ELLM 条目 → 动态路由，config.model == hint。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -417,7 +384,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_ellm_entry(api_key="")],
-            agents=[],
         )
 
         config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
@@ -437,7 +403,6 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_ellm_entry(api_key="")],
-            agents=[_agent_entry(_ELLM_PROVIDER)],
         )
 
         config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
@@ -451,7 +416,7 @@ class TestResolveChatModelConfig:
         assert credential.model == "Qwen3-235B-A22B"
 
     def test_dynamic_hint_keeps_non_ellm_binding(self, monkeypatch) -> None:
-        """hint 为真实模型 ID + 场景绑定 deepseek（非 ELLM）→ 维持现状
+        """hint 为真实模型 ID + active 为 deepseek（非 ELLM）→ 维持现状
         （model 用静态条目名，hint 丢弃）。"""
         storage = _FakeStorage()
         storage.seed(
@@ -462,10 +427,19 @@ class TestResolveChatModelConfig:
         self._patch_loaders(
             monkeypatch,
             models=[_deepseek_entry("sk-test")],
-            agents=[_agent_entry(_DEEPSEEK_PROVIDER)],
         )
 
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+        config = _resolve(
+            storage,
+            "user-1",
+            hint="Qwen3-235B-A22B",
+            request=_FakeRequest(
+                active=SimpleNamespace(
+                    provider_id=_DEEPSEEK_PROVIDER,
+                    model_name="deepseek-chat",
+                ),
+            ),
+        )
 
         assert config is not None
         assert config.type == "deepseek"

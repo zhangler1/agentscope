@@ -26,9 +26,9 @@ curl http://192.168.0.106/api/stats/storage
 > 输出 deer-flow 2.0（LangGraph Platform）SSE 协议：`event:` → `data:` → `id:`
 > 帧 + `Last-Event-ID` 断线续传 + `Content-Location` 响应头。
 >
-> - `thread_id` 即原生 `session_id`（同一资源）；`agent_id` 选场景：
->   default / customer_service / risk_control
-> - `x-user-id` 请求头**可选**（缺省 `default`，单租户本地部署；生产接入认证后可收紧为必填）
+> - `thread_id` 即原生 `session_id`（同一资源）；`agent_id` 为原生
+>   storage 中的智能体 ID（由原生 `/agent` 接口创建，见第 2 节）
+> - `x-user-id` 请求头**必填**（缺失或为空 → 401）
 > - 同 session 已有活跃 run 时再次创建 → `409 Conflict`
 
 ```bash
@@ -59,11 +59,11 @@ curl -X POST http://192.168.0.106/api/threads/t1/runs/{run_id}/cancel \
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `agent_id` | 否 | 场景 ID（同 `/chat/`）；与 `assistant_id` 二选一，都省略时回退 config.yaml 首个 seed agent |
-| `assistant_id` | 否 | LangGraph SDK 别名（前端固定传 `lead_agent`）；不在 seed 场景中时自动回退默认场景 |
+| `agent_id` | 是 | 原生智能体 ID（storage 中注册的 agent，见第 2 节）；缺失 → 400 |
+| `assistant_id` | 否 | LangGraph SDK 别名，接受但忽略（前端适配已废弃） |
 | `input` | 否 | 输入消息：单条消息 dict `{"type":"human","content":"..."}` 或 `{"messages":[...]}` 列表；**不接受纯字符串** |
 | `custom_params` | 否 | 请求级运行时配置（空间码 / custom_prompt / 检索开关 / guwp_token 等），见下节 |
-| `session_id` | 否 | 省略即 `thread_id`；显式提供且不一致 → 400 |
+| `session_id` | 是 | 必须等于路径 `thread_id`（thread_id == session_id 同一资源）；缺失或不一致 → 400 |
 | `stream_mode` / `multitask_strategy` | 否 | 接受但忽略（固定 messages+custom 流、reject 并发策略） |
 | `on_disconnect` | 否 | `cancel`（默认，断线即中断 run）/ `continue`（仅断开订阅） |
 
@@ -91,24 +91,12 @@ curl -N -X POST http://192.168.0.106/api/threads/t1/runs/stream \
 > [custom_params.md](./custom_params.md)。首次带值请求会落盘到会话 workspace
 > （`sessions/{session_id}/custom_params.json`），后续不带参数的请求自动回退加载。
 
-## 2. 场景种子（config.yaml `agents` 段）
+## 2. 智能体（原生 `/agent` 路由）
 
-场景不再提供独立 CRUD API——启动时由 lifespan 幂等同步进框架
-StorageBase（`user_id="default"`，所有用户经 default fallback 可见），
-chat / deerflow 按 `agent_id` 解析。场景的增删改走框架内置 `/agent` 路由。
-
-```yaml
-# config.yaml
-agents:
-  - agent_id: default
-    name: "通用助手"
-    system_prompt: "..."
-    model_provider: ""    # 留空使用全局 active provider
-    model_name: ""
-    max_iters: 20
-    enabled_tools: []     # 空 = 全部工具；非空在首次创建时写入工具白名单
-    enabled_skills: []    # 技能白名单（匹配技能 frontmatter name 或目录名），空 = 全部
-```
+智能体全部存于框架 StorageBase（config.yaml `agents` 场景种子机制已移除）。
+创建 / 修改 / 删除走框架内置 `/agent` 路由，`system_prompt` 随智能体记录
+入库；chat / deerflow 运行时按 `agent_id` 从 storage 解析（不可见 → 404）。
+模型选择不再按 agent 绑定：请求级模型名未指定时回退全局 active provider。
 
 ## 3. 模型（`/models`、`/model`）
 
@@ -276,7 +264,7 @@ curl http://192.168.0.106/api/tts-model/
 
 ## 备注
 
-- 场景会话闭环验证只需第 0/1/2 组命令：`POST /api/threads/t1/runs/stream` 用 `agent_id` 验证场景路由（不同场景 → 不同 system_prompt / 模型 / 工具白名单）
+- 场景会话闭环验证只需第 0/1/2 组命令：`POST /api/threads/t1/runs/stream` 用 `agent_id` 验证 agent 路由（不同 agent → 不同 system_prompt / 工具白名单）
 - OpenAPI 在线文档：`http://192.168.0.106:8000/docs` 或 `http://192.168.0.106:8000/openapi.json`（直连端口）
 - 会话状态与消息由原生 storage 落库（config.yaml `db.url`，PostgreSQL）；工作区文件根目录见 config.yaml `workspace_dir`（docker 挂载 `examples/agent_service/workspaces`）
 - custom_params 落盘位置：会话 workspace 的 `sessions/{session_id}/custom_params.json`（本地模式即 `{workspace_dir}/{agent_id}/sessions/{session_id}/` 下）

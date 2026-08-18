@@ -236,39 +236,6 @@ class ModelEntry(BaseModel):
     )
 
 
-class AgentEntry(BaseModel):
-    """config.yaml 中单个场景（Agent 模板）条目。
-
-    启动时由 ``load_agents_from_yaml`` 读取并在 lifespan 中幂等同步进
-    框架 StorageBase；chat / deerflow 按 ``agent_id`` 从 storage 解析
-    场景配置。
-    """
-
-    agent_id: str = Field(description="场景唯一标识，即 /api/chat/run 的 agent_id")
-    name: str = Field(default="", description="场景显示名")
-    system_prompt: str = Field(
-        default="You are a helpful AI assistant.",
-        description="场景系统提示词（Agent 的 system_prompt）",
-    )
-    model_provider: str = Field(
-        default="",
-        description="场景绑定的模型 provider_id；留空使用全局 active provider",
-    )
-    model_name: str = Field(
-        default="",
-        description="场景绑定的模型名（展示 / 校验用）",
-    )
-    max_iters: int = Field(default=20, description="ReAct 最大迭代次数")
-    enabled_tools: list[str] = Field(
-        default_factory=list,
-        description="场景启用的工具白名单（空 = 全部工具）",
-    )
-    enabled_skills: list[str] = Field(
-        default_factory=list,
-        description="场景启用的技能白名单（空 = 全部技能）",
-    )
-
-
 class ProviderConfig(BaseModel):
     """模型 Provider 路由配置。
 
@@ -518,30 +485,6 @@ def load_models_from_yaml(
     result: list[ModelEntry] = []
     for item in entries_data:
         result.append(ModelEntry(**item))
-    return result
-
-
-def load_agents_from_yaml(
-    path: str | Path | None = None,
-) -> list[AgentEntry]:
-    """从 YAML 文件加载场景（Agent 模板）列表。
-
-    与 ``load_models_from_yaml`` 同构：默认读取 ``agent_service/config.yaml``
-    （绝对路径，与启动工作目录无关），读取后先做 ``$VAR`` / ``${VAR}``
-    环境变量展开。文件不存在时返回空列表（不影响启动）。
-    """
-    if path:
-        p = Path(path)
-        if not p.exists():
-            return []
-        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        data = expand_env_vars(raw) if isinstance(raw, dict) else {}
-    else:
-        data = expand_env_vars(load_config_yaml())
-    entries_data = data.get("agents", [])
-    result: list[AgentEntry] = []
-    for item in entries_data:
-        result.append(AgentEntry(**item))
     return result
 
 

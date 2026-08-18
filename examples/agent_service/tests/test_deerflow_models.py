@@ -2,10 +2,10 @@
 
 覆盖计划测试矩阵：
 
-- ``_resolve_requested_model_name``：四通道优先级与空回退；
+- ``_resolve_requested_model_name``：llm_model_name 单一通道与空回退；
 - ``ensure_default_credentials``：default 用户维度、幂等 upsert、失败不阻断；
 - ``_resolve_chat_model_config``：按 model_name / provider_id 匹配、
-  未命中回退 agent 绑定 provider、用户凭证优先引用、默认凭证复制入库、
+  未命中回退 active provider、用户凭证优先引用、默认凭证复制入库、
   default 凭证缺失回退 config.yaml 条目；
 - ``_ensure_session``：首次 backfill、模型切换更新、一致不更新；
 - ``GET /api/deerflow/models``：默认凭证 id 返回、用户凭证优先、
@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 from agentscope.app.storage import ChatModelConfig, SessionConfig
 from agentscope.app.storage._utils import _dump_with_secrets
 
-from bocomadp.config.app_config import AgentEntry, ModelEntry
+from bocomadp.config.app_config import ModelEntry
 from bocomadp.deerflow.credentials import (
     DEFAULT_CREDENTIAL_OWNER,
     default_credential_id,
@@ -65,19 +65,6 @@ def _make_model_entry(
     }
     kwargs.update(overrides)
     return ModelEntry(**kwargs)
-
-
-def _make_agent_entry(
-    agent_id: str = AGENT_ID,
-    model_provider: str = "ds",
-    model_name: str = "deepseek-chat",
-) -> AgentEntry:
-    return AgentEntry(
-        agent_id=agent_id,
-        name=agent_id,
-        model_provider=model_provider,
-        model_name=model_name,
-    )
 
 
 def _credential_data(
@@ -185,54 +172,25 @@ class FakeWorkspaceManager:
 # ── _resolve_requested_model_name ─────────────────────────────────────
 
 
-def test_resolve_requested_model_name_priority() -> None:
-    """四通道按优先级取第一个非空：context > config > body > custom_params。"""
-    # context 最高
+def test_resolve_requested_model_name_from_custom_params() -> None:
+    """唯一通道 custom_params.llm_model_name；SDK 字段 context / config 忽略。"""
     body = CreateRunRequest(
         context={"model_name": "from-context"},
         config={"configurable": {"model_name": "from-config"}},
-        model_name="from-body",
         custom_params={"llm_model_name": "from-custom"},
     )
-    assert _resolve_requested_model_name(body, body.custom_params) == (
-        "from-context"
-    )
-
-    # config 次之
-    body = CreateRunRequest(
-        config={"configurable": {"model_name": "from-config"}},
-        model_name="from-body",
-        custom_params={"llm_model_name": "from-custom"},
-    )
-    assert _resolve_requested_model_name(body, body.custom_params) == (
-        "from-config"
-    )
-
-    # body.model_name 再次
-    body = CreateRunRequest(
-        model_name="from-body",
-        custom_params={"llm_model_name": "from-custom"},
-    )
-    assert _resolve_requested_model_name(body, body.custom_params) == (
-        "from-body"
-    )
-
-    # custom_params 兜底
-    body = CreateRunRequest(custom_params={"llm_model_name": "from-custom"})
-    assert _resolve_requested_model_name(body, body.custom_params) == (
-        "from-custom"
-    )
+    assert _resolve_requested_model_name(body.custom_params) == "from-custom"
 
 
 def test_resolve_requested_model_name_empty_fallback() -> None:
-    """全部缺失返回空串；空白值视为缺失。"""
-    assert _resolve_requested_model_name(CreateRunRequest()) == ""
+    """缺失返回空串；空白值视为缺失；其他 SDK 字段不参与解析。"""
+    assert _resolve_requested_model_name(None) == ""
     body = CreateRunRequest(
-        context={"model_name": "  "},
-        config={"configurable": {"model_name": ""}},
-        custom_params={},
+        context={"model_name": "from-context"},
+        config={"configurable": {"model_name": "from-config"}},
+        custom_params={"llm_model_name": "  "},
     )
-    assert _resolve_requested_model_name(body, body.custom_params) == ""
+    assert _resolve_requested_model_name(body.custom_params) == ""
 
 
 # ── ensure_default_credentials ────────────────────────────────────────
@@ -311,17 +269,10 @@ def test_ensure_default_credentials_failure_does_not_block(
 def _patch_config_loader(
     monkeypatch,
     models: list[ModelEntry],
-    agents: list[AgentEntry] | None = None,
 ) -> None:
     monkeypatch.setattr(
         "bocomadp.deerflow.routers.deerflow_chat.load_models_from_yaml",
         lambda: models,
-    )
-    monkeypatch.setattr(
-        "bocomadp.deerflow.routers.deerflow_chat.load_agents_from_yaml",
-        lambda: agents
-        if agents is not None
-        else [_make_agent_entry()],
     )
 
 
@@ -340,10 +291,9 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(),
+            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            AGENT_ID,
-            model_name_hint="r1",
+            hint="r1",
         ),
     )
 
@@ -362,10 +312,9 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(),
+            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            AGENT_ID,
-            model_name_hint="ds-r1",
+            hint="ds-r1",
         ),
     )
 
@@ -374,10 +323,10 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
     assert config.credential_id == user_credential_id(USER_ID, "ds-r1")
 
 
-def test_resolve_chat_model_config_unmatched_falls_back_to_agent_provider(
+def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
     monkeypatch,
 ) -> None:
-    """hint 未命中告警后回退场景绑定 provider（与 deer-flow 一致）。"""
+    """hint 未命中告警后回退全局 active provider。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -385,10 +334,9 @@ def test_resolve_chat_model_config_unmatched_falls_back_to_agent_provider(
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(),
+            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            AGENT_ID,
-            model_name_hint="nope",
+            hint="nope",
         ),
     )
 
@@ -408,7 +356,11 @@ def test_resolve_chat_model_config_reuses_user_credential(
     storage.seed_credential(USER_ID, own_id, api_key="sk-custom")
 
     config = _run(
-        _resolve_chat_model_config(storage, FakeRequest(), USER_ID, AGENT_ID),
+        _resolve_chat_model_config(
+            storage,
+            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
+            USER_ID,
+        ),
     )
 
     assert config is not None
@@ -430,7 +382,11 @@ def test_resolve_chat_model_config_copies_from_default_credential(
     )
 
     config = _run(
-        _resolve_chat_model_config(storage, FakeRequest(), USER_ID, AGENT_ID),
+        _resolve_chat_model_config(
+            storage,
+            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
+            USER_ID,
+        ),
     )
 
     own_id = user_credential_id(USER_ID, "ds")
@@ -450,7 +406,11 @@ def test_resolve_chat_model_config_falls_back_to_entry_without_default(
     storage = FakeStorage()
 
     config = _run(
-        _resolve_chat_model_config(storage, FakeRequest(), USER_ID, AGENT_ID),
+        _resolve_chat_model_config(
+            storage,
+            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
+            USER_ID,
+        ),
     )
 
     own_id = user_credential_id(USER_ID, "ds")
@@ -463,18 +423,13 @@ def test_resolve_chat_model_config_falls_back_to_entry_without_default(
 def test_resolve_chat_model_config_unknown_entry_returns_none(
     monkeypatch,
 ) -> None:
-    """agent 未绑定 provider 且无 active：返回 None 不阻断。"""
-    _patch_config_loader(
-        monkeypatch,
-        [],
-        agents=[_make_agent_entry(model_provider="", model_name="")],
-    )
+    """无 active provider：返回 None 不阻断。"""
+    _patch_config_loader(monkeypatch, [])
     config = _run(
         _resolve_chat_model_config(
             FakeStorage(),
             FakeRequest(active=None),
             USER_ID,
-            AGENT_ID,
         ),
     )
     assert config is None
@@ -492,7 +447,7 @@ def _run_ensure_session(
         _ensure_session(
             storage,
             FakeWorkspaceManager(),
-            request or FakeRequest(),
+            request or FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
             AGENT_ID,
             "s1",
@@ -603,7 +558,7 @@ def _make_models_app(storage: FakeStorage) -> FastAPI:
 
 
 def test_list_models_returns_default_credential_id(monkeypatch) -> None:
-    """无用户凭证时返回 default 凭证 id；X-User-ID 缺省 default 用户。"""
+    """无用户凭证时返回 default 凭证 id（X-User-ID 必填，缺省 401）。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     monkeypatch.setattr(
         models_module,
@@ -618,7 +573,10 @@ def test_list_models_returns_default_credential_id(monkeypatch) -> None:
         )
 
     with TestClient(_make_models_app(storage)) as client:
-        response = client.get("/api/deerflow/models")
+        response = client.get(
+            "/api/deerflow/models",
+            headers={"X-User-ID": DEFAULT_CREDENTIAL_OWNER},
+        )
 
     assert response.status_code == 200
     body = response.json()["models"]
@@ -670,7 +628,10 @@ def test_list_models_skips_entry_without_any_credential(
     storage = FakeStorage()
 
     with TestClient(_make_models_app(storage)) as client:
-        response = client.get("/api/deerflow/models")
+        response = client.get(
+            "/api/deerflow/models",
+            headers={"X-User-ID": DEFAULT_CREDENTIAL_OWNER},
+        )
 
     assert response.status_code == 200
     assert response.json() == {"models": []}

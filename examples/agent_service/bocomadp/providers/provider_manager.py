@@ -114,7 +114,7 @@ class ProviderManager:
         """Return the model for *provider_id*, or the active provider's model.
 
         Args:
-            provider_id: 场景绑定的 provider；为空时回退当前 active
+            provider_id: 指定的 provider；为空时回退当前 active
                 provider（保持原有调用兼容）。
 
         Returns:
