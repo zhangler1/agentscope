@@ -155,7 +155,7 @@ async def create_agent_with_memory(
         access=access,
     )
     try:
-        await memory_config.memory_upsert(created.agent_id, mem)
+        await memory_config.memory_upsert(user_id, created.agent_id, mem)
     except Exception:
         # best-effort 回滚：删除刚创建的 agent，避免"存在但记忆配置丢失"
         logger.exception("memory upsert failed for %s; rolling back", created.agent_id)
@@ -191,7 +191,7 @@ async def list_agents_with_memory(
     )
     merged: list[AgentViewWithMemory] = []
     for view in result.agents:
-        mem = await memory_config.memory_get(view.id)
+        mem = await memory_config.memory_get(user_id, view.id)
         mem_fields = mem.model_dump() if mem is not None else _memory_defaults()
         merged.append(
             AgentViewWithMemory.model_validate(
@@ -243,21 +243,21 @@ async def update_agent_with_memory(
         if v is not None
     }
     if mem_updates:
-        existing = await memory_config.memory_get(agent_id)
+        existing = await memory_config.memory_get(user_id, agent_id)
         merged = (
             existing.model_copy(update=mem_updates)
             if existing
             else memory_config.MemoryConfig(**mem_updates)
         )
         try:
-            await memory_config.memory_upsert(agent_id, merged)
+            await memory_config.memory_upsert(user_id, agent_id, merged)
         except Exception:
             logger.exception("memory upsert failed for %s", agent_id)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Agent updated but memory config write failed.",
             )
-    final_mem = await memory_config.memory_get(agent_id)
+    final_mem = await memory_config.memory_get(user_id, agent_id)
     mem_fields = (
         final_mem.model_dump() if final_mem is not None else _memory_defaults()
     )
@@ -285,7 +285,7 @@ async def delete_agent_with_memory(
         access=access,
     )
     try:
-        await memory_config.memory_delete(agent_id)
+        await memory_config.memory_delete(user_id, agent_id)
     except Exception:
         logger.exception("memory delete failed for %s; agent already deleted", agent_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
