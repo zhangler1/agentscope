@@ -28,7 +28,6 @@ from .audit_config import AuditConfig, get_audit_config
 from .uploads_config import UploadConfig, VIRTUAL_PATH_PREFIX, get_upload_config
 from .app_config import (
     AppConfig,
-    AgentEntry,
     CheckpointsConfig,
     GovernanceConfig,
     HooksConfig,
@@ -46,7 +45,6 @@ from .app_config import (
     build_model_instance,
     get_app_config,
     is_trace_correlation_enabled,
-    load_agents_from_yaml,
     load_models_from_yaml,
 )
 
@@ -70,7 +68,6 @@ __all__ = [
     "get_upload_config",
     # app_config.py —— 单源化配置（config.yaml 主源 + env 覆盖）
     "AppConfig",
-    "AgentEntry",
     "CheckpointsConfig",
     "GovernanceConfig",
     "HooksConfig",
@@ -88,6 +85,5 @@ __all__ = [
     "build_model_instance",
     "get_app_config",
     "is_trace_correlation_enabled",
-    "load_agents_from_yaml",
     "load_models_from_yaml",
 ]

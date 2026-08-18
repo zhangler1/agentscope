@@ -99,7 +99,9 @@ def test_join_finished_record_ends_immediately() -> None:
 
     with TestClient(app) as client:
         response = client.get(
-            f"/api/deerflow/threads/t1/runs/{rec.run_id}/stream")
+            f"/api/deerflow/threads/t1/runs/{rec.run_id}/stream",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert "event: end" in response.text
@@ -113,7 +115,9 @@ def test_join_unknown_run_without_active_task_ends() -> None:
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/deerflow/threads/t1/runs/ghost-run/stream")
+            "/api/deerflow/threads/t1/runs/ghost-run/stream",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert "event: end" in response.text
@@ -145,7 +149,11 @@ def test_join_unknown_run_with_active_task_still_waits() -> None:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test") as client:
                 resp_task = asyncio.create_task(
-                    client.get("/api/deerflow/threads/t1/runs/ghost-run/stream"))
+                    client.get(
+                        "/api/deerflow/threads/t1/runs/ghost-run/stream",
+                        headers={"X-User-ID": "default"},
+                    )
+                )
                 # 0.3 秒内不应返回（live 阶段挂起，只可能有心跳帧）
                 await asyncio.sleep(0.3)
                 assert not resp_task.done()
