@@ -16,16 +16,19 @@ from pydantic import BaseModel, Field
 
 from bocomadp.config import get_app_config
 
-# updated_at 用 TIMESTAMP 与框架 agents 表（_sql/_tables.py 的 DateTime）
-# 保持一致；PG 端映射为 timestamp 类型。
+# 主键 (user_id, agent_id) 与框架 agents 表的 (user_id 归属 + agent_id)
+# 模型对齐，强化按用户隔离；updated_at 用 TIMESTAMP 与框架 agents 表
+# （_sql/_tables.py 的 DateTime）一致；PG 端映射为 timestamp 类型。
 _CREATE_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS agent_memory_configs ("
-    "agent_id VARCHAR(255) PRIMARY KEY, "
+    "user_id VARCHAR(255) NOT NULL, "
+    "agent_id VARCHAR(255) NOT NULL, "
     "memory_update_prompt TEXT NOT NULL DEFAULT '', "
     "memory_enabled BOOLEAN NOT NULL DEFAULT FALSE, "
     "memory_type INTEGER NOT NULL DEFAULT 0, "
     "memory_update_rounds INTEGER NOT NULL DEFAULT 10, "
-    "updated_at TIMESTAMP NOT NULL"
+    "updated_at TIMESTAMP NOT NULL, "
+    "PRIMARY KEY (user_id, agent_id)"
     ")"
 )
 
@@ -86,7 +89,11 @@ async def _ensure_table() -> None:
     _initialized_for = engine
 
 
-async def memory_upsert(agent_id: str, config: MemoryConfig) -> None:
+async def memory_upsert(
+    user_id: str,
+    agent_id: str,
+    config: MemoryConfig,
+) -> None:
     """原子 UPSERT 一条记忆配置（不存在则插入，存在则覆盖）。"""
     await _ensure_table()
     engine = await _get_engine()
@@ -96,10 +103,11 @@ async def memory_upsert(agent_id: str, config: MemoryConfig) -> None:
         await conn.execute(
             text(
                 "INSERT INTO agent_memory_configs "
-                "(agent_id, memory_update_prompt, memory_enabled, "
+                "(user_id, agent_id, memory_update_prompt, memory_enabled, "
                 " memory_type, memory_update_rounds, updated_at) "
-                "VALUES (:agent_id, :prompt, :enabled, :mtype, :rounds, :ts) "
-                "ON CONFLICT (agent_id) DO UPDATE SET "
+                "VALUES (:user_id, :agent_id, :prompt, :enabled, "
+                ":mtype, :rounds, :ts) "
+                "ON CONFLICT (user_id, agent_id) DO UPDATE SET "
                 "memory_update_prompt = EXCLUDED.memory_update_prompt, "
                 "memory_enabled = EXCLUDED.memory_enabled, "
                 "memory_type = EXCLUDED.memory_type, "
@@ -107,6 +115,7 @@ async def memory_upsert(agent_id: str, config: MemoryConfig) -> None:
                 "updated_at = EXCLUDED.updated_at"
             ),
             {
+                "user_id": user_id,
                 "agent_id": agent_id,
                 "prompt": config.memory_update_prompt,
                 "enabled": config.memory_enabled,
@@ -117,7 +126,7 @@ async def memory_upsert(agent_id: str, config: MemoryConfig) -> None:
         )
 
 
-async def memory_get(agent_id: str) -> MemoryConfig | None:
+async def memory_get(user_id: str, agent_id: str) -> MemoryConfig | None:
     """读取一条记忆配置；无记录返回 None（调用方合并默认值）。"""
     await _ensure_table()
     engine = await _get_engine()
@@ -129,9 +138,10 @@ async def memory_get(agent_id: str) -> MemoryConfig | None:
                 text(
                     "SELECT memory_update_prompt, memory_enabled, "
                     "memory_type, memory_update_rounds "
-                    "FROM agent_memory_configs WHERE agent_id = :agent_id"
+                    "FROM agent_memory_configs "
+                    "WHERE user_id = :user_id AND agent_id = :agent_id"
                 ),
-                {"agent_id": agent_id},
+                {"user_id": user_id, "agent_id": agent_id},
             )
         ).mappings().first()
     if row is None:
@@ -144,7 +154,7 @@ async def memory_get(agent_id: str) -> MemoryConfig | None:
     )
 
 
-async def memory_delete(agent_id: str) -> bool:
+async def memory_delete(user_id: str, agent_id: str) -> bool:
     """删除一条记忆配置；返回是否删除成功（不存在返回 False）。"""
     await _ensure_table()
     engine = await _get_engine()
@@ -152,8 +162,11 @@ async def memory_delete(agent_id: str) -> bool:
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            text("DELETE FROM agent_memory_configs WHERE agent_id = :agent_id"),
-            {"agent_id": agent_id},
+            text(
+                "DELETE FROM agent_memory_configs "
+                "WHERE user_id = :user_id AND agent_id = :agent_id",
+            ),
+            {"user_id": user_id, "agent_id": agent_id},
         )
     return result.rowcount > 0
 

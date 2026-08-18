@@ -72,12 +72,14 @@ def client(tmp_path, monkeypatch):
             await conn.execute(
                 text(
                     "CREATE TABLE IF NOT EXISTS agent_memory_configs ("
-                    "agent_id VARCHAR(255) PRIMARY KEY, "
+                    "user_id VARCHAR(255) NOT NULL, "
+                    "agent_id VARCHAR(255) NOT NULL, "
                     "memory_update_prompt TEXT NOT NULL DEFAULT '', "
                     "memory_enabled BOOLEAN NOT NULL DEFAULT FALSE, "
                     "memory_type INTEGER NOT NULL DEFAULT 0, "
                     "memory_update_rounds INTEGER NOT NULL DEFAULT 10, "
-                    "updated_at DATETIME NOT NULL"
+                    "updated_at DATETIME NOT NULL, "
+                    "PRIMARY KEY (user_id, agent_id)"
                     ")",
                 ),
             )
