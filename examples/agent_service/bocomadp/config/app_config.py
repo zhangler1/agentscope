@@ -158,6 +158,29 @@ class RunConcurrencyConfig(BaseModel):
     )
 
 
+class EllmKeyRefreshConfig(BaseModel):
+    """ELLM apikey 刷新策略配置。
+
+    ``refresh_ahead_secs`` 为**提前刷新窗口**：在网关下发的 key 真正
+    过期之前就提前换新，留出网关抖动/网络异常的缓冲，避免拿一个
+    已失效的 key 去请求（旧逻辑只在 ``now > apikey_expires_at``
+    时才刷新，过期边界上一旦刷新失败即带死 key 请求）。
+
+    取值约定：``0`` 表示关闭提前刷新（回退到旧行为：硬过期才换）；
+    正数表示在过期前 N 秒开始刷新。建议设为 key 有效期的 1/10 左右
+    （如有效期 25 分钟则取 120~180s）。
+    """
+
+    refresh_ahead_secs: float = Field(
+        default=120.0,
+        ge=0,
+        description=(
+            "ELLM key 提前刷新窗口（秒）；0=关闭（硬过期才换），"
+            "建议 120~180s。"
+        ),
+    )
+
+
 class DbConfig(BaseModel):
     """AgentScope 持久化存储后端（AsyncSQLAlchemyStorage）。
 
@@ -233,39 +256,6 @@ class ModelEntry(BaseModel):
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description="透传给 ChatModel.Parameters 的额外参数",
-    )
-
-
-class AgentEntry(BaseModel):
-    """config.yaml 中单个场景（Agent 模板）条目。
-
-    启动时由 ``load_agents_from_yaml`` 读取并在 lifespan 中幂等同步进
-    框架 StorageBase；chat / deerflow 按 ``agent_id`` 从 storage 解析
-    场景配置。
-    """
-
-    agent_id: str = Field(description="场景唯一标识，即 /api/chat/run 的 agent_id")
-    name: str = Field(default="", description="场景显示名")
-    system_prompt: str = Field(
-        default="You are a helpful AI assistant.",
-        description="场景系统提示词（Agent 的 system_prompt）",
-    )
-    model_provider: str = Field(
-        default="",
-        description="场景绑定的模型 provider_id；留空使用全局 active provider",
-    )
-    model_name: str = Field(
-        default="",
-        description="场景绑定的模型名（展示 / 校验用）",
-    )
-    max_iters: int = Field(default=20, description="ReAct 最大迭代次数")
-    enabled_tools: list[str] = Field(
-        default_factory=list,
-        description="场景启用的工具白名单（空 = 全部工具）",
-    )
-    enabled_skills: list[str] = Field(
-        default_factory=list,
-        description="场景启用的技能白名单（空 = 全部技能）",
     )
 
 
@@ -478,6 +468,10 @@ class AppConfig(BaseSettings):
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     db: DbConfig = Field(default_factory=DbConfig)
+    ellm_key_refresh: EllmKeyRefreshConfig = Field(
+        default_factory=EllmKeyRefreshConfig,
+        description="ELLM apikey 提前刷新窗口配置。",
+    )
     run_concurrency: RunConcurrencyConfig = Field(
         default_factory=RunConcurrencyConfig,
         description="/chat 并发控制配置。",
@@ -518,30 +512,6 @@ def load_models_from_yaml(
     result: list[ModelEntry] = []
     for item in entries_data:
         result.append(ModelEntry(**item))
-    return result
-
-
-def load_agents_from_yaml(
-    path: str | Path | None = None,
-) -> list[AgentEntry]:
-    """从 YAML 文件加载场景（Agent 模板）列表。
-
-    与 ``load_models_from_yaml`` 同构：默认读取 ``agent_service/config.yaml``
-    （绝对路径，与启动工作目录无关），读取后先做 ``$VAR`` / ``${VAR}``
-    环境变量展开。文件不存在时返回空列表（不影响启动）。
-    """
-    if path:
-        p = Path(path)
-        if not p.exists():
-            return []
-        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        data = expand_env_vars(raw) if isinstance(raw, dict) else {}
-    else:
-        data = expand_env_vars(load_config_yaml())
-    entries_data = data.get("agents", [])
-    result: list[AgentEntry] = []
-    for item in entries_data:
-        result.append(AgentEntry(**item))
     return result
 
 

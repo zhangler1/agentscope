@@ -32,7 +32,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agentscope.agent import ContextConfig, ReActConfig
 from agentscope.app.deps import (
     get_chat_run_registry,
     get_chat_service,
@@ -42,8 +41,6 @@ from agentscope.app.deps import (
 from agentscope.app._manager import ChatRunRegistry
 from agentscope.app._service import ChatService
 from agentscope.app.storage import (
-    AgentData,
-    AgentRecord,
     ChatModelConfig,
     SessionConfig,
     StorageBase,
@@ -57,7 +54,7 @@ from agentscope.event import (
 )
 from agentscope.message import Msg, TextBlock
 
-from bocomadp.config import load_agents_from_yaml, load_models_from_yaml
+from bocomadp.config import load_models_from_yaml
 from bocomadp.credential.ellm import ELLMCredential
 
 from ..bridge import BusBridge
@@ -81,7 +78,6 @@ from ..custom_params import (
     set_custom_params,
 )
 from ..deps import (
-    _default_agent_id,
     get_bridge,
     get_deerflow_user_id,
     get_run_manager,
@@ -273,28 +269,26 @@ class CreateRunRequest(BaseModel):
 
     兼容 LangGraph SDK 的调用契约（前端经 ``useStream`` 发起）：
 
-    - ``assistant_id`` 为 SDK 固定携带的别名（等价于原生 ``agent_id``）；
-      两者都省略时回退 config.yaml 首个 seed agent。
+    - ``assistant_id`` 接受但忽略（前端适配已废弃）；``agent_id`` 必填，
+      缺失时 400。
     - ``input`` 接受 SDK 的 ``{"messages": [...]}`` / 单条消息 dict，
       转换后等价于原生 ``ChatRequest.input``。
-    - ``session_id`` 可省略（缺省即 thread_id）；deer-flow 扩展参数
+    - ``session_id`` 必填且必须等于 thread_id；deer-flow 扩展参数
       （``stream_mode`` / ``multitask_strategy``）接受但忽略——本方案
       固定流模式与 reject 并发策略（裁剪项 1/2）。
     """
 
     agent_id: str | None = Field(
         default=None,
-        description="Agent ID（与原生 /chat/ 一致）。与 assistant_id "
-        "二选一；都省略时使用 config.yaml 首个 seed agent。",
+        description="Agent ID（与原生 /chat/ 一致），必填；缺失时 400。",
     )
     assistant_id: str | None = Field(
         default=None,
-        description="LangGraph SDK 别名（前端固定传 lead_agent）；"
-        "与 agent_id 等价，二选一。",
+        description="接受但忽略：前端适配已废弃，不再作为 agent_id 别名。",
     )
     session_id: str | None = Field(
         default=None,
-        description="原生 session id。省略时即 thread_id（两者同一资源）。",
+        description="原生 session id，必填且必须等于 thread_id（两者同一资源）。",
     )
     input: (
         Msg
@@ -330,23 +324,16 @@ class CreateRunRequest(BaseModel):
     context: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "deer-flow 前端 context overrides（对齐原生 thread_runs.py "
-            "的 context 字段）；本路由只读取 model_name，其余 key 忽略。"
-        ),
-    )
-    model_name: str | None = Field(
-        default=None,
-        description=(
-            "模型名直传通道（简单接入方）；优先级低于 context 与 config，"
-            "语义等价于 context.model_name。"
+            "LangGraph SDK 固定携带的 context（前端 overrides）。"
+            "接受但忽略：原生 ChatRequest 无请求级配置通道，模型名"
+            "改由 custom_params.llm_model_name 传递。"
         ),
     )
     config: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "LangGraph SDK 的 RunnableConfig；只读取 "
-            "config.configurable.model_name 作为模型名通道，"
-            "其余 key 接受但忽略。"
+            "LangGraph SDK 的 RunnableConfig。接受但忽略：原生 "
+            "ChatRequest 无请求级配置通道。"
         ),
     )
 
@@ -355,8 +342,13 @@ class CreateRunRequest(BaseModel):
 
 
 def _resolve_session_id(thread_id: str, body: CreateRunRequest) -> str:
-    """thread_id 与 session_id 同一资源；显式提供且不一致时报 400。"""
-    if body.session_id is not None and body.session_id != thread_id:
+    """thread_id 与 session_id 同一资源；session_id 必填且必须一致。"""
+    if body.session_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="session_id is required and must equal thread_id.",
+        )
+    if body.session_id != thread_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -368,114 +360,87 @@ def _resolve_session_id(thread_id: str, body: CreateRunRequest) -> str:
 
 
 def _resolve_requested_model_name(
-    body: CreateRunRequest,
     custom_params: dict[str, Any] | None = None,
 ) -> str:
-    """解析请求级模型名（四通道，按优先级取第一个非空）。
+    """解析请求级模型名（单一通道：custom_params.llm_model_name）。
 
-    对齐 deer-flow 原生链路的模型名通道：
+    对齐 deer-flow lead_agent 的 runtime_model_name。调用方保证传入
+    ELLM 需要的模型名，本函数不做校验/映射，直接信任。原生
+    ChatRequest 无请求级模型名通道，context / config 等 LangGraph
+    SDK 字段不再作为模型名来源（接受但忽略）。
 
-    1. ``context.model_name`` —— 官方前端模型选择器（input-box 的
-       per-thread 设置，每轮 run 携带）；
-    2. ``config.configurable.model_name`` —— LangGraph SDK 的
-       RunnableConfig 通道；
-    3. ``model_name`` —— 请求体直传字段（简单接入方）；
-    4. ``custom_params.llm_model_name`` —— 运行时覆盖通道（对齐
-       deer-flow lead_agent 的 runtime_model_name）。
-
-    全部缺失返回空串（调用方回退 agent 绑定 / 全局默认模型）。
+    缺失返回空串（调用方回退全局 active provider / config.yaml
+    条目解析）。
     """
-    context = body.context or {}
-    value = context.get("model_name")
-    if value:
-        return str(value).strip()
-    config = body.config or {}
-    configurable = config.get("configurable") or {}
-    value = configurable.get("model_name")
-    if value:
-        return str(value).strip()
-    if body.model_name:
-        return body.model_name.strip()
     value = (custom_params or {}).get("llm_model_name")
     return str(value).strip() if value else ""
 
 
 def _resolve_agent_id(body: CreateRunRequest) -> str:
-    """agent_id / assistant_id / config 默认值，按序取第一个非空。"""
-    if body.agent_id:
-        return body.agent_id
-    if body.assistant_id:
-        return body.assistant_id
-    default = _default_agent_id()
-    logger.info("deerflow: agent_id omitted, defaulting to %r.", default)
-    return default
-
-
-def _fallback_agent_id(agent_id: str) -> str:
-    """agent 未注册时回退默认 agent。
-
-    LangGraph SDK 固定携带 ``assistant_id=lead_agent``，而注册表 =
-    config.yaml seed agents（lifespan 已同步进原生 storage）；不存在的
-    agent 回退到默认 agent，保证前端零改动可对话。
-    """
-    seed_ids = {entry.agent_id for entry in load_agents_from_yaml()}
-    if agent_id not in seed_ids:
-        fallback = _default_agent_id()
-        logger.info(
-            "deerflow: agent %r not registered, falling back to %r.",
-            agent_id,
-            fallback,
+    """agent_id 必填（与原生 /chat/ 一致）；assistant_id 接受但忽略。"""
+    if not body.agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="agent_id is required; assistant_id is accepted "
+            "but ignored.",
         )
-        return fallback
-    return agent_id
+    return body.agent_id
+
+
+async def _check_agent_id(
+    storage: StorageBase,
+    user_id: str,
+    agent_id: str,
+) -> str:
+    """按原生可见性语义校验 agent_id；不可见一律 404。
+
+    agent 全部存于原生 storage（config.yaml seed 机制已废弃），校验
+    只查 storage（原生 resolve_agent 语义）：该 user_id 下可见 →
+    原样采用；否则 404——不再有 seed 名单或回退默认 agent 之类的
+    配置依赖。
+    """
+    if await storage.get_agent(user_id, agent_id) is not None:
+        return agent_id
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=(
+            f"Agent {agent_id!r} not found for user {user_id!r}; "
+            "agents are resolved from native storage only."
+        ),
+    )
 
 
 async def _resolve_chat_model_config(
     storage: StorageBase,
     request: Request,
     user_id: str,
-    agent_id: str,
-    model_name_hint: str = "",
+    hint: str = "",
 ) -> ChatModelConfig | None:
     """把 config.yaml 的模型条目解析为原生 ChatModelConfig。
 
-    优先按请求级模型名（``model_name_hint``）匹配 config.yaml 模型条目
+    优先按请求级模型名（``hint``）匹配 config.yaml 模型条目
     （model_name / provider_id 双键，对齐 deer-flow ``_resolve_model_name``
-    的语义）；未命中告警后回退场景绑定的 provider/model，仍为空时回退
-    全局 active provider（bocomadp 场景 model_provider 常留空）。匹配到
-    条目后按「用户优先、默认复制」解析 credential：用户维度凭证
+    的语义）；未命中告警后回退全局 active provider（ProviderManager）。
+    匹配到条目后按「用户优先、默认复制」解析 credential：用户维度凭证
     （``deerflow-<user_id>-<provider_id>``）已存在则直接引用，否则从
     default 用户默认凭证（``deerflow-default-<provider_id>``）复制参数
     入库，两者都不存在时回退条目参数。无可用条目时返回 None（由原生
     404 报错兜底，不阻断请求）。
     """
-    hint = (model_name_hint or "").strip()
 
-    # 场景绑定的 provider/model 直接查 config.yaml 种子条目（lifespan
-    # 已同步进 storage；框架 AgentData 无模型绑定字段，种子是唯一来源）
+    # 全局 active provider 兜底（config.yaml agents 种子机制已移除，
+    # 不再有 agent 级模型绑定来源）
     provider_id = ""
     model_name = ""
-    seed_entry = next(
-        (
-            candidate
-            for candidate in load_agents_from_yaml()
-            if candidate.agent_id == agent_id
-        ),
-        None,
-    )
-    if seed_entry is not None:
-        provider_id = seed_entry.model_provider
-        model_name = seed_entry.model_name
-    if not provider_id:
-        pm = getattr(request.app.state, "provider_manager", None)
-        active = pm.get_active_model() if pm is not None else None
-        if active is not None:
-            provider_id = active.provider_id
-            model_name = model_name or active.model_name
+    pm = getattr(request.app.state, "provider_manager", None)
+    active = pm.get_active_model() if pm is not None else None
+    if active is not None:
+        provider_id = active.provider_id
+        model_name = active.model_name
 
     # 请求级模型名优先：按 model_name / provider_id 双键匹配 config.yaml
     # 模型条目（deer-flow 前端的模型名可能对应条目 model_name 或
-    # provider_id）；未命中告警并回退场景绑定 / active provider。
+    # provider_id）；未命中告警并沿用已解析的 active provider。
     # 约定 credential id 直传（/api/deerflow/models 返回的 id）则直接
     # 解析出 provider_id，等价于命中该 config 条目。
     entry = None
@@ -510,7 +475,7 @@ async def _resolve_chat_model_config(
             else:
                 logger.warning(
                     "deerflow: model %r not found in config.yaml; "
-                    "fallback to agent-bound provider %r (user=%s).",
+                    "fallback to active provider %r (user=%s).",
                     hint,
                     provider_id,
                     user_id,
@@ -527,8 +492,8 @@ async def _resolve_chat_model_config(
     # 动态模型路由（ELLM 内网模型）：hint 非约定 credential id、也未
     # 静态命中双键匹配时，把它当作真实模型 ID 路由到 ELLM 类型条目，
     # 运行时覆盖 model 字段（对齐 deer-flow dynamic_model 语义）。
-    # 目标条目：兜底解析出的条目本身为 ELLM（场景绑定 / active 指向
-    # ELLM provider）→ 直接命中；条目缺失且 provider_id 为空 → 取
+    # 目标条目：兜底解析出的条目本身为 ELLM（active 指向 ELLM
+    # provider）→ 直接命中；条目缺失且 provider_id 为空 → 取
     # config.yaml 中唯一 ELLM 条目（多个告警取第一个）；否则维持
     # 现状（hint 丢弃）。
     dynamic_hit = False
@@ -652,56 +617,6 @@ async def _resolve_chat_model_config(
     )
 
 
-async def _ensure_agent(
-    storage: StorageBase,
-    user_id: str,
-    agent_id: str,
-) -> None:
-    """bocomadp 场景 agent 同步到原生 agent 存储（缺失时按 config.yaml 补写）。
-
-    种子在 lifespan 以 ``user_id="default"`` 注册；原生 ChatService 经
-    ``ResourceAccessService.resolve_agent`` 按调用者 user_id 解析 agent，
-    这里把 config.yaml 的 seed agent 以原生记录形态按 user_id 补写，
-    保证 deerflow 链路选中的 agent（含回退默认值）都能在原生
-    ChatService 中解析到。已存在时不覆盖（保留用户后续的修改）。
-    """
-    if await storage.get_agent(user_id, agent_id) is not None:
-        return
-    entry = next(
-        (
-            candidate
-            for candidate in load_agents_from_yaml()
-            if candidate.agent_id == agent_id
-        ),
-        None,
-    )
-    if entry is None:
-        logger.warning(
-            "deerflow: agent %r not found in config.yaml; skipped sync.",
-            agent_id,
-        )
-        return
-    await storage.upsert_agent(
-        user_id,
-        AgentRecord(
-            id=agent_id,
-            user_id=user_id,
-            data=AgentData(
-                id=agent_id,
-                name=entry.name or agent_id,
-                system_prompt=entry.system_prompt,
-                context_config=ContextConfig(),
-                react_config=ReActConfig(max_iters=entry.max_iters),
-            ),
-        ),
-    )
-    logger.info(
-        "deerflow: agent %r synced into native storage (user=%s).",
-        agent_id,
-        user_id,
-    )
-
-
 async def _ensure_session(
     storage: StorageBase,
     workspace_manager,
@@ -715,21 +630,30 @@ async def _ensure_session(
 
     workspace_id 由 workspace_manager 的隔离策略分配（与原生 /session/
     创建路径一致）；chat_model_config 优先按请求级模型名匹配 config.yaml
-    条目，未命中回退场景绑定 provider / 全局 active（bocomadp 场景
-    model_provider 常留空），保证默认会话也能在原生链路上真实调用模型。
-    会话已存在时若本次解析的 (type, credential_id, model) 与现状不一致
-    则更新（官方前端 per-thread 切换模型后新 run 生效）；HITL 续跑携带
-    同一 thread 的模型名时一致不更新，无副作用。
+    条目，未命中回退全局 active provider（ProviderManager），保证默认
+    会话也能在原生链路上真实调用模型。
+    会话已存在时：配置缺失则回填；请求显式携带模型名（``model_name_hint``
+    非空）且解析出的 (type, credential_id, model) 与现状不一致时才更新
+    （per-run 模型切换）；未携带模型名则保持既有配置不动——原生接口
+    建好的会话（如绑定 ELLM 凭证）不被 config.yaml 全局 active
+    provider 静默覆盖。
     """
-    await _ensure_agent(storage, user_id, agent_id)
+    existing = await storage.get_session(user_id, agent_id, session_id)
+    if (
+        existing is not None
+        and existing.config.chat_model_config is not None
+        and not model_name_hint
+    ):
+        # 会话已存在且带模型配置、本次未显式指定模型名 → 保持既有
+        # 配置不动：原生接口建好的会话（如绑定 ELLM 凭证）不能被
+        # config.yaml 的全局 active provider 静默覆盖。
+        return
     model_config = await _resolve_chat_model_config(
         storage,
         request,
         user_id,
-        agent_id,
         model_name_hint,
     )
-    existing = await storage.get_session(user_id, agent_id, session_id)
     if existing is not None:
         existing_config = existing.config.chat_model_config
         if model_config is not None and (
@@ -1215,12 +1139,16 @@ async def create_run_stream(
     自动建库，保证原生 ChatService.run 的 session 前置条件成立。
     """
     session_id = _resolve_session_id(thread_id, body)
-    agent_id = _fallback_agent_id(_resolve_agent_id(body))
+    agent_id = await _check_agent_id(
+        storage,
+        user_id,
+        _resolve_agent_id(body),
+    )
     converted = _convert_input(body.input)
-    # 请求级模型名（context > config > model_name > custom_params），在
+    # 请求级模型名（custom_params.llm_model_name，唯一通道），在
     # custom_params 落盘/回退之前解析——首次建会话时 workspace 尚不存在，
     # 直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
-    model_name_hint = _resolve_requested_model_name(body, body.custom_params)
+    model_name_hint = _resolve_requested_model_name(body.custom_params)
     await _ensure_session(
         storage,
         workspace_manager,
@@ -1322,10 +1250,15 @@ async def create_run_wait(
 ) -> dict[str, Any]:
     """创建 run 并阻塞至后台任务完成，返回 run 终态。"""
     session_id = _resolve_session_id(thread_id, body)
-    agent_id = _fallback_agent_id(_resolve_agent_id(body))
+    agent_id = await _check_agent_id(
+        storage,
+        user_id,
+        _resolve_agent_id(body),
+    )
     input_msg = _convert_input(body.input)
-    # 同 create_run_stream：先解析请求级模型名（四通道）再懒建会话。
-    model_name_hint = _resolve_requested_model_name(body, body.custom_params)
+    # 同 create_run_stream：先解析请求级模型名（custom_params 唯一通道）
+    # 再懒建会话。
+    model_name_hint = _resolve_requested_model_name(body.custom_params)
     await _ensure_session(
         storage,
         workspace_manager,

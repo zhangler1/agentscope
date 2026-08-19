@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI
@@ -24,6 +25,7 @@ from bocomadp.deerflow.runs import RunManager
 
 THREAD_ID = "t1"
 USER_ID = "user-1"
+AGENT_ID = "test-agent"
 
 
 class FakeStorage:
@@ -39,7 +41,8 @@ class FakeStorage:
         self._sessions[(user_id, agent_id, session_id)] = config
 
     async def get_agent(self, user_id: str, agent_id: str):
-        return None
+        del user_id, agent_id
+        return SimpleNamespace(id=AGENT_ID)
 
     async def upsert_agent(self, user_id: str, record) -> None:
         return None
@@ -182,7 +185,8 @@ def test_create_run_stream_echoes_human_message_first() -> None:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test") as client:
                 payload = {
-                    "assistant_id": "lead_agent",
+                    "agent_id": AGENT_ID,
+                    "session_id": THREAD_ID,
                     "input": {
                         "messages": [
                             {"type": "human", "content": "德国的历史是什么？"},
@@ -192,6 +196,7 @@ def test_create_run_stream_echoes_human_message_first() -> None:
                 resp = await client.post(
                     f"/api/deerflow/threads/{THREAD_ID}/runs/stream",
                     json=payload,
+                    headers={"X-User-ID": USER_ID},
                 )
                 return _parse_sse(resp.text) if resp.status_code == 200 else []
         finally:
@@ -241,6 +246,7 @@ def test_join_run_stream_echoes_human_messages() -> None:
                 transport=transport, base_url="http://test") as client:
                 resp = await client.get(
                     f"/api/deerflow/threads/{THREAD_ID}/runs/ghost-run/stream",
+                    headers={"X-User-ID": USER_ID},
                 )
                 return _parse_sse(resp.text) if resp.status_code == 200 else []
         finally:

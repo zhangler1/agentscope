@@ -166,11 +166,17 @@ class EllmKeyRefresher:
     """Lazily refresh the ELLM api key stored in a credential record.
 
     The gateway issues keys valid for ~25 minutes; the stored key's expiry
-    is judged solely from the independent ``record.data["apikey_expires_at"]``
+    is judged from the independent ``record.data["apikey_expires_at"]``
     (Unix seconds, stamped on every refresh).  A record without a usable
     stamp is treated as expired, so the refresh writes it and the record
     converges.  An empty ``api_key`` (e.g. the frontend cleared it on
     update) forces an immediate refresh regardless of any expiry stamp.
+
+    ``refresh_ahead_secs`` is the **refresh-ahead window**: the key is
+    refreshed ``refresh_ahead_secs`` before its real expiry (instead of
+    only after it has already expired) to absorb gateway jitter / network
+    blips — if a refresh triggered at the hard-expiry edge fails, the old
+    key is already dead and the request fails with a stale key.
 
     All key state lives in the user-scoped credential record identified by
     ``credential_id``; the record's ``data`` dict is expected to carry
@@ -185,6 +191,7 @@ class EllmKeyRefresher:
         storage: StorageBase,
         message_bus: MessageBus,
         user_id: str,
+        refresh_ahead_secs: float = 0.0,
     ) -> None:
         """Initialize the refresher.
 
@@ -195,10 +202,14 @@ class EllmKeyRefresher:
             message_bus (MessageBus): Transport used for the refresh lock
                 (``acquire_lock``); ``InMemoryMessageBus`` in tests.
             user_id (str): Owner of the credential records.
+            refresh_ahead_secs (float): Refresh the key this many seconds
+                before its real expiry (default ``0.0`` = refresh only
+                after the key has actually expired, the legacy behavior).
         """
         self._storage = storage
         self._message_bus = message_bus
         self._user_id = user_id
+        self._refresh_ahead_secs = max(0.0, float(refresh_ahead_secs))
 
     @property
     def user_id(self) -> str:
@@ -214,16 +225,20 @@ class EllmKeyRefresher:
            the frontend) clear it to force a refresh — is immediately
            expired regardless of any expiry stamp.
         2. A valid ``data["apikey_expires_at"]`` (Unix seconds, stamped on
-           every write-back) is expired once ``now`` passes it.  A record
-           without a usable expiry stamp is treated as expired, so the
-           refresh writes the stamp and the record converges.
+           every write-back) is considered expired once ``now`` passes
+           ``apikey_expires_at - refresh_ahead_secs``.  A record without a
+           usable expiry stamp is treated as expired, so the refresh writes
+           the stamp and the record converges.
         """
         api_key = record.data.get("api_key")
         if not api_key:
             return True
         apikey_expires_at = record.data.get("apikey_expires_at")
         if isinstance(apikey_expires_at, (int, float)) and apikey_expires_at > 0:
-            return time.time() > apikey_expires_at
+            return (
+                time.time()
+                > apikey_expires_at - self._refresh_ahead_secs
+            )
         return True
 
     async def ensure_fresh_key(
@@ -307,6 +322,36 @@ class EllmKeyRefresher:
         credential_obj = CredentialFactory.from_dict(record.data)
         await self._storage.upsert_credential(self._user_id, credential_obj)
         return new_key, record
+
+    async def invalidate_key(self, credential_id: str) -> None:
+        """Forcibly mark a credential's stored key as expired.
+
+        Clears ``data["apikey_expires_at"]`` (writes ``None``) so the next
+        call to :meth:`ensure_fresh_key` — from *any* conversation that
+        uses this credential — sees it as expired and refreshes via the
+        regular lock-protected slow path.  The current call is **not**
+        retried; it surfaces the 401 to the caller and the refresh happens
+        lazily on the next use.
+
+        The write is idempotent and lock-free: it only clears the expiry
+        stamp, and the real refresh is debounced by ``ensure_fresh_key``'s
+        ``ellm:refresh:<id>`` lock.  The previously stored ``api_key`` is
+        left untouched — even under a concurrent write the worst case is a
+        short-lived stale key that still forces a refresh on next use, so
+        correctness is preserved.
+
+        Args:
+            credential_id (str): The stored ELLM credential record id.
+        """
+        record = await self._storage.get_credential(
+            self._user_id,
+            credential_id,
+        )
+        if record is None:
+            return
+        record.data["apikey_expires_at"] = None
+        credential_obj = CredentialFactory.from_dict(record.data)
+        await self._storage.upsert_credential(self._user_id, credential_obj)
 
 
 __all__ = ["fetch_ellm_key", "EllmKeyRefresher"]

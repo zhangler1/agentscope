@@ -36,9 +36,7 @@ from agentscope.app.deps import get_chat_service, get_storage
 from agentscope.app.storage import StorageBase
 from agentscope.message import Msg, ToolCallState
 
-from bocomadp.config import load_agents_from_yaml
-
-from ..deps import _default_agent_id, get_deerflow_user_id, get_run_manager
+from ..deps import get_deerflow_user_id, get_run_manager
 from ..formatter import build_confirm_card
 from ..runs import RunManager, RunStatus
 
@@ -93,19 +91,23 @@ async def _load_messages(storage: StorageBase, user_id: str,
     return messages
 
 
-def _agent_ids() -> list[str]:
-    """config.yaml seed agents + 默认 agent（去重，供 session 遍历）。
+async def _agent_ids(storage: StorageBase, user_id: str) -> list[str]:
+    """该用户可见的全部 agent id（供 session 遍历）。
 
-    thread_id == session_id，而 session 归属某个 agent（session 记录以
-    (user, agent) 分片），读取会话前需先枚举候选 agent。
+    agent 全部存于原生 storage（config.yaml seed 机制已废弃），
+    thread_id == session_id，而 session 记录以 (user, agent) 分片，
+    读取会话前需先枚举候选 agent。枚举失败降级为空列表——对应端点
+    返回空结果，不阻断。
     """
     try:
-        agent_ids = [entry.agent_id for entry in load_agents_from_yaml()]
-    except Exception:  # noqa: BLE001 —— config 不可读时仅用默认 agent
-        agent_ids = []
-    if _default_agent_id() not in agent_ids:
-        agent_ids.append(_default_agent_id())
-    return agent_ids
+        records = await storage.list_agents(user_id)
+    except Exception:  # noqa: BLE001 —— 只读枚举，失败降级为空
+        logger.exception(
+            "deerflow: failed to list agents for user %s",
+            user_id,
+        )
+        return []
+    return [record.id for record in records]
 
 
 def _thread_title(record: Any) -> str:
@@ -142,7 +144,7 @@ async def _pending_confirm_cards(
     前端 HumanInputCard 重新渲染。
     """
     cards: list[dict[str, Any]] = []
-    for agent_id in _agent_ids():
+    for agent_id in await _agent_ids(storage, user_id):
         try:
             session_record = await storage.get_session(
                 user_id,
@@ -246,7 +248,7 @@ async def search_threads(
     # 跨 agent 聚合 session；同一 thread 只属于一个 agent，但保险起见
     # 按 thread_id 去重（保留 updated_at 最新的一条）。
     records: dict[str, Any] = {}
-    for agent_id in _agent_ids():
+    for agent_id in await _agent_ids(storage, user_id):
         try:
             sessions = await storage.list_sessions(user_id, agent_id)
         except Exception:  # noqa: BLE001 —— 单个 agent 查询失败不阻断其余
@@ -297,7 +299,7 @@ async def delete_thread(
     继续写已删除的 session）再删除。未找到时幂等返回成功——前端删除
     后无需区分"已不存在"。
     """
-    for agent_id in _agent_ids():
+    for agent_id in await _agent_ids(storage, user_id):
         try:
             session_record = await storage.get_session(
                 user_id,

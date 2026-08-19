@@ -58,7 +58,6 @@ from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注�
 from bocomadp.config import (
     get_app_config,
     is_trace_correlation_enabled,
-    load_agents_from_yaml,
     load_models_from_yaml,
     build_model_instance,
 )
@@ -94,6 +93,7 @@ from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
@@ -268,10 +268,8 @@ _AGENT_CREATOR_SYSTEM_PROMPT = (
     "- 以 _ 开头的系统内置智能体不可删除\n"
 )
 
-# 场景种子（config.yaml 的 agents 段）不再灌入 MultiAgentManager ——
-# chat / deerflow 按 agent_id 从框架 StorageBase 解析配置，因此种子注册
-# 已迁移到 lifespan 的 ``_seed_agents_from_yaml``（storage 就绪后幂等
-# upsert，与 ``_register_builtin_agents`` 同构）。
+# agent 全部存于框架 StorageBase（config.yaml agents 种子机制已移除，
+# 启动时不再灌入；agent 由用户通过原生接口创建或运行前自行入库）。
 
 # ---------------------------------------------------------------------------
 # 3. MCP 服务器 + Agent 工具工厂
@@ -682,7 +680,12 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
 
 # 通用中间件构建入口：registry 自动扫描 + 企业中间件主动 build（审计留痕）
 # + ELLM key 刷新中间件（每次模型调用前惰性刷新 apikey）。
-_ellm_refresh_mw_factory = build_ellm_refresh_middleware(storage, message_bus)
+# refresh_ahead_secs 来自 config.ellm_key_refresh，提前刷新留缓冲。
+_ellm_refresh_mw_factory = build_ellm_refresh_middleware(
+    storage,
+    message_bus,
+    refresh_ahead_secs=config.ellm_key_refresh.refresh_ahead_secs,
+)
 
 
 async def _build_agent_middlewares_with_ellm(
@@ -772,57 +775,6 @@ async def _register_builtin_agents() -> None:
     ]
 
 
-async def _seed_agents_from_yaml() -> None:
-    """Seed scenario agents from config.yaml into framework storage.
-
-    config.yaml 的 agents 段（场景种子）注册到框架 StorageBase 的
-    ``user_id="default"`` 下（幂等：已存在则跳过）。chat / deerflow
-    路由按 agent_id 从 storage 解析配置，因此种子场景对所有用户可见
-    （``_build_context`` 与 ``_BuiltinAgentStorageProxy`` 均有 default
-    用户 fallback）。
-
-    框架 AgentData 没有模型绑定与技能白名单字段：
-    - ``model_provider`` / ``model_name``：忽略，chat 沿用全局 active
-      provider（ProviderManager）
-    - ``enabled_tools``：仅在首次创建时写入工具白名单（与 storage
-      记录同生命周期，已存在的 agent 不覆盖，避免重启清掉用户手动配置）
-    - ``enabled_skills``：暂无技能白名单落地机制，忽略
-    """
-    from agentscope.app.storage import AgentData, AgentRecord
-    from agentscope.agent import ContextConfig as _ContextConfig
-    from agentscope.agent import ReActConfig as _ReActConfig
-    from bocomadp.routers.agent_tools import (
-        _persist_whitelists,
-        _tool_whitelists,
-    )
-
-    whitelist_dirty = False
-    for _entry in load_agents_from_yaml():
-        existing = await storage.get_agent("default", _entry.agent_id)
-        if existing is not None:
-            continue
-        record = AgentRecord(
-            id=_entry.agent_id,
-            user_id="default",
-            data=AgentData(
-                name=_entry.name or _entry.agent_id,
-                system_prompt=_entry.system_prompt,
-                context_config=_ContextConfig(),
-                react_config=_ReActConfig(max_iters=_entry.max_iters),
-            ),
-        )
-        await storage.upsert_agent("default", record)
-        if _entry.enabled_tools:
-            _tool_whitelists[_entry.agent_id] = list(_entry.enabled_tools)
-            whitelist_dirty = True
-        logger.info(
-            "agent seeded from config.yaml into storage: %s",
-            _entry.agent_id,
-        )
-    if whitelist_dirty:
-        _persist_whitelists()
-
-
 _original_lifespan = app.router.lifespan_context
 
 
@@ -841,7 +793,6 @@ async def _lifespan_with_builtin_agents(app):
         except Exception as e:  # noqa: BLE001
             logger.warning("pool concurrency sync skipped: %s", e)
         await _register_builtin_agents()
-        await _seed_agents_from_yaml()
         # config.yaml 模型条目作为 default 用户默认凭证入库（deerflow
         # 模型名解析的默认参数单一来源；幂等，失败仅告警不阻断启动）
         await ensure_default_credentials(storage)
@@ -870,6 +821,9 @@ app.state.bus_bridge = BusBridge(message_bus)
 # ---------------------------------------------------------------------------
 # 7. 在 12 个内置路由之上挂载自定义路由
 # ---------------------------------------------------------------------------
+# 智能体记忆字段包裹路由：覆盖框架 /agent/ 的 4 个端点（创建/查询/更新/删除），
+# 增加记忆字段（侧边 PG 表 agent_memory_configs 持久化）。
+install_agent_memory_router(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)

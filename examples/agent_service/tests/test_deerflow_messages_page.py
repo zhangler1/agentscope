@@ -68,7 +68,9 @@ def test_page_returns_latest_limit_ascending() -> None:
     messages = [_msg(i) for i in range(1, 7)]  # 6 条
     with TestClient(_make_app(messages)) as client:
         response = client.get(
-            "/api/deerflow/threads/thread-1/messages/page?limit=3")
+            "/api/deerflow/threads/thread-1/messages/page?limit=3",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     body = response.json()
@@ -81,7 +83,9 @@ def test_page_before_seq_advances_backward() -> None:
     messages = [_msg(i) for i in range(1, 7)]
     with TestClient(_make_app(messages)) as client:
         response = client.get(
-            "/api/deerflow/threads/thread-1/messages/page?limit=3&before_seq=4")
+            "/api/deerflow/threads/thread-1/messages/page?limit=3&before_seq=4",
+            headers={"X-User-ID": "default"},
+        )
 
     body = response.json()
     assert _seqs(body["data"]) == [1, 2, 3]
@@ -93,7 +97,9 @@ def test_page_exact_limit_has_no_more() -> None:
     messages = [_msg(i) for i in range(1, 3)]
     with TestClient(_make_app(messages)) as client:
         response = client.get(
-            "/api/deerflow/threads/thread-1/messages/page?limit=2")
+            "/api/deerflow/threads/thread-1/messages/page?limit=2",
+            headers={"X-User-ID": "default"},
+        )
 
     body = response.json()
     assert _seqs(body["data"]) == [1, 2]
@@ -104,7 +110,9 @@ def test_page_exact_limit_has_no_more() -> None:
 def test_page_empty_session() -> None:
     with TestClient(_make_app([])) as client:
         response = client.get(
-            "/api/deerflow/threads/thread-1/messages/page?limit=2")
+            "/api/deerflow/threads/thread-1/messages/page?limit=2",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert response.json() == {
@@ -115,7 +123,9 @@ def test_page_row_carries_content_id_for_dedupe() -> None:
     messages = [_msg(1)]
     with TestClient(_make_app(messages)) as client:
         response = client.get(
-            "/api/deerflow/threads/thread-1/messages/page")
+            "/api/deerflow/threads/thread-1/messages/page",
+            headers={"X-User-ID": "default"},
+        )
 
     row = response.json()["data"][0]
     assert row["run_id"] == row["content"]["id"]  # 前端以 content.id 去重
@@ -126,10 +136,17 @@ def test_page_row_carries_content_id_for_dedupe() -> None:
 
 def test_page_rejects_invalid_params() -> None:
     messages = [_msg(i) for i in range(1, 4)]
+    headers = {"X-User-ID": "default"}
     with TestClient(_make_app(messages)) as client:
         assert client.get(
-            "/api/deerflow/threads/thread-1/messages/page?limit=0").status_code == 422
+            "/api/deerflow/threads/thread-1/messages/page?limit=0",
+            headers=headers,
+        ).status_code == 422
         assert client.get(
-            "/api/deerflow/threads/thread-1/messages/page?limit=201").status_code == 422
+            "/api/deerflow/threads/thread-1/messages/page?limit=201",
+            headers=headers,
+        ).status_code == 422
         assert client.get(
-            "/api/deerflow/threads/thread-1/messages/page?before_seq=0").status_code == 422
+            "/api/deerflow/threads/thread-1/messages/page?before_seq=0",
+            headers=headers,
+        ).status_code == 422

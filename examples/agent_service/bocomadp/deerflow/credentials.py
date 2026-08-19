@@ -33,7 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover —— 仅类型标注
 
 logger = logging.getLogger(__name__)
 
-# 默认凭证归属 default 用户（与 DEERFLOW_DEFAULT_USER_ID 同值）。
+# 默认凭证归属 default 用户（原生默认用户约定）。
 DEFAULT_CREDENTIAL_OWNER = "default"
 
 # 用户/默认凭证 id 前缀（与 deerflow_chat 原逻辑一致，保持兼容）。
