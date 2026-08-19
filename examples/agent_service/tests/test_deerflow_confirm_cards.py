@@ -24,7 +24,6 @@ from agentscope.message import Msg, TextBlock, ToolCallBlock, ToolCallState
 from agentscope.permission import PermissionRule
 from agentscope.state import AgentState
 
-from bocomadp.deerflow.routers import threads as threads_module
 from bocomadp.deerflow.routers.threads import threads_router
 
 AGENT_ID = "test-agent"
@@ -40,6 +39,10 @@ class FakeStorage:
     def __init__(self, messages: list[Msg], state: AgentState) -> None:
         self._messages = list(messages)  # 正序（旧→新）
         self._state = state
+
+    async def list_agents(self, user_id: str):
+        del user_id
+        return [SimpleNamespace(id=AGENT_ID)]
 
     async def list_messages(
         self,
@@ -94,16 +97,14 @@ def _asking_state(extra: dict | None = None) -> AgentState:
 
 
 def _make_app(storage: FakeStorage) -> FastAPI:
+    # 与 main.py 一致：router 挂到子应用，再 mount 到 /api（对外路径不变）；
+    # state 必须设在子应用上（挂载后 request.app 是子应用）。
+    api = FastAPI()
+    api.state.storage = storage
+    api.include_router(threads_router)
     app = FastAPI()
-    app.state.storage = storage
-    app.include_router(threads_router)
+    app.mount("/api", api)
     return app
-
-
-def _patch_agents(monkeypatch) -> None:
-    """固定 agent 遍历列表与默认 agent，不依赖真实 config.yaml。"""
-    monkeypatch.setattr(threads_module, "load_agents_from_yaml", lambda: [])
-    monkeypatch.setattr(threads_module, "_default_agent_id", lambda: AGENT_ID)
 
 
 def _messages(*roles: str) -> list[Msg]:
@@ -137,12 +138,14 @@ def _assert_card(card: dict[str, Any]) -> None:
     assert artifact["input_mode"] == "single_choice"
 
 
-def test_state_endpoint_appends_rebuilt_card(monkeypatch) -> None:
+def test_state_endpoint_appends_rebuilt_card() -> None:
     """state 端点：ASKING 会话的消息末尾追加重建卡片。"""
     storage = FakeStorage(_messages("user", "assistant"), _asking_state())
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage)) as client:
-        response = client.get("/api/threads/t1/state")
+        response = client.get(
+            "/api/deerflow/threads/t1/state",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     messages = response.json()["values"]["messages"]
@@ -153,12 +156,15 @@ def test_state_endpoint_appends_rebuilt_card(monkeypatch) -> None:
     assert [o["value"] for o in options] == ["confirm", "reject"]
 
 
-def test_history_endpoint_appends_rebuilt_card(monkeypatch) -> None:
+def test_history_endpoint_appends_rebuilt_card() -> None:
     """history 端点：checkpoint 的 values.messages 末尾追加重建卡片。"""
     storage = FakeStorage(_messages("user"), _asking_state())
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage)) as client:
-        response = client.post("/api/threads/t1/history", json={})
+        response = client.post(
+            "/api/deerflow/threads/t1/history",
+            json={},
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     checkpoints = response.json()
@@ -168,12 +174,14 @@ def test_history_endpoint_appends_rebuilt_card(monkeypatch) -> None:
     _assert_card(messages[-1])
 
 
-def test_messages_page_appends_card_on_latest_page(monkeypatch) -> None:
+def test_messages_page_appends_card_on_latest_page() -> None:
     """messages/page 最新页：末尾追加 confirm-card 行。"""
     storage = FakeStorage(_messages("user"), _asking_state())
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage)) as client:
-        response = client.get("/api/threads/t1/messages/page")
+        response = client.get(
+            "/api/deerflow/threads/t1/messages/page",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     body = response.json()
@@ -184,24 +192,31 @@ def test_messages_page_appends_card_on_latest_page(monkeypatch) -> None:
     _assert_card(card_row["content"])
 
 
-def test_messages_page_skips_card_when_paging_backward(monkeypatch) -> None:
+def test_messages_page_skips_card_when_paging_backward() -> None:
     """向后翻页（before_seq）只读历史：不追加重建卡片。"""
     storage = FakeStorage(_messages("user", "assistant"), _asking_state())
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage)) as client:
-        response = client.get("/api/threads/t1/messages/page?before_seq=1")
+        response = client.get(
+            "/api/deerflow/threads/t1/messages/page?before_seq=1",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert response.json()["data"] == []
 
 
-def test_no_card_when_no_pending_confirmation(monkeypatch) -> None:
+def test_no_card_when_no_pending_confirmation() -> None:
     """session 无 ASKING 工具调用：读端点不追加任何卡片。"""
     storage = FakeStorage(_messages("user"), AgentState(context=[]))
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage)) as client:
-        state_resp = client.get("/api/threads/t1/state")
-        page_resp = client.get("/api/threads/t1/messages/page")
+        state_resp = client.get(
+            "/api/deerflow/threads/t1/state",
+            headers={"X-User-ID": "default"},
+        )
+        page_resp = client.get(
+            "/api/deerflow/threads/t1/messages/page",
+            headers={"X-User-ID": "default"},
+        )
 
     assert [m["type"] for m in state_resp.json()["values"]["messages"]] == [
         "human",
@@ -209,7 +224,7 @@ def test_no_card_when_no_pending_confirmation(monkeypatch) -> None:
     assert [row["seq"] for row in page_resp.json()["data"]] == [1]
 
 
-def test_card_options_include_confirm_always_with_rules(monkeypatch) -> None:
+def test_card_options_include_confirm_always_with_rules() -> None:
     """suggested_rules 存在：追加"同意并始终允许"选项。"""
     from agentscope.permission import PermissionBehavior
 
@@ -226,9 +241,11 @@ def test_card_options_include_confirm_always_with_rules(monkeypatch) -> None:
         },
     )
     storage = FakeStorage(_messages("user"), state)
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage)) as client:
-        response = client.get("/api/threads/t1/state")
+        response = client.get(
+            "/api/deerflow/threads/t1/state",
+            headers={"X-User-ID": "default"},
+        )
 
     card = response.json()["values"]["messages"][-1]
     options = card["artifact"]["human_input"]["options"]

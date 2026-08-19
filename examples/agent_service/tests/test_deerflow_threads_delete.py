@@ -13,18 +13,22 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from bocomadp.deerflow.routers import threads as threads_module
 from bocomadp.deerflow.routers.threads import threads_router
 
 AGENT_ID = "test-agent"
 
 
 class FakeStorage:
-    """模拟 storage：get_session 命中归属 agent，delete_session 记录调用。"""
+    """模拟 storage：list_agents 枚举候选 agent，get_session 命中归属
+    agent，delete_session 记录调用。"""
 
     def __init__(self, session_exists: bool = True) -> None:
         self._session_exists = session_exists
         self.deleted: list[tuple[str, str, str]] = []
+
+    async def list_agents(self, user_id: str):
+        del user_id
+        return [SimpleNamespace(id=AGENT_ID)]
 
     async def get_session(self, user_id: str, agent_id: str, session_id: str):
         del user_id
@@ -73,27 +77,27 @@ def _make_app(
     chat_service: FakeChatService,
     run_manager: FakeRunManager,
 ) -> FastAPI:
+    # 与 main.py 一致：router 挂到子应用，再 mount 到 /api（对外路径不变）；
+    # state 必须设在子应用上（挂载后 request.app 是子应用）。
+    api = FastAPI()
+    api.state.storage = storage
+    api.state.chat_service = chat_service
+    api.state.run_manager = run_manager
+    api.include_router(threads_router)
     app = FastAPI()
-    app.state.storage = storage
-    app.state.chat_service = chat_service
-    app.state.run_manager = run_manager
-    app.include_router(threads_router)
+    app.mount("/api", api)
     return app
 
 
-def _patch_agents(monkeypatch) -> None:
-    """固定 agent 遍历列表与默认 agent，不依赖真实 config.yaml。"""
-    monkeypatch.setattr(threads_module, "load_agents_from_yaml", lambda: [])
-    monkeypatch.setattr(threads_module, "_default_agent_id", lambda: AGENT_ID)
-
-
-def test_delete_thread_removes_session(monkeypatch) -> None:
+def test_delete_thread_removes_session() -> None:
     storage = FakeStorage(session_exists=True)
     chat_service = FakeChatService()
     run_manager = FakeRunManager()
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
-        response = client.delete("/api/threads/t1")
+        response = client.delete(
+            "/api/deerflow/threads/t1",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert response.json() == {
@@ -103,15 +107,17 @@ def test_delete_thread_removes_session(monkeypatch) -> None:
     assert storage.deleted == [(AGENT_ID, "t1")]
 
 
-def test_delete_thread_interrupts_active_run(monkeypatch) -> None:
+def test_delete_thread_interrupts_active_run() -> None:
     """有活跃 run 时：RunManager 置 interrupted + 原生 interrupt。"""
     record = SimpleNamespace(run_id="run-1", active=True)
     storage = FakeStorage(session_exists=True)
     chat_service = FakeChatService()
     run_manager = FakeRunManager(active_record=record)
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
-        response = client.delete("/api/threads/t1")
+        response = client.delete(
+            "/api/deerflow/threads/t1",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert response.json()["success"] is True
@@ -120,14 +126,16 @@ def test_delete_thread_interrupts_active_run(monkeypatch) -> None:
     assert storage.deleted == [(AGENT_ID, "t1")]
 
 
-def test_delete_thread_skips_interrupt_without_active_run(monkeypatch) -> None:
+def test_delete_thread_skips_interrupt_without_active_run() -> None:
     """无活跃 run：仍调用原生 interrupt（尽力而为），删除照常。"""
     storage = FakeStorage(session_exists=True)
     chat_service = FakeChatService()
     run_manager = FakeRunManager(active_record=None)
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
-        response = client.delete("/api/threads/t1")
+        response = client.delete(
+            "/api/deerflow/threads/t1",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert response.json()["success"] is True
@@ -135,14 +143,16 @@ def test_delete_thread_skips_interrupt_without_active_run(monkeypatch) -> None:
     assert storage.deleted == [(AGENT_ID, "t1")]
 
 
-def test_delete_thread_idempotent_when_missing(monkeypatch) -> None:
+def test_delete_thread_idempotent_when_missing() -> None:
     """session 不存在：幂等返回成功，不抛 404。"""
     storage = FakeStorage(session_exists=False)
     chat_service = FakeChatService()
     run_manager = FakeRunManager()
-    _patch_agents(monkeypatch)
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
-        response = client.delete("/api/threads/ghost")
+        response = client.delete(
+            "/api/deerflow/threads/ghost",
+            headers={"X-User-ID": "default"},
+        )
 
     assert response.status_code == 200
     assert response.json() == {

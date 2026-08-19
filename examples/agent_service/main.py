@@ -36,6 +36,7 @@ from logging.handlers import TimedRotatingFileHandler
 from typing import Any
 
 import uvicorn
+from fastapi import FastAPI
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -57,7 +58,6 @@ from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注�
 from bocomadp.config import (
     get_app_config,
     is_trace_correlation_enabled,
-    load_agents_from_yaml,
     load_models_from_yaml,
     build_model_instance,
 )
@@ -72,8 +72,10 @@ from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.request_log import AccessLogMiddleware
 from bocomadp.providers import ProviderManager
 from bocomadp.deerflow import BusBridge, RunManager
+from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
 from bocomadp.deerflow.routers.deerflow_chat import deerflow_router
+from bocomadp.deerflow.routers.models import deerflow_models_router
 from bocomadp.deerflow.routers.threads import threads_router
 from bocomadp.routers.uploads import uploads_router
 from bocomadp.routers.channels import channels_router
@@ -98,6 +100,7 @@ from bocomadp.team_briefing import patch_team_briefing
 from bocomadp.projectors import WorkerFailureNotifier
 from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
+from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
@@ -106,7 +109,7 @@ from agentscope.app._router._agent import (
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
 # 统一注册，本文件无需 import 或 include；框架 chat_router(POST /chat/) 与
-# deerflow_router(POST /api/threads/...) 路径不同，互不冲突。
+# deerflow_router(POST /deerflow/threads/...) 路径不同，互不冲突。
 from bocomadp.mcp import McpRegistry
 from bocomadp.skills import ExternalSkillHub
 from bocomadp.skills.bocom_skill_hub import BocomSkillHub
@@ -276,10 +279,8 @@ _AGENT_CREATOR_SYSTEM_PROMPT = (
     "- 以 _ 开头的系统内置智能体不可删除\n"
 )
 
-# 场景种子（config.yaml 的 agents 段）不再灌入 MultiAgentManager ——
-# chat / deerflow 按 agent_id 从框架 StorageBase 解析配置，因此种子注册
-# 已迁移到 lifespan 的 ``_seed_agents_from_yaml``（storage 就绪后幂等
-# upsert，与 ``_register_builtin_agents`` 同构）。
+# agent 全部存于框架 StorageBase（config.yaml agents 种子机制已移除，
+# 启动时不再灌入；agent 由用户通过原生接口创建或运行前自行入库）。
 
 # ---------------------------------------------------------------------------
 # 3. MCP 服务器 + Agent 工具工厂
@@ -780,57 +781,6 @@ async def _register_builtin_agents() -> None:
     ]
 
 
-async def _seed_agents_from_yaml() -> None:
-    """Seed scenario agents from config.yaml into framework storage.
-
-    config.yaml 的 agents 段（场景种子）注册到框架 StorageBase 的
-    ``user_id="default"`` 下（幂等：已存在则跳过）。chat / deerflow
-    路由按 agent_id 从 storage 解析配置，因此种子场景对所有用户可见
-    （``_build_context`` 与 ``_BuiltinAgentStorageProxy`` 均有 default
-    用户 fallback）。
-
-    框架 AgentData 没有模型绑定与技能白名单字段：
-    - ``model_provider`` / ``model_name``：忽略，chat 沿用全局 active
-      provider（ProviderManager）
-    - ``enabled_tools``：仅在首次创建时写入工具白名单（与 storage
-      记录同生命周期，已存在的 agent 不覆盖，避免重启清掉用户手动配置）
-    - ``enabled_skills``：暂无技能白名单落地机制，忽略
-    """
-    from agentscope.app.storage import AgentData, AgentRecord
-    from agentscope.agent import ContextConfig as _ContextConfig
-    from agentscope.agent import ReActConfig as _ReActConfig
-    from bocomadp.routers.agent_tools import (
-        _persist_whitelists,
-        _tool_whitelists,
-    )
-
-    whitelist_dirty = False
-    for _entry in load_agents_from_yaml():
-        existing = await storage.get_agent("default", _entry.agent_id)
-        if existing is not None:
-            continue
-        record = AgentRecord(
-            id=_entry.agent_id,
-            user_id="default",
-            data=AgentData(
-                name=_entry.name or _entry.agent_id,
-                system_prompt=_entry.system_prompt,
-                context_config=_ContextConfig(),
-                react_config=_ReActConfig(max_iters=_entry.max_iters),
-            ),
-        )
-        await storage.upsert_agent("default", record)
-        if _entry.enabled_tools:
-            _tool_whitelists[_entry.agent_id] = list(_entry.enabled_tools)
-            whitelist_dirty = True
-        logger.info(
-            "agent seeded from config.yaml into storage: %s",
-            _entry.agent_id,
-        )
-    if whitelist_dirty:
-        _persist_whitelists()
-
-
 _original_lifespan = app.router.lifespan_context
 
 
@@ -855,12 +805,14 @@ async def _lifespan_with_builtin_agents(app):
         except Exception as e:  # noqa: BLE001
             logger.warning("pool concurrency sync skipped: %s", e)
         await _register_builtin_agents()
-        await _seed_agents_from_yaml()
         # 专家团工具注入（workflow 严格交接 + AgentInvite 池回填）——
         # 原实现改 src/_service/_toolkit.py 的 get_toolkit，现搬迁到
         # bocomadp/team_toolkit.py；必须先于 patch_get_toolkit 挂载，
         # 让白名单包装看到已注入的完整 Toolkit。
         patch_team_toolkit()
+        # config.yaml 模型条目作为 default 用户默认凭证入库（deerflow
+        # 模型名解析的默认参数单一来源；幂等，失败仅告警不阻断启动）
+        await ensure_default_credentials(storage)
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
         patch_get_toolkit()
@@ -938,12 +890,20 @@ app.router.routes[:] = [
     r for r in app.router.routes if not _is_framework_agent_route(r)
 ]
 app.include_router(agent_router)
+# 智能体记忆字段包裹路由（必须后于 include bocomadp agent_router）：
+# 按路径移除 bocomadp agent_router 中被覆盖的 /agent/ 4 条 CRUD 路由
+# （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
+# 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
+# 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
+install_agent_memory_router(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
 app.include_router(deerflow_router)
-# deer-flow 前端认证桩（/api/v1/auth/me、/api/v1/auth/setup-status 固定用户）
+# deer-flow 模型列表（GET /api/deerflow/models，deer-flow Model 格式）
+app.include_router(deerflow_models_router)
+# deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
 app.include_router(auth_stub_router)
 # deer-flow 渠道兼容占位路由（providers/connections 恒空，前端优雅降级）
 app.include_router(channels_router)
@@ -964,6 +924,30 @@ app.include_router(oss_download_router)
 app.include_router(credential_model_router)
 
 
+# ---------------------------------------------------------------------------
+# 8. 统一 /api 前缀：把完整 app 挂载为子应用
+# ---------------------------------------------------------------------------
+# 所有路由统一挂到 /api 下，与 webui 前端契约一致（client.ts：后端自带
+# /api 前缀，nginx / vite 代理均不剥前缀直接透传）：
+#   内置 /chat、/agent...        → /api/chat、/api/agent...
+#   bocomadp /agents、/files...  → /api/agents、/api/files...
+#   deerflow /deerflow/threads、/deerflow/v1/auth → /api/deerflow/threads...
+
+
+@asynccontextmanager
+async def _root_lifespan(root):
+    # Starlette mount 不会自动传播子应用 lifespan，这里手动运行子应用
+    # （框架资源生命周期 + 内置智能体注册均在 app 的 lifespan 中）。
+    async with app.router.lifespan_context(app):
+        yield
+
+
+root_app = FastAPI(title="BocomADP", lifespan=_root_lifespan)
+# 健康检查保留根层副本：K8s 探针直打 /healthz、/readyz，不受 /api 影响
+root_app.include_router(health_router)
+root_app.mount("/api", app)
+
+
 if __name__ == "__main__":
     logger.info(
         "Starting BocomADP on %s:%s (trace_enhance=%s, format=%s, reload=%s)",
@@ -974,7 +958,7 @@ if __name__ == "__main__":
         config.service.reload,
     )
     uvicorn.run(
-        "main:app",
+        "main:root_app",
         host=config.service.host,
         port=config.service.port,
         reload=config.service.reload,

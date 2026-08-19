@@ -226,42 +226,13 @@ class ModelEntry(BaseModel):
     base_url: str = Field(default="", description="API base URL，留空用默认")
     is_active: bool = Field(default=False, description="是否设为活跃模型")
     supports_multimodal: bool = Field(default=False, description="是否支持多模态")
+    supports_thinking: bool = Field(
+        default=False,
+        description="是否支持 thinking 模式（deer-flow 前端据此展示开关）",
+    )
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description="透传给 ChatModel.Parameters 的额外参数",
-    )
-
-
-class AgentEntry(BaseModel):
-    """config.yaml 中单个场景（Agent 模板）条目。
-
-    启动时由 ``load_agents_from_yaml`` 读取并在 lifespan 中幂等同步进
-    框架 StorageBase；chat / deerflow 按 ``agent_id`` 从 storage 解析
-    场景配置。
-    """
-
-    agent_id: str = Field(description="场景唯一标识，即 /api/chat/run 的 agent_id")
-    name: str = Field(default="", description="场景显示名")
-    system_prompt: str = Field(
-        default="You are a helpful AI assistant.",
-        description="场景系统提示词（Agent 的 system_prompt）",
-    )
-    model_provider: str = Field(
-        default="",
-        description="场景绑定的模型 provider_id；留空使用全局 active provider",
-    )
-    model_name: str = Field(
-        default="",
-        description="场景绑定的模型名（展示 / 校验用）",
-    )
-    max_iters: int = Field(default=20, description="ReAct 最大迭代次数")
-    enabled_tools: list[str] = Field(
-        default_factory=list,
-        description="场景启用的工具白名单（空 = 全部工具）",
-    )
-    enabled_skills: list[str] = Field(
-        default_factory=list,
-        description="场景启用的技能白名单（空 = 全部技能）",
     )
 
 
@@ -517,30 +488,6 @@ def load_models_from_yaml(
     return result
 
 
-def load_agents_from_yaml(
-    path: str | Path | None = None,
-) -> list[AgentEntry]:
-    """从 YAML 文件加载场景（Agent 模板）列表。
-
-    与 ``load_models_from_yaml`` 同构：默认读取 ``agent_service/config.yaml``
-    （绝对路径，与启动工作目录无关），读取后先做 ``$VAR`` / ``${VAR}``
-    环境变量展开。文件不存在时返回空列表（不影响启动）。
-    """
-    if path:
-        p = Path(path)
-        if not p.exists():
-            return []
-        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        data = expand_env_vars(raw) if isinstance(raw, dict) else {}
-    else:
-        data = expand_env_vars(load_config_yaml())
-    entries_data = data.get("agents", [])
-    result: list[AgentEntry] = []
-    for item in entries_data:
-        result.append(AgentEntry(**item))
-    return result
-
-
 def build_model_instance(entry: ModelEntry):
     """根据 ModelEntry 动态创建 ChatModel 实例。
 
@@ -568,6 +515,9 @@ def build_model_instance(entry: ModelEntry):
     # 仅当 credential 类有 base_url 字段时才传入
     if entry.base_url and "base_url" in credential_cls.model_fields:
         credential_kwargs["base_url"] = entry.base_url
+    # 仅当 credential 类有 model 字段时才传入（如 ELLMCredential 必填）
+    if "model" in credential_cls.model_fields:
+        credential_kwargs["model"] = entry.model_name or entry.provider_id
     credential = credential_cls(**credential_kwargs)
 
     model_cls = credential_cls.get_chat_model_class()
