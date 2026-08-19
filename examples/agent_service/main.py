@@ -680,7 +680,12 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
 
 # 通用中间件构建入口：registry 自动扫描 + 企业中间件主动 build（审计留痕）
 # + ELLM key 刷新中间件（每次模型调用前惰性刷新 apikey）。
-_ellm_refresh_mw_factory = build_ellm_refresh_middleware(storage, message_bus)
+# refresh_ahead_secs 来自 config.ellm_key_refresh，提前刷新留缓冲。
+_ellm_refresh_mw_factory = build_ellm_refresh_middleware(
+    storage,
+    message_bus,
+    refresh_ahead_secs=config.ellm_key_refresh.refresh_ahead_secs,
+)
 
 
 async def _build_agent_middlewares_with_ellm(

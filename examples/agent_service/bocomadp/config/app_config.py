@@ -158,6 +158,29 @@ class RunConcurrencyConfig(BaseModel):
     )
 
 
+class EllmKeyRefreshConfig(BaseModel):
+    """ELLM apikey 刷新策略配置。
+
+    ``refresh_ahead_secs`` 为**提前刷新窗口**：在网关下发的 key 真正
+    过期之前就提前换新，留出网关抖动/网络异常的缓冲，避免拿一个
+    已失效的 key 去请求（旧逻辑只在 ``now > apikey_expires_at``
+    时才刷新，过期边界上一旦刷新失败即带死 key 请求）。
+
+    取值约定：``0`` 表示关闭提前刷新（回退到旧行为：硬过期才换）；
+    正数表示在过期前 N 秒开始刷新。建议设为 key 有效期的 1/10 左右
+    （如有效期 25 分钟则取 120~180s）。
+    """
+
+    refresh_ahead_secs: float = Field(
+        default=120.0,
+        ge=0,
+        description=(
+            "ELLM key 提前刷新窗口（秒）；0=关闭（硬过期才换），"
+            "建议 120~180s。"
+        ),
+    )
+
+
 class DbConfig(BaseModel):
     """AgentScope 持久化存储后端（AsyncSQLAlchemyStorage）。
 
@@ -445,6 +468,10 @@ class AppConfig(BaseSettings):
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     db: DbConfig = Field(default_factory=DbConfig)
+    ellm_key_refresh: EllmKeyRefreshConfig = Field(
+        default_factory=EllmKeyRefreshConfig,
+        description="ELLM apikey 提前刷新窗口配置。",
+    )
     run_concurrency: RunConcurrencyConfig = Field(
         default_factory=RunConcurrencyConfig,
         description="/chat 并发控制配置。",

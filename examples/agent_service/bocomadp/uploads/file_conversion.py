@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
-"""上传文件格式转换（移植自 deer-flow utils/file_conversion.py）。
+"""上传文件格式转换（MarkItDown 优先，独立解析器回退）。
 
 统一把可文本化的文件转换为 **Markdown (.md)** 文本。与历史版本不同，
 本模块不再直接落盘——转换在 **host 侧**（第三方库）完成，返回 markdown
 文本字符串，由上层（routers/uploads.py）经 ``workspace.get_backend()``
 写入沙箱；该设计使上传逻辑沙箱感知（双 PVC / 共享 PVC 下 session 隔离）。
 
-支持：
-- 文本/代码类（txt/md/csv/json/xml/log/各类源码） -> 复制为同名 .md
-- PDF  -> .md (pdfplumber)
-- Word (.docx/.doc) -> .md (python-docx)
-- PPT  (.pptx/.ppt) -> .md (python-pptx)
-- Excel (.xlsx/.xls) -> .md 表格 (openpyxl/pandas)
-- HTML -> .md (html2text)
-不支持：图片、压缩包、二进制等 -> 由调用方按需拒绝。
+转换策略（双通道）：
+- 文档/HTML 类（PDF / Word(docx) / PPT(pptx) / Excel(xlsx,xlsm) / HTML）**优先**
+  由 ``markitdown`` 转换（输出质量更高，表格/标题识别好）；MarkItDown 失败
+  （格式不支持、转换异常、输出为空）时**回退**到该格式的独立解析器：
+  pdfplumber（pdf）/ python-docx（docx）/ python-pptx（pptx）/
+  openpyxl（xlsx,xlsm）/ html2text（html）。
+- 老格式 .doc/.ppt/.xls 双通道（MarkItDown 与独立解析器）均不支持，已从
+  支持列表移除——上传后作为"仅原始文件"处理，不尝试转换。
+- 文本/代码类（txt/md/csv/json/xml/log/各类源码）为复制语义，直接按
+  UTF-8 解码返回（不走转换器，避免源码类扩展名不支持导致失败）。
+- 图片、压缩包、二进制等 -> 由调用方按需拒绝。
+
+依赖（pyproject.toml service extra）：``markitdown[all]`` + 上述
+独立解析器库（回退通道需要）。
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ import io
 from .manager import UploadError
 
 
-# 扩展名 -> (类别) 映射
+# 文本/代码类：复制语义（非转换），UTF-8 直读
 _TEXT_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".xml",
     ".log", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash",
@@ -30,11 +36,19 @@ _TEXT_EXTS = {
     ".hpp", ".cs", ".rb", ".php", ".rs", ".kt", ".swift", ".sql", ".r", ".scala",
     ".pl", ".lua", ".vim", ".dockerfile", ".gitignore", ".env",
 }
-_PDF_EXTS = {".pdf"}
-_WORD_EXTS = {".docx", ".doc"}
-_PPT_EXTS = {".pptx", ".ppt"}
-_EXCEL_EXTS = {".xlsx", ".xls", ".xlsm"}
-_HTML_EXTS = {".html", ".htm"}
+
+# 文档/HTML 类：值为入库的 format 标签（MarkItDown 优先 + 独立解析器回退）
+# 仅保留双通道（MarkItDown 与独立解析器）都支持的格式；老格式 .doc/.ppt/.xls
+# 双通道均不支持，已移除——上传后作为"仅原始文件"处理，不再尝试转换。
+_DOC_FORMAT = {
+    ".pdf": "pdf",
+    ".docx": "word",
+    ".pptx": "ppt",
+    ".xlsx": "excel",
+    ".xlsm": "excel",
+    ".html": "html",
+    ".htm": "html",
+}
 
 
 class UnsupportedFileType(UploadError):
@@ -44,12 +58,7 @@ class UnsupportedFileType(UploadError):
 def is_supported_format(filename: str) -> bool:
     """判断文件名是否可转换为 .md。"""
     ext = f".{_split_ext(filename)}"  # 补点后与下方带点扩展名集合比较
-    return any(
-        ext in group
-        for group in (
-            _TEXT_EXTS, _PDF_EXTS, _WORD_EXTS, _PPT_EXTS, _EXCEL_EXTS, _HTML_EXTS,
-        )
-    )
+    return ext in _TEXT_EXTS or ext in _DOC_FORMAT
 
 
 def _split_ext(filename: str) -> str:
@@ -75,30 +84,58 @@ def convert_file_bytes(
     """
     ext = f".{_split_ext(filename)}"
     if ext in _TEXT_EXTS:
+        # 文本/代码类：复制语义，UTF-8 直读（非转换）
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             text = data.decode("utf-8", errors="ignore")
         return "text", text
 
-    if ext in _PDF_EXTS:
-        return "pdf", _convert_pdf(data)
-    if ext in _WORD_EXTS:
-        return "word", _convert_docx(data)
-    if ext in _PPT_EXTS:
-        return "ppt", _convert_pptx(data)
-    if ext in _EXCEL_EXTS:
-        return "excel", _convert_excel(data)
-    if ext in _HTML_EXTS:
-        return "html", _convert_html(data)
+    if ext in _DOC_FORMAT:
+        fmt = _DOC_FORMAT[ext]
+        # 优先 MarkItDown；失败（不支持/异常/空输出）回退该格式独立解析器
+        try:
+            return fmt, _convert_markitdown(data, ext)
+        except UnsupportedFileType:
+            fallback = _FALLBACK_CONVERTERS.get(ext)
+            if fallback is None:
+                raise
+            return fmt, fallback(data)
 
     raise UnsupportedFileType(f"unsupported file type: {ext}")
 
 
+def _convert_markitdown(src: bytes, ext: str) -> str:
+    """用 MarkItDown 把文档字节转换为 markdown 文本。
+
+    按扩展名交给 MarkItDown 内置转换器（pdf/docx/pptx/xlsx/html）；
+    任何失败（未安装、格式不支持、转换异常、输出为空）都抛
+    `UnsupportedFileType`，由调用方回退到独立解析器。
+    """
+    try:
+        from markitdown import MarkItDown
+    except ImportError as e:
+        raise UnsupportedFileType("markitdown not installed") from e
+    try:
+        result = MarkItDown().convert_stream(
+            io.BytesIO(src),
+            file_extension=ext,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise UnsupportedFileType(f"markitdown failed for {ext}: {e}") from e
+    text = (result.text_content or "").strip()
+    if not text:
+        raise UnsupportedFileType(f"markitdown produced empty output for {ext}")
+    return text
+
+
 # ---------------------------------------------------------------------------
-# 具体格式转换实现（按需 import 第三方库，缺失则标记不支持）
-# 统一签名：(src: bytes) -> md_text: str
+# 独立解析器回退通道（MarkItDown 失败时按扩展名选用）
+# 统一签名：(src: bytes) -> md_text: str；库缺失时抛 UnsupportedFileType
 # ---------------------------------------------------------------------------
+_FALLBACK_CONVERTERS: dict[str, object] = {}
+
+
 def _convert_pdf(src: bytes) -> str:
     try:
         import pdfplumber  # type: ignore
@@ -181,3 +218,14 @@ def _convert_html(src: bytes) -> str:
     h.body_width = 0  # 不自动换行
     raw = src.decode("utf-8", errors="ignore")
     return h.handle(raw)
+
+
+_FALLBACK_CONVERTERS.update({
+    ".pdf": _convert_pdf,
+    ".docx": _convert_docx,
+    ".pptx": _convert_pptx,
+    ".xlsx": _convert_excel,
+    ".xlsm": _convert_excel,
+    ".html": _convert_html,
+    ".htm": _convert_html,
+})
