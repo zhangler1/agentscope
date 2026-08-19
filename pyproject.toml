@@ -69,6 +69,7 @@ service = [
     "python-pptx",
     "openpyxl",
     "html2text",
+    "markitdown[all]",
     # OSS 打包下载：oss2 上传 + cryptography(Fernet) 凭证解密
     "oss2",
     "cryptography",
