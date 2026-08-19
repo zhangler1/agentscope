@@ -166,6 +166,19 @@ async def list_agents(
             "list stays clean."
         ),
     ),
+    page_num: int = Query(
+        default=1,
+        ge=1,
+        alias="pageNum",
+        description="Page number, 1-based.",
+    ),
+    page_size: int = Query(
+        default=5,
+        ge=1,
+        le=100,
+        alias="pageSize",
+        description="Page size (items per page), 1-100.",
+    ),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
@@ -231,11 +244,16 @@ async def list_agents(
             }
             if member_ids:
                 entries = [e for e in entries if e.id not in member_ids]
+    # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
+    # 直接切片即可，total 用切片前的完整数量，前端可据此算总页数。
+    total = len(entries)
+    start = (page_num - 1) * page_size
+    page_entries = entries[start : start + page_size]
     # 框架 list_resource 返回 AgentView，而 schema 需要 TeamAgentView
     # （多出 is_team / parent_agent_id / is_self_built 三个专家团字段），
     # 显式转换以通过 Pydantic 校验。
-    views = [TeamAgentView(**e.model_dump()) for e in entries]
-    return ListAgentsResponse(agents=views, total=len(views))
+    views = [TeamAgentView(**e.model_dump()) for e in page_entries]
+    return ListAgentsResponse(agents=views, total=total)
 
 
 @agent_router.post(

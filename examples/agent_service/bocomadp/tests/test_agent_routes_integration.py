@@ -212,3 +212,102 @@ class TestListWithParent:
         )
         assert resp.status_code == 200
         assert resp.json()["agents"] == []
+
+
+class TestPagination:
+    """分页参数 pageNum / pageSize 的行为锁死。
+
+    约定（docs/api.md 第三节）：
+    - 不传分页参数 → 默认第 1 页、每页 5 条；
+    - pageNum 从 1 开始（>=1），pageSize 范围 1~100（越界 422）；
+    - total 恒为分页前的完整总数（与当前页 agents 数量可不同）。
+    """
+
+    def _create_agents(self, client, n: int) -> list[str]:
+        """建 n 个顶层可见的 agent（leader），返回 id 列表。"""
+        return [_create_leader(client) for _ in range(n)]
+
+    def test_default_returns_first_page_of_five(self, client):
+        ids = self._create_agents(client, 7)
+
+        resp = client.get("/agent/", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        page_ids = {a["id"] for a in body["agents"]}
+        # 默认每页 5 条，7 个 agent 只有 5 个在第一页
+        assert len(page_ids) == 5
+        assert page_ids.issubset(set(ids))
+        # total 是分页前的完整总数
+        assert body["total"] == 7
+
+    def test_second_page_returns_remaining(self, client):
+        ids = self._create_agents(client, 7)
+
+        resp = client.get("/agent/?pageNum=2&pageSize=5", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        page_ids = {a["id"] for a in body["agents"]}
+        # 第 2 页只有剩下的 2 个
+        assert len(page_ids) == 2
+        assert page_ids.issubset(set(ids))
+        assert body["total"] == 7
+
+        # 两页拼起来正好是全集（无重复、无遗漏）
+        page1 = client.get("/agent/?pageNum=1&pageSize=5", headers=HEADERS)
+        all_ids = {a["id"] for a in page1.json()["agents"]} | page_ids
+        assert all_ids == set(ids)
+        assert len(all_ids) == 7
+
+    def test_pages_do_not_overlap(self, client):
+        self._create_agents(client, 7)
+
+        page1 = client.get("/agent/?pageNum=1&pageSize=5", headers=HEADERS).json()
+        page2 = client.get("/agent/?pageNum=2&pageSize=5", headers=HEADERS).json()
+        page1_ids = {a["id"] for a in page1["agents"]}
+        page2_ids = {a["id"] for a in page2["agents"]}
+        # 分页切片不允许同一 agent 出现在两页
+        assert page1_ids.isdisjoint(page2_ids)
+        assert page1["total"] == page2["total"] == 7
+
+    def test_beyond_last_page_returns_empty_but_total_stays(self, client):
+        self._create_agents(client, 7)
+
+        resp = client.get("/agent/?pageNum=99&pageSize=5", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["agents"] == []
+        # 越界页 agents 为空，但 total 仍是完整总数
+        assert body["total"] == 7
+
+    def test_custom_page_size(self, client):
+        ids = self._create_agents(client, 7)
+
+        resp = client.get("/agent/?pageNum=1&pageSize=3", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["agents"]) == 3
+        assert {a["id"] for a in body["agents"]}.issubset(set(ids))
+        assert body["total"] == 7
+
+    def test_page_size_one(self, client):
+        ids = self._create_agents(client, 3)
+
+        resp = client.get("/agent/?pageNum=3&pageSize=1", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["agents"]) == 1
+        assert {a["id"] for a in body["agents"]}.issubset(set(ids))
+        assert body["total"] == 3
+
+    def test_invalid_page_num_rejected(self, client):
+        # pageNum 从 1 开始，0 非法 → 422
+        resp = client.get("/agent/?pageNum=0&pageSize=5", headers=HEADERS)
+        assert resp.status_code == 422
+
+    def test_invalid_page_size_rejected(self, client):
+        # pageSize 范围 1~100，0 和 101 都非法 → 422
+        assert client.get("/agent/?pageNum=1&pageSize=0", headers=HEADERS).status_code == 422
+        assert (
+            client.get("/agent/?pageNum=1&pageSize=101", headers=HEADERS).status_code
+            == 422
+        )
