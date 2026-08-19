@@ -323,5 +323,35 @@ class EllmKeyRefresher:
         await self._storage.upsert_credential(self._user_id, credential_obj)
         return new_key, record
 
+    async def invalidate_key(self, credential_id: str) -> None:
+        """Forcibly mark a credential's stored key as expired.
+
+        Clears ``data["apikey_expires_at"]`` (writes ``None``) so the next
+        call to :meth:`ensure_fresh_key` — from *any* conversation that
+        uses this credential — sees it as expired and refreshes via the
+        regular lock-protected slow path.  The current call is **not**
+        retried; it surfaces the 401 to the caller and the refresh happens
+        lazily on the next use.
+
+        The write is idempotent and lock-free: it only clears the expiry
+        stamp, and the real refresh is debounced by ``ensure_fresh_key``'s
+        ``ellm:refresh:<id>`` lock.  The previously stored ``api_key`` is
+        left untouched — even under a concurrent write the worst case is a
+        short-lived stale key that still forces a refresh on next use, so
+        correctness is preserved.
+
+        Args:
+            credential_id (str): The stored ELLM credential record id.
+        """
+        record = await self._storage.get_credential(
+            self._user_id,
+            credential_id,
+        )
+        if record is None:
+            return
+        record.data["apikey_expires_at"] = None
+        credential_obj = CredentialFactory.from_dict(record.data)
+        await self._storage.upsert_credential(self._user_id, credential_obj)
+
 
 __all__ = ["fetch_ellm_key", "EllmKeyRefresher"]

@@ -95,6 +95,12 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 current_model.inject_think_tag = bool(
                     record.data.get("inject_think_tag", False),
                 )
+                # 401 时把该凭证的 key 置为过期（当前调用不重试，下一次
+                # 使用该凭证的调用会走惰性刷新）。回调闭包绑定本次
+                # credential_id，避免并发串号。
+                current_model.set_auth_invalidate_callback(
+                    lambda: self._refresher.invalidate_key(credential_id),
+                )
                 logger.debug(
                     "injected refreshed ELLM key (user=%s, credential=%s)",
                     self._refresher.user_id,
