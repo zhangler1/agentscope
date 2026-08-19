@@ -40,6 +40,11 @@ db:
   pool_pre_ping: true        # 取连接前探测存活，服务端静默断连时自动重建
   pool_recycle: 1800         # 空闲连接 30 分钟回收，早于防火墙/NAT 空闲超时
 
+# ---------- ELLM apikey 提前刷新窗口 ----------
+# 默认提前 120s 换新
+ellm_key_refresh:
+  refresh_ahead_secs: 120
+
 # ---------- Redis（消息总线 / 分布式锁 / 缓存） ----------
 # 存储后端已迁至上方 db（AsyncSQLAlchemyStorage）；Redis 仅保留给
 # RedisMessageBus 等瞬时协调用途。当前 main.py 用 InMemoryMessageBus，
