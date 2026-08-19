@@ -57,10 +57,21 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
       ``set_api_key`` 注入 → 同步 ``inject_think_tag`` 开关。
     """
 
-    def __init__(self, storage: Any, message_bus: Any, user_id: str) -> None:
+    def __init__(
+        self,
+        storage: Any,
+        message_bus: Any,
+        user_id: str,
+        refresh_ahead_secs: float = 0.0,
+    ) -> None:
         from bocomadp.providers.ellm_key import EllmKeyRefresher
 
-        self._refresher = EllmKeyRefresher(storage, message_bus, user_id)
+        self._refresher = EllmKeyRefresher(
+            storage,
+            message_bus,
+            user_id,
+            refresh_ahead_secs=refresh_ahead_secs,
+        )
 
     async def on_model_call(
         self,
@@ -84,6 +95,12 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 current_model.inject_think_tag = bool(
                     record.data.get("inject_think_tag", False),
                 )
+                # 401 时把该凭证的 key 置为过期（当前调用不重试，下一次
+                # 使用该凭证的调用会走惰性刷新）。回调闭包绑定本次
+                # credential_id，避免并发串号。
+                current_model.set_auth_invalidate_callback(
+                    lambda: self._refresher.invalidate_key(credential_id),
+                )
                 logger.debug(
                     "injected refreshed ELLM key (user=%s, credential=%s)",
                     self._refresher.user_id,
@@ -96,12 +113,15 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
 def build_ellm_refresh_middleware(
     storage: Any,
     message_bus: Any,
+    refresh_ahead_secs: float = 0.0,
 ) -> Any:
     """构造 ``AgentMiddlewareFactory``，供 ``create_app(extra_agent_middlewares=...)`` 使用。
 
     Args:
         storage: StorageBase 实例（bocomadp main.py 已持有）。
         message_bus: MessageBus 实例。
+        refresh_ahead_secs: ELLM key 提前刷新窗口（秒），来自
+            ``config.ellm_key_refresh.refresh_ahead_secs``。
 
     Returns:
         ``AgentMiddlewareFactory`` —— ``async (user_id, agent_id, session_id)
@@ -113,7 +133,14 @@ def build_ellm_refresh_middleware(
         agent_id: str,
         session_id: str,
     ) -> list:
-        return [EllmKeyRefreshMiddleware(storage, message_bus, user_id)]
+        return [
+            EllmKeyRefreshMiddleware(
+                storage,
+                message_bus,
+                user_id,
+                refresh_ahead_secs=refresh_ahead_secs,
+            )
+        ]
 
     return factory
 
