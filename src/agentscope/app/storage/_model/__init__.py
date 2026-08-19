@@ -5,8 +5,6 @@ from ._agent import (
     AgentRecord,
     AgentData,
     InviteConfig,
-    TeamConfig,
-    HandoffRelation,
 )
 from ._credential import CredentialRecord
 from ._knowledge_base import KnowledgeBaseData, KnowledgeBaseRecord
@@ -56,6 +54,4 @@ __all__ = [
     "TeamMember",
     "UserRecord",
     "InviteConfig",
-    "TeamConfig",
-    "HandoffRelation",
 ]

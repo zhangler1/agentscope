@@ -29,47 +29,21 @@ from ..storage import (
 
 
 class AgentView(AgentRecord):
-    """Agent record + viewer-relative ``editable`` + team markers.
+    """Agent record + viewer-relative ``editable``.
 
     Subclasses :class:`AgentRecord` so the wire format is a strict
     superset of the historical response (one extra top-level field);
     old clients ignore ``editable`` transparently.
+
+    The expert-team markers (``is_team`` / ``parent_agent_id`` /
+    ``is_self_built``) previously declared here were moved out of the
+    framework into the ``expert_team_relations`` table; plugin code
+    re-derives them from there and returns an extended view.
     """
 
     editable: bool = Field(
         description=(
             "Whether the current viewer may PATCH/DELETE this agent."
-        ),
-    )
-    is_team: bool = Field(
-        default=False,
-        description=(
-            "True when this agent is an expert-team leader — i.e. its "
-            "team_config is present. Members may be empty until they are "
-            "created, so a leader created with is_team=true is already "
-            "classified as a team. Lets the frontend distinguish team "
-            "leaders from plain agents in the shared agent list."
-        ),
-    )
-    parent_agent_id: str | None = Field(
-        default=None,
-        description=(
-            "When set, this agent is a member of the expert team led by "
-            "the referenced agent. Plain (non-team) agents leave this None. "
-            "Exposed directly on the view for convenient client-side "
-            "filtering of team members."
-        ),
-    )
-    is_self_built: bool | None = Field(
-        default=None,
-        description=(
-            "Team-membership origin, set only when the list was queried "
-            "with ``parent_agent_id``. True = created under that leader "
-            "(``data.parent_agent_id == leader``): editable and "
-            "cascade-deletable. False = invited by reference (id in the "
-            "leader's ``team_config.member_ids`` without a parent "
-            "backlink): config frozen, unlink-only. None when queried "
-            "without ``parent_agent_id`` (top-level list)."
         ),
     )
 
@@ -216,7 +190,6 @@ class ResourceAccessService:
         self,
         viewer_id: str,
         kind: ResourceKind,
-        parent_agent_id: str | None = None,
     ) -> list[BaseModel]:
         """List resources of ``kind`` visible to ``viewer_id``.
 
@@ -226,31 +199,7 @@ class ResourceAccessService:
         viewer have their ``data`` payload masked in the view;
         :meth:`resolve_credential` should be used when the raw payload
         is required for runtime provider calls.
-
-        Args:
-            parent_agent_id: When set (AGENT kind only), limits results to
-                members of the referenced team leader. When ``None`` (the
-                default), team members are hidden so the top-level agent
-                list stays clean — call again with this id to fetch a
-                team's members.
         """
-        # When filtering by a team leader, also collect the leader's
-        # invited-by-reference members (ids present in ``member_ids`` but
-        # without a ``parent_agent_id`` backlink) so the team member list
-        # is complete — self-built vs invited is exposed via
-        # ``AgentView.is_self_built``.
-        member_ids: set[str] = set()
-        if kind is ResourceKind.AGENT and parent_agent_id is not None:
-            leader = await self._storage.get_agent(
-                viewer_id,
-                parent_agent_id,
-            )
-            if (
-                leader is not None
-                and leader.data.team_config is not None
-            ):
-                member_ids = set(leader.data.team_config.member_ids)
-
         if kind is ResourceKind.CREDENTIAL:
             own = await self._storage.list_credentials(viewer_id)
         elif kind is ResourceKind.AGENT:
@@ -258,35 +207,12 @@ class ResourceAccessService:
                 record
                 for record in await self._storage.list_agents(viewer_id)
                 if record.source != "team"
-                and (
-                    (
-                        parent_agent_id is None
-                        and record.data.parent_agent_id is None
-                    )
-                    or (
-                        parent_agent_id is not None
-                        and record.data.parent_agent_id == parent_agent_id
-                    )
-                    or (
-                        parent_agent_id is not None
-                        and record.id in member_ids
-                    )
-                )
             ]
         else:
             own = await self._storage.list_knowledge_bases(viewer_id)
 
         views: list[BaseModel] = [
-            self._build_view(
-                record,
-                viewer_id,
-                True,
-                is_self_built=self._self_built_flag(
-                    record,
-                    parent_agent_id,
-                    member_ids,
-                ),
-            )
+            self._build_view(record, viewer_id, True)
             for record in own
         ]
         seen = {(record.user_id, record.id) for record in own}
@@ -311,47 +237,11 @@ class ResourceAccessService:
                     record,
                     viewer_id,
                     ref.permission == ResourcePermission.EDIT,
-                    is_self_built=self._self_built_flag(
-                        record,
-                        parent_agent_id,
-                        member_ids,
-                    ),
                 ),
             )
             seen.add(key)
 
-        # Default list order: most recently modified first (updated_at
-        # desc). Both the top-level agent list and the per-team member
-        # list flow through this method, and the sort runs after shared
-        # references are merged, so storage-level ordering (SQL has no
-        # ORDER BY; Redis Sets are unordered) never leaks through.
-        views.sort(
-            key=lambda v: getattr(v, "updated_at"),
-            reverse=True,
-        )
         return views
-
-    @staticmethod
-    def _self_built_flag(
-        record: AgentRecord,
-        parent_agent_id: str | None,
-        member_ids: set[str],
-    ) -> bool | None:
-        """Classify a listed agent's team-membership origin.
-
-        Only meaningful when the list was filtered by ``parent_agent_id``:
-        a matching ``parent_agent_id`` backlink marks a self-built member;
-        presence in the leader's ``member_ids`` without such a backlink
-        marks an invited-by-reference member. Top-level listings (no
-        ``parent_agent_id``) leave the flag ``None``.
-        """
-        if parent_agent_id is None:
-            return None
-        if record.data.parent_agent_id == parent_agent_id:
-            return True
-        if record.id in member_ids:
-            return False
-        return None
 
     # ------------------------------------------------------------------
     # get_resource
@@ -591,18 +481,12 @@ class ResourceAccessService:
         record: Any,
         viewer_id: str,
         editable: bool,
-        *,
-        is_self_built: bool | None = None,
     ) -> BaseModel:
         """Project a raw storage record onto a viewer-relative view.
 
         Credential ``data`` is masked when the viewer is not the owner
         so the wire format never leaks the shared secret; other kinds
         pass through unchanged apart from the added ``editable`` flag.
-
-        ``is_self_built`` only applies to AGENT views inside a team
-        member listing (see :meth:`list_resource`); every other caller
-        leaves it ``None``.
         """
         if isinstance(record, CredentialRecord):
             payload = record.model_dump()
@@ -615,19 +499,8 @@ class ResourceAccessService:
             payload["editable"] = editable
             return CredentialView.model_validate(payload)
         if isinstance(record, AgentRecord):
-            team_cfg = record.data.team_config
-            # A non-None team_config marks the agent as an expert-team
-            # leader ("shell counts as a team"), so a leader created with
-            # is_team=true but no members yet is still classified as a team.
-            is_team = team_cfg is not None
             return AgentView.model_validate(
-                {
-                    **record.model_dump(),
-                    "editable": editable,
-                    "is_team": is_team,
-                    "parent_agent_id": record.data.parent_agent_id,
-                    "is_self_built": is_self_built,
-                },
+                {**record.model_dump(), "editable": editable},
             )
         return KnowledgeBaseView.model_validate(
             {**record.model_dump(), "editable": editable},
