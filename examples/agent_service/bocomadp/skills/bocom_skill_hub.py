@@ -7,20 +7,18 @@
 
 当前实现两个端点（其余暂不实现）：
 
-    GET {base}/api/v1/skills?keyword=&userId=&page=&size=   → 目录查询
-    GET {base}/api/v1/skills/global/<name>/download         → 下载 zip
+    POST {base}/bocomListSkill.do          → 目录查询（REQ_MESSAGE）
+    POST {base}/bocomExportSkill.upload    → 下载 zip（REQ_MESSAGE）
 
 服务地址从环境变量 ``BOCOMADP_BOCOM_SKILLHUB_URL`` 读取（默认
-``http://12.235.193.172/EAGP.EAGP-AGENT.V-1.0``）；
-业务用户标识从 ``BOCOMADP_BOCOM_SKILLHUB_USER_ID`` 读取（默认
-``5000147900``）。
+``http://eaip-2.bocomm.com/EAGP.EAGP-AGENT.V-1.0``）；认证头
+``guwp-token`` 由调用方逐请求传入。
 
 接入方式（main.py）：::
 
-    skill_hubs=[..., BocomSkillHub(hub_id="external")]
+    skill_hubs=[..., BocomSkillHub(hub_id="bocom")]
 
-``hub_id`` 需为 ``"external"`` 才能被 skill_router 的
-``_external_hub`` 命中；或调整路由中的 hub key。
+``hub_id`` 对应框架通用 hub 路由；或调整路由中的 hub key。
 """
 from __future__ import annotations
 
@@ -37,20 +35,11 @@ from ._card import SkillCard, SkillHubPage
 if TYPE_CHECKING:
     import httpx
 
-#: 目录查询端点路径。
-CATALOG_PATH = "/api/v1/skills"
-
-#: 下载端点前缀 —— 最终 URL 为 ``{base}{DOWNLOAD_PREFIX}/{name}/download``。
-DOWNLOAD_PREFIX = "/api/v1/skills/global"
-
 #: 默认流式块大小（64 KiB）。
 DEFAULT_CHUNK_SIZE = 64 * 1024
 
 #: 默认服务地址（未配置 ``BOCOMADP_BOCOM_SKILLHUB_URL`` 时使用）。
-DEFAULT_BASE_URL = "http://12.235.193.172/EAGP.EAGP-AGENT.V-1.0"
-
-#: 默认业务用户标识（未配置 ``BOCOMADP_BOCOM_SKILLHUB_USER_ID`` 时使用）。
-DEFAULT_USER_ID = "5000147900"
+DEFAULT_BASE_URL = "http://eaip-2.bocomm.com/EAGP.EAGP-AGENT.V-1.0"
 
 
 def _default_base_url() -> str:
@@ -61,22 +50,14 @@ def _default_base_url() -> str:
     return os.environ.get("BOCOMADP_BOCOM_SKILLHUB_URL", "").strip() or DEFAULT_BASE_URL
 
 
-def _default_user_id() -> str:
-    """从环境变量读取业务用户标识，带默认值。
-
-    环境变量未设置或为空字符串时，回退到默认标识。
-    """
-    return os.environ.get("BOCOMADP_BOCOM_SKILLHUB_USER_ID", "").strip() or DEFAULT_USER_ID
-
-
 class BocomSkillHub(SkillHubBase):
     """对接 Bocom 技能服务的 skill hub（查询 + 下载）。
 
     .. code-block:: python
 
-        hub = BocomSkillHub()                 # base_url/user_id 取环境变量
-        page = await hub.list_skills(user_id="zy", q="excel")
-        archive = await hub.download(user_id="zy", "data-tag")
+        hub = BocomSkillHub()                 # base_url 取环境变量
+        page = await hub.list_skills(user_id="zy", keyword="excel")
+        archive = await hub.download(user_id="zy", name="data-tag")
     """
 
     def __init__(
@@ -87,8 +68,8 @@ class BocomSkillHub(SkillHubBase):
         icon_url: str | None = None,
         *,
         base_url: str | None = None,
-        user_id: str | None = None,
         timeout: float = 30.0,
+        api_token: str | None = None,
     ) -> None:
         """初始化 Bocom skillhub 提供者。
 
@@ -99,23 +80,22 @@ class BocomSkillHub(SkillHubBase):
             icon_url (`str | None`): hub 图标。
             base_url (`str | None`): 服务地址；``None`` 时取
                 ``BOCOMADP_BOCOM_SKILLHUB_URL``（或默认值）。
-            user_id (`str | None`): 目录查询使用的业务用户标识；
-                ``None`` 时取 ``BOCOMADP_BOCOM_SKILLHUB_USER_ID``。
             timeout (`float`): 单请求超时（秒）。
+            api_token (`str | None`): 初始 ``guwp-token``，可后续通过
+                :meth:`set_token` 更新。
         """
         super().__init__(hub_id, display_name, description, icon_url)
         self.base_url = (base_url or _default_base_url()).rstrip("/")
-        self.user_id = user_id or _default_user_id()
         self.timeout = timeout
         self._client: "httpx.AsyncClient | None" = None
+        self._guwp_token = api_token or ""
 
-    def set_user_id(self, user_id: str | None) -> None:
-        """更新本次查询使用的业务用户标识（对应 Bocom 接口的 ``userId``）。
+    def set_token(self, token: str | None) -> None:
+        """更新目录/下载请求使用的 ``guwp-token`` 请求头。
 
-        可逐请求调用；未设置时使用构造参数/环境变量提供的默认值。
+        可逐请求调用；未设置时请求不带 token 头。
         """
-        if user_id:
-            self.user_id = user_id
+        self._guwp_token = token or ""
 
     # ── 生命周期 ────────────────────────────────────────────────
 
@@ -141,51 +121,65 @@ class BocomSkillHub(SkillHubBase):
         return self._client
 
     def _headers(self) -> dict[str, str]:
-        """构造请求头。"""
-        return {
+        """构造请求头（含 Content-Type 与可选的 guwp-token）。"""
+        headers = {
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
+            "Content-Type": "application/json",
             "User-Agent": "PostmanRuntime-ApipostRuntime/1.1.0",
         }
+        if self._guwp_token:
+            headers["guwp-token"] = self._guwp_token
+        return headers
 
     # ── SkillHubBase ─────────────────────────────────────────────
 
     async def list_skills(
         self,
         user_id: str,
-        q: str | None = None,
-        cursor: str | None = None,
-        limit: int = 20,
-        loginName: str | None = None,
+        *,
+        keyword: str = "",
+        status: str = "PUBLISHED",
+        namespace: str = "global",
+        labelSlugs: str = "",
+        page: int = 1,
+        myOnly: bool = True,
+        size: int = 10,
     ) -> SkillHubPage:
-        """浏览目录。``cursor`` 以 ``page:N`` 编码上游页码。
+        """浏览目录（POST ``bocomListSkill.do``，body 为 ``REQ_MESSAGE``）。
 
-        ``user_id`` 参数为框架层调用者标识，Bocom 业务用户标识由
-        :attr:`self.user_id` 提供（构造参数或环境变量）。
-        ``loginName`` 为可选业务登录名，透传给上游查询参数。
+        参数与上游 curl 请求完全一致：``keyword`` / ``status`` /
+        ``namespace`` / ``labelSlugs`` / ``page`` / ``myOnly`` / ``size``。
+
+        ``user_id`` 参数为框架层调用者标识。
         """
-        import urllib.parse
+        import json
 
-        page = 0
-        if cursor and cursor.startswith("page:"):
-            try:
-                page = int(cursor.split(":", 1)[1])
-            except ValueError:
-                page = 0
+        param = {
+            "keyword": keyword,
+            "status": status,
+            "namespace": namespace,
+            "labelSlugs": labelSlugs,
+            "page": page,
+            "myOnly": myOnly,
+            "size": size,
+        }
 
-        # 上游页码从 1 开始（示例 page=1），内部 cursor 从 0 计。
-        upstream_page = max(page + 1, 1)
-        url = (
-            f"{self.base_url}{CATALOG_PATH}"
-            f"?keyword={urllib.parse.quote(q or '', safe='')}"
-            f"&userId={urllib.parse.quote(self.user_id, safe='')}"
-        )
-        if loginName:
-            url += f"&loginName={urllib.parse.quote(loginName, safe='')}"
-        url += f"&page={upstream_page}&size={limit}"
+        payload = {
+            "REQ_HEAD": {
+                "TRAN_PROCESS": "bocomListSkill",
+                "TRAN_ID": "",
+            },
+            "REQ_BODY": {"param": param},
+        }
+        url = f"{self.base_url}/bocomListSkill.do"
         try:
-            resp = await self._http().get(url, headers=self._headers())
+            resp = await self._http().post(
+                url,
+                data={"REQ_MESSAGE": json.dumps(payload, ensure_ascii=False)},
+                headers=self._headers(),
+            )
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:  # noqa: BLE001
@@ -198,21 +192,11 @@ class BocomSkillHub(SkillHubBase):
             for item in items
             if isinstance(item, dict) and self._card_name(item)
         ]
-        next_cursor = f"page:{page + 1}" if (page + 1) * limit < (total or 0) else None
         return SkillHubPage(
             cards=cards,
-            next_cursor=next_cursor,
+            next_cursor=None,
             total=total,
         )
-
-    async def list_uploaded_skills(
-        self,
-        user_id: str,
-        page: int = 0,
-        size: int = 5,
-    ) -> SkillHubPage:
-        """暂不实现 —— 返回空页（避免路由层 AttributeError）。"""
-        return SkillHubPage(cards=[], next_cursor=None, total=0)
 
     async def get_skill(self, user_id: str, card_id: str) -> SkillCard:
         """尚未实现。
@@ -230,28 +214,44 @@ class BocomSkillHub(SkillHubBase):
     async def download(
         self,
         user_id: str,
-        card_id: str,
-        version: str | None = None,
+        *,
+        name: str,
+        namespaceSlug: str = "Global",
     ) -> SkillArchive:
-        """打开 skill 归档流（``{base}/api/v1/skills/global/<name>/download``）。
+        """导出技能归档（POST ``bocomExportSkill.upload``，body 为 ``REQ_MESSAGE``）。
 
-        响应头在此处等待——缺失的 skill（404）在调用方开始安装前抛出；
-        body 保持惰性，归档可被直接管道送入 workspace 而无需整体驻留内存。
+        ``REQ_BODY.param`` 与上游 curl 请求对齐（``name`` / ``namespaceSlug``）；
+        响应体保持惰性，归档可被直接管道送入 workspace 而无需整体驻留内存。
         """
-        import urllib.parse
+        import json
 
-        url = (
-            f"{self.base_url}{DOWNLOAD_PREFIX}/"
-            f"{urllib.parse.quote(card_id, safe='')}/download"
-        )
+        payload = {
+            "REQ_HEAD": {"TRAN_PROCESS": "", "TRAN_ID": ""},
+            "REQ_BODY": {
+                "param": {
+                    "name": name,
+                    "namespaceSlug": namespaceSlug,
+                },
+            },
+        }
+        url = f"{self.base_url}/bocomExportSkill.upload"
+        headers = dict(self._headers())
+        headers["Accept"] = "application/json;charset=utf-8"
+        headers["Accept-Encoding"] = "gzip, deflate"
+
         client = self._http()
         stack = AsyncExitStack()
         try:
             response = await stack.enter_async_context(
-                client.stream("GET", url, headers=self._headers()),
+                client.stream(
+                    "POST",
+                    url,
+                    data={"REQ_MESSAGE": json.dumps(payload, ensure_ascii=False)},
+                    headers=headers,
+                ),
             )
             if response.status_code == 404:
-                raise KeyError(card_id)
+                raise KeyError(name)
             if response.status_code >= 400:
                 body = await response.aread()
                 raise HubError(
@@ -270,8 +270,9 @@ class BocomSkillHub(SkillHubBase):
     def _extract_items(data: Any) -> tuple[list, int | None]:
         """从响应中宽容提取目录列表与总数。
 
-        兼容 ``data.items``、``data.list``、``data.records``、``data``
-        直接为列表等常见结构；总数取 ``total`` / ``totalCount`` / ``count``。
+        兼容 ``RSP_BODY.result.list``、``data.items``、``data.list`` 等
+        常见结构；总数取 ``total`` / ``totalCount`` / ``count``（含
+        ``pageCond`` 内）。
         """
         if isinstance(data, list):
             return data, None
@@ -279,9 +280,13 @@ class BocomSkillHub(SkillHubBase):
             return [], None
 
         node = data
-        for wrapper in ("data", "result", "content", "body"):
-            if isinstance(node.get(wrapper), (dict, list)):
-                node = node[wrapper]
+        # 逐层深入常见 wrapper（RSP_BODY → result 等多层）。
+        for _ in range(5):
+            for wrapper in ("RSP_BODY", "data", "result", "content", "body"):
+                if isinstance(node.get(wrapper), (dict, list)):
+                    node = node[wrapper]
+                    break
+            else:
                 break
 
         if isinstance(node, list):
@@ -293,10 +298,18 @@ class BocomSkillHub(SkillHubBase):
             items = node.get(items_key)
             if isinstance(items, list):
                 total = None
+                # 总数可能在 node 直接或 pageCond 内。
                 for total_key in ("total", "totalCount", "count"):
                     if isinstance(node.get(total_key), int):
                         total = node[total_key]
                         break
+                if total is None:
+                    page_cond = node.get("pageCond")
+                    if isinstance(page_cond, dict):
+                        for total_key in ("total", "totalCount", "count"):
+                            if isinstance(page_cond.get(total_key), int):
+                                total = page_cond[total_key]
+                                break
                 return items, total
         return [], None
 
@@ -310,7 +323,10 @@ class BocomSkillHub(SkillHubBase):
         return None
 
     def _to_card(self, item: dict) -> SkillCard:
-        """由一条目录记录构造 :class:`SkillCard`。"""
+        """由一条目录记录构造 :class:`SkillCard`。
+
+        ``namespaceName`` 提取到 ``tags``，完整记录透传 ``metadata``。
+        """
         name = self._card_name(item)
         card_id = item.get("id") or item.get("skillId") or name
         description = (
@@ -319,11 +335,15 @@ class BocomSkillHub(SkillHubBase):
             or item.get("desc")
             or ""
         )
+        tags: list[str] = []
+        if item.get("namespaceName"):
+            tags.append(str(item["namespaceName"]))
         return SkillCard(
             hub_id=self.hub_id,
             id=str(card_id),
             name=name or "",
             description=str(description),
+            tags=tags,
             metadata={k: v for k, v in item.items()},
         )
 
