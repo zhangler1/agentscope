@@ -167,6 +167,7 @@ async def list_agents(
         ),
     ),
     user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> ListAgentsResponse:
     """Return all agent records visible to the authenticated user.
@@ -184,6 +185,9 @@ async def list_agents(
             Optional team leader id to filter members.
         user_id (`str`):
             Injected authenticated user ID.
+        storage (`StorageBase`):
+            Injected storage backend (used to look up the team roster when
+            ``parent_agent_id`` is given).
         access (`ResourceAccessService`):
             Injected resource access service.
 
@@ -191,12 +195,47 @@ async def list_agents(
         `ListAgentsResponse`:
             All visible agent records paired with per-viewer editability.
     """
-    entries = await access.list_resource(
-        user_id,
-        ResourceKind.AGENT,
-        parent_agent_id=parent_agent_id,
-    )
-    return ListAgentsResponse(agents=entries, total=len(entries))
+    # 生产环境已由 main.py 调用 patch_team_access()/patch_agent_list_sort()，
+    # 此时 access.list_resource 签名是 (viewer_id, kind, parent_agent_id=None)：
+    # 传 parent_agent_id 走成员分支返回名册，不传走顶层分支（隐藏自建成员、
+    # 保留被邀成员 + is_team 标记）。必须把 parent_agent_id 透传过去，
+    # 否则真实环境永远走顶层分支，带 parent 的名册查询就缺自建成员。
+    # 未 patch 的环境（纯单元测试）签名是 (viewer_id, kind)，透传会
+    # TypeError，此时回退到自行按团队关系表过滤（行为等价）。
+    try:
+        entries = await access.list_resource(
+            user_id,
+            ResourceKind.AGENT,
+            parent_agent_id=parent_agent_id,
+        )
+    except TypeError:
+        entries = await access.list_resource(user_id, ResourceKind.AGENT)
+        if parent_agent_id is not None:
+            # The framework access layer has no team concept; member filtering
+            # is re-derived from the expert-team relation table here.
+            team = await get_team(storage, user_id, parent_agent_id)
+            member_ids = set(team.member_ids) if team is not None else set()
+            entries = [e for e in entries if e.id in member_ids]
+        else:
+            # Top-level list stays clean: only *self-built* team members are
+            # hidden here and reachable via parent_agent_id=<leader> (matches
+            # the docstring above, docs/api.md, and the access-layer patch in
+            # team_access.py). Invited-by-reference members are ordinary agents
+            # owned by the user and stay visible at the top level.
+            teams = await list_teams(storage, user_id)
+            member_ids = {
+                m.agent_id
+                for team in teams
+                for m in team.members
+                if team.is_self_built(m.agent_id)
+            }
+            if member_ids:
+                entries = [e for e in entries if e.id not in member_ids]
+    # 框架 list_resource 返回 AgentView，而 schema 需要 TeamAgentView
+    # （多出 is_team / parent_agent_id / is_self_built 三个专家团字段），
+    # 显式转换以通过 Pydantic 校验。
+    views = [TeamAgentView(**e.model_dump()) for e in entries]
+    return ListAgentsResponse(agents=views, total=len(views))
 
 
 @agent_router.post(

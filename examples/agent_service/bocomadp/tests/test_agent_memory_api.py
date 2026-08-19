@@ -2,6 +2,8 @@
 """agent_api 模型 + 包裹路由测试。"""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 
@@ -19,7 +21,7 @@ from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 
-from bocomadp import memory_config
+from bocomadp import memory_config, team_store
 from bocomadp.routers.agent_api import install_agent_memory_router
 
 
@@ -95,6 +97,15 @@ def client(tmp_path, monkeypatch):
         f"sqlite+aiosqlite:///{tmp_path / 'mem_main.db'}",
         create_tables=True,
     )
+    # 专家团关系表是 bocomadp 独立 metadata（框架 create_tables 不覆盖），
+    # 需显式建表——生产在 main.py 启动时调 team_store.ensure_team_tables。
+    # 注意：engine 是 storage 进入上下文（__aenter__）时才创建的，
+    # 必须先 async with 触发建 engine，再 ensure_team_tables 才能建表。
+    async def _provision():
+        async with storage:
+            await team_store.ensure_team_tables(storage)
+
+    asyncio.run(_provision())
     app = create_app(
         storage=storage,
         message_bus=InMemoryMessageBus(),
@@ -259,3 +270,114 @@ class TestDelete:
     def test_delete_missing_404(self, client):
         resp = client.delete("/agent/no-such-id", headers=HEADERS)
         assert resp.status_code == 404
+
+
+# ------------------------------------------------------------------
+# 多用户隔离：他人智能体不可见、不可改、不可删（框架 404 语义）
+# ------------------------------------------------------------------
+
+USER_ALICE = {"X-User-ID": "user-alice"}
+USER_BOB = {"X-User-ID": "user-bob"}
+
+
+class TestIsolation:
+    def test_other_user_cannot_see_in_list(self, client):
+        alice_id = client.post(
+            "/agent/", json={"name": "alice-agent"}, headers=USER_ALICE
+        ).json()["agent_id"]
+
+        resp = client.get("/agent/", headers=USER_BOB)
+        assert resp.status_code == 200
+        assert all(a["id"] != alice_id for a in resp.json()["agents"])
+
+    def test_other_user_patch_404(self, client):
+        alice_id = client.post(
+            "/agent/", json={"name": "alice-agent"}, headers=USER_ALICE
+        ).json()["agent_id"]
+
+        resp = client.patch(
+            f"/agent/{alice_id}",
+            json={"name": "hacked"},
+            headers=USER_BOB,
+        )
+        assert resp.status_code == 404
+
+    def test_other_user_delete_404(self, client):
+        alice_id = client.post(
+            "/agent/", json={"name": "alice-agent"}, headers=USER_ALICE
+        ).json()["agent_id"]
+
+        resp = client.delete(f"/agent/{alice_id}", headers=USER_BOB)
+        assert resp.status_code == 404
+        # Alice 视角：智能体依然在（Bob 删不掉）
+        listed = client.get("/agent/", headers=USER_ALICE).json()["agents"]
+        assert any(a["id"] == alice_id for a in listed)
+
+
+class TestBoundaries:
+    """边界值：轮数 0/超大、超长 prompt、patch null 语义、删除残留。"""
+
+    def test_rounds_zero_allowed(self, client):
+        resp = client.post(
+            "/agent/",
+            json={"name": "r0", "memory_update_rounds": 0},
+            headers=HEADERS,
+        )
+        assert resp.status_code == 201
+        assert resp.json()["memory_update_rounds"] == 0
+
+    def test_rounds_large_allowed(self, client):
+        resp = client.post(
+            "/agent/",
+            json={"name": "big", "memory_update_rounds": 1_000_000_000},
+            headers=HEADERS,
+        )
+        assert resp.status_code == 201
+        assert resp.json()["memory_update_rounds"] == 1_000_000_000
+
+    def test_long_prompt_roundtrip(self, client):
+        long_prompt = "x" * 5000
+        created = client.post(
+            "/agent/",
+            json={"name": "long", "memory_update_prompt": long_prompt},
+            headers=HEADERS,
+        ).json()
+        assert created["memory_update_prompt"] == long_prompt
+
+        resp = client.get("/agent/", headers=HEADERS)
+        agents = {a["id"]: a for a in resp.json()["agents"]}
+        assert agents[created["agent_id"]]["memory_update_prompt"] == long_prompt
+
+    def test_patch_null_keeps_memory(self, client):
+        created = client.post(
+            "/agent/",
+            json={"name": "a", "memory_enabled": True, "memory_type": 1},
+            headers=HEADERS,
+        ).json()
+        resp = client.patch(
+            f"/agent/{created['agent_id']}",
+            json={"memory_enabled": None},
+            headers=HEADERS,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # null = 不改：原记忆字段原样保留
+        assert body["memory_enabled"] is True
+        assert body["memory_type"] == 1
+
+    def test_delete_cascades_memory_side_record(self, client):
+        created = client.post(
+            "/agent/",
+            json={"name": "a", "memory_enabled": True},
+            headers=HEADERS,
+        ).json()
+        agent_id = created["agent_id"]
+        assert (
+            client.delete(f"/agent/{agent_id}", headers=HEADERS).status_code
+            == 204
+        )
+        # 硬断言：侧边记忆表真的删干净了（不只是列表里看不见）
+        got = asyncio.run(
+            memory_config.memory_get(HEADERS["X-User-ID"], agent_id)
+        )
+        assert got is None

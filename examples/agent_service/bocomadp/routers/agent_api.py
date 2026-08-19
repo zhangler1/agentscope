@@ -182,12 +182,20 @@ async def create_agent_with_memory(
 async def list_agents_with_memory(
     parent_agent_id: str | None = None,
     user_id: str = Depends(get_current_user_id),
+    storage=Depends(get_storage),
     access=Depends(get_resource_access_service),
 ) -> ListAgentsResponseWithMemory:
-    """列表查询：框架原逻辑 + 每项合并记忆字段（无记录用默认值）。"""
+    """列表查询：框架原逻辑 + 每项合并记忆字段（无记录用默认值）。
+
+    storage 必须显式传给核心实现：list_agents 在 parent_agent_id 非空
+    时要查 expert_team_relations 表过滤成员，顶层列表也要隐藏成员，
+    都依赖真存储。漏传会拿到 Depends 占位对象（无 _session_factory），
+    get_team 静默返回 None，带 parent 的列表就永远变空。
+    """
     result: ListAgentsResponse = await _core_list_agents(
         parent_agent_id=parent_agent_id,
         user_id=user_id,
+        storage=storage,
         access=access,
     )
     merged: list[AgentViewWithMemory] = []
