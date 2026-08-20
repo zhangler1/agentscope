@@ -417,7 +417,11 @@ async def build_agent_middlewares(
 ):
     middlewares = middleware_registry.list_middlewares()
     middlewares.extend(
-        await build_enterprise_middlewares(user_id, agent_id, session_id),
+        await build_enterprise_middlewares(
+            user_id,
+            agent_id,
+            session_id,
+        ),
     )
     return middlewares
 
