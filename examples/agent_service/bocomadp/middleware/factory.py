@@ -36,14 +36,9 @@ async def build_enterprise_middlewares(
     参数签名（user_id / agent_id / session_id）为与 main.py 调用
     契约对齐而保留。
     """
-    return [
+    middlewares: list[MiddlewareBase] = [
         CustomPromptMiddleware(),
     ]
-
-    if get_audit_config().enabled:
-        middlewares.append(
-            AuditMiddleware(user_id=user_id, session_id=session_id),
-        )
 
     if os.getenv("ADP_K8S_SLOT_RELEASE_ON_RUN_END", "1") == "1":
         middlewares.append(

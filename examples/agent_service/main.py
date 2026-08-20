@@ -427,7 +427,7 @@ async def build_agent_tools(
 # 合并「MiddlewareRegistry 自动扫描的内置中间件」+「主动 build 的企业中间件」；
 # 经 ``_build_agent_middlewares_with_ellm`` 传给 create_app 的
 # ``extra_agent_middlewares``，与注册表视图保持同源。
-# 企业中间件（审计留痕）采用主动 build（middleware/factory.py），
+# 企业中间件采用主动 build（middleware/factory.py），
 # 按会话创建独立实例，不依赖 custom/ 被动扫描。
 async def build_agent_middlewares(
     user_id: str,
