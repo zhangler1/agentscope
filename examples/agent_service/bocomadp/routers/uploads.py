@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import mimetypes
 import os
-from urllib.parse import quote
+from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
+
+import httpx
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, status, UploadFile
 from pydantic import BaseModel, Field
@@ -109,6 +112,227 @@ def _upload_abs(backend, workdir: str, name: str) -> str:
     return backend.join_path(workdir, to_upload_rel_path(name))
 
 
+async def _persist_uploaded_bytes(
+    *,
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    storage: StorageBase,
+    workspace_manager: WorkspaceManagerBase,
+    original_name: str,
+    data: bytes,
+    content_type: str | None,
+) -> UploadedFile:
+    """落盘原始文件 + 图片 base64 固化 / 文档转 .md + 写入 uploads DB。
+
+    ``POST /files/upload`` 端点与 ``custom_params.additional_urls`` 下载
+    共用本函数，保证两条路径的文件元数据与落盘格式完全一致（下游
+    ``list_uploaded_files`` / ``view_image_tool`` / ``<context name="files">``
+    均以 uploads DB 记录为感知通道）。
+
+    Raises:
+        `UploadError`: 文件名非法 / 落盘失败（调用方按需处理）。
+    """
+    # 安全文件名
+    stored_name = normalize_filename(original_name or "file")
+    validate_path_traversal(stored_name)
+    virtual_path = to_virtual_path(stored_name)
+
+    # 解析工作区与 backend（沙箱 / 本地统一）
+    workspace = await _resolve_workspace(
+        user_id, agent_id, session_id, storage, workspace_manager,
+    )
+    backend = workspace.get_backend()
+    workdir = workspace.workdir
+
+    # 上传目录由来宾工作区的 _ensure_workspace_layout() 保证存在
+    #（user-data/uploads）；backend.write_file 也会自动创建父目录，
+    # 无需重复 mkdir。
+    abs_target = _upload_abs(backend, workdir, stored_name)
+
+    # 落盘原始文件
+    try:
+        await backend.write_file(abs_target, data)
+    except Exception as e:  # noqa: BLE001
+        raise UploadError(f"write failed: {e}") from e
+
+    # 转换 .md（host 侧第三方库），并写回工作区
+    converted = False
+    convert_format = None
+    convert_error = None
+    markdown = None
+    base64 = None
+    mime_type = None
+    is_img = is_image(content_type, stored_name)
+    try:
+        if is_img:
+            # 图片：直接固化为 base64 存入元数据，供 view_image_tool
+            # 直接解析（不生成 .md，不内联进消息正文）。MIME 以文件头
+            # 实测为准（内容优先），实测不到时按扩展名兜底。
+            mime_type = detect_image_mime(data) or image_ext_to_mime(stored_name)
+            if mime_type is None:
+                convert_error = (
+                    "unsupported image format; supported: jpg, jpeg, png, webp"
+                )
+            else:
+                base64 = encode_image_base64(data)
+        elif file_conversion.is_supported_format(stored_name):
+            fmt, md_text = file_conversion.convert_file_bytes(
+                stored_name, data, content_type,
+            )
+            if md_text:
+                converted = True
+                convert_format = fmt
+                markdown = md_text
+                md_name = f"{os.path.splitext(stored_name)[0]}.md"
+                await backend.write_file(
+                    _upload_abs(backend, workdir, md_name),
+                    md_text.encode("utf-8"),
+                )
+    except Exception as e:  # noqa: BLE001
+        convert_error = str(e)
+
+    return get_uploads_db().add(
+        UploadedFileCreate(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            workspace_id=getattr(workspace, "workspace_id", None),
+            original_name=original_name or stored_name,
+            stored_name=stored_name,
+            virtual_path=virtual_path,
+            size_bytes=len(data),
+            content_type=content_type,
+            converted=converted,
+            convert_format=convert_format,
+            convert_error=convert_error,
+            markdown=markdown,
+            base64=base64,
+            mime_type=mime_type,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# URL 下载保存（deerflow custom_params.additional_urls）
+# ---------------------------------------------------------------------------
+# 对齐 deer-flow uploads.py 的下载参数：整体 60s 超时（连接 10s）+ 跟随
+# 重定向；单文件大小沿用本服务 uploads 配置（max_file_size_mb）。
+_URL_DOWNLOAD_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+
+
+def _filename_from_url(url: str) -> str:
+    """从 URL 路径提取文件名（URL 解码）；无有效路径段回退 ``downloaded``。"""
+    parsed = urlparse(url)
+    name = unquote(Path(parsed.path).name) if parsed.path else ""
+    return name if name and name not in {".", ".."} else "downloaded"
+
+
+async def download_urls_to_session(
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    urls: list[str],
+    storage: StorageBase,
+    workspace_manager: WorkspaceManagerBase,
+) -> list[UploadedFile]:
+    """下载 URL 文件并保存到会话 uploads 目录（``custom_params.additional_urls``）。
+
+    对齐 deer-flow ``download_urls_to_thread`` 语义：单个 URL 失败仅告警
+    跳过（部分成功可接受），不阻断调用方流程；保存逻辑与
+    ``POST /files/upload`` 完全一致（经 :func:`_persist_uploaded_bytes`
+    落盘 + 图片 base64 固化 / 文档 .md 转换 + uploads DB 记录），保证
+    下游链路立即可见。
+
+    Args:
+        urls: 待下载的 OSS / HTTP(S) 地址列表（同名文件会被
+            ``normalize_filename`` 归一化；重复文件名直接覆盖）。
+
+    Returns:
+        `list[UploadedFile]`: 成功保存的上传记录（按 URL 顺序）。
+    """
+    cfg = get_upload_config()
+    if not cfg.enabled or not urls:
+        return []
+    db = get_uploads_db()
+    saved: list[UploadedFile] = []
+    async with httpx.AsyncClient(
+        timeout=_URL_DOWNLOAD_TIMEOUT,
+        follow_redirects=True,
+    ) as client:
+        for url in urls:
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "additional_urls: URL %s returned HTTP %s",
+                    url,
+                    e.response.status_code,
+                )
+                continue
+            except httpx.RequestError as e:
+                logger.error(
+                    "additional_urls: failed to download %s: %s",
+                    url,
+                    e,
+                )
+                continue
+
+            content = resp.content
+            if len(content) > cfg.max_file_size_bytes:
+                logger.warning(
+                    "additional_urls: file from %s exceeds %.1f MB limit",
+                    url,
+                    cfg.max_file_size_mb,
+                )
+                continue
+            if (
+                db.count_by_session(user_id, agent_id, session_id)
+                >= cfg.max_files_per_session
+            ):
+                logger.warning(
+                    "additional_urls: session %s exceeds %d files; "
+                    "remaining URLs skipped",
+                    session_id,
+                    cfg.max_files_per_session,
+                )
+                break
+            try:
+                record = await _persist_uploaded_bytes(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    storage=storage,
+                    workspace_manager=workspace_manager,
+                    original_name=_filename_from_url(url),
+                    data=content,
+                    content_type=resp.headers.get("content-type"),
+                )
+            except UploadError as e:
+                logger.warning(
+                    "additional_urls: skip %s: %s",
+                    url,
+                    e,
+                )
+                continue
+            except Exception as e:  # noqa: BLE001 —— 保存失败不阻断其余 URL
+                logger.error(
+                    "additional_urls: failed to save %s: %s",
+                    url,
+                    e,
+                )
+                continue
+            saved.append(record)
+            logger.info(
+                "additional_urls: downloaded %s -> %s (%d bytes)",
+                url,
+                record.virtual_path,
+                len(content),
+            )
+    return saved
+
+
 # ---------------------------------------------------------------------------
 # GET /files/limits — 上传能力/限制信息
 # ---------------------------------------------------------------------------
@@ -168,91 +392,22 @@ async def upload_file(
             f"session {session_id!r} exceeds {cfg.max_files_per_session} files",
         )
 
-    # 安全文件名
+    # 落盘 + 转换 + DB 记录（与 custom_params.additional_urls 下载共用
+    # _persist_uploaded_bytes，保证两条路径行为一致）
     try:
-        stored_name = normalize_filename(file.filename or "file")
-        validate_path_traversal(stored_name)
-    except UploadError as e:
-        _raise_upload_error(e)
-
-    virtual_path = to_virtual_path(stored_name)
-
-    # 解析工作区与 backend（沙箱 / 本地统一）
-    workspace = await _resolve_workspace(
-        user_id, agent_id, session_id, storage, workspace_manager,
-    )
-    backend = workspace.get_backend()
-    workdir = workspace.workdir
-
-    # 上传目录由来宾工作区的 _ensure_workspace_layout() 保证存在
-    #（user-data/uploads）；backend.write_file 也会自动创建父目录，
-    # 无需重复 mkdir。
-    abs_target = _upload_abs(backend, workdir, stored_name)
-
-    # 落盘原始文件
-    try:
-        await backend.write_file(abs_target, data)
-    except Exception as e:  # noqa: BLE001
-        _raise_upload_error(UploadError(f"write failed: {e}"))
-
-    # 转换 .md（host 侧第三方库），并写回工作区
-    converted = False
-    convert_format = None
-    convert_error = None
-    markdown = None
-    base64 = None
-    mime_type = None
-    content_type = file.content_type
-    is_img = is_image(content_type, stored_name)
-    try:
-        if is_img:
-            # 图片：前端已校验图片格式，后端直接固化为 base64 存入元数据，
-            # 供 view_image_tool 直接解析（不生成 .md，不内联进消息正文）。
-            # MIME 以文件头实测为准（内容优先，兼容扩展名与实际内容不一致
-            # 的真实文件，如 JPEG 内容存成 .png 名），实测不到时按扩展名兜底。
-            mime_type = detect_image_mime(data) or image_ext_to_mime(stored_name)
-            if mime_type is None:
-                convert_error = (
-                    "unsupported image format; supported: jpg, jpeg, png, webp"
-                )
-            else:
-                base64 = encode_image_base64(data)
-        elif file_conversion.is_supported_format(stored_name):
-            fmt, md_text = file_conversion.convert_file_bytes(
-                stored_name, data, content_type,
-            )
-            if md_text:
-                converted = True
-                convert_format = fmt
-                markdown = md_text
-                md_name = f"{os.path.splitext(stored_name)[0]}.md"
-                await backend.write_file(
-                    _upload_abs(backend, workdir, md_name),
-                    md_text.encode("utf-8"),
-                )
-    except Exception as e:  # noqa: BLE001
-        convert_error = str(e)
-
-    record = db.add(
-        UploadedFileCreate(
+        return await _persist_uploaded_bytes(
             user_id=user_id,
             agent_id=agent_id,
             session_id=session_id,
-            workspace_id=getattr(workspace, "workspace_id", None),
-            original_name=file.filename or stored_name,
-            stored_name=stored_name,
-            virtual_path=virtual_path,
-            size_bytes=len(data),
-            content_type=content_type,
-            converted=converted,
-            convert_format=convert_format,
-            convert_error=convert_error,
-            markdown=markdown,
-            base64=base64,
-            mime_type=mime_type,
-        ),
-    )
-    return record
+            storage=storage,
+            workspace_manager=workspace_manager,
+            original_name=file.filename or "file",
+            data=data,
+            content_type=file.content_type,
+        )
+    except UploadError as e:
+        _raise_upload_error(e)
+        raise  # pragma: no cover —— _raise_upload_error 必然抛 HTTPException
 
 
 # ---------------------------------------------------------------------------
