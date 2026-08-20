@@ -10,11 +10,14 @@
 """
 from __future__ import annotations
 
+import os
+
 from agentscope.middleware import MiddlewareBase
 
 from ..config import get_audit_config
 from .audit import AuditMiddleware
 from .custom_prompt import CustomPromptMiddleware
+from .slot_release import SlotReleaseMiddleware
 
 
 async def build_enterprise_middlewares(
@@ -29,6 +32,10 @@ async def build_enterprise_middlewares(
 
     CustomPromptMiddleware 无 per-session 状态（提示词从请求级
     ContextVar 读取），每次组装构建新实例即可，无额外成本。
+
+    SlotReleaseMiddleware 负责 run 结束无条件软释放温池 slot（配合
+    SharedPvcK8sWorkspace.release_slot），开关
+    ``ADP_K8S_SLOT_RELEASE_ON_RUN_END``（默认开）控制。
     """
     middlewares: list[MiddlewareBase] = [
         CustomPromptMiddleware(),
@@ -37,6 +44,11 @@ async def build_enterprise_middlewares(
     if get_audit_config().enabled:
         middlewares.append(
             AuditMiddleware(user_id=user_id, session_id=session_id),
+        )
+
+    if os.getenv("ADP_K8S_SLOT_RELEASE_ON_RUN_END", "1") == "1":
+        middlewares.append(
+            SlotReleaseMiddleware(session_id=session_id),
         )
 
     return middlewares
