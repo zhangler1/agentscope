@@ -36,7 +36,16 @@ from .base import (
 # cross_search → get_cross_search_config）。
 # 新增此类业务节点时，必须加入本集合，否则启动校验会 fail-fast。
 _BUSINESS_KEYS: frozenset[str] = frozenset(
-    {"models", "cross_search", "uploads", "agents"},
+    {
+        "models",
+        "audit",
+        "cross_search",
+        "online_search",
+        "personal_search",
+        "vector_search",
+        "uploads",
+        "agents",
+    },
 )
 
 # 拼写校验相似度阈值：YAML 键与声明字段的相似度达到该值即视为疑似拼写错误。

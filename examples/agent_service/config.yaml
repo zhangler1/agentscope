@@ -235,6 +235,38 @@ cross_search:
     jumpcloud-ENV: "BASE"
 
 
+# ---------- 联网搜索（online_search，含 custom_search 请求逻辑） ----------
+# 扁平结构：键与 online_search_config.py 字段一一对应。
+online_search:
+  # 指向本地 mock（examples/agent_service/mock_search_server.py）：
+  #   python mock_search_server.py  # 监听 0.0.0.0:8001
+  # 生产/联调真实网关时改回环境变量引用：api_url: $CUSTOM_SEARCH_API_URL
+  api_url: "http://127.0.0.1:8001/online"
+  timeout: 30
+  max_results: 5
+
+# ---------- 个人知识库搜索（personal_search） ----------
+personal_search:
+  # 指向本地 mock；真实网关时改回：api_url: $PERSONAL_SEARCH_API_URL
+  api_url: "http://127.0.0.1:8001/personal"
+  timeout: 30                         # 请求超时(秒)
+  source_type: "WDZS"                 # 请求体 sourceType
+  repository: "personal-search"       # 请求体 repository
+  search_type: "0"                    # 请求体 searchType
+  headers:                            # 可选：合并覆盖默认头
+    jumpCloud-Env: "BASE"
+
+# ---------- 行内搜索（vector_search） ----------
+vector_search:
+  # 指向本地 mock；真实网关时改回：api_url: $VECTOR_SEARCH_API_URL
+  api_url: "http://127.0.0.1:8001/vector"
+  timeout: 30
+  page_size: 10
+  text_top_n: 7
+  vector_top_n: 10
+  space_codes: ["SP0999999", "SP0000214"]
+
+
 # ---------- 文件上传能力 ----------
 # 非图片文件上传 / 格式转换（-> Markdown）/ 上下文注入。
 # base_dir 为独立上传根（不挂在 workspace 下），相对路径基于 BASE_DIR 归一化。
