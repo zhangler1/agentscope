@@ -199,10 +199,13 @@ async def get_bocom_skills(
     agent_id: str = Query(...),
     session_id: str = Query(...),
     keyword: str = Query(default=""),
-    userId: str = Query(default=""),
-    loginName: str = Query(default="1"),
+    status: str = Query(default="PUBLISHED"),
+    namespace: str = Query(default="global"),
+    labelSlugs: str = Query(default=""),
     page: int = Query(default=1, ge=1),
+    myOnly: bool = Query(default=False),
     size: int = Query(default=10, ge=1, le=200),
+    guwp_token: str | None = Header(default=None, alias="guwpToken"),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
@@ -211,8 +214,8 @@ async def get_bocom_skills(
 ) -> AgentSkillsListResponse:
     """查询 Bocom skillhub 目录并返回（返回格式与 external hub 一致）。
 
-    参数与 Bocom 上游查询接口对齐：``keyword`` / ``userId`` /
-    ``loginName``（默认 ``"1"``）/ ``page``（从 1 起）/ ``size``；
+    参数与 Bocom 上游 curl 请求对齐：``keyword`` / ``status`` /
+    ``namespace`` / ``labelSlugs`` / ``page`` / ``myOnly`` / ``size``；
     ``agent_id`` / ``session_id`` 用于解析 workspace 以标记 ``used`` 状态。
     """
     # 归属校验：agent 必须属于（或被共享给）调用者，否则 404。
@@ -233,26 +236,26 @@ async def get_bocom_skills(
             detail="No 'bocom' skill hub is registered.",
         )
 
-    # 显式传入的业务 userId 覆盖 hub 默认值（逐请求设置）。
-    set_user_id = getattr(hub, "set_user_id", None)
-    if set_user_id is not None and userId:
-        set_user_id(userId)
+    # 透传 guwp-token（逐请求设置，与 external hub 的 set_token 一致）。
+    set_token = getattr(hub, "set_token", None)
+    if set_token is not None:
+        set_token(guwp_token)
 
-    merged_q = keyword or None
-    # 上游 page 从 1 起；hub 的 cursor 从 0 计。
-    cursor = f"page:{page - 1}" if page > 1 else None
     page_result = await hub.list_skills(
         user_id,
-        q=merged_q,
-        cursor=cursor,
-        limit=size,
-        loginName=loginName,
+        keyword=keyword,
+        status=status,
+        namespace=namespace,
+        labelSlugs=labelSlugs,
+        page=page,
+        myOnly=myOnly,
+        size=size,
     )
 
     skills_list = [
         SkillInfo(
             name=card.name,
-            category="public",
+            category=card.tags[0] if card.tags else "global",
             description=card.description or "",
             used=card.name in used_names,
         )
@@ -464,6 +467,7 @@ async def enable_bocom_skill(
     skill_name: str,
     agent_id: str = Query(...),
     session_id: str = Query(...),
+    namespaceSlug: str = Query(default="Global"),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
@@ -515,7 +519,11 @@ async def enable_bocom_skill(
         )
     _set_token(hub, guwp_token)
     try:
-        archive = await hub.download(user_id, skill_name)
+        archive = await hub.download(
+            user_id,
+            name=skill_name,
+            namespaceSlug=namespaceSlug,
+        )
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
