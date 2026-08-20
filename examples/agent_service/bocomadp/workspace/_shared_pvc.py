@@ -759,7 +759,6 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         agent_id: str,
         session_id: str,
         workspace_id: str | None = None,
-        claim_slot: bool = True,
     ) -> SharedPvcK8sWorkspace:
         """返回 session-scoped workspace，挂载到 hash 路由的池 Pod。
 
@@ -769,15 +768,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             session_id (`str`): 会话 ID（用于 hash 路由和 workdir 子目录）。
             workspace_id (`str | None`, optional):
                 Stable workspace identifier。``None`` 时自动生成。
-            claim_slot (`bool`, defaults to `True`):
-                兼容旧调用点保留的参数。hash 路由下无占用语义
-                （同一 Pod 可被多会话并发复用），直接忽略。
 
         Returns:
             `SharedPvcK8sWorkspace`: 已初始化的 workspace。
         """
-        del claim_slot  # hash 路由无占用语义，参数仅为兼容保留
-
         if workspace_id is None:
             workspace_id = self.assign_workspace_id(
                 user_id=user_id,
