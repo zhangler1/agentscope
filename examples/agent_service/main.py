@@ -63,6 +63,7 @@ from bocomadp.config import (
 )
 from bocomadp.concurrency.guard import ConcurrencyGuard
 from bocomadp.logging.logging_config import configure_logging
+from bocomadp.logging.trace_context import get_current_trace_id
 from bocomadp.logging.trace_middleware import TraceMiddleware
 from bocomadp.middleware.concurrency_guard import ConcurrencyGuardMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
@@ -135,15 +136,18 @@ setup_logger("INFO")  # 只挂 StreamHandler；文件 handler 由下方共享实
 
 class _EventsFormatter(logging.Formatter):
     """单个滚动 handler 同时服务 ``as`` 与 ``uvicorn.access``，
-    按 logger 名保持各自原有行格式。"""
+    按 logger 名保持各自原有行格式；统一注入 ``trace_id`` 字段，
+    使模型/工具事件日志可与 access log 按 trace 关联。"""
 
     _FORMATS = {
         "as": (
             "%(asctime)s | %(levelname)-7s | "
+            "[trace_id=%(trace_id)s] "
             "%(module)s:%(funcName)s:%(lineno)s - %(message)s"
         ),
         "uvicorn.access": (
-            "%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"
+            "%(asctime)s | %(levelname)-7s | %(name)s "
+            "[trace_id=%(trace_id)s] - %(message)s"
         ),
     }
 
@@ -154,6 +158,12 @@ class _EventsFormatter(logging.Formatter):
         }
 
     def format(self, record: logging.LogRecord) -> str:
+        # 与 JsonTraceFormatter 同策略：record 缺失 trace_id 时补当前
+        # 上下文值（"-" 表示未绑定/未启用），不依赖 filter 安装顺序。
+        # ``as`` logger 自带独立 handler（propagate=False），
+        # configure_logging 只增强 root，因此必须在此层注入。
+        if not hasattr(record, "trace_id"):
+            record.trace_id = get_current_trace_id() or "-"
         sub = self._sub_formatters.get(record.name)
         return sub.format(record) if sub is not None else super().format(record)
 
@@ -417,7 +427,7 @@ async def build_agent_tools(
 # 合并「MiddlewareRegistry 自动扫描的内置中间件」+「主动 build 的企业中间件」；
 # 经 ``_build_agent_middlewares_with_ellm`` 传给 create_app 的
 # ``extra_agent_middlewares``，与注册表视图保持同源。
-# 企业中间件（审计留痕）采用主动 build（middleware/factory.py），
+# 企业中间件采用主动 build（middleware/factory.py），
 # 按会话创建独立实例，不依赖 custom/ 被动扫描。
 async def build_agent_middlewares(
     user_id: str,
@@ -426,7 +436,11 @@ async def build_agent_middlewares(
 ):
     middlewares = middleware_registry.list_middlewares()
     middlewares.extend(
-        await build_enterprise_middlewares(user_id, agent_id, session_id),
+        await build_enterprise_middlewares(
+            user_id,
+            agent_id,
+            session_id,
+        ),
     )
     return middlewares
 
@@ -636,13 +650,15 @@ trace_enabled = is_trace_correlation_enabled(config)
 
 
 class TokenCaptureMiddleware:
-    """Capture the ``guwpToken`` request header into a ContextVar.
+    """Capture the ``guwpToken`` / ``X-User-ID`` request headers into
+    ContextVars.
 
-    Pure ASGI middleware: the ContextVar is set in the request task
+    Pure ASGI middleware: the ContextVars are set in the request task
     itself, so the framework's ``ChatRunRegistry.spawn`` (which uses
-    ``asyncio.create_task``) copies it into the chat-run background
-    task, making the token available to agent-factory tools during
-    the run.
+    ``asyncio.create_task``) copies them into the chat-run background
+    task — the token stays available to agent-factory tools, and the
+    user id feeds the agent event logs (``user_id=`` field) without
+    touching framework internals.
     """
 
     def __init__(self, app: Any) -> None:
@@ -651,12 +667,18 @@ class TokenCaptureMiddleware:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             token = ""
+            user_id = ""
             for key, value in scope.get("headers") or []:
                 if key.lower() == b"guwptoken":
                     token = value.decode("utf-8", errors="replace")
-                    break
+                elif key.lower() == b"x-user-id":
+                    user_id = value.decode("utf-8", errors="replace")
+            from bocomadp.logging.trace_context import set_current_user_id
             from bocomadp.tools.agent_factory_tools import _current_token
+
             _current_token.set(token)
+            if user_id:
+                set_current_user_id(user_id)
         await self.app(scope, receive, send)
 
 
@@ -689,7 +711,7 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
     ]
 
 
-# 通用中间件构建入口：registry 自动扫描 + 企业中间件主动 build（审计留痕）
+# 通用中间件构建入口：registry 自动扫描 + 企业中间件主动 build
 # + ELLM key 刷新中间件（每次模型调用前惰性刷新 apikey）。
 # refresh_ahead_secs 来自 config.ellm_key_refresh，提前刷新留缓冲。
 _ellm_refresh_mw_factory = build_ellm_refresh_middleware(

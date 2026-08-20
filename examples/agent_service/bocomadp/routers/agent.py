@@ -181,6 +181,21 @@ async def list_agents(
     ),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
+    is_team: bool | None = Query(
+        default=None,
+        description=(
+            "Optional top-level filter: `true` returns only expert-team "
+            "leaders, `false` only plain agents. Omit to list all."
+        ),
+    ),
+    invitable: bool | None = Query(
+        default=None,
+        description=(
+            "Optional filter: `true` returns only agents whose "
+            "invite_config.invitable is enabled, `false` only disabled "
+            "ones. Omit to list all."
+        ),
+    ),
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> ListAgentsResponse:
     """Return all agent records visible to the authenticated user.
@@ -188,7 +203,9 @@ async def list_agents(
     Includes the caller's own ``source == "user"`` agents plus any agents
     shared to them through :class:`ResourceAccessPolicyBase`. Each entry
     carries an ``editable`` flag indicating whether the caller may
-    PATCH/DELETE it, and an ``is_team`` flag marking expert-team leaders.
+    PATCH/DELETE it, and an ``is_team`` flag marking expert-team leaders
+    (``is_team=true`` filters to leaders only; ``is_team=false`` to plain
+    agents).
 
     Pass ``parent_agent_id`` to list the members of a specific expert team
     (otherwise team members are hidden so the top-level list stays clean).
@@ -244,6 +261,20 @@ async def list_agents(
             }
             if member_ids:
                 entries = [e for e in entries if e.id not in member_ids]
+    # is_team 筛选：生产环境顶层分支已在 TeamAgentView 上标记 is_team
+    # （True=团长，False=普通/被邀成员）。未 patch 的环境没有该字段，
+    # getattr 兜底为 None，此时两种过滤都筛空（语义合理：无团队概念）。
+    if is_team is not None:
+        entries = [e for e in entries if getattr(e, "is_team", None) is is_team]
+    # invitable 筛选：按 invite_config.invitable 过滤（缺失视为 False），
+    # 供"邀请成员"的可选列表只展示可被邀请的智能体（invitable=true）。
+    if invitable is not None:
+        entries = [
+            e
+            for e in entries
+            if bool((e.data.invite_config or InviteConfig()).invitable)
+            is invitable
+        ]
     # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
     # 直接切片即可，total 用切片前的完整数量，前端可据此算总页数。
     total = len(entries)
@@ -727,6 +758,10 @@ async def set_team_config(
     }
     rel.members = []
     for mid in body.member_ids:
+        # Hard-check the ``AgentInvite`` switch: only invitable agents may
+        # be in the roster, otherwise the runtime workflow could never
+        # borrow them and the invitation would be a no-op.
+        await _require_invitable(storage, owner_id, mid)
         rel.add_member(mid, old_relations.get(mid, "invited"))
     await upsert_team(storage, rel)
     return await get_team_config(agent_id, user_id, access, storage)
@@ -791,6 +826,44 @@ async def set_collaboration_mode(
     return CollaborationModeResponse(collaboration_mode=rel.collaboration_mode)
 
 
+async def _require_invitable(
+    storage: StorageBase,
+    owner_id: str,
+    member_agent_id: str,
+) -> None:
+    """Reject inviting an agent whose ``AgentInvite`` switch is off.
+
+    Only agents with ``invite_config.invitable=true`` (plus a non-empty
+    ``invite_description``) may be invited into a team: otherwise the
+    invitation is only a config-layer roster record and the member can
+    never be ``AgentInvite``-borrowed into a runtime workflow — the
+    invitation would silently be a no-op. Hard-checking at both invite
+    entry points keeps the roster consistent with what the frontend's
+    ``invitable=true`` picker offers. Agents invisible to the current
+    user are also rejected (nothing to verify).
+    """
+    invited = await storage.get_agent(owner_id, member_agent_id)
+    if invited is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Agent '{member_agent_id}' not found or not owned by the "
+                "current user; cannot verify invitable before inviting."
+            ),
+        )
+    inv = invited.data.invite_config or InviteConfig()
+    if inv.invitable and (inv.invite_description or "").strip():
+        return
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            f"Agent '{member_agent_id}' is not invitable: set "
+            "invite_config.invitable=true (with a non-empty "
+            "invite_description) before inviting it into a team."
+        ),
+    )
+
+
 @agent_router.post(
     "/{agent_id}/team/members",
     response_model=TeamConfigResponse,
@@ -807,8 +880,10 @@ async def add_team_member(
     """Invite an existing agent (``body.agent_id``) into the team.
 
     Appends to ``member_ids`` if not already present and within
-    ``max_members``. The invited agent's own config is frozen and is not
-    modified here.
+    ``max_members``. The invited agent must be ``invitable`` (with a
+    non-empty ``invite_description``) — otherwise the invitation is
+    rejected with 422 so the roster never holds members that the runtime
+    workflow could not ``AgentInvite``-borrow.
     """
     owner_id, agent = await access.resolve_for_edit(
         user_id,
@@ -826,6 +901,7 @@ async def add_team_member(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Team already at max_members={rel.max_members}.",
         )
+    await _require_invitable(storage, owner_id, body.agent_id)
     rel.add_member(body.agent_id, "invited")
     await upsert_team(storage, rel)
     return await get_team_config(agent_id, user_id, access, storage)

@@ -71,7 +71,7 @@ def build_k8s_workspace_manager() -> (
             sweep_interval=cfg.sweep_interval,
             # ── 池化 ──
             max_active_pods=cfg.max_active_pods,
-            pool_wait_timeout=cfg.pool_wait_timeout,
+            pool_idle_ttl=cfg.pool_idle_ttl,
             redis_host=redis_cfg.host,
             redis_port=redis_cfg.port,
         )
