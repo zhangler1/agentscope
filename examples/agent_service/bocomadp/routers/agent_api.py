@@ -9,9 +9,9 @@
 - ``memory_type``           — 0=程序性记忆，1=事务性记忆
 - ``memory_update_rounds``  — 每 N 轮对话触发记忆更新
 
-包裹 handler 直接调用框架原始 endpoint 函数（``agentscope.app._router._agent``），
-行为（权限 / 团队入队 / 404/409/422 语义）零漂移；记忆字段读写侧边
-存储（``bocomadp.memory_config``）。
+包裹 handler 直接调用专家团 endpoint 函数（``bocomadp.routers.agent``，
+即迁移后的 expert-team 实现），行为（权限 / 团队入队 / 404/409/422 语义）
+零漂移；记忆字段读写侧边存储（``bocomadp.memory_config``）。
 
 装配：``main.py`` 在 ``create_app`` 之后调用
 ``install_agent_memory_router(app)`` —— 路由前插覆盖同名路径，并移除
@@ -22,23 +22,23 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from agentscope.app._router._agent import (
-    create_agent as _framework_create_agent,
-    delete_agent as _framework_delete_agent,
-    list_agents as _framework_list_agents,
-    update_agent as _framework_update_agent,
+from bocomadp.routers.agent import (
+    create_agent as _core_create_agent,
+    delete_agent as _core_delete_agent,
+    list_agents as _core_list_agents,
+    update_agent as _core_update_agent,
 )
-from agentscope.app._router._schema._agent import (
+from bocomadp.routers._schema.agent import (
     CreateAgentRequest,
     CreateAgentResponse,
     ListAgentsResponse,
+    TeamAgentView,
     UpdateAgentRequest,
 )
-from agentscope.app._service import AgentView
 from agentscope.app.deps import (
     get_current_user_id,
     get_resource_access_service,
@@ -87,8 +87,9 @@ class CreateAgentResponseWithMemory(BaseModel):
     memory_update_rounds: int = 10
 
 
-class AgentViewWithMemory(AgentView):
-    """框架 AgentView + 4 记忆字段（列表 / 更新响应合并）。"""
+class AgentViewWithMemory(TeamAgentView):
+    """专家团 TeamAgentView（含 is_team / parent_agent_id / is_self_built）
+    + 4 记忆字段（列表 / 更新响应合并）。"""
 
     memory_update_prompt: str = ""
     memory_enabled: bool = False
@@ -148,7 +149,7 @@ async def create_agent_with_memory(
             },
         ),
     )
-    created: CreateAgentResponse = await _framework_create_agent(
+    created: CreateAgentResponse = await _core_create_agent(
         body=framework_body,
         user_id=user_id,
         storage=storage,
@@ -180,13 +181,39 @@ async def create_agent_with_memory(
 )
 async def list_agents_with_memory(
     parent_agent_id: str | None = None,
+    page_num: int = Query(
+        default=1,
+        ge=1,
+        alias="pageNum",
+        description="Page number, 1-based.",
+    ),
+    page_size: int = Query(
+        default=5,
+        ge=1,
+        le=100,
+        alias="pageSize",
+        description="Page size (items per page), 1-100.",
+    ),
     user_id: str = Depends(get_current_user_id),
+    storage=Depends(get_storage),
     access=Depends(get_resource_access_service),
 ) -> ListAgentsResponseWithMemory:
-    """列表查询：框架原逻辑 + 每项合并记忆字段（无记录用默认值）。"""
-    result: ListAgentsResponse = await _framework_list_agents(
+    """列表查询：框架原逻辑（含分页）+ 每项合并记忆字段（无记录用默认值）。
+
+    storage 必须显式传给核心实现：list_agents 在 parent_agent_id 非空
+    时要查 expert_team_relations 表过滤成员，顶层列表也要隐藏成员，
+    都依赖真存储。漏传会拿到 Depends 占位对象（无 _session_factory），
+    get_team 静默返回 None，带 parent 的列表就永远变空。
+
+    分页参数透传给核心：total 为分页前的完整数量（与 agents 当前页
+    条数可能不同），前端可据此算总页数。
+    """
+    result: ListAgentsResponse = await _core_list_agents(
         parent_agent_id=parent_agent_id,
+        page_num=page_num,
+        page_size=page_size,
         user_id=user_id,
+        storage=storage,
         access=access,
     )
     merged: list[AgentViewWithMemory] = []
@@ -224,7 +251,7 @@ async def update_agent_with_memory(
         },
     )
     framework_body = UpdateAgentRequest(**core)
-    view: AgentView = await _framework_update_agent(
+    view: TeamAgentView = await _core_update_agent(
         agent_id=agent_id,
         body=framework_body,
         user_id=user_id,
@@ -278,7 +305,7 @@ async def delete_agent_with_memory(
     access=Depends(get_resource_access_service),
 ) -> Response:
     """删除智能体：框架原逻辑（404/403 语义）+ 侧边记忆记录清理。"""
-    await _framework_delete_agent(
+    await _core_delete_agent(
         agent_id=agent_id,
         user_id=user_id,
         session_service=session_service,

@@ -93,8 +93,19 @@ from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent import agent_router
+from bocomadp.agent_list_sort import patch_agent_list_sort
+from bocomadp.team_access import patch_team_access
+from bocomadp.team_briefing import patch_team_briefing
+from bocomadp.projectors import WorkerFailureNotifier
+from bocomadp.session_team_cascade import patch_session_team_cascade
+from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
+# 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
+from agentscope.app._router._agent import (
+    agent_router as _framework_agent_router,
+)
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
 # 统一注册，本文件无需 import 或 include；框架 chat_router(POST /chat/) 与
@@ -783,6 +794,12 @@ async def _lifespan_with_builtin_agents(app):
     async with _original_lifespan(app):
         # 恢复持久化的工具白名单（内存存储重启会丢）
         load_tool_whitelists()
+        # 专家团关系表（expert_team_relations）——团队档案从 AgentData
+        # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
+        # 必须早于下面所有读团队档案的补丁挂载。
+        from bocomadp import team_store
+
+        await team_store.ensure_team_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -793,12 +810,45 @@ async def _lifespan_with_builtin_agents(app):
         except Exception as e:  # noqa: BLE001
             logger.warning("pool concurrency sync skipped: %s", e)
         await _register_builtin_agents()
+        # 专家团工具注入（workflow 严格交接 + AgentInvite 池回填）——
+        # 原实现改 src/_service/_toolkit.py 的 get_toolkit，现搬迁到
+        # bocomadp/team_toolkit.py；必须先于 patch_get_toolkit 挂载，
+        # 让白名单包装看到已注入的完整 Toolkit。
+        patch_team_toolkit()
         # config.yaml 模型条目作为 default 用户默认凭证入库（deerflow
         # 模型名解析的默认参数单一来源；幂等，失败仅告警不阻断启动）
         await ensure_default_credentials(storage)
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
         patch_get_toolkit()
+        # 资源列表团队成员过滤 + is_self_built 标记——原实现改
+        # src/_service/_access.py 的 list_resource，现搬迁到
+        # bocomadp/team_access.py；必须先于 patch_agent_list_sort 挂载
+        # （排序包装会把 parent_agent_id 透传给本过滤层）。
+        patch_team_access()
+        # 资源列表按 updated_at 倒序（最近修改优先）——原实现直接改
+        # src/_service/_access.py，现按约定搬迁到 bocomadp/agent_list_sort.py。
+        patch_agent_list_sort()
+        # 专家团 leader 删除级联（自建成员级联删、被邀成员摘除引用）——
+        # 原实现改 src/_service/_session.py 的 delete_agent，现搬迁到
+        # bocomadp/session_team_cascade.py。
+        patch_session_team_cascade()
+        # 专家团 briefing（leader 的 system prompt 注入团队成员/交接序）
+        # 原实现改 src/_service/_chat.py 的 _run_impl，现搬迁到
+        # bocomadp/team_briefing.py，包装 ResourceAccessService.resolve_agent。
+        patch_team_briefing()
+        # WorkerFailureNotifier（worker 失败时提醒团队 leader）原实现位于
+        # src/_service/_projectors/_worker_failure_notifier.py，按约定搬迁到
+        # bocomadp/projectors/；ChatService 由框架 lifespan 构造，因此这里
+        # 直接向已构造实例追加（幂等）。
+        chat_service = app.state.chat_service
+        if not any(
+            getattr(p, "KIND", None) == WorkerFailureNotifier.KIND
+            for p in chat_service._projectors
+        ):
+            chat_service._projectors.append(
+                WorkerFailureNotifier(app.state.storage)
+            )
         yield
 
 
@@ -821,8 +871,35 @@ app.state.bus_bridge = BusBridge(message_bus)
 # ---------------------------------------------------------------------------
 # 7. 在 12 个内置路由之上挂载自定义路由
 # ---------------------------------------------------------------------------
-# 智能体记忆字段包裹路由：覆盖框架 /agent/ 的 4 个端点（创建/查询/更新/删除），
-# 增加记忆字段（侧边 PG 表 agent_memory_configs 持久化）。
+# 覆盖内置 /agent 路由：框架 agent_router 不含专家团 8 个 /team/* 端点
+# 与 CRUD 专家团行为（已按约定搬到 bocomadp/routers/agent.py）。FastAPI
+# 0.141+ 的 include_router 不复制路由对象，而是插入惰性的
+# _IncludedRouter 包装（持有 original_router 引用），因此摘除必须按
+# 引用身份判断；旧版 FastAPI 才按路径判断。bocomadp 其余路由均以
+# /agents（复数）等其它前缀挂载，不会误伤。
+_framework_agent_paths = {
+    r.path
+    for r in _framework_agent_router.routes
+    if getattr(r, "path", "").startswith("/agent")
+}
+
+
+def _is_framework_agent_route(r: object) -> bool:
+    original = getattr(r, "original_router", None)
+    if original is not None:  # FastAPI 0.141+: _IncludedRouter 包装
+        return original is _framework_agent_router
+    return getattr(r, "path", "") in _framework_agent_paths  # 旧版复制
+
+
+app.router.routes[:] = [
+    r for r in app.router.routes if not _is_framework_agent_route(r)
+]
+app.include_router(agent_router)
+# 智能体记忆字段包裹路由（必须后于 include bocomadp agent_router）：
+# 按路径移除 bocomadp agent_router 中被覆盖的 /agent/ 4 条 CRUD 路由
+# （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
+# 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
+# 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
 install_agent_memory_router(app)
 app.include_router(health_router)
 app.include_router(stats_router)

@@ -33,22 +33,27 @@ Design notes:
   deleted or the leader session has been replaced, we log and
   skip — a stale notification is worse than none.
 - This projector is stacked alongside :class:`SubagentHitlProjector`
-  (built-in) and any user-supplied projectors; it is wired into
-  :class:`ChatService` at construction. It needs the storage
-  handle (to resolve the team) and the message bus (to enqueue
-  the inbox hint + a leader wakeup).
+  (built-in) and any user-supplied projectors. It is wired into
+  :class:`ChatService` in ``main.py``'s lifespan by appending it
+  to ``app.state.chat_service._projectors`` (the framework
+  constructs ``ChatService`` before bocomadp code can run).
+
+历史说明：本文件最初实现于 ``src/agentscope/app/_service/
+_projectors/_worker_failure_notifier.py``（作为框架内置投影器）。
+按「框架源码不动、企业逻辑进 bocomadp」的约定搬到这里，实现不变，
+仅将相对导入改为绝对导入。
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ....event import ReplyEndEvent, ReplyFinishedReason
-from ..._bus_ops import enqueue_run_trigger
-from ...message_bus import MessageBusKeys
+from agentscope.event import ReplyEndEvent, ReplyFinishedReason
+from agentscope.app._bus_ops import enqueue_run_trigger
+from agentscope.app.message_bus import MessageBusKeys
 
 if TYPE_CHECKING:
-    from ...storage import AgentRecord, SessionRecord, StorageBase
-    from ._session_projection import SessionProjection
+    from agentscope.app._service._session_projection import SessionProjection
+    from agentscope.app.storage import AgentRecord, SessionRecord, StorageBase
 
 
 # Reasons that should bubble a synthetic notice up to the leader.

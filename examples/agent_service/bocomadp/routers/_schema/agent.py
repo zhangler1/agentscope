@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Request / response schemas for the agent router."""
+"""Request / response schemas for the BocomADP agent router (expert team)."""
 import warnings
 
 from pydantic import BaseModel, Field
 
-from ....agent import ContextConfig, ReActConfig
-from ...storage import InviteConfig
-from ..._service import AgentView
+from agentscope.agent import ContextConfig, ReActConfig
+from agentscope.app.storage import InviteConfig
+from agentscope.app._service import AgentView
 
 
 class CreateAgentRequest(BaseModel):
@@ -31,6 +31,25 @@ class CreateAgentRequest(BaseModel):
             "Invite-pool settings for this agent. See "
             ":class:`InviteConfig` — enforces the "
             "``invitable ⇒ non-empty description`` invariant."
+        ),
+    )
+    parent_agent_id: str | None = Field(
+        default=None,
+        description=(
+            "When set, this new agent is created as a member of the "
+            "expert team led by the referenced agent. The leader's "
+            "team_config.member_ids is updated to include the new agent "
+            "automatically. Leave None to create a plain agent."
+        ),
+    )
+    is_team: bool = Field(
+        default=False,
+        description=(
+            "When True (and ``parent_agent_id`` is None), the new agent is "
+            "created as an expert-team leader with an empty ``team_config`` "
+            "so it is already classified as a team in listings even before "
+            "any member references it. Ignored when ``parent_agent_id`` is "
+            "set (a member cannot also be a leader)."
         ),
     )
 
@@ -70,10 +89,27 @@ class UpdateAgentRequest(BaseModel):
     )
 
 
+class TeamAgentView(AgentView):
+    """Agent view re-deriving the expert-team fields.
+
+    ``is_team`` / ``parent_agent_id`` / ``is_self_built`` used to live on
+    the framework :class:`AgentView`; they were moved out of ``src/`` into
+    the ``expert_team_relations`` table. This subclass re-exposes them so
+    the wire contract of the list / update endpoints is unchanged.
+    """
+
+    is_team: bool = False
+    parent_agent_id: str | None = None
+    # None at top-level (not a member query); True/False only when the
+    # list was queried with ``parent_agent_id`` — mirrors the historical
+    # framework ``AgentView`` contract.
+    is_self_built: bool | None = None
+
+
 class ListAgentsResponse(BaseModel):
     """Response body for listing agents."""
 
-    agents: list[AgentView] = Field(description="Agent records.")
+    agents: list[TeamAgentView] = Field(description="Agent records.")
     total: int = Field(description="Total number of agents.")
 
 
