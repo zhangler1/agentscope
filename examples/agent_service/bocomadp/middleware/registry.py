@@ -79,7 +79,7 @@ class MiddlewareRegistry:
         """自动扫描 ``custom/`` 包下所有子模块的 Middleware 实例。
 
         在 ``custom/`` 下新建任意 ``.py`` 文件，实例化 Middleware 子类并
-        在模块级导出（如 ``audit_mw = AuditMiddleware()``），重启后自动
+        在模块级导出（如 ``rate_limit_mw = RateLimitMiddleware()``），重启后自动
         注册，无需修改 main.py。
         """
         try:

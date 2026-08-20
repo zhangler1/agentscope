@@ -11,7 +11,7 @@
 #
 # 框架级参数（log_level / logging / service / redis /
 # tools / middlewares / mcp / providers）与业务配置（models /
-# app_name / audit / workspace_dir）统一在本文件声明；
+# app_name / workspace_dir）统一在本文件声明；
 # 部署期需要临时覆盖时用 BOCOMADP_* 环境变量（优先级高于本文件）。
 # ==========================================================
 
@@ -163,12 +163,37 @@ models:
   #   parameters:
   #     temperature: 0.7
 
-# ---------- 审计（Audit） ----------
-audit:
-  # 审计留痕开关：记录每次 agent 调用（谁/何时/用了哪些工具/输出摘要）
-  enabled: true
-  # 日志路径（JSONL）
-  log_path: "./logs/audit.jsonl"
+# ---------- 场景（Agent 模板） ----------
+# 每个场景 = 预设 Agent 模板（系统提示词 + 模型 + 工具白名单 + 技能白名单 + 迭代上限）。
+# 运行时通过 POST /api/chat/run 的 agent_id 选择场景；启动时由 lifespan
+# 幂等同步进框架 StorageBase（chat / deerflow 可见）。
+# model_provider 留空时使用 ProviderManager 的全局 active provider。
+# enabled_skills 为技能白名单（匹配技能 frontmatter name 或目录名），空 = 全部技能。
+# agents:
+#   - agent_id: default
+#     name: "通用助手"
+#     system_prompt: "You are a helpful AI assistant. Use the available tools to answer user questions."
+#     model_provider: ""
+#     model_name: ""
+#     max_iters: 20
+#     enabled_tools: []
+#     enabled_skills: []
+
+#   - agent_id: customer_service
+#     name: "客服助手"
+#     system_prompt: "你是交通银行智能客服助手。请礼貌、简洁地回答客户问题；涉及余额、流水等敏感信息时，必须先确认客户身份。"
+#     model_provider: deepseek
+#     model_name: deepseek-chat
+#     max_iters: 20
+#     enabled_tools: []
+
+#   - agent_id: risk_control
+#     name: "风控分析助手"
+#     system_prompt: "你是银行风控分析专家。请基于给定数据给出严谨的风险评估结论，明确标注数据来源与不确定性，禁止编造指标。"
+#     model_provider: deepseek
+#     model_name: deepseek-chat
+#     max_iters: 30
+#     enabled_tools: []
 
 # ---------- 运行时目录 ----------
 # 工作区目录（AgentScope 沙箱文件读写根目录 + 会话持久化根目录：

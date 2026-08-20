@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """上传文件格式转换（MarkItDown 优先，独立解析器回退）。
 
-统一把可文本化的文件转换为 **Markdown (.md)** 文本。与历史版本不同，
+统一把文档类文件（PDF/Word/PPT/Excel/HTML）转换为 **Markdown (.md)** 文本；
+文本/代码类文件不转换，直接以原始文件形式上传。与历史版本不同，
 本模块不再直接落盘——转换在 **host 侧**（第三方库）完成，返回 markdown
 文本字符串，由上层（routers/uploads.py）经 ``workspace.get_backend()``
 写入沙箱；该设计使上传逻辑沙箱感知（双 PVC / 共享 PVC 下 session 隔离）。
@@ -14,8 +15,8 @@
   openpyxl（xlsx,xlsm）/ html2text（html）。
 - 老格式 .doc/.ppt/.xls 双通道（MarkItDown 与独立解析器）均不支持，已从
   支持列表移除——上传后作为"仅原始文件"处理，不尝试转换。
-- 文本/代码类（txt/md/csv/json/xml/log/各类源码）为复制语义，直接按
-  UTF-8 解码返回（不走转换器，避免源码类扩展名不支持导致失败）。
+- 文本/代码类（txt/md/csv/json/xml/log/各类源码）**不转换**：直接上传为
+  原始文件（"仅原始文件"），Agent 用文件读取工具直接读沙箱内原文件。
 - 图片、压缩包、二进制等 -> 由调用方按需拒绝。
 
 依赖（pyproject.toml service extra）：``markitdown[all]`` + 上述
@@ -27,15 +28,6 @@ import io
 
 from .manager import UploadError
 
-
-# 文本/代码类：复制语义（非转换），UTF-8 直读
-_TEXT_EXTS = {
-    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".xml",
-    ".log", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash",
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".c", ".cpp", ".h",
-    ".hpp", ".cs", ".rb", ".php", ".rs", ".kt", ".swift", ".sql", ".r", ".scala",
-    ".pl", ".lua", ".vim", ".dockerfile", ".gitignore", ".env",
-}
 
 # 文档/HTML 类：值为入库的 format 标签（MarkItDown 优先 + 独立解析器回退）
 # 仅保留双通道（MarkItDown 与独立解析器）都支持的格式；老格式 .doc/.ppt/.xls
@@ -56,9 +48,9 @@ class UnsupportedFileType(UploadError):
 
 
 def is_supported_format(filename: str) -> bool:
-    """判断文件名是否可转换为 .md。"""
+    """判断文件名是否可转换为 .md（仅文档/HTML 类；文本类不转换）。"""
     ext = f".{_split_ext(filename)}"  # 补点后与下方带点扩展名集合比较
-    return ext in _TEXT_EXTS or ext in _DOC_FORMAT
+    return ext in _DOC_FORMAT
 
 
 def _split_ext(filename: str) -> str:
@@ -83,14 +75,6 @@ def convert_file_bytes(
         `UnsupportedFileType` 或具体转换错误（调用方捕获后不阻断上传）。
     """
     ext = f".{_split_ext(filename)}"
-    if ext in _TEXT_EXTS:
-        # 文本/代码类：复制语义，UTF-8 直读（非转换）
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = data.decode("utf-8", errors="ignore")
-        return "text", text
-
     if ext in _DOC_FORMAT:
         fmt = _DOC_FORMAT[ext]
         # 优先 MarkItDown；失败（不支持/异常/空输出）回退该格式独立解析器

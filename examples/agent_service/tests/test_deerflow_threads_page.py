@@ -77,7 +77,7 @@ def make_thread(n: int, middleware: set[int] | None = None) -> list[Msg]:
             "user" if i % 2 == 0 else "assistant",
             f"msg-{i}",
             i,
-            caller="middleware:audit" if i in middleware else None,
+            caller="middleware:custom" if i in middleware else None,
         )
         for i in range(1, n + 1)
     ]
@@ -157,7 +157,7 @@ def test_middleware_messages_filtered() -> None:
     assert resp["has_more"] is False
     assert [row["seq"] for row in resp["data"]] == list(range(1, 9))
     assert all(
-        row["metadata"]["caller"] != "middleware:audit"
+        row["metadata"]["caller"] != "middleware:custom"
         for row in resp["data"]
     )
 

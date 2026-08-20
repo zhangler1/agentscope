@@ -7,8 +7,11 @@
 
 支持钩子：
 
-- ``on_model_call`` —— 记录 ``MODEL_INPUT`` / ``MODEL_OUTPUT``
-- ``on_acting`` —— 记录 ``TOOL_INPUT`` / ``TOOL_OUTPUT``
+- ``on_model_call`` —— 记录 ``MODEL_INPUT`` / ``MODEL_OUTPUT`` / ``MODEL_ERROR``
+- ``on_acting`` —— 记录 ``TOOL_INPUT`` / ``TOOL_OUTPUT`` / ``TOOL_ERROR``
+
+``MODEL_ERROR`` / ``TOOL_ERROR`` 在调用异常时输出（异常摘要 + 上下文），
+随后原样上抛，不吞异常——保证失败现场可见且不影响框架错误处理。
 
 输出通道：``logging.getLogger("as")``，复用 ``main.py`` 的 ``setup_logger``
 配置，自动落到 ``/app/logs/events.log``。
@@ -16,9 +19,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, AsyncGenerator, Awaitable, Callable
 
 from agentscope.middleware import MiddlewareBase
+
+from ...logging.trace_context import (
+    get_current_run_id,
+    get_current_user_id,
+)
 
 # 显式打标记：即便模块加载顺序让 MiddlewareBase._is_agent_middleware
 # 还没被 agent_middleware.py 设置，本中间件也能被扫描器识别。
@@ -45,6 +54,25 @@ def _reply_id(agent: Any) -> str:
         return "-"
     # 优先用 property，缺失时回退 reply_context.reply_id
     return getattr(state, "reply_id", "-") or "-"
+
+
+def _agent_id(agent: Any) -> str:
+    """框架中 ``Agent.name`` 即 ``agent_id``（事件/消息的 name 字段同源）。"""
+    return getattr(agent, "name", "-") or "-"
+
+
+def _ctx_fields(agent: Any) -> str:
+    """事件公共上下文段：session/reply/agent/user/run 五元组。
+
+    ``user_id`` 由 ASGI 层（X-User-ID 头）绑定，``run_id`` 由路由层在
+    ``ChatRunRegistry.spawn`` 前绑定（后台任务经 asyncio 复制上下文继承）；
+    两者缺失时均展示 ``-``，不影响事件可用性。
+    """
+    return (
+        f"session_id={_session_id(agent)} reply_id={_reply_id(agent)} "
+        f"agent_id={_agent_id(agent)} user_id={get_current_user_id() or '-'} "
+        f"run_id={get_current_run_id() or '-'}"
+    )
 
 
 def _block_text(block: Any) -> str:
@@ -86,21 +114,31 @@ def _response_text(content: Any) -> str:
     return _block_text(content)
 
 
+def _exc_summary(exc: BaseException) -> str:
+    """异常单行摘要（类型 + 消息），拍平换行避免破坏日志单行结构。"""
+    return f"{type(exc).__name__}: {str(exc).replace(chr(10), ' ')}"
+
+
+def _elapsed_ms(t0: float) -> int:
+    """自 *t0*（``time.monotonic``）以来的毫秒数，用于事件耗时统计。"""
+    return int((time.monotonic() - t0) * 1000)
+
+
 def _emit_model_output(
-    session_id: str,
-    reply_id: str,
+    ctx: str,
     model_name: str,
     text: str,
     usage: Any,
+    duration_ms: int,
 ) -> None:
     in_tok = getattr(usage, "input_tokens", "-") if usage else "-"
     out_tok = getattr(usage, "output_tokens", "-") if usage else "-"
     _logger.info(
-        "MODEL_OUTPUT session_id=%s reply_id=%s model=%s "
-        "output=%s input_tokens=%s output_tokens=%s",
-        session_id,
-        reply_id,
+        "MODEL_OUTPUT %s model=%s duration_ms=%d output=%s "
+        "input_tokens=%s output_tokens=%s",
+        ctx,
         model_name,
+        duration_ms,
         _truncate(text or "-", _MAX_OUTPUT),
         in_tok,
         out_tok,
@@ -131,20 +169,19 @@ def _tool_content_text(content: Any) -> str:
 
 
 def _emit_tool_output(
-    session_id: str,
-    reply_id: str,
+    ctx: str,
     tool_call_id: str,
     state: Any,
     output_text: str,
+    duration_ms: int,
 ) -> None:
     """记录工具执行结果（state 取自 ``ToolResponse.state``）。"""
     _logger.info(
-        "TOOL_OUTPUT session_id=%s reply_id=%s tool_call_id=%s "
-        "state=%s output=%s",
-        session_id,
-        reply_id,
+        "TOOL_OUTPUT %s tool_call_id=%s state=%s duration_ms=%d output=%s",
+        ctx,
         tool_call_id,
         state,
+        duration_ms,
         _truncate(output_text or "-", _MAX_OUTPUT),
     )
 
@@ -197,51 +234,70 @@ class EventLogMiddleware(MiddlewareBase):
             or getattr(current_model, "name", None)
             or "-"
         )
-        session_id = _session_id(agent)
-        reply_id = _reply_id(agent)
+        ctx = _ctx_fields(agent)
 
         _logger.info(
-            "MODEL_INPUT session_id=%s reply_id=%s model=%s messages=%s",
-            session_id,
-            reply_id,
+            "MODEL_INPUT %s model=%s messages=%s",
+            ctx,
             model_name,
             _format_messages(messages),
         )
 
-        # 2. 调用下一个中间件 / 真实模型调用
-        result = await next_handler()
+        # 2. 调用下一个中间件 / 真实模型调用（创建阶段异常 → MODEL_ERROR）
+        t0 = time.monotonic()
+        try:
+            result = await next_handler()
+        except Exception as exc:
+            _logger.error(
+                "MODEL_ERROR %s model=%s duration_ms=%d error=%s",
+                ctx,
+                model_name,
+                _elapsed_ms(t0),
+                _truncate(_exc_summary(exc), _MAX_OUTPUT),
+            )
+            raise
 
         # 3. 流式 vs 非流式分发 —— 注意：函数本身不能 yield！
         if hasattr(result, "__aiter__"):
             # 流式：用内嵌 async generator 透传 + 累积
             # 上层会拿到这个 generator 并 async for 消费，消费完后才会
-            # 执行 _emit_model_output。
+            # 执行 _emit_model_output。消费阶段异常 → MODEL_ERROR 后上抛。
             async def _wrapped() -> AsyncGenerator[Any, None]:
                 full_text = ""
                 full_usage = None
-                async for chunk in result:
-                    full_text += _response_text(getattr(chunk, "content", []))
-                    chunk_usage = getattr(chunk, "usage", None)
-                    if chunk_usage is not None:
-                        full_usage = chunk_usage
-                    yield chunk
+                try:
+                    async for chunk in result:
+                        full_text += _response_text(getattr(chunk, "content", []))
+                        chunk_usage = getattr(chunk, "usage", None)
+                        if chunk_usage is not None:
+                            full_usage = chunk_usage
+                        yield chunk
+                except Exception as exc:
+                    _logger.error(
+                        "MODEL_ERROR %s model=%s duration_ms=%d error=%s",
+                        ctx,
+                        model_name,
+                        _elapsed_ms(t0),
+                        _truncate(_exc_summary(exc), _MAX_OUTPUT),
+                    )
+                    raise
                 _emit_model_output(
-                    session_id,
-                    reply_id,
+                    ctx,
                     model_name,
                     full_text,
                     full_usage,
+                    _elapsed_ms(t0),
                 )
             return _wrapped()
         else:
             # 非流式：直接拿到 ChatResponse，记录后透传
             text = _response_text(getattr(result, "content", []))
             _emit_model_output(
-                session_id,
-                reply_id,
+                ctx,
                 model_name,
                 text,
                 getattr(result, "usage", None),
+                _elapsed_ms(t0),
             )
             return result
 
@@ -259,8 +315,7 @@ class EventLogMiddleware(MiddlewareBase):
         """
         # 1. 解析 tool_call 元信息
         tool_call = input_kwargs.get("tool_call")
-        session_id = _session_id(agent)
-        reply_id = _reply_id(agent)
+        ctx = _ctx_fields(agent)
         tool_call_id = getattr(tool_call, "id", "-")
         tool_name = getattr(tool_call, "name", "-")
         # tool_call.input 已经是 JSON 字符串（见 _extractor.py:553-555），
@@ -268,35 +323,50 @@ class EventLogMiddleware(MiddlewareBase):
         arguments = getattr(tool_call, "input", "-") or "-"
 
         _logger.info(
-            "TOOL_INPUT session_id=%s reply_id=%s tool_call_id=%s "
-            "tool_name=%s arguments=%s",
-            session_id,
-            reply_id,
+            "TOOL_INPUT %s tool_call_id=%s tool_name=%s arguments=%s",
+            ctx,
             tool_call_id,
             tool_name,
             _truncate(arguments, _MAX_CONTENT),
         )
 
         # 2. 透传 ToolChunk / ToolResponse，同时追踪最后一个 item
+        t0 = time.monotonic()
         last_item: Any = None
         try:
             async for item in next_handler(**input_kwargs):
                 last_item = item
                 yield item
+        except Exception as exc:
+            # 工具执行失败：先打 TOOL_ERROR（含失败摘要与已产生响应），
+            # 再原样上抛由框架处理，保证失败现场不丢失。
+            state = getattr(last_item, "state", "-") if last_item else "-"
+            _logger.error(
+                "TOOL_ERROR %s tool_call_id=%s tool_name=%s state=%s "
+                "duration_ms=%d error=%s",
+                ctx,
+                tool_call_id,
+                tool_name,
+                state,
+                _elapsed_ms(t0),
+                _truncate(_exc_summary(exc), _MAX_OUTPUT),
+            )
+            raise
         finally:
-            # 3. 记录工具输出（无论成功 / 异常都打日志）
+            # 3. 记录工具输出（成功 / 异常但已有部分响应都打日志）
             # next_handler 的最后一个 item 一定是 ToolResponse（见
             # _acting_impl 的实现）；若 ToolResponse 缺失则跳过。
-            state = getattr(last_item, "state", "-") if last_item else "-"
-            content = getattr(last_item, "content", None) if last_item else None
-            output_text = _tool_content_text(content) if content is not None else "-"
-            _emit_tool_output(
-                session_id,
-                reply_id,
-                tool_call_id,
-                state,
-                output_text,
-            )
+            if last_item is not None:
+                state = getattr(last_item, "state", "-") if last_item else "-"
+                content = getattr(last_item, "content", None) if last_item else None
+                output_text = _tool_content_text(content) if content is not None else "-"
+                _emit_tool_output(
+                    ctx,
+                    tool_call_id,
+                    state,
+                    output_text,
+                    _elapsed_ms(t0),
+                )
 
 
 # ---------------------------------------------------------------------------

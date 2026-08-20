@@ -20,8 +20,14 @@ clean. The ``custom/`` package is auto-imported if it exists.
 from __future__ import annotations
 
 import logging
+import time
 
 logger = logging.getLogger(__name__)
+
+# 事件日志通道：``as`` logger 自带 events.log 滚动 handler 且经
+# main.py ``_EventsFormatter`` 自动注入 trace_id——与 MODEL_*/TOOL_*
+# 事件同文件，可按 trace / session 关联图片解析链路。
+_events_logger = logging.getLogger("as")
 
 try:
     from agentscope.tool import tool
@@ -241,14 +247,17 @@ def _get_vision_model():
         for entry in load_models_from_yaml():
             if entry.supports_multimodal:
                 _vision_model = build_model_instance(entry)
-                logger.info(
-                    "view_image_tool: vision model built: %s (%s)",
+                _events_logger.info(
+                    "VIEW_IMAGE_MODEL_BUILT provider_id=%s model_name=%s",
                     entry.provider_id,
                     entry.model_name,
                 )
                 return _vision_model
-    except Exception:  # noqa: BLE001
-        logger.exception("view_image_tool: build vision model failed")
+    except Exception as exc:  # noqa: BLE001
+        _events_logger.exception(
+            "VIEW_IMAGE_MODEL_BUILT_ERROR error=%s",
+            exc,
+        )
     _vision_model_failed = True
     return None
 
@@ -317,17 +326,49 @@ async def view_image_tool(
             "（框架通常会自动注入），以便唯一定位上传记录。"
         )
 
+    # 事件公共上下文段 + 计时起点：所有 VIEW_IMAGE_* 事件共用。
+    ctx = f"user_id={user_id} session_id={session_id} agent_id={agent_id}"
+    t0 = time.monotonic()
+
     try:
         _, _, filename = resolve_upload_parts(virtual_path)
     except Exception as exc:  # noqa: BLE001
+        _events_logger.error(
+            "VIEW_IMAGE_ERROR %s virtual_path=%s error=路径解析失败: %s",
+            ctx,
+            virtual_path,
+            exc,
+        )
         return f"路径解析失败（可能越权或非法）: {exc}"
+
+    _events_logger.info(
+        "VIEW_IMAGE_INPUT %s virtual_path=%s filename=%s question=%s",
+        ctx,
+        virtual_path,
+        filename,
+        (question or "请详细描述这张图片的内容")[:200],
+    )
 
     rec = get_uploads_db().get_by_session_file(
         user_id, session_id, filename, agent_id,
     )
     if rec is None:
+        _events_logger.error(
+            "VIEW_IMAGE_ERROR %s virtual_path=%s filename=%s "
+            "error=上传记录不存在",
+            ctx,
+            virtual_path,
+            filename,
+        )
         return f"上传记录不存在: {virtual_path}"
     if not rec.is_image:
+        _events_logger.error(
+            "VIEW_IMAGE_ERROR %s filename=%s mime_type=%s "
+            "error=不是可解析的图片",
+            ctx,
+            filename,
+            getattr(rec, "mime_type", "-"),
+        )
         return (
             f"{filename} 不是可解析的图片（支持格式：jpg/jpeg/png/webp，"
             "且需已通过 /files/upload 上传并完成 base64 固化）。"
@@ -335,6 +376,11 @@ async def view_image_tool(
 
     vision_model = _get_vision_model()
     if vision_model is None:
+        _events_logger.error(
+            "VIEW_IMAGE_ERROR %s filename=%s error=未找到可用的多模态模型",
+            ctx,
+            filename,
+        )
         return (
             "未找到可用的多模态模型：请在 config.yaml 的 models 段配置 "
             "supports_multimodal: true 的模型条目后重启服务。"
@@ -380,4 +426,13 @@ async def view_image_tool(
     # )
     # return f"图片分析结果 ({filename}):\n\n{text}"
     text = "这是一张交通银行logo"
+    _events_logger.info(
+        "VIEW_IMAGE_OUTPUT %s filename=%s mime_type=%s cost_ms=%d "
+        "result_len=%d",
+        ctx,
+        filename,
+        getattr(rec, "mime_type", "-"),
+        int((time.monotonic() - t0) * 1000),
+        len(text),
+    )
     return f"图片分析结果 ({filename}):\n\n{text}"

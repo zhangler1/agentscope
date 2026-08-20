@@ -118,14 +118,19 @@ def _level_from_name(name: str | None) -> int:
 
 
 def apply_logging_level(name: str | None) -> None:
-    """Apply *name* to the ``bocomadp`` and ``app`` logger hierarchies.
+    """Apply *name* to the ``bocomadp``, ``app`` and ``as`` logger hierarchies.
 
-    Only these two logger levels are changed so that third-party library
+    Only these logger levels are changed so that third-party library
     verbosity (uvicorn, sqlalchemy, ...) is not affected. Root handler
     levels are lowered (never raised) so configured messages propagate.
+
+    The framework ``as`` logger is included so that ``log_level: debug``
+    also reveals AgentScope's own detail logs (MCP calls, sandbox builds,
+    tool adapters, formatters, wakeup dispatcher); its handlers are
+    level-unfiltered (NOTSET), so lowering the logger level suffices.
     """
     level = _level_from_name(name)
-    for logger_name in ("bocomadp", "app"):
+    for logger_name in ("bocomadp", "app", "as"):
         logging.getLogger(logger_name).setLevel(level)
     for handler in logging.root.handlers:
         if level < handler.level:
