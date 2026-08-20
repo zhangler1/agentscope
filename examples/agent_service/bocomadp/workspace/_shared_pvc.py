@@ -187,6 +187,10 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         # 存活，下次 run 经快路径重挂载（详见 release_slot）。
         self._slot_released: bool = False
 
+        # ── run 使用标记：sweeper 对 busy 的 ws 续期而非 close，
+        # 防止超 TTL 的长 run 被拆 backend（详见 set_run_active）。
+        self._run_active: bool = False
+
         # ── 懒缩容：归还 slot 时与当前池大小比较 ──
         self._agent_id: str = agent_id
         self._pool_size_provider: Any = pool_size_provider
@@ -334,6 +338,17 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             _k8s_safe_label(self._session_id),
             self._released_label(),
         )
+
+    def set_run_active(self, active: bool) -> None:
+        """标记 run 使用中：sweeper 对 busy 条目续期，避免长 run 被 close。
+
+        每次 run 开始时置 True（SlotReleaseMiddleware），结束时置
+        False。``SharedPvcK8sWorkspaceManager._sweep_once`` 对
+        ``_run_active`` 为 True 的 ws 刷新访问时间戳（跳过 TTL
+        回收）：否则超过 TTL 的长 run 会被 close 拆 backend，
+        后续工具执行报错。
+        """
+        self._run_active = active
 
     async def release_slot(self) -> None:
         """软释放温池 slot：标签改为 ``released-{session}``。
@@ -1648,6 +1663,28 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 )
             ]
 
+            # ── 会话优先级：优先抢回本 session 软释放的 Pod ──
+            # 跨实例重建（cache miss）时抢回原 Pod 的网关必热
+            # （软释放不杀网关），免冷启动。三级：
+            # ① 本 session released（网关热、skills 最全）
+            # ② available（完全空闲，大概率已预热）
+            # ③ 其他 session released（可抢但会打掉对方的快路径
+            #    重挂载）。list.sort 稳定，同优先级保持 K8s 顺序。
+            my_released = _k8s_safe_label(f"released-{session_id}")
+
+            def _pick_order(pod: Any) -> int:
+                slot = (pod.metadata.labels or {}).get(
+                    self.POOL_LABEL_SLOT,
+                    "",
+                )
+                if slot == my_released:
+                    return 0
+                if slot == self.POOL_SLOT_AVAILABLE:
+                    return 1
+                return 2
+
+            available.sort(key=_pick_order)
+
             for pod in available:
                 pod_name = pod.metadata.name
                 try:
@@ -1687,6 +1724,23 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             backoff = min(backoff * 2, 8.0)
 
         raise RuntimeError("沙箱资源已满，请稍后重试")
+
+    # ── TTL 回收：run 进行中条目续期 ──────────────────────────
+
+    async def _sweep_once(self) -> None:
+        """框架 TTL 回收 + run 进行中条目续期。
+
+        run 进行中的 ws（``_run_active``）即使超过 TTL 也不 close，
+        并把访问时间戳续到现在——否则长 run（> TTL）会被 sweeper
+        close 拆 backend，后续工具执行报错。续期后 run 结束仍保有
+        完整 TTL 窗口，随后的回收照常。
+        """
+        now = time.monotonic()
+        async with self._lock:
+            for wid, (ws, _ts) in list(self._cache.items()):
+                if getattr(ws, "_run_active", False):
+                    self._cache[wid] = (ws, now)
+        await super()._sweep_once()
 
     # ── 孤儿 slot 回收 ───────────────────────────────────────
 

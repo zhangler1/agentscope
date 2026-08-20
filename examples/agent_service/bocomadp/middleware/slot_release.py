@@ -12,6 +12,10 @@ run 经 manager 快路径重挂载（百毫秒级）；池紧张时 slot 可立�
 后台任务持有的网关句柄不受影响；仅当网关本身已不健康才会重启，
 此时后台任务本已失败。固定释放也让 released 状态对所有实例可见，
 同一会话跨实例任意时刻最多占用一个 slot，不会累积占坑。
+
+run 期间对 workspace 置 busy 标记（``set_run_active``），配合
+``SharedPvcK8sWorkspaceManager._sweep_once`` 的续期逻辑：超过 TTL
+的长 run 不会被 sweeper close 拆 backend，工具执行不受影响。
 """
 from __future__ import annotations
 
@@ -55,16 +59,42 @@ class SlotReleaseMiddleware(MiddlewareBase):
         input_kwargs: dict,
         next_handler: Any,
     ) -> AsyncGenerator:
-        """包一层 next_handler，reply 结束后（含中断）释放 slot。
+        """包一层 next_handler：run 全程置 busy，结束后释放 slot。
 
-        ``finally`` 在生成器正常结束或被 close（中断/提前断开）时
-        都会执行，因此用户中断、HITL 暂停、正常完成都能触发释放。
+        busy 标记配合 ``SharedPvcK8sWorkspaceManager._sweep_once``：
+        超 TTL 的长 run 不会被 sweeper close（条目续期），工具执行
+        不受影响。``finally`` 在生成器正常结束或被 close（中断/
+        提前断开）时都会执行，因此用户中断、HITL 暂停、正常完成
+        都能触发释放；HITL 挂起期间标记保持 True，sweeper 持续
+        续期，不会在用户确认前回收。
         """
         try:
+            self._mark_run_active(agent, True)
             async for item in next_handler(**input_kwargs):
                 yield item
         finally:
             await self._release(agent)
+            self._mark_run_active(agent, False)
+
+    def _mark_run_active(self, agent: Any, active: bool) -> None:
+        """置/清 run 使用标记（ws.set_run_active），供 sweeper 续期。
+
+        本地模式 / 按需模式 workspace 没有该方法 → 跳过。
+        """
+        offloader = getattr(agent, "offloader", None)
+        set_active = getattr(offloader, "set_run_active", None)
+        if set_active is None:
+            return
+        try:
+            set_active(active)
+        except Exception:
+            logger.warning(
+                "SlotReleaseMiddleware: mark run-active=%s failed "
+                "(session=%r)",
+                active,
+                self._session_id,
+                exc_info=True,
+            )
 
     async def _release(self, agent: Any) -> None:
         """无条件软释放本会话的温池 slot。"""
