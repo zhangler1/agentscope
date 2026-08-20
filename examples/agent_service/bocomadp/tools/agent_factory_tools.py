@@ -82,7 +82,7 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _AGENT_API = "http://localhost:8000/agent"
 
 # Tool-config API base — the per-agent tool whitelist endpoints.
-_TOOLS_API = "http://localhost:8000/api/agents"
+_TOOLS_API = "http://localhost:8000/agents"
 
 # Session API base — used to ensure a target agent has a session before
 # skill operations (skill endpoints resolve the workspace via session).
@@ -94,6 +94,30 @@ _SKILLS_API = "http://localhost:8000/workspace"
 # Workspace builtins are always available and not affected by
 # ``enabled_tools`` — skip them when aligning tool whitelists.
 _BUILTIN_NAMES = {"bash", "read", "write", "edit", "glob", "grep"}
+
+#: Unicode 连字符/空白 → ASCII 映射（LLM 生成的名称中很常见）。
+_NAME_TRANS = str.maketrans(
+    {
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+        "\u2012": "-",  # figure dash
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2015": "-",  # horizontal bar
+        "\u2212": "-",  # minus sign
+        "\u00a0": " ",  # non-breaking space
+    },
+)
+
+
+def _clean_name(name: str) -> str:
+    """清洗智能体名称：Unicode 连字符/空白归一化为 ASCII。
+
+    LLM 生成的名称常含 U+2011（不间断连字符）等字符；这些字符一旦
+    被拼进 agent_id、目录名或 K8s label，会触发 API server 422。
+    归一化只影响显示名称中的特殊连字符，可读性不变。
+    """
+    return name.translate(_NAME_TRANS).strip()
 
 
 def init_factory_tools(
@@ -145,7 +169,7 @@ async def _api(
         "guwpToken": _current_token.get(),
     }
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.request(
                 method,
                 url,
@@ -191,6 +215,7 @@ async def create_agent(
         enabled_tools (list[str]): 要启用的工具名列表；空列表表示全部可用。
             工具名从 list_tools_for_agent 的结果中选取。
     """
+    name = _clean_name(name)
     body: dict = {
         "name": name,
         "system_prompt": system_prompt,
@@ -243,7 +268,7 @@ async def update_agent(
     """
     body: dict = {}
     if name:
-        body["name"] = name
+        body["name"] = _clean_name(name)
     if system_prompt:
         body["system_prompt"] = system_prompt
     if max_iters is not None:
@@ -453,9 +478,12 @@ async def _get_or_create_session(agent_id: str) -> tuple[str, str]:
     Returns:
         ``(session_id, error)`` — exactly one of the two is non-empty.
     """
+    # 注意尾斜杠：框架路由定义 GET "/"（/sessions/），请求无尾斜杠的
+    # /sessions 会触发 307 重定向；虽然 _api 已开启 follow_redirects，
+    # 这里仍显式带上尾斜杠，避免依赖重定向语义。
     result = await _api(
         "GET",
-        f"?agent_id={urllib.parse.quote(agent_id)}",
+        f"/?agent_id={urllib.parse.quote(agent_id)}",
         base=_SESSIONS_API,
     )
     if isinstance(result, str):

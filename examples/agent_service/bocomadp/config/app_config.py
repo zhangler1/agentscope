@@ -4,7 +4,7 @@
 > ``config.yaml`` 为唯一配置载体，``AppConfig`` 为唯一 schema：
 >
 > - ``config.yaml`` 中的全部节点（``log_level`` / ``logging`` / ``service`` /
->   ``redis`` / ``runtime`` / ``tools`` / ``middlewares`` / ``mcp`` /
+>   ``redis`` / ``tools`` / ``middlewares`` / ``mcp`` /
 >   ``providers`` / ``app_name`` / ``workspace_dir``）作为主配置源；
 > - ``BOCOMADP_`` 前缀环境变量 / ``.env`` 文件可在部署期覆盖（优先级更高）。
 >
@@ -32,11 +32,11 @@ from .base import (
 )
 
 # 顶层业务节点白名单：这些键**有意**不在 AppConfig schema 内，
-# 由独立读取器消费（models → load_models_from_yaml；audit → AuditConfig；
+# 由独立读取器消费（models → load_models_from_yaml；
 # cross_search → get_cross_search_config）。
 # 新增此类业务节点时，必须加入本集合，否则启动校验会 fail-fast。
 _BUSINESS_KEYS: frozenset[str] = frozenset(
-    {"models", "audit", "cross_search", "uploads"},
+    {"models", "cross_search", "uploads", "agents"},
 )
 
 # 拼写校验相似度阈值：YAML 键与声明字段的相似度达到该值即视为疑似拼写错误。
@@ -130,6 +130,57 @@ class RedisConfig(BaseModel):
     port: int = Field(default=6379)
 
 
+class RunConcurrencyConfig(BaseModel):
+    """/chat 并发控制上限(仿 deer-flow run_concurrency)。
+
+    ``0`` 表示不限;``grace_secs`` 为装配窗口宽限秒数;``enabled=false``
+    时中间件完全透传,跳过对账/占位/注册。
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="并发控制总开关;false 时中间件完全透传,跳过对账/占位/注册。",
+    )
+    max_running: int = Field(
+        default=10,
+        ge=0,
+        description="全局并发上限(0=不限)。",
+    )
+    max_running_per_user: int = Field(
+        default=3,
+        ge=0,
+        description="每用户并发上限(0=不限)。",
+    )
+    grace_secs: float = Field(
+        default=6.0,
+        gt=0,
+        description="装配窗口宽限秒数(响应先于框架锁 key 创建的时间窗口)。",
+    )
+
+
+class EllmKeyRefreshConfig(BaseModel):
+    """ELLM apikey 刷新策略配置。
+
+    ``refresh_ahead_secs`` 为**提前刷新窗口**：在网关下发的 key 真正
+    过期之前就提前换新，留出网关抖动/网络异常的缓冲，避免拿一个
+    已失效的 key 去请求（旧逻辑只在 ``now > apikey_expires_at``
+    时才刷新，过期边界上一旦刷新失败即带死 key 请求）。
+
+    取值约定：``0`` 表示关闭提前刷新（回退到旧行为：硬过期才换）；
+    正数表示在过期前 N 秒开始刷新。建议设为 key 有效期的 1/10 左右
+    （如有效期 25 分钟则取 120~180s）。
+    """
+
+    refresh_ahead_secs: float = Field(
+        default=120.0,
+        ge=0,
+        description=(
+            "ELLM key 提前刷新窗口（秒）；0=关闭（硬过期才换），"
+            "建议 120~180s。"
+        ),
+    )
+
+
 class DbConfig(BaseModel):
     """AgentScope 持久化存储后端（AsyncSQLAlchemyStorage）。
 
@@ -150,6 +201,20 @@ class DbConfig(BaseModel):
         description=(
             "启动时 Base.metadata.create_all 自动建表，dev/单机够用；"
             "多副本生产应关闭，改用离线 alembic upgrade head 避免迁移竞争。"
+        ),
+    )
+    pool_pre_ping: bool = Field(
+        default=True,
+        description=(
+            "取出连接前先探测存活（asyncpg ping），"
+            "服务端/网络静默断连时自动重建，避免 connection is closed。"
+        ),
+    )
+    pool_recycle: int = Field(
+        default=1800,
+        description=(
+            "空闲连接回收秒数（默认 30 分钟），"
+            "早于防火墙/NAT 空闲超时主动重建连接。"
         ),
     )
 
@@ -184,6 +249,10 @@ class ModelEntry(BaseModel):
     base_url: str = Field(default="", description="API base URL，留空用默认")
     is_active: bool = Field(default=False, description="是否设为活跃模型")
     supports_multimodal: bool = Field(default=False, description="是否支持多模态")
+    supports_thinking: bool = Field(
+        default=False,
+        description="是否支持 thinking 模式（deer-flow 前端据此展示开关）",
+    )
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description="透传给 ChatModel.Parameters 的额外参数",
@@ -263,26 +332,8 @@ class LocalModelsConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Runtime / tools / middleware config (new framework modules)
+# Tools / middleware config (new framework modules)
 # ---------------------------------------------------------------------------
-
-
-class RuntimeConfig(BaseModel):
-    """Configuration for the 8-phase runtime orchestrator.
-
-    Controls the SSE heartbeat interval and whether the runtime
-    SSE endpoint is mounted (vs. relying on AgentScope's built-in
-    fire-and-forget chat).
-    """
-
-    enabled: bool = Field(
-        default=True,
-        description="Mount the /api/chat/run SSE endpoint.",
-    )
-    heartbeat_interval_seconds: float = Field(
-        default=15.0,
-        description="SSE keep-alive interval for long-idle periods.",
-    )
 
 
 class ToolsConfig(BaseModel):
@@ -417,6 +468,14 @@ class AppConfig(BaseSettings):
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     db: DbConfig = Field(default_factory=DbConfig)
+    ellm_key_refresh: EllmKeyRefreshConfig = Field(
+        default_factory=EllmKeyRefreshConfig,
+        description="ELLM apikey 提前刷新窗口配置。",
+    )
+    run_concurrency: RunConcurrencyConfig = Field(
+        default_factory=RunConcurrencyConfig,
+        description="/chat 并发控制配置。",
+    )
 
     # ---- QwenPaw migration placeholders (all default off) ----
     providers: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -427,7 +486,6 @@ class AppConfig(BaseSettings):
     local_models: LocalModelsConfig = Field(default_factory=LocalModelsConfig)
 
     # ---- New framework modules ----
-    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     middlewares: MiddlewaresConfig = Field(default_factory=MiddlewaresConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
@@ -484,13 +542,22 @@ def build_model_instance(entry: ModelEntry):
     # 仅当 credential 类有 base_url 字段时才传入
     if entry.base_url and "base_url" in credential_cls.model_fields:
         credential_kwargs["base_url"] = entry.base_url
+    # 仅当 credential 类有 model 字段时才传入（如 ELLMCredential 必填）
+    if "model" in credential_cls.model_fields:
+        credential_kwargs["model"] = entry.model_name or entry.provider_id
     credential = credential_cls(**credential_kwargs)
 
     model_cls = credential_cls.get_chat_model_class()
+    # AgentScope 的 ChatModel 期望 Parameters（pydantic 模型）而非 dict；
+    # 将 config.yaml 的 parameters 字典转换为模型类对应的 Parameters 对象，
+    # 否则调用阶段会报 'dict' object has no attribute 'max_tokens'。
+    parameters = entry.parameters or None
+    if parameters is not None:
+        parameters = model_cls.Parameters(**parameters)
     model = model_cls(
         credential=credential,
         model=entry.model_name or entry.provider_id,
-        parameters=entry.parameters or None,
+        parameters=parameters,
     )
     return model
 

@@ -16,9 +16,21 @@ The key-refresh logic (api-key header rotation) lives in the
 which injects the fresh key per call via :meth:`set_api_key`; this class
 only carries the protocol differences.
 """
+import logging
 from collections import OrderedDict
 from datetime import datetime
-from typing import Literal, Any, AsyncGenerator, TYPE_CHECKING, List, Type
+from typing import (
+    Awaitable,
+    Callable,
+    Literal,
+    Any,
+    AsyncGenerator,
+    TYPE_CHECKING,
+    List,
+    Type,
+)
+
+logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field
 
@@ -131,6 +143,16 @@ class EllmChatModel(ChatModelBase):
         # ``EllmKeyRefreshMiddleware``.  When unset, the static
         # ``credential.api_key`` configured at construction time is used.
         self._api_key_override: str | None = None
+        # Callback invoked when the gateway rejects our key with an
+        # ``invalid_api_key`` 401.  It forcibly marks the credential's
+        # stored key as expired so the *next* conversation using this
+        # credential refreshes it lazily.  Injected per call by the
+        # ``EllmKeyRefreshMiddleware`` (bound to the current credential);
+        # when ``None`` (e.g. the model is called outside the middleware)
+        # a 401 is surfaced as-is without invalidating anything.
+        self._auth_invalidate_callback: (
+            Callable[[], Awaitable[None]] | None
+        ) = None
 
         import openai
 
@@ -154,6 +176,48 @@ class EllmChatModel(ChatModelBase):
                 The API key to send as ``Authorization: Bearer <api_key>``.
         """
         self._api_key_override = api_key
+
+    def set_auth_invalidate_callback(
+        self,
+        callback: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        """Set (or clear) the auth-invalidation callback.
+
+        The callback is invoked when the gateway rejects our key with an
+        ``invalid_api_key`` 401; it should forcibly expire the underlying
+        credential so the next call using it refreshes the key.  It is
+        injected per call by the
+        :class:`~bocomadp.middleware.ellm_refresh.EllmKeyRefreshMiddleware`
+        and is bound to the credential actually in use for this call.
+
+        Args:
+            callback (`Callable[[], Awaitable[None]] | None`):
+                Async no-arg callback, or ``None`` to disable invalidation.
+        """
+        self._auth_invalidate_callback = callback
+
+    @staticmethod
+    def _is_invalid_key_error(exc: Any) -> bool:
+        """Whether an exception is a "key missing/expired" 401.
+
+        The BOCOM gateway returns ``{"error": {"message": "API KEY不存在或已过期",
+        "code": "invalid_api_key"}}`` with HTTP 401.  We match on the
+        ``code == "invalid_api_key"`` first (most stable), and fall back to
+        the message text so a gateway that omits the code still triggers
+        invalidation.
+        """
+        if getattr(exc, "status_code", None) != 401:
+            return False
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error") or {}
+            code = error.get("code")
+            if code == "invalid_api_key":
+                return True
+            message = str(error.get("message") or "")
+            if "不存在或已过期" in message:
+                return True
+        return False
 
     @classmethod
     def _get_retryable_exceptions(cls) -> tuple[Type[Exception], ...]:
@@ -227,7 +291,35 @@ class EllmChatModel(ChatModelBase):
             kwargs["tool_choice"] = fmt_tool_choice
 
         start_datetime = datetime.now()
-        response = await self.client.chat.completions.create(**kwargs)
+        try:
+            response = await self.client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # A "key missing/expired" 401 means the gateway no longer
+            # accepts our key.  Do **not** retry this call; instead mark
+            # the credential's stored key as expired so the *next* call
+            # using it refreshes lazily (lock-protected).  The current 401
+            # is still surfaced to the caller.  Failure to invalidate
+            # (e.g. DB hiccup) is swallowed with a warning.
+            if self._is_invalid_key_error(exc):
+                if self._auth_invalidate_callback is not None:
+                    try:
+                        await self._auth_invalidate_callback()
+                        logger.info(
+                            "ELLM key invalidated on 401 (credential=%s)",
+                            getattr(self.credential, "id", None),
+                        )
+                    except Exception as invalidate_exc:  # noqa: BLE001
+                        logger.warning(
+                            "ELLM key invalidation failed after 401 "
+                            "(error=%s)",
+                            invalidate_exc,
+                        )
+                else:
+                    logger.warning(
+                        "ELLM 401 with no invalidation callback installed; "
+                        "key not invalidated",
+                    )
+            raise
 
         if self.stream:
             return self._parse_stream_response(start_datetime, response)

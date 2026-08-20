@@ -10,11 +10,11 @@
    - :class:`ToolRegistry`         — custom tools
    - :class:`MiddlewareRegistry`   — agent middlewares
    - :class:`ProviderManager`      — multi-model routing
-   - :class:`HookRegistry`         — 8-phase lifecycle hooks
-   - :class:`Runtime`              — 8-phase orchestrator
+   - :class:`RunManager`           — deerflow run bookkeeping
+   - :class:`BusBridge`            — deerflow SSE bridge over MessageBus
 4. Build the AgentScope app via :func:`create_app` (12 built-in routers).
 5. Inject ASGI middlewares via ``extra_middlewares``.
-6. Mount custom routers (chat SSE, agent manage, models, health, stats).
+6. Mount custom routers (deerflow SSE, models, health, stats).
 7. Register sub-agent templates via ``custom_subagent_templates``.
 
 企业扩展能力（bocomadp）：
@@ -32,9 +32,11 @@ Run::
 import logging
 import os
 from contextlib import asynccontextmanager
+from logging.handlers import TimedRotatingFileHandler
 from typing import Any
 
 import uvicorn
+from fastapi import FastAPI
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -59,20 +61,25 @@ from bocomadp.config import (
     load_models_from_yaml,
     build_model_instance,
 )
+from bocomadp.concurrency.guard import ConcurrencyGuard
 from bocomadp.logging.logging_config import configure_logging
+from bocomadp.logging.trace_context import get_current_trace_id
 from bocomadp.logging.trace_middleware import TraceMiddleware
+from bocomadp.middleware.concurrency_guard import ConcurrencyGuardMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
 from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.request_log import AccessLogMiddleware
 from bocomadp.providers import ProviderManager
-from bocomadp.routers.agent_manage import (
-    AgentConfigRequest,
-    MultiAgentManager,
-    agent_manage_router,
-)
+from bocomadp.deerflow import BusBridge, RunManager
+from bocomadp.deerflow.credentials import ensure_default_credentials
+from bocomadp.deerflow.routers.auth_stub import auth_stub_router
+from bocomadp.deerflow.routers.deerflow_chat import deerflow_router
+from bocomadp.deerflow.routers.models import deerflow_models_router
+from bocomadp.deerflow.routers.threads import threads_router
 from bocomadp.routers.uploads import uploads_router
+from bocomadp.routers.channels import channels_router
 from bocomadp.routers.credential_model import credential_model_router
 from bocomadp.routers.health import health_router
 from bocomadp.routers.models import models_router
@@ -80,18 +87,31 @@ from bocomadp.routers.platform_health import platform_health_router
 from bocomadp.routers.skill_router import skill_router
 from bocomadp.routers.stats import stats_router
 from bocomadp.routers.workspace_files import workspace_files_router
+from bocomadp.routers.oss_download import oss_download_router
 from bocomadp.routers.session_usage import session_usage_router
 from bocomadp.routers.agent_tools import agent_tools_router
 from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
+from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent import agent_router
+from bocomadp.agent_list_sort import patch_agent_list_sort
+from bocomadp.team_access import patch_team_access
+from bocomadp.team_briefing import patch_team_briefing
+from bocomadp.projectors import WorkerFailureNotifier
+from bocomadp.session_team_cascade import patch_session_team_cascade
+from bocomadp.team_toolkit import patch_team_toolkit
+from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
+# 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
+from agentscope.app._router._agent import (
+    agent_router as _framework_agent_router,
+)
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
-# 统一注册，本文件无需 import 或 include；框架 chat_router(POST /chat/) 与本项目
-# chat_sse_router(POST /chat/run、/chat/stop) 路径不同，互不冲突。
+# 统一注册，本文件无需 import 或 include；框架 chat_router(POST /chat/) 与
+# deerflow_router(POST /deerflow/threads/...) 路径不同，互不冲突。
 from bocomadp.mcp import McpRegistry
-from bocomadp.runtime import Runtime, HookRegistry
 from bocomadp.skills import ExternalSkillHub
 from bocomadp.skills.bocom_skill_hub import BocomSkillHub
 from bocomadp.tools import ToolRegistry, build_enterprise_tools, init_factory_tools
@@ -108,19 +128,66 @@ from bocomadp.workspace import (
 # 以便它们使用的 ``as`` logger 自动拥有文件 handler。
 _LOG_DIR = os.getenv("AGENTSCOPE_LOG_DIR", "/app/logs")
 _LOG_FILE = os.path.join(_LOG_DIR, "events.log")
+# 每日滚动的历史文件保留天数（backupCount；0 = 永不自动清理）
+_LOG_BACKUP_COUNT = int(os.getenv("AGENTSCOPE_LOG_BACKUP_COUNT", "30"))
 os.makedirs(_LOG_DIR, exist_ok=True)
-setup_logger("INFO", filepath=_LOG_FILE)
+setup_logger("INFO")  # 只挂 StreamHandler；文件 handler 由下方共享实例接管
+
+
+class _EventsFormatter(logging.Formatter):
+    """单个滚动 handler 同时服务 ``as`` 与 ``uvicorn.access``，
+    按 logger 名保持各自原有行格式；统一注入 ``trace_id`` 字段，
+    使模型/工具事件日志可与 access log 按 trace 关联。"""
+
+    _FORMATS = {
+        "as": (
+            "%(asctime)s | %(levelname)-7s | "
+            "[trace_id=%(trace_id)s] "
+            "%(module)s:%(funcName)s:%(lineno)s - %(message)s"
+        ),
+        "uvicorn.access": (
+            "%(asctime)s | %(levelname)-7s | %(name)s "
+            "[trace_id=%(trace_id)s] - %(message)s"
+        ),
+    }
+
+    def __init__(self) -> None:
+        super().__init__(self._FORMATS["as"])
+        self._sub_formatters = {
+            name: logging.Formatter(fmt) for name, fmt in self._FORMATS.items()
+        }
+
+    def format(self, record: logging.LogRecord) -> str:
+        # 与 JsonTraceFormatter 同策略：record 缺失 trace_id 时补当前
+        # 上下文值（"-" 表示未绑定/未启用），不依赖 filter 安装顺序。
+        # ``as`` logger 自带独立 handler（propagate=False），
+        # configure_logging 只增强 root，因此必须在此层注入。
+        if not hasattr(record, "trace_id"):
+            record.trace_id = get_current_trace_id() or "-"
+        sub = self._sub_formatters.get(record.name)
+        return sub.format(record) if sub is not None else super().format(record)
+
+
+# 每日滚动文件 handler：当天写 events.log，次日零点第一条日志触发滚动，
+# 旧文件重命名为 events.log.<前一天日期>（如 events.log.2026-08-13），
+# 超出 _LOG_BACKUP_COUNT 天的历史文件自动删除。
+# 注意：``as`` 与 ``uvicorn.access`` 必须共享同一个 handler 实例 ——
+# 若各自持有独立实例，两个实例会在同一天各自执行 rename，
+# 后执行者会覆盖先滚动出的旧文件（os.rename 静默覆盖），当天日志丢失。
+_events_file_handler = TimedRotatingFileHandler(
+    _LOG_FILE,
+    when="midnight",
+    interval=1,
+    backupCount=_LOG_BACKUP_COUNT,
+    encoding="utf-8",
+)
+_events_file_handler.suffix = "%Y-%m-%d"
+_events_file_handler.setFormatter(_EventsFormatter())
+logging.getLogger("as").addHandler(_events_file_handler)
 
 # 把 uvicorn 的 HTTP 访问日志（``uvicorn.access``）也并入同一个文件，
 # 便于在一个文件中对照"客户端请求 → 后端处理 → 模型调用 → 工具调用"时间线。
-_access_logger = logging.getLogger("uvicorn.access")
-_access_file_handler = logging.FileHandler(_LOG_FILE)
-_access_file_handler.setFormatter(
-    logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s - %(message)s",
-    ),
-)
-_access_logger.addHandler(_access_file_handler)
+logging.getLogger("uvicorn.access").addHandler(_events_file_handler)
 
 default_mcps = [
     MCPClient(
@@ -203,10 +270,6 @@ if config.providers.enabled:
                 exc_info=True,
             )
 
-hook_registry = HookRegistry()
-
-multi_agent_manager = MultiAgentManager()
-
 # ── 内置智能体：智能体工厂（agent-creator） ──
 # 专门用于对话式创建/修改智能体，不需要 K8s 沙箱，
 # 工具通过 AgentBuilder 在运行时按 agent_id 注入。
@@ -225,6 +288,9 @@ _AGENT_CREATOR_SYSTEM_PROMPT = (
     "- 修改已有智能体时先查看当前配置，保留用户确认过的核心逻辑\n"
     "- 以 _ 开头的系统内置智能体不可删除\n"
 )
+
+# agent 全部存于框架 StorageBase（config.yaml agents 种子机制已移除，
+# 启动时不再灌入；agent 由用户通过原生接口创建或运行前自行入库）。
 
 # ---------------------------------------------------------------------------
 # 3. MCP 服务器 + Agent 工具工厂
@@ -340,7 +406,7 @@ async def build_agent_tools(
         ])
 
     # Apply the per-agent tool whitelist managed by agent_tools_router
-    # (PUT/DELETE /api/agents/{id}/tools/{name}):
+    # (PUT/DELETE /agents/{id}/tools/{name}):
     #   empty  -> every tool above stays available
     #   non-empty -> only the listed tool names survive
     # This makes the tool config APIs effective at runtime (for agents
@@ -358,9 +424,10 @@ async def build_agent_tools(
 
 
 # 通用中间件构建入口（AgentScope ``AgentMiddlewareFactory``）：
-# 合并「MiddlewareRegistry 自动扫描的内置中间件」+「主动 build 的企业中间件」，
-# 与 Runtime 层 AgentBuilder 注入的中间件视图保持一致。
-# 企业中间件（审计留痕）采用主动 build（middleware/factory.py），
+# 合并「MiddlewareRegistry 自动扫描的内置中间件」+「主动 build 的企业中间件」；
+# 经 ``_build_agent_middlewares_with_ellm`` 传给 create_app 的
+# ``extra_agent_middlewares``，与注册表视图保持同源。
+# 企业中间件采用主动 build（middleware/factory.py），
 # 按会话创建独立实例，不依赖 custom/ 被动扫描。
 async def build_agent_middlewares(
     user_id: str,
@@ -369,7 +436,11 @@ async def build_agent_middlewares(
 ):
     middlewares = middleware_registry.list_middlewares()
     middlewares.extend(
-        await build_enterprise_middlewares(user_id, agent_id, session_id),
+        await build_enterprise_middlewares(
+            user_id,
+            agent_id,
+            session_id,
+        ),
     )
     return middlewares
 
@@ -380,6 +451,12 @@ async def build_agent_middlewares(
 storage = AsyncSQLAlchemyStorage(
     url=config.db.url,
     create_tables=config.db.create_tables,
+    # 连接池健康参数：pre_ping 探测陈旧连接自动重建，recycle 早于
+    # 防火墙/NAT 空闲超时回收，避免 asyncpg connection is closed
+    engine_kwargs={
+        "pool_pre_ping": config.db.pool_pre_ping,
+        "pool_recycle": config.db.pool_recycle,
+    },
 )
 
 
@@ -390,9 +467,8 @@ class _BuiltinAgentStorageProxy:
     Framework lookup paths (``ResourceAccessService.resolve_agent`` etc.)
     only query the caller's own user id, so without this proxy the
     built-in agent is invisible to every non-default user (404 on
-    sessions/chat/agent views). ``Runtime._build_context`` already
-    applies the same fallback; this proxy extends it to the framework
-    HTTP API paths.
+    sessions/chat/agent views). This proxy extends the same fallback
+    to the framework HTTP API paths.
     """
 
     def __init__(self, inner: Any) -> None:
@@ -504,15 +580,6 @@ storage = _BuiltinAgentStorageProxy(storage)
 # ── 初始化工厂工具（注入 ToolRegistry / McpRegistry）──
 init_factory_tools(tool_registry, mcp_registry)
 
-runtime = Runtime(
-    hook_registry=hook_registry,
-    tool_registry=tool_registry,
-    middleware_registry=middleware_registry,
-    provider_manager=provider_manager,
-    storage=storage,
-    heartbeat_interval=config.runtime.heartbeat_interval_seconds,
-)
-
 logger.info(
     "framework modules initialized: "
     "tools=%d middlewares=%d providers=%d mcps=%d",
@@ -553,12 +620,28 @@ else:
         default_mcps=build_default_mcps(),
     )
 
+# 并发控制仅在生产 Redis 模式生效(InMemory 本地/测试模式零日志噪声)
+from agentscope.app.message_bus import RedisMessageBus as _RedisMessageBus
+
+_concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
-# per-agent 白名单过滤（PUT/DELETE /api/agents/{id}/tools/{name}）。
+# per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
 workspace_manager = WhitelistWorkspaceManager(workspace_manager)
 
-runtime.workspace_manager = workspace_manager
+# ---------------------------------------------------------------------------
+# 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
+# ---------------------------------------------------------------------------
+# Redis 客户端惰性获取:连接池由框架 lifespan 进入 message_bus 时创建,
+# get_client() 在进入前不可用,中间件运行期调用,失败即 fail-open。
+def _get_redis_client():
+    return message_bus.get_client()
+
+concurrency_guard = ConcurrencyGuard(
+    _get_redis_client,
+    max_running=config.run_concurrency.max_running,
+    max_running_per_user=config.run_concurrency.max_running_per_user,
+)
 
 # ---------------------------------------------------------------------------
 # 5. 构建 App —— create_app 自动注册 12 个内置路由
@@ -567,13 +650,15 @@ trace_enabled = is_trace_correlation_enabled(config)
 
 
 class TokenCaptureMiddleware:
-    """Capture the ``guwpToken`` request header into a ContextVar.
+    """Capture the ``guwpToken`` / ``X-User-ID`` request headers into
+    ContextVars.
 
-    Pure ASGI middleware: the ContextVar is set in the request task
+    Pure ASGI middleware: the ContextVars are set in the request task
     itself, so the framework's ``ChatRunRegistry.spawn`` (which uses
-    ``asyncio.create_task``) copies it into the chat-run background
-    task, making the token available to agent-factory tools during
-    the run.
+    ``asyncio.create_task``) copies them into the chat-run background
+    task — the token stays available to agent-factory tools, and the
+    user id feeds the agent event logs (``user_id=`` field) without
+    touching framework internals.
     """
 
     def __init__(self, app: Any) -> None:
@@ -582,17 +667,23 @@ class TokenCaptureMiddleware:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "http":
             token = ""
+            user_id = ""
             for key, value in scope.get("headers") or []:
                 if key.lower() == b"guwptoken":
                     token = value.decode("utf-8", errors="replace")
-                    break
+                elif key.lower() == b"x-user-id":
+                    user_id = value.decode("utf-8", errors="replace")
+            from bocomadp.logging.trace_context import set_current_user_id
             from bocomadp.tools.agent_factory_tools import _current_token
+
             _current_token.set(token)
+            if user_id:
+                set_current_user_id(user_id)
         await self.app(scope, receive, send)
 
 
 def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
-    """构建 ASGI 中间件栈（由内到外）。"""
+    """构建 ASGI 中间件栈(先注册者最外层)。"""
     return [
         # 最内层：捕获 guwpToken 到 ContextVar，随请求上下文透传给
         # 框架 chat-run 后台任务（agent-creator 工厂工具使用）。
@@ -606,12 +697,28 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
             allow_methods=["*"],
             allow_headers=["*"],
         ),
+        Middleware(
+            ConcurrencyGuardMiddleware,
+            guard=concurrency_guard,
+            grace_secs=config.run_concurrency.grace_secs,
+            enabled=config.run_concurrency.enabled
+            and (
+                config.run_concurrency.max_running > 0
+                or config.run_concurrency.max_running_per_user > 0
+            )
+            and _concurrency_active,
+        ),
     ]
 
 
-# 通用中间件构建入口：registry 自动扫描 + 企业中间件主动 build（审计留痕）
+# 通用中间件构建入口：registry 自动扫描 + 企业中间件主动 build
 # + ELLM key 刷新中间件（每次模型调用前惰性刷新 apikey）。
-_ellm_refresh_mw_factory = build_ellm_refresh_middleware(storage, message_bus)
+# refresh_ahead_secs 来自 config.ellm_key_refresh，提前刷新留缓冲。
+_ellm_refresh_mw_factory = build_ellm_refresh_middleware(
+    storage,
+    message_bus,
+    refresh_ahead_secs=config.ellm_key_refresh.refresh_ahead_secs,
+)
 
 
 async def _build_agent_middlewares_with_ellm(
@@ -650,7 +757,7 @@ app = create_app(
 
 
 # ── 注册内置智能体：智能体工厂（agent-creator）到框架 StorageBase ──
-# 使用 user_id="default" 创建；runtime._build_context 中对所有用户
+# 使用 user_id="default" 创建；对话上下文构建中对所有用户
 # fallback 查询 default 用户，确保每个用户都能与 agent-creator 对话。
 # 注意：框架 create_app 用 lifespan 创建 app（FastAPI(lifespan=...)），
 # @app.on_event("startup") 注册的处理器会被 Starlette 静默忽略，因此
@@ -709,10 +816,61 @@ async def _lifespan_with_builtin_agents(app):
     async with _original_lifespan(app):
         # 恢复持久化的工具白名单（内存存储重启会丢）
         load_tool_whitelists()
+        # 专家团关系表（expert_team_relations）——团队档案从 AgentData
+        # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
+        # 必须早于下面所有读团队档案的补丁挂载。
+        from bocomadp import team_store
+
+        await team_store.ensure_team_tables(storage)
+        # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
+        try:
+            from bocomadp.pool_config import sync_all_to_redis
+
+            synced = await sync_all_to_redis()
+            if synced:
+                logger.info("pool concurrency configs synced to redis: %d", synced)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pool concurrency sync skipped: %s", e)
         await _register_builtin_agents()
+        # 专家团工具注入（workflow 严格交接 + AgentInvite 池回填）——
+        # 原实现改 src/_service/_toolkit.py 的 get_toolkit，现搬迁到
+        # bocomadp/team_toolkit.py；必须先于 patch_get_toolkit 挂载，
+        # 让白名单包装看到已注入的完整 Toolkit。
+        patch_team_toolkit()
+        # config.yaml 模型条目作为 default 用户默认凭证入库（deerflow
+        # 模型名解析的默认参数单一来源；幂等，失败仅告警不阻断启动）
+        await ensure_default_credentials(storage)
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
         patch_get_toolkit()
+        # 资源列表团队成员过滤 + is_self_built 标记——原实现改
+        # src/_service/_access.py 的 list_resource，现搬迁到
+        # bocomadp/team_access.py；必须先于 patch_agent_list_sort 挂载
+        # （排序包装会把 parent_agent_id 透传给本过滤层）。
+        patch_team_access()
+        # 资源列表按 updated_at 倒序（最近修改优先）——原实现直接改
+        # src/_service/_access.py，现按约定搬迁到 bocomadp/agent_list_sort.py。
+        patch_agent_list_sort()
+        # 专家团 leader 删除级联（自建成员级联删、被邀成员摘除引用）——
+        # 原实现改 src/_service/_session.py 的 delete_agent，现搬迁到
+        # bocomadp/session_team_cascade.py。
+        patch_session_team_cascade()
+        # 专家团 briefing（leader 的 system prompt 注入团队成员/交接序）
+        # 原实现改 src/_service/_chat.py 的 _run_impl，现搬迁到
+        # bocomadp/team_briefing.py，包装 ResourceAccessService.resolve_agent。
+        patch_team_briefing()
+        # WorkerFailureNotifier（worker 失败时提醒团队 leader）原实现位于
+        # src/_service/_projectors/_worker_failure_notifier.py，按约定搬迁到
+        # bocomadp/projectors/；ChatService 由框架 lifespan 构造，因此这里
+        # 直接向已构造实例追加（幂等）。
+        chat_service = app.state.chat_service
+        if not any(
+            getattr(p, "KIND", None) == WorkerFailureNotifier.KIND
+            for p in chat_service._projectors
+        ):
+            chat_service._projectors.append(
+                WorkerFailureNotifier(app.state.storage)
+            )
         yield
 
 
@@ -722,32 +880,99 @@ app.router.lifespan_context = _lifespan_with_builtin_agents
 # ---------------------------------------------------------------------------
 # 6. 将框架模块挂载到 app.state，供路由层访问
 # ---------------------------------------------------------------------------
-app.state.runtime = runtime
 app.state.provider_manager = provider_manager
-app.state.multi_agent_manager = multi_agent_manager
 app.state.tool_registry = tool_registry
 app.state.mcp_registry = mcp_registry
 app.state.middleware_registry = middleware_registry
-app.state.hook_registry = hook_registry
+# deerflow 路由单例：RunManager 记账（原生 ChatRunRegistry 为 lifespan
+# 单例，请求时由路由层注入，复用其 409 语义含原生 /chat/ 占用感知）；
+# BusBridge 封装同一 MessageBus。
+app.state.run_manager = RunManager()
+app.state.bus_bridge = BusBridge(message_bus)
 
 # ---------------------------------------------------------------------------
 # 7. 在 12 个内置路由之上挂载自定义路由
 # ---------------------------------------------------------------------------
+# 覆盖内置 /agent 路由：框架 agent_router 不含专家团 8 个 /team/* 端点
+# 与 CRUD 专家团行为（已按约定搬到 bocomadp/routers/agent.py）。FastAPI
+# 0.141+ 的 include_router 不复制路由对象，而是插入惰性的
+# _IncludedRouter 包装（持有 original_router 引用），因此摘除必须按
+# 引用身份判断；旧版 FastAPI 才按路径判断。bocomadp 其余路由均以
+# /agents（复数）等其它前缀挂载，不会误伤。
+_framework_agent_paths = {
+    r.path
+    for r in _framework_agent_router.routes
+    if getattr(r, "path", "").startswith("/agent")
+}
+
+
+def _is_framework_agent_route(r: object) -> bool:
+    original = getattr(r, "original_router", None)
+    if original is not None:  # FastAPI 0.141+: _IncludedRouter 包装
+        return original is _framework_agent_router
+    return getattr(r, "path", "") in _framework_agent_paths  # 旧版复制
+
+
+app.router.routes[:] = [
+    r for r in app.router.routes if not _is_framework_agent_route(r)
+]
+app.include_router(agent_router)
+# 智能体记忆字段包裹路由（必须后于 include bocomadp agent_router）：
+# 按路径移除 bocomadp agent_router 中被覆盖的 /agent/ 4 条 CRUD 路由
+# （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
+# 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
+# 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
+install_agent_memory_router(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
-# chat_sse_router 暂时不用，改用框架内置 POST /chat/
+app.include_router(deerflow_router)
+# deer-flow 模型列表（GET /api/deerflow/models，deer-flow Model 格式）
+app.include_router(deerflow_models_router)
+# deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
+app.include_router(auth_stub_router)
+# deer-flow 渠道兼容占位路由（providers/connections 恒空，前端优雅降级）
+app.include_router(channels_router)
+# deerflow threads 管理端点（create/search/state/history，对话闭环最小集）
+app.include_router(threads_router)
 app.include_router(uploads_router)
-app.include_router(agent_manage_router)
 app.include_router(models_router)
 app.include_router(platform_health_router)
 # 外部 skill hub（目录查询 / 我的上传 / 下载安装）
 app.include_router(skill_router)
+# 智能体沙箱并发管理（写 PG 真源 + 同步 Redis）
+app.include_router(agent_concurrency_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
+# OSS 打包下载（/workspace/file-download）
+app.include_router(oss_download_router)
 # 按凭证查询模型（含单模型绑定过滤）
 app.include_router(credential_model_router)
+
+
+# ---------------------------------------------------------------------------
+# 8. 统一 /api 前缀：把完整 app 挂载为子应用
+# ---------------------------------------------------------------------------
+# 所有路由统一挂到 /api 下，与 webui 前端契约一致（client.ts：后端自带
+# /api 前缀，nginx / vite 代理均不剥前缀直接透传）：
+#   内置 /chat、/agent...        → /api/chat、/api/agent...
+#   bocomadp /agents、/files...  → /api/agents、/api/files...
+#   deerflow /deerflow/threads、/deerflow/v1/auth → /api/deerflow/threads...
+
+
+@asynccontextmanager
+async def _root_lifespan(root):
+    # Starlette mount 不会自动传播子应用 lifespan，这里手动运行子应用
+    # （框架资源生命周期 + 内置智能体注册均在 app 的 lifespan 中）。
+    async with app.router.lifespan_context(app):
+        yield
+
+
+root_app = FastAPI(title="BocomADP", lifespan=_root_lifespan)
+# 健康检查保留根层副本：K8s 探针直打 /healthz、/readyz，不受 /api 影响
+root_app.include_router(health_router)
+root_app.mount("/api", app)
 
 
 if __name__ == "__main__":
@@ -760,7 +985,7 @@ if __name__ == "__main__":
         config.service.reload,
     )
     uvicorn.run(
-        "main:app",
+        "main:root_app",
         host=config.service.host,
         port=config.service.port,
         reload=config.service.reload,

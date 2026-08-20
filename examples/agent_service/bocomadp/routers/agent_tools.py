@@ -3,9 +3,9 @@
 
 Endpoints
 ---------
-``GET    /api/agents/{agent_id}/tools``           — list tools with status
-``PUT    /api/agents/{agent_id}/tools/{name}``    — enable a tool
-``DELETE /api/agents/{agent_id}/tools/{name}``    — disable a tool
+``GET    /agents/{agent_id}/tools``           — list tools with status
+``PUT    /agents/{agent_id}/tools/{name}``    — enable a tool
+``DELETE /agents/{agent_id}/tools/{name}``    — disable a tool
 
 Tool sources (matching the full ``get_toolkit()`` assembly):
 
@@ -42,7 +42,7 @@ from agentscope.app.deps import get_current_user_id
 logger = logging.getLogger("bocomadp.agent_tools")
 
 agent_tools_router = APIRouter(
-    prefix="/api/agents",
+    prefix="/agents",
     tags=["agent-tools"],
 )
 
@@ -54,44 +54,43 @@ _BUILTIN_TOOLS: list[dict] = [
     {
         "name": "bash",
         "description": (
-            "Execute a bash command in the workspace sandbox. "
-            "The command runs in the workspace directory and can "
-            "read/write files, install packages, and run scripts."
+            "在工作区沙箱中执行bash命令。"
+            "命令在工作区目录中运行，可以读写文件、安装包和执行脚本。"
         ),
     },
     {
         "name": "read",
         "description": (
-            "Read the contents of a file from the workspace. "
-            "Supports line-range selection for large files."
+            "读取工作区中文件的内容。"
+            "支持为大型文件选择行范围。"
         ),
     },
     {
         "name": "write",
         "description": (
-            "Write content to a file in the workspace. "
-            "Creates parent directories automatically."
+            "向工作区中的文件写入内容。"
+            "会自动创建父目录。"
         ),
     },
     {
         "name": "edit",
         "description": (
-            "Perform exact string replacements in an existing file. "
-            "Useful for targeted edits without rewriting the whole file."
+            "在现有文件中执行精确的字符串替换。"
+            "适用于无需重写整个文件的有针对性修改。"
         ),
     },
     {
         "name": "glob",
         "description": (
-            "Find files matching a glob pattern (e.g. ``**/*.py``). "
-            "Returns relative file paths."
+            "查找匹配glob模式的文件（例如 ``**/*.py``）。"
+            "返回相对文件路径。"
         ),
     },
     {
         "name": "grep",
         "description": (
-            "Search file contents using regular expressions. "
-            "Supports full regex syntax with ripgrep."
+            "使用正则表达式搜索文件内容。"
+            "支持基于ripgrep的完整正则语法。"
         ),
     },
 ]
@@ -242,7 +241,7 @@ def _all_tool_names(request: Request) -> set[str]:
 
 
 # ------------------------------------------------------------------
-# GET /api/agents/{agent_id}/tools
+# GET /agents/{agent_id}/tools
 # ------------------------------------------------------------------
 
 
@@ -329,7 +328,7 @@ async def list_agent_tools(
 
 
 # ------------------------------------------------------------------
-# PUT /api/agents/{agent_id}/tools/{tool_name}   — enable
+# PUT /agents/{agent_id}/tools/{tool_name}   — enable
 # ------------------------------------------------------------------
 
 
@@ -371,7 +370,7 @@ async def enable_agent_tool(
 
 
 # ------------------------------------------------------------------
-# DELETE /api/agents/{agent_id}/tools/{tool_name}   — disable
+# DELETE /agents/{agent_id}/tools/{tool_name}   — disable
 # ------------------------------------------------------------------
 
 
