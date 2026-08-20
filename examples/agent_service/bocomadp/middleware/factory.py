@@ -2,9 +2,8 @@
 """企业中间件主动构建工厂（bocomadp）。
 
 采用**主动 build** 而非 custom/ 被动扫描：
-- 企业中间件（审计留痕）由 :func:`build_enterprise_middlewares` 显式构建，
+- 企业中间件由 :func:`build_enterprise_middlewares` 显式构建，
   每次 agent 组装时按会话创建独立实例（user_id / session_id 直传）；
-- 按 ``audit.enabled`` 配置开关决定是否装配，关闭时不产生任何中间件；
 - 由 ``main.py`` 的通用中间件构建入口（``build_agent_middlewares``）调用，
   与 ``MiddlewareRegistry`` 自动扫描的内置中间件合并注入。
 """
@@ -14,8 +13,6 @@ import os
 
 from agentscope.middleware import MiddlewareBase
 
-from ..config import get_audit_config
-from .audit import AuditMiddleware
 from .custom_prompt import CustomPromptMiddleware
 from .slot_release import SlotReleaseMiddleware
 
@@ -36,8 +33,10 @@ async def build_enterprise_middlewares(
     SlotReleaseMiddleware 负责 run 结束无条件软释放温池 slot（配合
     SharedPvcK8sWorkspace.release_slot），开关
     ``ADP_K8S_SLOT_RELEASE_ON_RUN_END``（默认开）控制。
+    参数签名（user_id / agent_id / session_id）为与 main.py 调用
+    契约对齐而保留。
     """
-    middlewares: list[MiddlewareBase] = [
+    return [
         CustomPromptMiddleware(),
     ]
 
