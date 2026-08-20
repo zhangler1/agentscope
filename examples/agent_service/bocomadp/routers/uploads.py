@@ -92,7 +92,6 @@ async def _resolve_workspace(
         agent_id,
         session_id,
         session_record.config.workspace_id,
-        claim_slot=False,
     )
 
 
