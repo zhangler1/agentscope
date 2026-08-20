@@ -56,6 +56,7 @@ from agentscope.message import Msg, TextBlock
 
 from bocomadp.config import load_models_from_yaml
 from bocomadp.credential.ellm import ELLMCredential
+from bocomadp.logging.trace_context import run_id_context
 
 from ..bridge import BusBridge
 from ..credentials import (
@@ -929,17 +930,21 @@ def _spawn_run(
         ) from e
 
     try:
-        task = chat_run_registry.spawn(
-            chat_service.run(
-                user_id,
-                session_id,
-                agent_id,
-                input_msg,
-                run_id=record.run_id,
-            ),
-            session_id=session_id,
-            name=f"deerflow-run:{record.run_id}",
-        )
+        # spawn 前绑定 run_id：asyncio.create_task 复制调用方上下文，
+        # 后台 agent 任务内的事件日志（MODEL_*/TOOL_*）因此能带上 run_id
+        # 字段，与 RunManager 记账/SSE 订阅链路关联。
+        with run_id_context(record.run_id):
+            task = chat_run_registry.spawn(
+                chat_service.run(
+                    user_id,
+                    session_id,
+                    agent_id,
+                    input_msg,
+                    run_id=record.run_id,
+                ),
+                session_id=session_id,
+                name=f"deerflow-run:{record.run_id}",
+            )
     except RuntimeError as e:
         run_manager.set_status(
             record.run_id,
