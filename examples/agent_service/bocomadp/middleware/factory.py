@@ -33,8 +33,9 @@ async def build_enterprise_middlewares(
     CustomPromptMiddleware 无 per-session 状态（提示词从请求级
     ContextVar 读取），每次组装构建新实例即可，无额外成本。
 
-    SlotReleaseMiddleware 负责 run 结束无条件软释放温池 slot（配合
-    SharedPvcK8sWorkspace.release_slot），开关
+    SlotReleaseMiddleware 负责 run 期间置 busy 标记（配合 sweeper：
+    TTL 续期 + 池空闲回收的活跃信号）；hash 路由下无占用语义，
+    释放动作经 getattr 自动降级为 no-op。开关
     ``ADP_K8S_SLOT_RELEASE_ON_RUN_END``（默认开）控制。
     """
     middlewares: list[MiddlewareBase] = [

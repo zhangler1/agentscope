@@ -16,7 +16,7 @@
     - ``ADP_K8S_TTL``: 空闲超时（秒），默认 ``1800``（30 分钟）
     - ``ADP_K8S_SWEEP_INTERVAL``: 回收扫描间隔（秒），默认 ``300``
     - ``ADP_K8S_MAX_ACTIVE_PODS``: 温池大小，默认 ``5``（0=不池化）
-    - ``ADP_K8S_POOL_WAIT_TIMEOUT``: 池耗尽等待超时（秒），默认 ``60``
+    - ``ADP_K8S_POOL_IDLE_TTL``: 全池闲置回收阈值（秒），默认 ``3600``
     - ``ADP_K8S_RESOURCES_CPU_REQUEST``: CPU 请求，默认 ``"500m"``
     - ``ADP_K8S_RESOURCES_CPU_LIMIT``: CPU 限制
     - ``ADP_K8S_RESOURCES_MEM_REQUEST``: 内存请求，默认 ``"512Mi"``
@@ -155,8 +155,8 @@ class K8sWorkspaceConfig:
     max_active_pods: int = field(
         default_factory=lambda: _env_int("MAX_ACTIVE_PODS", 5),
     )
-    pool_wait_timeout: float = field(
-        default_factory=lambda: _env_float("POOL_WAIT_TIMEOUT", 60.0),
+    pool_idle_ttl: float = field(
+        default_factory=lambda: _env_float("POOL_IDLE_TTL", 3600.0),
     )
 
     @property
