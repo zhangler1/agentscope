@@ -181,6 +181,13 @@ async def create_agent_with_memory(
 )
 async def list_agents_with_memory(
     parent_agent_id: str | None = None,
+    is_team: bool | None = Query(
+        default=None,
+        description=(
+            "Optional top-level filter: `true` returns only expert-team "
+            "leaders, `false` only plain agents. Omit to list all."
+        ),
+    ),
     page_num: int = Query(
         default=1,
         ge=1,
@@ -210,6 +217,7 @@ async def list_agents_with_memory(
     """
     result: ListAgentsResponse = await _core_list_agents(
         parent_agent_id=parent_agent_id,
+        is_team=is_team,
         page_num=page_num,
         page_size=page_size,
         user_id=user_id,

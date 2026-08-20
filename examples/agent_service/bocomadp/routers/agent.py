@@ -181,6 +181,13 @@ async def list_agents(
     ),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
+    is_team: bool | None = Query(
+        default=None,
+        description=(
+            "Optional top-level filter: `true` returns only expert-team "
+            "leaders, `false` only plain agents. Omit to list all."
+        ),
+    ),
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> ListAgentsResponse:
     """Return all agent records visible to the authenticated user.
@@ -188,7 +195,9 @@ async def list_agents(
     Includes the caller's own ``source == "user"`` agents plus any agents
     shared to them through :class:`ResourceAccessPolicyBase`. Each entry
     carries an ``editable`` flag indicating whether the caller may
-    PATCH/DELETE it, and an ``is_team`` flag marking expert-team leaders.
+    PATCH/DELETE it, and an ``is_team`` flag marking expert-team leaders
+    (``is_team=true`` filters to leaders only; ``is_team=false`` to plain
+    agents).
 
     Pass ``parent_agent_id`` to list the members of a specific expert team
     (otherwise team members are hidden so the top-level list stays clean).
@@ -244,6 +253,11 @@ async def list_agents(
             }
             if member_ids:
                 entries = [e for e in entries if e.id not in member_ids]
+    # is_team 筛选：生产环境顶层分支已在 TeamAgentView 上标记 is_team
+    # （True=团长，False=普通/被邀成员）。未 patch 的环境没有该字段，
+    # getattr 兜底为 None，此时两种过滤都筛空（语义合理：无团队概念）。
+    if is_team is not None:
+        entries = [e for e in entries if getattr(e, "is_team", None) is is_team]
     # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
     # 直接切片即可，total 用切片前的完整数量，前端可据此算总页数。
     total = len(entries)
