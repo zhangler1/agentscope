@@ -56,6 +56,8 @@ from agentscope.message import Msg, TextBlock
 
 from bocomadp.config import load_models_from_yaml
 from bocomadp.credential.ellm import ELLMCredential
+from bocomadp.logging.trace_context import run_id_context
+from bocomadp.routers.uploads import download_urls_to_session
 
 from ..bridge import BusBridge
 from ..credentials import (
@@ -727,6 +729,52 @@ async def _resolve_custom_params(
     return loaded or {}
 
 
+async def _download_additional_urls(
+    body: CreateRunRequest,
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    storage: StorageBase,
+    workspace_manager: WorkspaceManagerBase,
+) -> None:
+    """下载 custom_params.additional_urls 到会话 uploads 目录（仅副作用）。
+
+    ``custom_params: {additional_urls: ["http://.../a.png", ...]}`` 中的
+    地址是 OSS / HTTP(S) 直链，需在 run 启动前下载并保存到会话 uploads
+    目录（与 ``POST /files/upload`` 同链路：落盘 + 图片 base64 / 文档
+    .md + uploads DB 记录，下游工具与 ``<context name="files">`` 立即可见）。
+
+    本函数不改变任何参数：custom_params（含 additional_urls）由调用方
+    原样交给 ``_resolve_custom_params`` **整体落盘** ``custom_params.json``，
+    便于事后查看历史传参。下载仅在请求显式携带 additional_urls 时触发
+    一次；回退加载路径（请求未携带时从落盘文件恢复）不会再次触发下载，
+    故持久化不会导致重复下载。
+    """
+    if not body.custom_params or not body.custom_params.get("additional_urls"):
+        return
+    raw = body.custom_params.get("additional_urls")
+    urls = (
+        [u.strip() for u in raw if isinstance(u, str) and u.strip()]
+        if isinstance(raw, list)
+        else []
+    )
+    if urls:
+        downloaded = await download_urls_to_session(
+            user_id,
+            agent_id,
+            session_id,
+            urls,
+            storage,
+            workspace_manager,
+        )
+        if downloaded:
+            logger.info(
+                "deerflow: saved %d additional_url file(s) for thread %s.",
+                len(downloaded),
+                session_id,
+            )
+
+
 async def _set_run_auth_contexts(
     session_id: str,
     params: dict[str, Any],
@@ -876,17 +924,21 @@ def _spawn_run(
         ) from e
 
     try:
-        task = chat_run_registry.spawn(
-            chat_service.run(
-                user_id,
-                session_id,
-                agent_id,
-                input_msg,
-                run_id=record.run_id,
-            ),
-            session_id=session_id,
-            name=f"deerflow-run:{record.run_id}",
-        )
+        # spawn 前绑定 run_id：asyncio.create_task 复制调用方上下文，
+        # 后台 agent 任务内的事件日志（MODEL_*/TOOL_*）因此能带上 run_id
+        # 字段，与 RunManager 记账/SSE 订阅链路关联。
+        with run_id_context(record.run_id):
+            task = chat_run_registry.spawn(
+                chat_service.run(
+                    user_id,
+                    session_id,
+                    agent_id,
+                    input_msg,
+                    run_id=record.run_id,
+                ),
+                session_id=session_id,
+                name=f"deerflow-run:{record.run_id}",
+            )
     except RuntimeError as e:
         run_manager.set_status(
             record.run_id,
@@ -1127,9 +1179,18 @@ async def create_run_stream(
     else:
         input_msg = converted
         human_chunks = _collect_human_chunks(input_msg)
-    # spawn 前注入请求级 custom_params：asyncio.create_task 复制当前
-    # ContextVar 上下文到后台 run 任务，工具中间件在 run 任务内读取
-    # 强制覆盖模型传参；spawn 后 reset 不影响已创建的子任务。
+    # spawn 前处理 custom_params：请求携带 additional_urls 时先下载到
+    # 会话 uploads 目录；随后 custom_params（含 additional_urls）整体
+    # 落盘到 custom_params.json（便于查看历史传参），未携带则从会话
+    # workspace 回退加载，reset 不影响已创建的后台 run 任务。
+    await _download_additional_urls(
+        body,
+        user_id,
+        agent_id,
+        session_id,
+        storage,
+        workspace_manager,
+    )
     resolved_params = await _resolve_custom_params(
         session_id,
         body.custom_params,
@@ -1211,9 +1272,19 @@ async def create_run_wait(
         session_id,
         model_name_hint,
     )
-    # 同 create_run_stream：spawn 前注入 custom_params（带请求值则先
-    # 落盘、不带则从会话 workspace 回退），reset 不影响已创建的后台
-    # run 任务（create_task 复制 ContextVar 上下文）。
+    # 同 create_run_stream：请求携带 additional_urls 时先下载到会话
+    # uploads 目录；随后 custom_params（含 additional_urls）整体落盘
+    # 到 custom_params.json（便于查看历史传参），未携带则从会话
+    # workspace 回退加载，reset 不影响已创建的后台 run 任务
+    # （create_task 复制 ContextVar 上下文）。
+    await _download_additional_urls(
+        body,
+        user_id,
+        agent_id,
+        session_id,
+        storage,
+        workspace_manager,
+    )
     resolved_params = await _resolve_custom_params(
         session_id,
         body.custom_params,

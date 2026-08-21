@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""共享 PVC 模式：温池 + session 独立 Pod，所有 session 共享一个 agent 级 RWX PVC。
+"""共享 PVC 模式：agent 级共享 PVC + 池 Pod hash 路由，无占用标记。
 
 架构
 ----
@@ -11,20 +11,18 @@
          ├── shared/skills/              ← 所有 Pod 共享
          ├── shared/.mcp                 ← 所有 Pod 共享
          │
-         ├── sessions/{sess_A}/          ← Pod slot-0 独占
-         │   ├── data/
-         │   └── {project}/
-         │
-         └── sessions/{sess_B}/          ← Pod slot-1 独占
-             ├── data/
-             └── {project}/
+         ├── sessions/{sess_A}/          ← 分目录隔离，与 Pod 无关
+         └── sessions/{sess_B}/
 
-温池
-----
+池（hash 路由）
+--------------
 
-Manager 根据 ``max_active_pods`` 预创建 N 个 Pod（slot-0 .. slot-N-1），
-标记 ``agentscope.pool.slot=available``。分配时通过 K8s resourceVersion
-乐观锁绑定 session，释放后归还池中。TTL 到期自动回收 slot。
+Manager 根据 ``max_active_pods`` 预创建 N 个 Pod
+（``as-ws-{hash}-0 .. N-1``），会话经 ``hash(session_id) % N``
+固定路由到某个 Pod，**不做任何占用标记**——同一 Pod 可被多个
+会话并发复用（per_agent 共享语义的 N Pod 变体）。Pod 缺失/不可用
+时顺延到下一个；全池空闲超 ``pool_idle_ttl`` 由 sweeper 全部回收
+（PVC 保留，下次访问懒重建）。
 
 零框架改动 — 所有逻辑通过子类覆盖实现，不动 ``agentscope`` 一行代码。
 """
@@ -33,7 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
+import shlex
 import time
 from typing import Any
 
@@ -43,14 +43,19 @@ from agentscope.app.workspace_manager import (
     IsolationPolicy,
 )
 from agentscope.workspace import K8sWorkspace
+from agentscope.workspace._gateway_client import GatewayClient
 from agentscope.workspace._k8s._k8s_backend import K8sBackend
 from agentscope.workspace._k8s._constants import (
+    GATEWAY_HOME,
     POD_WORKDIR,
     _k8s_safe_name,
 )
 
 # ── reuse parent's utility constants ───────────────────────────────
 from agentscope.workspace._utils import (
+    DEFAULT_GATEWAY_LOG,
+    DEFAULT_GATEWAY_SCRIPT,
+    DEFAULT_GATEWAY_VENV,
     DEFAULT_MCP_FILE,
     DEFAULT_SKILLS_DIR,
 )
@@ -71,18 +76,13 @@ DEFAULT_USER_OUTPUTS_DIR = "outputs"
 DEFAULT_USER_UPLOADS_DIR = "uploads"
 
 
-def _pool_slot_index(pod_name: str) -> int | None:
-    """从池 Pod 名 ``as-ws-{hash}-{i}`` 解析 slot 序号。
-
-    非池命名（session 按需 Pod）或解析失败返回 ``None``。
-    """
-    try:
-        return int(pod_name.rsplit("-", 1)[1])
-    except (ValueError, IndexError):
-        return None
-
-
 _K8S_LABEL_UNSAFE_RE = re.compile(r"[^a-zA-Z0-9-_.]")
+
+#: Pod annotation key：池 Pod 最近活跃时间（unix 秒，字符串）。
+#: hash 路由每次选中 Pod 时由 ``_touch_last_active`` 刷新；sweeper
+#: 据此判断 agent 的池是否整体闲置（超 ``pool_idle_ttl`` 全回收）。
+#: annotation 存 K8s 侧，不依赖进程内存，多实例部署下全局一致。
+LAST_ACTIVE_ANNOTATION = "agentscope.pool.last-active-at"
 
 
 def _k8s_safe_label(value: str, max_len: int = 63) -> str:
@@ -98,15 +98,15 @@ def _k8s_safe_label(value: str, max_len: int = 63) -> str:
 
 
 class SharedPvcK8sWorkspace(K8sWorkspace):
-    """K8sWorkspace 子类：session Pod，共享 agent 级 PVC + 温池。
+    """K8sWorkspace 子类：session 挂载到池 Pod，共享 agent 级 PVC。
 
     覆盖父类方法实现：
 
-    - Pod 名 = pool slot 名（温池）或 session 级（按需）
+    - Pod 名 = 池 Pod 名（hash 路由）或 session 级（按需）
     - PVC 名 = agent 级（``as-ws-{agent_hash}``），所有 session 共享
     - workdir = ``/workspace/sessions/{session_id}``（路径隔离）
     - skills/.mcp → ``/workspace/shared/``（共享）
-    - 释放时归还 slot 到池（温池）或删除 Pod（按需）
+    - 关闭时按需 Pod 删除、池 Pod 不动（由 Manager sweeper 管理）
     """
 
     def __init__(
@@ -117,9 +117,7 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         session_id: str = "",
         shared_pvc_access_mode: str = "ReadWriteMany",
         pod_name: str = "",
-        # ── 懒缩容支持（由 Manager 注入，普通构造可省略）──
-        agent_id: str = "",
-        pool_size_provider: Any = None,
+        refresh_heartbeat_interval: float = 0.0,
         # ── 透传给父类的所有参数 ──
         workspace_id: str | None = None,
         kubeconfig: str | None = None,
@@ -170,9 +168,18 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         self._shared_pvc_access_mode: str = shared_pvc_access_mode
         self._assigned_pod_name: str = pod_name
 
-        # ── 懒缩容：归还 slot 时与当前池大小比较 ──
-        self._agent_id: str = agent_id
-        self._pool_size_provider: Any = pool_size_provider
+        # ── 心跳间隔（pool_idle_ttl 派生，由 Manager 注入）：
+        # 供 SlotReleaseMiddleware 在 run 期间周期性刷新池 Pod
+        # 活跃信号，多实例部署下长 run 不会被其他实例的 sweeper
+        # 误判“全池闲置”回收。按需模式（无池 Pod）无此需求 →
+        # 置 0，middleware 探测后跳过心跳。
+        self.refresh_heartbeat_interval: float = (
+            refresh_heartbeat_interval if pod_name else 0.0
+        )
+
+        # ── run 使用标记：sweeper 对 busy 的 ws 续期而非 close，
+        # 防止超 TTL 的长 run 被拆 backend（详见 set_run_active）。
+        self._run_active: bool = False
 
         # ── 覆盖工作目录为 session 子目录 ──
         self.workdir = f"{POD_WORKDIR}/sessions/{self._session_id}"
@@ -195,7 +202,7 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             "\n        ├── sessions/  # 卸载的会话上下文与工具结果——系统管理"
             "\n        └── user-data/ # 用户工作目录"
             "\n            ├── scratch/   # 临时文件工作目录"
-            "\n            ├── uploads/    # 用户上传的文件——自动转换为 .md"
+            "\n            ├── uploads/    # 用户上传的文件——文档类自动转 .md，文本类保留原样"
             "\n            └── outputs/    # 最终交付物——完成的文件写到这里，不要询问"
             "\n```"
             "\n\n你的工作目录是{workdir}。"
@@ -212,9 +219,13 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             "\n- 在脚本和命令中，优先使用相对路径（如`hello.txt`、"
             "`../outputs/report.md`），避免硬编码绝对路径。"
             "\n\n### 上传文件"
-            "\n- 用户上传的文件会自动转换为 Markdown，转换结果是与原文件同名的 .md，"
-            "存放在`user-data/uploads/`目录下（例如 report.xlsx → report.md）。"
-            "\n- 分析上传文件时，必须优先读取同名 .md 版本——不要自行解析原始二进制文件"
+            "\n- 用户上传的文档类文件（.xlsx/.docx/.pdf 等）会自动转换为 Markdown，"
+            "转换结果是与原文件同名的 .md，存放在`user-data/uploads/`目录下"
+            "（例如 report.xlsx → report.md）。"
+            "\n- 文本/代码类文件（.txt/.md/.csv/.json/.log/.py 等）不转换为 .md，"
+            "保留原始文件——直接用文件读取工具（Read/bash cat）读取"
+            "`user-data/uploads/`下的原文件。"
+            "\n- 分析文档类文件时，必须优先读取同名 .md 版本——不要自行解析原始二进制文件"
             "（如 .xlsx/.docx/.pdf 等），也不要为了读取文件而 pip install 安装包。"
             "\n- 如果同名 .md 不存在，可以使用当前环境中已有的包自行解析原始二进制文件"
             "——但禁止安装新包。"
@@ -298,6 +309,94 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             ],
             cwd="/",
         )
+
+    # ── run 使用标记（供 sweeper 续期，防长 run 被回收） ─────
+
+    def set_run_active(self, active: bool) -> None:
+        """标记 run 使用中：sweeper 对 busy 条目续期，避免长 run 被 close。
+
+        每次 run 开始时置 True（SlotReleaseMiddleware），结束时置
+        False。``SharedPvcK8sWorkspaceManager._sweep_once`` 对
+        ``_run_active`` 为 True 的 ws 刷新访问时间戳（跳过 TTL
+        回收）：否则超过 TTL 的长 run 会被 close 拆 backend，
+        后续工具执行报错。
+        """
+        self._run_active = active
+
+    async def refresh_active(self) -> None:
+        """刷新池 Pod 活跃信号（last-active annotation）。
+
+        供 SlotReleaseMiddleware 在 run 开始/结束时调用，超长 run
+        期间由心跳任务周期性调用（间隔见
+        ``refresh_heartbeat_interval``）：空闲回收（sweeper
+        ``_sweep_pool``）据此判断 agent 的池是否闲置。
+        annotation 在 K8s 侧全局一致，多实例部署下也能正确保护
+        其他实例上进行中的长 run 不被误回收。按需模式（无池
+        Pod）或未初始化实例直接跳过；失败静默（仅影响空闲判定）。
+        """
+        if not self._assigned_pod_name or self._v1 is None:
+            return
+        from kubernetes_asyncio.client.rest import ApiException
+
+        try:
+            await self._v1.patch_namespaced_pod(
+                self._pod_name,
+                self._namespace,
+                {
+                    "metadata": {
+                        "annotations": {
+                            LAST_ACTIVE_ANNOTATION: str(int(time.time())),
+                        },
+                    },
+                },
+            )
+        except ApiException:
+            pass
+
+    async def _gateway_healthy(self) -> bool:
+        """探测 Pod 内网关 ``/health``，健康返回 True。
+
+        预热复用以它为准：健康 → 跳过启动，
+        直接绑定 :class:`GatewayClient`。
+        """
+        try:
+            backend = self.get_backend()
+        except RuntimeError:
+            return False
+        probe = GatewayClient(
+            backend=backend,
+            gateway_port=self.gateway_port,
+            timeout=30.0,
+            gateway_log_path=self._gateway_log,
+        )
+        try:
+            return await probe.health()
+        except Exception:
+            return False
+
+    async def _setup_mcp_gateway(self) -> None:
+        """复用 Pod 上健康运行的网关（温池预热），否则回退框架逻辑。
+
+        框架默认每次挂载都 pkill + 重启网关并轮询 /health（1~3s）；
+        预热保证空闲 Pod 的网关常驻健康，此处探测命中即可直接绑定，
+        跳过进程启动开销。探测失败（网关死/Pod 重建）时回退
+        ``super()`` 完整启动，保证正确性。
+        """
+        if await self._gateway_healthy():
+            logger.info(
+                "%s: reusing healthy gateway on pod %r",
+                type(self).__name__,
+                self._pod_name,
+            )
+            self._gateway = GatewayClient(
+                backend=self.get_backend(),
+                gateway_port=self.gateway_port,
+                timeout=30.0,
+                gateway_log_path=self._gateway_log,
+            )
+            self._mcps = list(await self._gateway.list_mcps())
+            return
+        await super()._setup_mcp_gateway()
 
     # ── 覆盖 provisioning: 支持池 Pod 名 ─────────────────────
 
@@ -509,91 +608,30 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         await self._v1.create_namespaced_pod(self._namespace, pod)
 
     async def _teardown_backend(self) -> None:
-        """温池模式：归还 slot；按需模式：删除 Pod。
+        """按需模式：删除 session Pod；池模式：Pod 不动。
 
-        共享 PVC 由 agent 级别管理，不在 session 结束时清理。
+        hash 路由下池 Pod 无归属概念（可被多会话并发复用），
+        生命周期由 Manager 的 sweeper 统一管理（空闲回收/死 Pod
+        重建），session close 只拆本实例连接。共享 PVC 由 agent
+        级别管理，不在 session 结束时清理。
         """
         from kubernetes_asyncio.client.rest import ApiException
 
         if self._v1 is not None and self._pod_name:
-            if self._assigned_pod_name:
-                # ── 温池：懒缩容判断 ──
-                # slot 序号 >= 当前池大小时直接删除 Pod（热更新缩容后
-                # 在下一次会话结束时自然收敛），否则 patch 归还池中。
-                slot_index = _pool_slot_index(self._pod_name)
-                target_size: int | None = None
-                if slot_index is not None and self._pool_size_provider:
-                    try:
-                        target_size = await self._pool_size_provider(
-                            self._agent_id,
-                        )
-                    except Exception:
-                        # 池大小查询失败 → 保守归还，不误删
-                        target_size = None
-                if (
-                    slot_index is not None
-                    and target_size is not None
-                    and slot_index >= target_size
-                ):
-                    # ── 懒缩容：删除超出池大小的 slot Pod ──
-                    try:
-                        await self._v1.delete_namespaced_pod(
-                            self._pod_name,
-                            self._namespace,
-                        )
-                        logger.info(
-                            "SharedPvcK8sWorkspace: shrunk pool slot %r "
-                            "(index=%d >= pool_size=%d)",
-                            self._pod_name,
-                            slot_index,
-                            target_size,
-                        )
-                    except ApiException as e:
-                        if e.status != 404:
-                            logger.warning(
-                                "SharedPvcK8sWorkspace: shrink slot %r "
-                                "failed: %s",
-                                self._pod_name,
-                                e,
-                            )
-                else:
-                    # ── patch label 归还 slot ──
-                    try:
-                        await self._v1.patch_namespaced_pod(
-                            self._pod_name,
-                            self._namespace,
-                            {"metadata": {"labels": {
-                                "agentscope.pool.slot": "available",
-                            }}},
-                        )
-                        logger.info(
-                            "SharedPvcK8sWorkspace: returned slot %r to pool",
-                            self._pod_name,
-                        )
-                    except ApiException as e:
-                        if e.status == 404:
-                            logger.warning(
-                                "SharedPvcK8sWorkspace: pool pod %r gone, "
-                                "cannot return slot",
-                                self._pod_name,
-                            )
-                        else:
-                            logger.warning(
-                                "SharedPvcK8sWorkspace: slot return "
-                                "failed: %s",
-                                e,
-                            )
-            else:
+            if not self._assigned_pod_name:
                 # ── 按需：删除 session Pod ──
                 try:
                     await self._v1.delete_namespaced_pod(
                         self._pod_name,
                         self._namespace,
                     )
-                except Exception as e:
-                    logger.warning(
-                        "SharedPvcK8sWorkspace: Pod delete failed: %s", e,
-                    )
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(
+                            "SharedPvcK8sWorkspace: Pod delete "
+                            "failed: %s",
+                            e,
+                        )
 
             # 共享模式下绝不删除 PVC
             # （即使 _delete_pvc_on_close=True 也忽略，
@@ -612,20 +650,21 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
 
 
 class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
-    """管理 :class:`SharedPvcK8sWorkspace` 实例 + 温池。
+    """管理 :class:`SharedPvcK8sWorkspace` 实例 + 池 Pod。
 
     与父类 :class:`K8sWorkspaceManager` 的区别：
 
-    - 隔离策略固定为 ``PER_SESSION``（每个 session 独立 Pod）
+    - 隔离策略固定为 ``PER_SESSION``（每个 session 独立 workspace 对象）
     - PVC 名称由 ``user_id::agent_id`` hash 派生（agent 级共享）
     - 缓存 key 仍是 session-scoped workspace_id
-    - 温池：预创建 Pod，快速分配，TTL 回收
+    - 池 Pod：按 ``hash(session_id) % N`` 固定路由，无占用标记，
+      同一 Pod 可被多会话并发复用；不可用顺延下一个
+    - 池生命周期：sweeper 删除不可用 Pod（下次访问补建）、
+      全池闲置超 ``pool_idle_ttl`` 时整体回收（PVC 保留）
     """
 
     # ── 池 label 常量 ──────────────────────────────────────
     POOL_LABEL_AGENT = "agentscope.pool.agent"
-    POOL_LABEL_SLOT = "agentscope.pool.slot"
-    POOL_SLOT_AVAILABLE = "available"
 
     # ── 池大小缓存 TTL（秒）──
     # 短 TTL 平衡热更新时效性与 Redis 往返开销
@@ -637,7 +676,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         shared_pvc_access_mode: str = "ReadWriteMany",
         # ── 池化 ──
         max_active_pods: int = 5,
-        pool_wait_timeout: float = 60.0,
+        # 全池闲置回收阈值（秒）：agent 的池 Pod 最近一次被路由
+        # 命中后超过该时长无任何访问，sweeper 将池全部回收。
+        pool_idle_ttl: float = 3600.0,
         # ── 池配置数据源（Redis） ──
         # 连接参数由工厂注入（来自 AppConfig），禁止直读裸环境变量
         redis_host: str = "localhost",
@@ -697,7 +738,7 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
 
         # ── 池化 ──
         self._max_active_pods = max_active_pods
-        self._pool_wait_timeout = pool_wait_timeout
+        self._pool_idle_ttl = pool_idle_ttl
         self._redis_host = redis_host
         self._redis_port = redis_port
         # 懒加载长连接 + 池大小短 TTL 缓存，避免每个新会话
@@ -719,12 +760,12 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         session_id: str,
         workspace_id: str | None = None,
     ) -> SharedPvcK8sWorkspace:
-        """返回 session-scoped workspace。温池模式先拿 slot。
+        """返回 session-scoped workspace，挂载到 hash 路由的池 Pod。
 
         Args:
             user_id (`str`): 用户 ID。
             agent_id (`str`): 智能体 ID（用于生成 PVC 名和池 key）。
-            session_id (`str`): 会话 ID（用于 Pod 名和 workdir 子目录）。
+            session_id (`str`): 会话 ID（用于 hash 路由和 workdir 子目录）。
             workspace_id (`str | None`, optional):
                 Stable workspace identifier。``None`` 时自动生成。
 
@@ -746,30 +787,48 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         shared_pvc_name = _k8s_safe_name(agent_hash)
 
         # ── 缓存查找（session-scoped key） ──
+        cached_ws: SharedPvcK8sWorkspace | None = None
         async with self._lock:
             cached = self._cache.get(workspace_id)
             if cached is not None:
                 ws, _ = cached
                 self._cache[workspace_id] = (ws, time.monotonic())
-                return ws  # type: ignore[return-value]
+                cached_ws = ws
 
-        # ── 缓存未命中 ──────────────────────────────────────────
+        if cached_ws is not None:
+            # ── 挂载前自检：池 Pod 可能已被任意实例的 sweeper ──
+            # 回收/重建，缓存命中必须确认 backend 仍可用，否则
+            # 驱逐走重建。多实例部署下其他实例的缓存无法被本
+            # 实例 sweeper 清理（其 sweeper 只扫现存 Pod），
+            # 自检是跨实例正确性的唯一保障。
+            if await self._ws_backend_alive(cached_ws):
+                return cached_ws  # type: ignore[return-value]
+            logger.info(
+                "SharedPvcK8sWorkspaceManager: cached ws %r backend "
+                "stale; evict and rebuild",
+                workspace_id,
+            )
+            async with self._lock:
+                cur = self._cache.get(workspace_id)
+                if cur is not None and cur[0] is cached_ws:
+                    self._cache.pop(workspace_id, None)
+            await self._safe_close(cached_ws)
+
+        # ── hash 路由选 Pod（不可用顺延，选中后刷新活跃时间） ──
         pool_size = await self._get_pool_size(agent_id)
         pod_name = ""
-
         if pool_size > 0:
-            # 确保池 Pod 存在
-            await self._ensure_pool(agent_hash, agent_id)
-            # 从池中获取 slot
-            pod_name = await self._acquire_slot(
+            pod_name = await self._route_pod(
                 agent_hash,
+                agent_id,
                 session_id,
+                pool_size,
             )
             logger.info(
-                "SharedPvcK8sWorkspaceManager: acquired slot %r "
-                "for session %r (agent=%r)",
-                pod_name,
+                "SharedPvcK8sWorkspaceManager: routed session %r "
+                "to pool pod %r (agent=%r)",
                 session_id,
+                pod_name,
                 agent_id,
             )
 
@@ -785,10 +844,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 shared_pvc_name=shared_pvc_name,
                 session_id=session_id,
                 pod_name=pod_name,
-                agent_id=agent_id,
             )
             self._cache[workspace_id] = (ws, time.monotonic())
-            return ws  # type: ignore[return-value]
+        return ws  # type: ignore[return-value]
 
     async def _build_and_start(
         self,
@@ -797,13 +855,12 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         shared_pvc_name: str,
         session_id: str,
         pod_name: str = "",
-        agent_id: str = "",
     ) -> SharedPvcK8sWorkspace:
         """构造 :class:`SharedPvcK8sWorkspace` 并初始化。
 
         Args:
-            pod_name: 非空表示使用温池 Pod，空表示按需创建。
-            agent_id: 用于归还 slot 时的懒缩容判断。
+            pod_name: 非空表示挂载到池 Pod（hash 路由），空表示
+                按需创建 session 级 Pod。
         """
         from agentscope.workspace._utils import DEFAULT_WORKSPACE_INSTRUCTIONS
 
@@ -813,8 +870,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             session_id=session_id,
             shared_pvc_access_mode=self._shared_pvc_access_mode,
             pod_name=pod_name,
-            agent_id=agent_id,
-            pool_size_provider=self._get_pool_size,
+            # 心跳间隔：run 期间每 pool_idle_ttl/2 刷新一次活跃
+            # 信号（下限 30s 防止误配导致过频），见 ws 属性说明。
+            refresh_heartbeat_interval=max(self._pool_idle_ttl / 2.0, 30.0),
             # ── 透传 Manager 配置 ──
             kubeconfig=self._kubeconfig,
             namespace=self._namespace,
@@ -920,16 +978,20 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         self,
         agent_hash: str,
         agent_id: str,
-    ) -> None:
-        """确保 agent 的池 Pod 已创建并运行。
+        primary: int = 0,
+    ) -> dict[str, Any]:
+        """确保 agent 的池 Pod 齐备，返回 name→Pod 映射。
 
-        检查当前池状态，补建缺少的 Pod。
-        首次调用时还会确保共享 PVC 存在。
+        补建缺失的 Pod；``primary``（本次 hash 路由命中的索引）
+        同步预热/修复网关（新建同步等待、已存在同步探测），
+        非 primary 的新建 Pod 后台预热、已存在则保持 lazy
+        （下次成为 primary 时再修复）。
         """
         await self._k8s_connect()
         pool_size = await self._get_pool_size(agent_id)
+        existing: dict[str, Any] = {}
         if pool_size <= 0:
-            return
+            return existing
 
         # ── 确保共享 PVC 存在（池 Pod 依赖它） ──
         shared_pvc_name = _k8s_safe_name(agent_hash)
@@ -950,18 +1012,28 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 "SharedPvcK8sWorkspaceManager: list pool pods failed: %s",
                 e,
             )
-            return
+            return existing
 
-        existing_names = {
-            p.metadata.name
-            for p in pods.items
-            if p.metadata is not None
-        }
+        for p in pods.items:
+            if p.metadata is not None:
+                existing[p.metadata.name] = p
 
-        # 补建缺失的 Pod
+        # 补建缺失 Pod：primary 同步预热（路由命中，立即要用），
+        # 其余新建后台预热；不可用 Pod（非 Running）不在此删除，
+        # 由 sweeper 周期重建，路由顺延保证不阻塞本次访问。
         for i in range(pool_size):
             pod_name = f"as-ws-{agent_hash}-{i}"
-            if pod_name in existing_names:
+            if pod_name in existing:
+                if i == primary:
+                    try:
+                        await self._preheat_pod_gateway(pod_name)
+                    except Exception:
+                        logger.warning(
+                            "SharedPvcK8sWorkspaceManager: gateway "
+                            "preheat failed for pool pod %r",
+                            pod_name,
+                            exc_info=True,
+                        )
                 continue
             logger.info(
                 "SharedPvcK8sWorkspaceManager: creating pool pod %r "
@@ -970,6 +1042,296 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 agent_id,
             )
             await self._create_pool_pod(pod_name, agent_hash, agent_id)
+            if i == primary:
+                # 新建 Pod：同步等待 Running 并启动网关——创建本就需
+                # 等待，预热开销与 Pod 就绪重叠，几乎免费。
+                try:
+                    await self._preheat_pod_gateway(pod_name)
+                except Exception:
+                    logger.warning(
+                        "SharedPvcK8sWorkspaceManager: gateway preheat "
+                        "failed for new pool pod %r",
+                        pod_name,
+                        exc_info=True,
+                    )
+            else:
+                asyncio.create_task(
+                    self._preheat_in_background(pod_name),
+                )
+        return existing
+
+    async def _ws_backend_alive(
+        self,
+        ws: SharedPvcK8sWorkspace,
+    ) -> bool:
+        """检查 ws 挂载的池 Pod 是否仍可用（Running + 网关健康）。
+
+        仅池模式（``_assigned_pod_name`` 非空）需要检查：池 Pod
+        会被任何实例的 sweeper 删除重建，挂载前自检保证缓存命中
+        不会返回僵尸 ws。网关探测覆盖"容器重启但 Pod 仍 Running"
+        的场景（网关进程丢失）。按需模式的 session Pod 生命周期
+        独立（不会被 sweeper 删），直接视为可用。K8s 异常时保守
+        返回 True——网络抖动不应导致误驱逐，下轮再自检。
+        """
+        pod_name = getattr(ws, "_assigned_pod_name", "")
+        if not pod_name:
+            return True
+        try:
+            await self._k8s_connect()
+        except Exception:
+            return True
+        from kubernetes_asyncio.client.rest import ApiException
+
+        try:
+            pod = await self._k8s_v1.read_namespaced_pod(
+                pod_name,
+                self._namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            logger.warning(
+                "SharedPvcK8sWorkspaceManager: probe pod %r failed: %s",
+                pod_name,
+                e,
+            )
+            return True  # 保守：网络抖动不驱逐
+        if pod.status is None or pod.status.phase != "Running":
+            return False
+        # 容器重启后 Pod 仍 Running 但网关进程已丢：探测网关
+        return await ws._gateway_healthy()
+
+    @staticmethod
+    def _hash_route_index(session_id: str, pool_size: int) -> int:
+        """hash(session_id) → 池索引：固定路由，同会话总落同一 Pod。"""
+        digest = hashlib.blake2b(
+            session_id.encode("utf-8"),
+            digest_size=8,
+        )
+        return int.from_bytes(digest.digest(), "big") % pool_size
+
+    async def _route_pod(
+        self,
+        agent_hash: str,
+        agent_id: str,
+        session_id: str,
+        pool_size: int,
+    ) -> str:
+        """hash 路由选 Pod：目标不可用顺延到下一个 Running Pod。
+
+        先经 :meth:`_ensure_pool` 补全池（primary=hash 目标，同步
+        预热），再从 hash 目标起顺延找第一个 Running Pod 并刷新
+        last-active annotation。全池无 Running Pod 时删除重建
+        hash 目标 Pod 并等待就绪，兜底保证 run 有可用沙箱。
+        周期性的不可用检测与重建主要由 sweeper 负责，这里是
+        访问路径上的兜底。
+        """
+        from kubernetes_asyncio.client.rest import ApiException
+
+        start = self._hash_route_index(session_id, pool_size)
+        existing = await self._ensure_pool(
+            agent_hash,
+            agent_id,
+            primary=start,
+        )
+
+        for k in range(pool_size):
+            i = (start + k) % pool_size
+            name = f"as-ws-{agent_hash}-{i}"
+            pod = existing.get(name)
+            if pod is not None and pod.status is not None and (
+                pod.status.phase == "Running"
+            ):
+                await self._touch_last_active(name)
+                return name
+
+        # ── 全池无 Running Pod：重建 hash 目标 Pod 兜底 ──
+        name = f"as-ws-{agent_hash}-{start}"
+        logger.warning(
+            "SharedPvcK8sWorkspaceManager: no running pool pod for "
+            "agent %r; rebuilding %r",
+            agent_id,
+            name,
+        )
+        try:
+            await self._k8s_v1.delete_namespaced_pod(name, self._namespace)
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(
+                    "SharedPvcK8sWorkspaceManager: delete bad pool pod "
+                    "%r failed: %s",
+                    name,
+                    e,
+                )
+        # 等 Pod 真正消失，避免重建撞 409
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            try:
+                await self._k8s_v1.read_namespaced_pod(
+                    name,
+                    self._namespace,
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    break
+                raise
+            await asyncio.sleep(1.0)
+        await self._create_pool_pod(name, agent_hash, agent_id)
+        await self._preheat_pod_gateway(name)
+        await self._touch_last_active(name)
+        return name
+
+    async def _touch_last_active(self, pod_name: str) -> None:
+        """刷新池 Pod 的 last-active annotation（unix 秒）。
+
+        sweeper 空闲回收的活跃信号。patch 失败静默——annotation
+        非关键路径，失败只会让 sweeper 对空闲判定更保守（用
+        Pod 创建时间兑底）。
+        """
+        from kubernetes_asyncio.client.rest import ApiException
+
+        try:
+            await self._k8s_v1.patch_namespaced_pod(
+                pod_name,
+                self._namespace,
+                {
+                    "metadata": {
+                        "annotations": {
+                            LAST_ACTIVE_ANNOTATION: str(int(time.time())),
+                        },
+                    },
+                },
+            )
+        except ApiException:
+            pass
+
+    async def _preheat_in_background(self, pod_name: str) -> None:
+        """后台预热网关：吞异常，避免未捕获任务异常刷日志。"""
+        try:
+            await self._preheat_pod_gateway(pod_name)
+        except Exception:
+            logger.warning(
+                "SharedPvcK8sWorkspaceManager: background gateway "
+                "preheat failed for %r",
+                pod_name,
+                exc_info=True,
+            )
+
+    async def _preheat_pod_gateway(self, pod_name: str) -> None:
+        """等待池 Pod 运行，并确保网关在 Pod 上健康运行。
+
+        步骤：等 Running → 确保共享目录与默认 ``.mcp`` 落盘 →
+        探测网关健康 → 不健康则 pkill + nohup 启动 + 轮询 /health。
+        与框架 ``_setup_mcp_gateway`` 的启动方式完全一致（同脚本、
+        同配置、同端口），session 挂载时经覆写探测直接复用。
+        """
+        await self._k8s_connect()
+        from kubernetes_asyncio.client.rest import ApiException
+
+        # 1. 等 Running
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            try:
+                pod = await self._k8s_v1.read_namespaced_pod(
+                    pod_name,
+                    self._namespace,
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    return  # Pod 已被删除，放弃预热
+                raise
+            phase = pod.status.phase if pod.status else None
+            if phase == "Running":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            logger.warning(
+                "SharedPvcK8sWorkspaceManager: pool pod %r not "
+                "running in time; skip gateway preheat",
+                pod_name,
+            )
+            return
+
+        backend = K8sBackend(
+            api_client=self._k8s_api_client,
+            namespace=self._namespace,
+            pod_name=pod_name,
+            container_name="workspace",
+            workdir=POD_WORKDIR,
+        )
+        shared_dir = f"{POD_WORKDIR}/shared"
+        mcp_file = f"{shared_dir}/{DEFAULT_MCP_FILE}"
+        gateway_python = (
+            f"{GATEWAY_HOME}/{DEFAULT_GATEWAY_VENV}/bin/python"
+        )
+        gateway_script = f"{GATEWAY_HOME}/{DEFAULT_GATEWAY_SCRIPT}"
+        gateway_log = f"{GATEWAY_HOME}/{DEFAULT_GATEWAY_LOG}"
+
+        # 2. 确保共享目录 + 默认 .mcp（与框架 _ensure_workspace_layout
+        # 的写入格式一致，agent 级 default_mcps）
+        await backend.exec_shell(
+            ["mkdir", "-p", shared_dir],
+            cwd="/",
+        )
+        if not await backend.file_exists(mcp_file):
+            payload = json.dumps(
+                [
+                    m.model_dump(mode="json")
+                    for m in (self._default_mcps or [])
+                ],
+                indent=2,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            await backend.write_file(mcp_file, payload)
+
+        # 3. 探测网关
+        gateway = GatewayClient(
+            backend=backend,
+            gateway_port=self._gateway_port,
+            timeout=30.0,
+            gateway_log_path=gateway_log,
+        )
+        try:
+            if await gateway.health():
+                return
+        except Exception:
+            pass
+
+        # 4. 启动网关（与框架 _setup_mcp_gateway 相同）
+        await backend.exec_shell(
+            ["sh", "-c", "pkill -f '[_]mcp_gateway_app.py' || true"],
+            cwd="/",
+        )
+        launch_cmd = (
+            f"nohup {shlex.quote(gateway_python)} -u "
+            f"{shlex.quote(gateway_script)} "
+            f"--config {shlex.quote(mcp_file)} "
+            f"--port {self._gateway_port} "
+            f"> {shlex.quote(gateway_log)} 2>&1 &"
+        )
+        await backend.exec_shell(["sh", "-c", launch_cmd], cwd="/")
+
+        # 5. 轮询健康（最多 ~15s）
+        deadline = time.monotonic() + 15.0
+        delay = 0.1
+        while time.monotonic() < deadline:
+            try:
+                if await gateway.health():
+                    logger.info(
+                        "SharedPvcK8sWorkspaceManager: preheated "
+                        "gateway on pool pod %r",
+                        pod_name,
+                    )
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 1.0)
+        logger.warning(
+            "SharedPvcK8sWorkspaceManager: gateway preheat timeout "
+            "on pool pod %r",
+            pod_name,
+        )
 
     async def _ensure_shared_pvc(self, pvc_name: str, agent_id: str) -> None:
         """确保共享 PVC 存在，不存在则创建。
@@ -1066,9 +1428,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         """创建单个池 Pod。
 
         与 session Pod 的区别：
-        - label 带 pool 标记
+        - label 带 pool 标记（``agentscope.pool.agent``）
         - working_dir 固定为 /workspace
-        - 初始 slot=available
+        - 无占用标记——hash 路由下同 Pod 可被多会话并发复用
         """
         await self._k8s_connect()
         from kubernetes_asyncio import client as k8s_client
@@ -1148,7 +1510,6 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                     "agentscope.workspace": "true",
                     "agentscope.agent_id": _k8s_safe_label(agent_id),
                     self.POOL_LABEL_AGENT: agent_hash,
-                    self.POOL_LABEL_SLOT: self.POOL_SLOT_AVAILABLE,
                 },
             ),
             spec=k8s_client.V1PodSpec(**spec_kwargs),
@@ -1161,92 +1522,180 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 return
             raise
 
-    async def _acquire_slot(
-        self,
-        agent_hash: str,
-        session_id: str,
-    ) -> str:
-        """从池中获取一个可用 slot。
+    # ── 池 Pod 生命周期：run 续期 + 不可用重建 + 空闲回收 ─────
 
-        通过 K8s label selector 查找 available Pod，
-        用 resourceVersion 乐观锁绑定到 session。
-        池满时退避等待，超时后报错。
+    async def _sweep_once(self) -> None:
+        """框架 TTL 回收 + run 续期 + 池 Pod 健康/空闲回收。
 
-        Returns:
-            获取到的 Pod 名称。
-
-        Raises:
-            RuntimeError: 超时未获取到 slot。
+        1. run 进行中的 ws（``_run_active``）续期访问时间戳——
+           否则长 run（> TTL）会被 sweeper close 拆 backend，
+           后续工具执行报错；
+        2. :meth:`_sweep_pool`：删除不可用池 Pod（下次访问补建），
+           全池闲置超 ``pool_idle_ttl`` 时整体回收（PVC 保留）；
+        3. 框架 TTL 回收照常。
         """
-        await self._k8s_connect()
+        now = time.monotonic()
+        async with self._lock:
+            for wid, (ws, _ts) in list(self._cache.items()):
+                if getattr(ws, "_run_active", False):
+                    self._cache[wid] = (ws, now)
+        await self._sweep_pool()
+        await super()._sweep_once()
+
+    async def _sweep_pool(self) -> None:
+        """周期扫描全部池 Pod：不可用删除 + 全池空闲回收。
+
+        按 agent（``agentscope.pool.agent`` 标签）分组：
+
+        - 不可用 Pod（非 Running/Pending，或 Running 但主容器长期
+          未就绪如 CrashLoopBackOff）→ 删除并驱逐挂载其上的 ws，
+          下次访问由 hash 路由/``_ensure_pool`` 补建重建；
+        - 全池最近活跃时间（``LAST_ACTIVE_ANNOTATION`` 的最大值，
+          无 annotation 用 Pod 创建时间兑底）超过 ``pool_idle_ttl``
+          → 删除全部池 Pod（PVC 保留，下次访问懒重建）。
+        """
+        try:
+            await self._k8s_connect()
+        except Exception:
+            return  # 连不上 K8s：本轮跳过，下轮再试
         from kubernetes_asyncio.client.rest import ApiException
 
-        label_available = (
-            f"{self.POOL_LABEL_AGENT}={agent_hash},"
-            f"{self.POOL_LABEL_SLOT}={self.POOL_SLOT_AVAILABLE}"
-        )
+        try:
+            pods = await self._k8s_v1.list_namespaced_pod(
+                namespace=self._namespace,
+                label_selector=self.POOL_LABEL_AGENT,
+            )
+        except ApiException as e:
+            logger.warning(
+                "SharedPvcK8sWorkspaceManager: sweep pool pods failed: %s",
+                e,
+            )
+            return
 
-        deadline = time.monotonic() + self._pool_wait_timeout
-        backoff = 1.0
-
-        while time.monotonic() < deadline:
-            try:
-                pods = await self._k8s_v1.list_namespaced_pod(
-                    namespace=self._namespace,
-                    label_selector=label_available,
-                )
-            except ApiException as e:
-                logger.warning(
-                    "SharedPvcK8sWorkspaceManager: list available "
-                    "slots failed: %s",
-                    e,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 8.0)
+        by_agent: dict[str, list[Any]] = {}
+        for p in pods.items or []:
+            if p.metadata is None or p.metadata.labels is None:
                 continue
+            agent_hash = p.metadata.labels.get(self.POOL_LABEL_AGENT)
+            if agent_hash:
+                by_agent.setdefault(agent_hash, []).append(p)
 
-            available = [
-                p
-                for p in pods.items
-                if p.status is not None
-                and p.status.phase == "Running"
-                and p.metadata is not None
-            ]
-
-            for pod in available:
-                pod_name = pod.metadata.name
+        now = time.time()
+        for agent_hash, agent_pods in by_agent.items():
+            dead: list[str] = []
+            last_used = 0.0
+            for p in agent_pods:
+                meta, status = p.metadata, p.status
+                phase = status.phase if status else ""
+                created = (
+                    meta.creation_timestamp.timestamp()
+                    if meta.creation_timestamp is not None
+                    else 0.0
+                )
+                if phase not in ("Running", "Pending"):
+                    # Failed/Succeeded/Unknown → 不可用，删除重建
+                    dead.append(meta.name)
+                    continue
+                if phase == "Running" and now - created > 60.0:
+                    # CrashLoopBackOff 等：主容器长期未就绪。
+                    # 60s 窗口避免误删刚创建、容器尚在启动的 Pod。
+                    ready = any(
+                        bool(cs.ready)
+                        for cs in status.container_statuses or []
+                    )
+                    if not ready:
+                        dead.append(meta.name)
+                        continue
+                # ── 空闲信号：全池取最近一次活跃 ──
+                raw = (meta.annotations or {}).get(
+                    LAST_ACTIVE_ANNOTATION,
+                )
                 try:
-                    # 带 resourceVersion 前置条件的条件 patch：
-                    # 并发抢同一 slot 时版本不匹配返回 409，试下一个，
-                    # 避免后写覆盖前写导致两个会话绑定同一 Pod
-                    await self._k8s_v1.patch_namespaced_pod(
+                    last_used = max(last_used, float(raw))
+                except (TypeError, ValueError):
+                    last_used = max(last_used, created)
+
+            # 1. 删除不可用 Pod（下次访问补建 + 预热）
+            for pod_name in dead:
+                try:
+                    await self._k8s_v1.delete_namespaced_pod(
                         pod_name,
                         self._namespace,
-                        {
-                            "metadata": {
-                                "resourceVersion": (
-                                    pod.metadata.resource_version
-                                ),
-                                "labels": {
-                                    self.POOL_LABEL_SLOT: _k8s_safe_label(
-                                        session_id,
-                                    ),
-                                },
-                            },
-                        },
                     )
-                    return pod_name  # type: ignore[no-any-return]
+                    logger.info(
+                        "SharedPvcK8sWorkspaceManager: deleted "
+                        "unhealthy pool pod %r (agent_hash=%r)",
+                        pod_name,
+                        agent_hash,
+                    )
                 except ApiException as e:
-                    if e.status == 409:
-                        # 被其他实例抢了，试下一个
-                        continue
-                    raise
+                    if e.status != 404:
+                        logger.warning(
+                            "SharedPvcK8sWorkspaceManager: delete "
+                            "unhealthy pool pod %r failed: %s",
+                            pod_name,
+                            e,
+                        )
+                # 驱逐挂载在死 Pod 上的 ws（backend 已失效，下次
+                # 访问重新路由）
+                await self._evict_ws_for_pod(pod_name)
 
-            # 没有可用 slot → 退避等待
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 8.0)
+            # 2. 全池空闲回收（PVC 保留，下次访问懒重建）
+            if last_used > 0 and now - last_used > self._pool_idle_ttl:
+                # 本进程有 run 进行中的 ws 挂在该池 → 视为活跃，
+                # 跳过本轮回收
+                if await self._pool_busy(agent_hash):
+                    continue
+                for p in agent_pods:
+                    await self._evict_ws_for_pod(p.metadata.name)
+                    try:
+                        await self._k8s_v1.delete_namespaced_pod(
+                            p.metadata.name,
+                            self._namespace,
+                        )
+                    except ApiException as e:
+                        if e.status != 404:
+                            logger.warning(
+                                "SharedPvcK8sWorkspaceManager: recycle "
+                                "pool pod %r failed: %s",
+                                p.metadata.name,
+                                e,
+                            )
+                logger.info(
+                    "SharedPvcK8sWorkspaceManager: recycled idle pool "
+                    "for agent_hash %r",
+                    agent_hash,
+                )
 
-        raise RuntimeError("沙箱资源已满，请稍后重试")
+    async def _pool_busy(self, agent_hash: str) -> bool:
+        """本进程是否有 run 进行中的 ws 挂在该 agent 的池上。"""
+        prefix = f"as-ws-{agent_hash}-"
+        async with self._lock:
+            for ws, _ts in self._cache.values():
+                if getattr(ws, "_run_active", False) and (
+                    getattr(ws, "_assigned_pod_name", "").startswith(
+                        prefix,
+                    )
+                ):
+                    return True
+        return False
+
+    async def _evict_ws_for_pod(self, pod_name: str) -> None:
+        """驱逐缓存中挂载在指定池 Pod 上的 ws（Pod 即将失效）。
+
+        本进程即时清理：sweeper 删除 Pod 时同步逐出，避免下一轮
+        run 命中僵尸 ws 走一遍自检驱逐的往返。跨实例的正确性不
+        依赖此处——其他实例的缓存由 get_workspace 挂载前自检
+        （``_ws_backend_alive``）兜底。
+        """
+        evicted: list[Any] = []
+        async with self._lock:
+            for wid, (ws, _ts) in list(self._cache.items()):
+                if getattr(ws, "_assigned_pod_name", "") == pod_name:
+                    self._cache.pop(wid, None)
+                    evicted.append(ws)
+        for ws in evicted:
+            await self._safe_close(ws)
 
     async def cleanup_pool(self, agent_id: str) -> None:
         """删除 agent 对应的所有池资源（Pod + PVC）。

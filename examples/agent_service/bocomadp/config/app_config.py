@@ -32,7 +32,7 @@ from .base import (
 )
 
 # 顶层业务节点白名单：这些键**有意**不在 AppConfig schema 内，
-# 由独立读取器消费（models → load_models_from_yaml；audit → AuditConfig；
+# 由独立读取器消费（models → load_models_from_yaml；
 # cross_search → get_cross_search_config）。
 # 新增此类业务节点时，必须加入本集合，否则启动校验会 fail-fast。
 _BUSINESS_KEYS: frozenset[str] = frozenset(
