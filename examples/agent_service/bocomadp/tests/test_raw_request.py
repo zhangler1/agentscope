@@ -29,7 +29,7 @@ from bocomadp.deerflow.custom_params import (
     set_custom_params,
 )
 from bocomadp.tools.enterprise import build_enterprise_tools
-from bocomadp.tools.raw_request import DEFAULT_API_PATHS, raw_request_tool
+from bocomadp.tools.raw_request import DEFAULT_API_PATHS, _raw_request_tool_impl
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +104,7 @@ def _run(body: str, intent: str) -> str:
         ResolvedAuth(auth_mode="guwp-token", guwp_token="tok-1")
     )
     try:
-        return asyncio.run(raw_request_tool(body, intent))
+        return asyncio.run(_raw_request_tool_impl(body, intent))
     finally:
         reset_resolved_auth(token_auth)
         reset_custom_params(token_params)
@@ -149,7 +149,7 @@ def test_muwp_user_attached(fake_client):
         ResolvedAuth(auth_mode="muwp-user", muwp_user={"userId": "u1"})
     )
     try:
-        asyncio.run(raw_request_tool("{}", "enterprise_detail"))
+        asyncio.run(_raw_request_tool_impl("{}", "enterprise_detail"))
     finally:
         reset_resolved_auth(token_auth)
         reset_custom_params(token_params)
@@ -162,7 +162,7 @@ def test_without_tools_param_ok(fake_client):
     token_params = set_custom_params({})
     token_auth = set_resolved_auth(ResolvedAuth(auth_mode="none"))
     try:
-        out = asyncio.run(raw_request_tool("{}", "enterprise_detail"))
+        out = asyncio.run(_raw_request_tool_impl("{}", "enterprise_detail"))
     finally:
         reset_resolved_auth(token_auth)
         reset_custom_params(token_params)
@@ -243,7 +243,7 @@ def test_raw_request_mounted_in_enterprise(monkeypatch):
     try:
         tools = asyncio.run(build_enterprise_tools("u1", "a1", "s1"))
         names = [t.name for t in tools]
-        assert "raw_request_tool" in names
+        assert "外数查" in names
         assert "cross_search" in names
         assert "online_search" not in names  # 默认不挂联网搜索
     finally:

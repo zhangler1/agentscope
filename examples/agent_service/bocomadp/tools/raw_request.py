@@ -22,6 +22,11 @@ import logging
 
 import httpx
 
+try:
+    from agentscope.tool import FunctionTool, ToolMiddlewareBase
+except ImportError:
+    FunctionTool = ToolMiddlewareBase = None
+
 from ..config.raw_request_config import get_raw_request_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
 from ..deerflow.custom_params import get_custom_params
@@ -56,7 +61,7 @@ DEFAULT_API_PATHS: dict[str, str] = {
 _EMOTION_CODES = "0,1,2"
 
 
-async def raw_request_tool(request_body: str, intent: str) -> str:
+async def _raw_request_tool_impl(request_body: str, intent: str) -> str:
     """外数查工具：根据请求报文和接口标识，发送POST请求并获取返回结果。
 
     用户点名"外数查/外数查询/查工商/查企业详情"等即可命中本工具；根据
@@ -139,3 +144,17 @@ async def raw_request_tool(request_body: str, intent: str) -> str:
             ensure_ascii=False,
         )
     return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+if FunctionTool is not None and ToolMiddlewareBase is not None:
+    raw_request_tool = FunctionTool(
+        _raw_request_tool_impl,
+        # 工具名显式中文化（对齐 deerflow 原设计：行内模型点名靠中文名）。
+        # 注意：行外 DeepSeek 等 API 强校验工具名 ^[a-zA-Z0-9_-]+$，
+        # 中文名会被 400 拒收；行内网关不校验，可正常使用。行外环境
+        # 如需兼容，可临时改回英文名 raw_request_tool。
+        name="外数查",
+        is_read_only=True,
+    )
+else:
+    raw_request_tool = _raw_request_tool_impl

@@ -59,7 +59,7 @@ async def build_enterprise_tools(
         FunctionTool(query_employee_info, is_read_only=True),
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
-        FunctionTool(raw_request_tool, is_read_only=True),
+        raw_request_tool,  # 已是 FunctionTool 实例（工具名"外数查"）
     ]
 
     # cross_search 始终挂载（2026-08-20 起不再受 vector_search_switch 控制）
