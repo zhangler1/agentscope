@@ -468,6 +468,10 @@ class K8sWorkspace(SandboxedWorkspaceBase):
 
         spec_kwargs: dict[str, Any] = {
             "restart_policy": "OnFailure",
+            # 沙箱无优雅停机需求（数据在 PVC 已落盘、网关无状态），
+            # 快杀让 Pod 删除可靠快速，避免 Terminating 卡满默认
+            # 30s grace period 导致删除等待超时。
+            "termination_grace_period_seconds": 5,
             "containers": [container],
             "volumes": volumes,
         }
@@ -562,8 +566,13 @@ class K8sWorkspace(SandboxedWorkspaceBase):
             f"within {timeout}s",
         )
 
-    async def _wait_pod_deleted(self, timeout: float = 30.0) -> None:
-        """Poll until the Pod is gone."""
+    async def _wait_pod_deleted(self, timeout: float = 90.0) -> None:
+        """Poll until the Pod is gone.
+
+        超时需大于 ``terminationGracePeriodSeconds``（默认 30s，沙箱
+        Pod 已调小为 5s）+ kubelet 清理 / volume unmount 的余量，
+        否则删除慢时会在边界处误报。
+        """
         from kubernetes_asyncio.client.rest import ApiException
 
         deadline = asyncio.get_event_loop().time() + timeout

@@ -576,6 +576,10 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
 
         spec_kwargs: dict[str, Any] = {
             "restart_policy": "OnFailure",
+            # 沙箱无优雅停机需求（数据在 PVC 已落盘、网关无状态），
+            # 快杀让 Pod 删除可靠快速，避免 Terminating 卡满默认
+            # 30s grace period 导致删除等待超时。
+            "termination_grace_period_seconds": 5,
             "containers": [container],
             "volumes": volumes,
         }
@@ -1058,6 +1062,17 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 asyncio.create_task(
                     self._preheat_in_background(pod_name),
                 )
+            # 读回最新状态入池：新建 Pod 不在 list 快照里，而
+            # _route_pod 靠 existing 判断 Running；不读回会误判
+            # “全池无 Running”，把刚建好的 Pod 删掉重建（白删
+            # 一轮，删除慢时还会撞删除等待超时）。
+            try:
+                existing[pod_name] = await self._k8s_v1.read_namespaced_pod(
+                    pod_name,
+                    self._namespace,
+                )
+            except ApiException:
+                pass
         return existing
 
     async def _ws_backend_alive(
@@ -1484,6 +1499,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
 
         spec_kwargs: dict[str, Any] = {
             "restart_policy": "OnFailure",
+            # 沙箱无优雅停机需求（数据在 PVC 已落盘、网关无状态），
+            # 快杀让 Pod 删除可靠快速，避免 Terminating 卡满默认
+            # 30s grace period 导致删除等待超时。
+            "termination_grace_period_seconds": 5,
             "containers": [container],
             "volumes": volumes,
         }
