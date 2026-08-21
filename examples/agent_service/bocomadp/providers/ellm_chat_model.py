@@ -40,7 +40,12 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 
+import redis
+import redis.asyncio as aioredis
+
 from pydantic import BaseModel, Field
+
+from bocomadp.config import get_app_config
 
 from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from agentscope.model._model_card import ModelCard
@@ -86,11 +91,7 @@ def _get_model_context_size(model: str) -> int:
         ``_FALLBACK_CONTEXT_SIZE``（65536，保持原构造默认）。
     """
     try:
-        from bocomadp.config import get_app_config
-
         cfg = get_app_config().redis
-        import redis
-
         client = redis.Redis(
             host=cfg.host,
             port=cfg.port,
@@ -113,23 +114,55 @@ def _get_model_context_size(model: str) -> int:
     return context_size
 
 
+async def _get_think_tag_from_redis(model: str) -> bool:
+    """按模型名从 Redis 读取 ``inject_think_tag``（供中间件异步调用）。
+
+    Args:
+        model (`str`): 模型名（Redis Hash ``bocomadp:model:think_tag`` 的 field）。
+
+    Returns:
+        `bool`: 该模型的 think_tag；Redis 无该模型记录/连接失败时返回
+        ``False``（安全默认，不误加 ``<think>`` 前缀）。
+    """
+    try:
+        cfg = get_app_config().redis
+        client = aioredis.Redis(
+            host=cfg.host,
+            port=cfg.port,
+            socket_connect_timeout=_REDIS_TIMEOUT,
+            socket_timeout=_REDIS_TIMEOUT,
+        )
+        try:
+            raw = await client.hget(_MODEL_THINK_TAG_KEY, model)
+        finally:
+            await client.aclose()
+    except Exception as e:  # pragma: no cover - Redis 不可用
+        logger.warning(
+            "EllmChatModel: Redis read failed for inject_think_tag of "
+            "model %r; fallback to False: %s",
+            model,
+            e,
+        )
+        return False
+    if raw is None:
+        return False
+    think, _, _ = _parse_model_meta(raw)
+    return think
+
+
 def _parse_model_meta(value: Any) -> tuple[bool, int, int]:
     """解析 Redis value 为 ``(think_tag, context_size, output_size)``。
 
-    兼容两种存储格式：
-
-    - 新格式 JSON：``{"think_tag": 1, "context_size": 1000000, \
-"output_size": 384000}``；
-    - 旧格式 ``"0"`` / ``"1"``（仅 think_tag，context_size / output_size \
-取默认值）。
+    仅接受 JSON 格式：``{"think_tag": 1, "context_size": 1000000, \
+"output_size": 384000}``；非 JSON 或字段缺失时回退默认值
+    （think_tag=False，context_size / output_size 取默认值）。
     """
     if isinstance(value, bytes):
         value = value.decode("utf-8", "replace")
-    text = str(value)
     try:
-        data = json.loads(text)
+        data = json.loads(value)
         if isinstance(data, dict):
-            think = data.get("think_tag") in (1, "1", True)
+            think = data.get("think_tag") in (1, True)
             context_size = int(
                 data.get("context_size") or _DEFAULT_CONTEXT_SIZE
             )
@@ -139,7 +172,7 @@ def _parse_model_meta(value: Any) -> tuple[bool, int, int]:
             return think, context_size, output_size
     except (ValueError, TypeError):
         pass
-    return text == "1", _DEFAULT_CONTEXT_SIZE, _DEFAULT_OUTPUT_SIZE
+    return False, _DEFAULT_CONTEXT_SIZE, _DEFAULT_OUTPUT_SIZE
 
 
 def _build_parameter_schema(
@@ -173,11 +206,7 @@ def _list_models_from_redis() -> list[ModelCard] | None:
         Redis 连接失败返回 ``None``，由调用方降级读取 yaml。
     """
     try:
-        from bocomadp.config import get_app_config
-
         cfg = get_app_config().redis
-        import redis
-
         client = redis.Redis(
             host=cfg.host,
             port=cfg.port,
