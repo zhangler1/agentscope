@@ -4,9 +4,10 @@
 每次模型调用前，通过 :class:`EllmKeyRefresher` 惰性检查/刷新 ELLM
 apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落），
 再用 ``EllmChatModel.set_api_key`` 把新鲜 key 注入到当前模型实例的
-请求头（``Authorization: Bearer <key>``），并按模型名从 Redis 模型表
-（``bocomadp:model:think_tag``）读取 ``inject_think_tag`` 开关——
-不换类、不重建 client，模型调用链保持不变。
+请求头（``Authorization: Bearer <key>``），并设置 ``inject_think_tag``
+开关——优先级：请求体 ``custom_params.add_think``（deerflow run/stream
+每轮携带）> Redis 模型表 ``bocomadp:model:think_tag``（按模型名）> 默认
+False。不换类、不重建 client，模型调用链保持不变。
 
 挂载方式（bocomadp main.py）::
 
@@ -47,10 +48,33 @@ except ImportError:  # pragma: no cover — offline syntax fallback
 
 MiddlewareBase._is_agent_middleware = True  # type: ignore[attr-defined]
 
+from bocomadp.deerflow.custom_params import get_custom_params  # noqa: E402
 from bocomadp.providers.ellm_chat_model import (  # noqa: E402
     EllmChatModel,
     _get_think_tag_from_redis,
 )
+
+
+def _parse_add_think(value: Any) -> bool | None:
+    """严格解析请求级 ``add_think``，无法识别返回 ``None``。
+
+    避免 ``bool("false")`` 为 True 的陷阱：仅接受 bool / 数字 /
+    常见布尔字符串；``None`` 表示未指定或无法识别，由调用方回退
+    下一优先级（Redis 模型表）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+    return None
 
 
 class EllmKeyRefreshMiddleware(MiddlewareBase):
@@ -58,7 +82,8 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
 
     - 非 :class:`EllmChatModel` 模型直接透传，不做任何处理；
     - :class:`EllmChatModel` 模型：``EllmKeyRefresher`` 惰性刷新 →
-      ``set_api_key`` 注入 → 按模型名读取 ``inject_think_tag``。
+      ``set_api_key`` 注入 → 设置 ``inject_think_tag``（请求体
+      ``custom_params.add_think`` 优先，否则按模型名查 Redis 模型表）。
     """
 
     def __init__(
@@ -96,12 +121,22 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                     credential_id,
                 )
                 current_model.set_api_key(key)
-                # inject_think_tag 来源：按模型名查 Redis 模型表
-                # ``bocomadp:model:think_tag``（不再是凭证记录字段），
-                # 查不到/Redis 不可用时默认 False。
-                current_model.inject_think_tag = (
-                    await _get_think_tag_from_redis(current_model.model)
+                # inject_think_tag 优先级：
+                #   1) 请求体 custom_params.add_think（deerflow run/stream
+                #      每轮携带，第一优先级）；
+                #   2) Redis 模型表 bocomadp:model:think_tag（按模型名）；
+                #   3) 默认 False。
+                # 原生 /chat/ 或请求未携带 add_think 时，第 1 级返回
+                # None，自动回退到第 2/3 级，行为与之前一致。
+                req_think = _parse_add_think(
+                    (get_custom_params() or {}).get("add_think"),
                 )
+                if req_think is not None:
+                    current_model.inject_think_tag = req_think
+                else:
+                    current_model.inject_think_tag = (
+                        await _get_think_tag_from_redis(current_model.model)
+                    )
                 # 401 时把该凭证的 key 置为过期（当前调用不重试，下一次
                 # 使用该凭证的调用会走惰性刷新）。回调闭包绑定本次
                 # credential_id，避免并发串号。
