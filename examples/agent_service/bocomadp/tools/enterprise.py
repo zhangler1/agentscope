@@ -23,6 +23,7 @@ from .placeholder import (
     query_internal_doc,
     submit_it_ticket,
 )
+from .raw_request import raw_request_tool
 from .vector_search import vector_search_tool
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ async def build_enterprise_tools(
         FunctionTool(query_employee_info, is_read_only=True),
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
+        FunctionTool(raw_request_tool, is_read_only=True),
     ]
 
     # cross_search 始终挂载（2026-08-20 起不再受 vector_search_switch 控制）
