@@ -4,8 +4,9 @@
 每次模型调用前，通过 :class:`EllmKeyRefresher` 惰性检查/刷新 ELLM
 apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落），
 再用 ``EllmChatModel.set_api_key`` 把新鲜 key 注入到当前模型实例的
-请求头（``Authorization: Bearer <key>``），并从凭证记录同步
-``inject_think_tag`` 开关——不换类、不重建 client，模型调用链保持不变。
+请求头（``Authorization: Bearer <key>``），并按模型名从 Redis 模型表
+（``bocomadp:model:think_tag``）读取 ``inject_think_tag`` 开关——
+不换类、不重建 client，模型调用链保持不变。
 
 挂载方式（bocomadp main.py）::
 
@@ -46,7 +47,10 @@ except ImportError:  # pragma: no cover — offline syntax fallback
 
 MiddlewareBase._is_agent_middleware = True  # type: ignore[attr-defined]
 
-from bocomadp.providers.ellm_chat_model import EllmChatModel  # noqa: E402
+from bocomadp.providers.ellm_chat_model import (  # noqa: E402
+    EllmChatModel,
+    _get_think_tag_from_redis,
+)
 
 
 class EllmKeyRefreshMiddleware(MiddlewareBase):
@@ -54,7 +58,7 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
 
     - 非 :class:`EllmChatModel` 模型直接透传，不做任何处理；
     - :class:`EllmChatModel` 模型：``EllmKeyRefresher`` 惰性刷新 →
-      ``set_api_key`` 注入 → 同步 ``inject_think_tag`` 开关。
+      ``set_api_key`` 注入 → 按模型名读取 ``inject_think_tag``。
     """
 
     def __init__(
@@ -88,12 +92,15 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 None,
             )
             if credential_id:
-                key, record = await self._refresher.ensure_fresh_key(
+                key, _ = await self._refresher.ensure_fresh_key(
                     credential_id,
                 )
                 current_model.set_api_key(key)
-                current_model.inject_think_tag = bool(
-                    record.data.get("inject_think_tag", False),
+                # inject_think_tag 来源：按模型名查 Redis 模型表
+                # ``bocomadp:model:think_tag``（不再是凭证记录字段），
+                # 查不到/Redis 不可用时默认 False。
+                current_model.inject_think_tag = (
+                    await _get_think_tag_from_redis(current_model.model)
                 )
                 # 401 时把该凭证的 key 置为过期（当前调用不重试，下一次
                 # 使用该凭证的调用会走惰性刷新）。回调闭包绑定本次

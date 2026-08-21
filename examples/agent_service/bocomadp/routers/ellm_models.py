@@ -6,7 +6,7 @@
 
 - Field = 模型名（如 ``deepseek-v4-flash``）
 - Value = JSON（``{"think_tag": 1, "context_size": 1000000, \
-"output_size": 384000}``）；兼容旧格式 ``"0"`` / ``"1"``（仅 think_tag）
+"output_size": 384000}``）
 
 - ``think_tag`` 开关：``1`` 启用 <think> 注入，``0`` 不启用
 - ``context_size`` 上下文大小（token），默认 1000000
@@ -140,19 +140,16 @@ async def _get_redis() -> Any:
 def _decode_meta(value: Any) -> tuple[bool, int, int]:
     """解析 Redis value 为 ``(think_tag, context_size, output_size)``。
 
-    兼容两种存储格式：
-
-    - 新格式 JSON：``{"think_tag": 1, "context_size": 1000000, \
-"output_size": 384000}``；
-    - 旧格式 ``"0"`` / ``"1"``（仅 think_tag，其余取默认值）。
+    仅接受 JSON 格式：``{"think_tag": 1, "context_size": 1000000, \
+"output_size": 384000}``；非 JSON 或字段缺失时回退默认值
+    （think_tag=False，context_size / output_size 取默认值）。
     """
     if isinstance(value, bytes):
         value = value.decode("utf-8", "replace")
-    text = str(value)
     try:
-        data = json.loads(text)
+        data = json.loads(value)
         if isinstance(data, dict):
-            think = data.get("think_tag") in (1, "1", True)
+            think = data.get("think_tag") in (1, True)
             context_size = int(
                 data.get("context_size") or _DEFAULT_CONTEXT_SIZE
             )
@@ -162,7 +159,7 @@ def _decode_meta(value: Any) -> tuple[bool, int, int]:
             return think, context_size, output_size
     except (ValueError, TypeError):
         pass
-    return text == "1", _DEFAULT_CONTEXT_SIZE, _DEFAULT_OUTPUT_SIZE
+    return False, _DEFAULT_CONTEXT_SIZE, _DEFAULT_OUTPUT_SIZE
 
 
 def _encode_meta(
