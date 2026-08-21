@@ -66,6 +66,7 @@ from bocomadp.logging.logging_config import configure_logging
 from bocomadp.logging.trace_context import get_current_trace_id
 from bocomadp.logging.trace_middleware import TraceMiddleware
 from bocomadp.middleware.concurrency_guard import ConcurrencyGuardMiddleware
+from bocomadp.middleware.active_skill import ActiveSkillMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
 from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
@@ -688,6 +689,8 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
         # 最内层：捕获 guwpToken 到 ContextVar，随请求上下文透传给
         # 框架 chat-run 后台任务（agent-creator 工厂工具使用）。
         Middleware(TokenCaptureMiddleware),
+        # 解析用户消息中的 /skill_name 前缀（存入 ContextVar，供提示词注入）
+        Middleware(ActiveSkillMiddleware),
         Middleware(TraceMiddleware, enabled=trace_enabled),
         Middleware(AccessLogMiddleware, skip_paths=("/healthz", "/readyz")),
         Middleware(ErrorHandlingMiddleware),
@@ -949,6 +952,12 @@ app.include_router(workspace_files_router)
 app.include_router(oss_download_router)
 # 按凭证查询模型（含单模型绑定过滤）
 app.include_router(credential_model_router)
+# 系统提示词管理（全局默认 + 按智能体自定义）
+from bocomadp.routers.system_prompt import system_prompt_router
+app.include_router(system_prompt_router)
+# ELLM 模型管理（Redis bocomadp:model:think_tag 增删改查）
+from bocomadp.routers.ellm_models import ellm_models_router
+app.include_router(ellm_models_router)
 
 
 # ---------------------------------------------------------------------------
