@@ -86,10 +86,14 @@ class ELLMCredential(CredentialBase):
     )
     """API key 过期时间。"""
 
-    model: str = Field(
-        description="绑定的模型名——必须来自 _models/ 候选（B 方案：一凭证一模型）。",
+    model: str | None = Field(
+        default=None,
+        description=(
+            "绑定的模型名（可空，B 方案：一凭证一模型）；为空时凭证不绑定"
+            "单模型，候选模型由 list_models 返回全部。"
+        ),
     )
-    """绑定的模型名（必填，候选见 ``bocomadp/credential/_models/*.yaml``）。"""
+    """绑定的模型名（可空；候选见 ``bocomadp/providers/_models/*.yaml``）。"""
 
     # @model_validator(mode="after")
     # def _validate_model(self) -> Self:
@@ -105,13 +109,13 @@ class ELLMCredential(CredentialBase):
 
     @classmethod
     def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """动态注入 model 字段的 enum（候选来自 _models/），前端表单变下拉。"""
+        """动态注入 model 字段的 enum（候选来自 Redis list_models），前端表单变下拉。"""
         schema = super().model_json_schema(*args, **kwargs)
         candidates = [
             card.name for card in cls.get_chat_model_class().list_models()
         ]
         model_prop = schema.get("properties", {}).get("model")
-        if model_prop is not None:
+        if model_prop is not None and candidates:
             model_prop["enum"] = candidates
         return schema
 

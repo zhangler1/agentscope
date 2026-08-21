@@ -22,6 +22,7 @@ from .oss_download import oss_download_router
 from .session_usage import session_usage_router
 from .agent_tools import agent_tools_router
 from .system_prompt import system_prompt_router
+from .ellm_models import ellm_models_router
 
 __all__ = [
     "models_router",
@@ -34,4 +35,5 @@ __all__ = [
     "session_usage_router",
     "agent_tools_router",
     "system_prompt_router",
+    "ellm_models_router",
 ]
