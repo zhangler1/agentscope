@@ -13,7 +13,7 @@
 - 检索开关（行内/联网/个人三个维度）
 - 认证方案（guwp / jrt / okic / muwp 四选一）
 
-并对齐 deer-flow 的落盘机制：请求带值时持久化到会话 workspace，之后不带也能回退加载。
+并对齐 deer-flow 的持久化语义：请求带值时写入 Redis（按 session_id，TTL 4h 原生过期），之后不带也能回退加载。
 
 ## 2. 背景：为什么需要 custom_params
 
@@ -38,36 +38,40 @@ bocomadp 的解法是**把"构建时参数"转化为"运行时参数"**：用 Co
         │
         ▼
 deerflow_chat.py  路由层（FastAPI 端点）
-  1) _resolve_custom_params()   ← 带值：落盘到 workspace；不带：从 workspace 回退
+  1) _resolve_custom_params()   ← 带值：写入 Redis；不带：从 Redis 回退
   2) set_custom_params()        ← ContextVar.set(resolved)
-  3) _set_run_auth_contexts()   ← ResolvedAuth + _current_token 联动
+  3) _set_run_auth_contexts()   ← ResolvedAuth + save_auth(Redis) + _current_token 联动
   4) _spawn_run()               ← asyncio.create_task 复制当前 ContextVar 快照
   5) reset（不影响已创建的后台任务）
         │
         ▼  run 任务内（ContextVar 已复制进来）
   ┌─────────────────────────────────────────────────────────────┐
   │ AgentToolFactory → build_enterprise_tools()                 │
-  │   · vector_search_switch=False → 不挂 cross_search 工具      │
+  │   · cross_search 始终挂载                                    │
+  │   · vector_search_switch=False → 不挂 vector_search 工具     │
+  │   · online_search_switch=true → 挂 online_search             │
+  │   · personal_search_switch=true + 空间参数齐备 → 挂 personal_search │
   │                                                             │
   │ Agent 组装 → build_enterprise_middlewares()                 │
   │   · CustomPromptMiddleware.on_system_prompt → 整体覆盖提示词 │
   │                                                             │
-  │ 模型调用工具 → _SpacecodeOverrideMiddleware.on_tool_call    │
-  │   · 空间码强制覆盖 / personal_search_switch 清空个人参数     │
+  │ 模型调用工具 → PersonalSpacecodeOverrideMiddleware.on_tool_call │
+  │   · personal_search 空间码强制覆盖                           │
   │                                                             │
   │ 工具后端 → get_resolved_auth() 读取认证信息（预留消费点）     │
   └─────────────────────────────────────────────────────────────┘
         │
         ▼
-workspace: sessions/{session_id}/custom_params.json（持久化，重启可读回）
+Redis: bocomadp:session:{session_id}:custom_params（TTL 4h 原生过期，多 worker 共享）
 ```
 
 ### 3.1 涉及的 6 个文件
 
 | 文件 | 角色 |
 |---|---|
-| `bocomadp/deerflow/custom_params.py` | ContextVar 存取 + workspace 落盘/回退 |
-| `bocomadp/deerflow/auth_context.py` | 认证方案解析（ResolvedAuth）+ ContextVar |
+| `bocomadp/deerflow/custom_params.py` | ContextVar 存取 + Redis 存储委托（save/load） |
+| `bocomadp/deerflow/_session_store.py` | 会话级 Redis 存储（custom_params + auth 同 key 同 TTL） |
+| `bocomadp/deerflow/auth_context.py` | 认证方案解析（ResolvedAuth）+ ContextVar + save_auth/load_auth |
 | `bocomadp/deerflow/routers/deerflow_chat.py` | 路由层入口：resolve → set → spawn → reset |
 | `bocomadp/tools/cross_search.py` | 空间码覆盖中间件 + personal 开关参数层处理 |
 | `bocomadp/middleware/custom_prompt.py` | 自定义提示词注入中间件 |
@@ -109,30 +113,35 @@ finally:
 
 **坑二：线程池不传回。** `asyncio.to_thread` / 裸 `threading.Thread` 不会自动继承 ContextVar。如果将来某消费点被放到线程池执行，需要显式把参数传进去（当前所有消费点均在 async 上下文，无此问题）。
 
-## 5. 核心机制二：落盘持久化与回退
+## 5. 核心机制二：Redis 持久化与回退
 
-对齐 deer-flow 的 `_save_custom_params` / `_load_custom_params`：
+对齐 deer-flow 的 `_save_custom_params` / `_load_custom_params`，但存储从 workspace 文件改为**会话级 Redis**（2026-08-20 用户改选）：
 
 ```
-请求带 custom_params ──► _resolve_custom_params ──► save 到 workspace ──► 采用请求值
-请求不带 custom_params ──► 从 workspace 回退 load ──► 有文件用文件值 / 无文件用 {}
+请求带 custom_params ──► _resolve_custom_params ──► save 到 Redis ──► 采用请求值
+请求不带 custom_params ──► 从 Redis 回退 load ──► 有记录用记录值 / 无记录用 {}
 ```
 
-- **落盘路径**：`{workspace.workdir}/sessions/{session_id}/custom_params.json`
-- **落盘内容**：请求携带的原始 dict（JSON 序列化，`ensure_ascii=False`）
-- **关键设计——非致命降级**：落盘/读盘任何异常都只 `logger.warning`，不阻断 run。原因：custom_params 是"锦上添花"的配置，检索接口不可用时用户至少还能对话；若因为磁盘问题让对话直接失败，收益为负。
-- **覆盖语义**：每次带值请求整体覆盖旧文件（不是合并）。
-- **workspace 隔离**：`PER_SESSION` 隔离策略下每会话一个 workspace，路径精确；`is_persistent=False` 的沙箱类后端，落盘在会话内有效、重启丢失，自动降级为"仅本次生效"。
+- **存储**：`bocomadp/deerflow/_session_store.py`，纯 Redis、无自建清扫任务。
+  - key：`bocomadp:session:{session_id}:custom_params`
+  - hash 字段：`params`（custom_params JSON）/ `auth`（ResolvedAuth JSON）
+  - TTL：Redis 原生 `EXPIRE` 4h 自动过期，条目**同生共死**（auth 与 custom_params 一起失效）
+- **客户端**：懒加载 `redis.asyncio.Redis`（参数来自 AppConfig，连接超时 2s）；**多 worker / 多实例共享同一 Redis**，回退加载不 miss，无进程内 dict 的 worker 隔离问题。
+- **关键设计——非致命降级（fail-open）**：Redis 不可用时 save 仅 `logger.warning` 不阻断 run、load 返回 None。与 `pool_config.py` 一致；生产消息总线已是 RedisMessageBus，同设施可用性一致。
+- **覆盖语义**：每次带值请求整体覆盖旧记录（HSET 更新，不是合并）。
 
 ```python
-# custom_params.py 核心接口
+# custom_params.py 核心接口（Redis 化后）
 def set_custom_params(params) -> Token      # ContextVar.set
 def reset_custom_params(token) -> None      # ContextVar.reset
 def get_custom_params() -> dict[str, Any]   # ContextVar.get（消费点用）
 
-async def save_custom_params_to_workspace(workspace, session_id, params) -> None  # 非致命
-async def load_custom_params_from_workspace(workspace, session_id) -> dict | None # 非致命
+async def save_custom_params(session_id, params) -> None  # 委托 _session_store，非致命
+async def load_custom_params(session_id) -> dict | None   # 委托 _session_store，非致命
 ```
+
+鉴权快照同样按会话写 Redis（`save_auth` / `load_auth`，见 `auth_context.py`），与
+custom_params 同 key 同 TTL，HITL 续跑等场景一并回退恢复。
 
 ## 6. 各消费点详解
 
@@ -207,29 +216,39 @@ class CustomPromptMiddleware(MiddlewareBase):
 
 | 开关 | deer-flow 默认 | bocomadp 语义 | 生效点 |
 |---|---|---|---|
-| `vector_search_switch` | True | 显式 `False` → 不挂 cross_search 工具 | `build_enterprise_tools` |
-| `online_search_switch` | False | 显式 `True` → 挂联网搜索（预留，暂无工具） | `build_enterprise_tools` |
-| `personal_search_switch` | False | 显式 `False` → 清空个人检索参数 | cross_search 覆盖中间件 |
+| `vector_search_switch` | True | 显式 `False` → 不挂 vector_search 工具（cross_search 始终挂载） | `build_enterprise_tools` |
+| `online_search_switch` | False | 显式 `True` → 挂 online_search 联网搜索（默认不挂） | `build_enterprise_tools` |
+| `personal_search_switch` | False | 显式 `True` 且空间参数齐备 → 挂 personal_search 工具 | `build_enterprise_tools` |
 
 ```python
-# enterprise.py（工具挂载开关）
+# enterprise.py（工具挂载开关，2026-08-20 起 cross_search 不受 vector 开关控制）
 params = get_custom_params()
+tools.append(cross_search_tool)              # cross_search 始终挂载
+
 vector_switch = params.get("vector_search_switch")
 if vector_switch is False:
-    logger.info("cross_search disabled by vector_search_switch=false")
+    logger.info("vector_search disabled by vector_search_switch=false")
 else:
-    tools.append(cross_search_tool)          # 未传默认挂载（对齐 deer-flow 默认 True）
+    tools.append(vector_search_tool)          # 未传默认挂载（对齐 deer-flow 默认 True）
+
+if params.get("online_search_switch") is True:
+    tools.append(online_search_tool)          # 显式 True 才挂联网搜索
+
+pks = (params.get("tools_param") or {}).get("personalKnowledgeSearch") or {}
+if (
+    params.get("personal_search_switch") is True
+    and pks.get("psnlSpaceCodeId")
+    and pks.get("psnlCategoryIdList")
+):
+    tools.append(personal_search_tool)        # 空间参数齐备才挂独立工具
 ```
 
-```python
-# cross_search.py（参数层开关，覆盖之后执行——关闭优先于覆盖）
-if params.get("personal_search_switch") is False:
-    for key in ("psnl_space_code_id", "psnl_category_id_list"):
-        if input_kwargs.get(key):
-            input_kwargs[key] = None
-```
-
-为什么 personal 开关在**参数层**而不是工具层？因为 bocomadp 没有独立的"个人知识库搜索"工具——个人检索是 cross_search 的一个维度（`psnl_space_code_id` 参数）。deer-flow 中该开关为 False 是不挂独立工具；bocomadp 等价翻译为**禁用 cross_search 的个人检索维度**（config 中对应默认值为空，参数置 `None` 后不会回填，实现真正禁用）。
+为什么 personal 开关在**工具层**而不是参数层？2026-08-20 起 bocomadp 引入了独立的
+personal_search 工具（行内搜索之外的"个人知识库搜索"维度），空间参数
+（`psnlSpaceCodeId` / `psnlCategoryIdList`）来自 custom_params 的
+``tools_param.personalKnowledgeSearch``，由
+:class:`PersonalSpacecodeOverrideMiddleware` 强制覆盖模型传参；开关为 True
+且空间参数齐备才挂载该工具。
 
 ### 6.4 认证参数（auth_context.py + 路由联动）
 
@@ -264,12 +283,14 @@ def resolve_auth_params(custom_params) -> ResolvedAuth:
 | `customized_tag_list` | list[str] | 覆盖中间件 | 自定义标签过滤，强制覆盖 |
 | `psnl_category_id_list` | list[str] | 覆盖中间件 | 个人知识分类 ID，强制覆盖 |
 | `custom_prompt` | str | CustomPromptMiddleware | 请求级自定义提示词（整体覆盖 system 提示词） |
-| `vector_search_switch` | bool | build_enterprise_tools | 显式 False 卸载行内检索（默认挂载） |
-| `online_search_switch` | bool | build_enterprise_tools | 显式 True 挂联网搜索（预留） |
-| `personal_search_switch` | bool | 覆盖中间件 | 显式 False 禁用个人检索维度 |
+| `vector_search_switch` | bool | build_enterprise_tools | 显式 False 卸载 vector_search（默认挂载；cross_search 不受控） |
+| `online_search_switch` | bool | build_enterprise_tools | 显式 True 挂 online_search（默认不挂） |
+| `personal_search_switch` | bool | build_enterprise_tools | 显式 True 且空间参数齐备 → 挂 personal_search |
+| `tools_param.personalKnowledgeSearch` | dict | PersonalSpacecodeOverrideMiddleware | 个人空间参数（psnlSpaceCodeId / psnlCategoryIdList）强制覆盖 |
+| `tools_param.source_param` | dict | vector_search 后端 | sourceType / repository / aggRepositories / HNSSParam |
 | `guwp_token` / `jrt_auth_code` / `okic_token` / `okic_type` / `muwp_user` | str / dict | resolve_auth_params | 认证方案（优先级 guwp > jrt > okic > muwp） |
 
-未列出的 key 会被落盘保存但**静默忽略**（无消费点）。
+未列出的 key 会被保存（Redis）但**静默忽略**（无消费点）。
 
 ## 8. 教学实践：新增一个消费点（step-by-step）
 
@@ -295,7 +316,7 @@ _OVERRIDE_KEYS = (..., "max_results")   # cross_search.py
 
 **Step 3（可选）：如需在中间件/工厂装配时生效**，在对应工厂函数里读取（参见 6.3 的 `vector_search_switch` 模式）。
 
-**Step 4（可选）：如需持久化语义**——已自动获得：带值请求自动落盘、不带值请求自动回退，无需额外代码。
+**Step 4（可选）：如需持久化语义**——已自动获得：带值请求自动写入 Redis、不带值请求自动回退，无需额外代码。
 
 **Step 5：验证**。写最小验证脚本（模式见第 10 节）：set_custom_params → 触发消费点 → 断言行为 → reset。
 
@@ -313,10 +334,11 @@ _OVERRIDE_KEYS = (..., "max_results")   # cross_search.py
 | ContextVar 默认 dict 被写入 | 跨请求串台（污染共享默认值） | 消费点只读；写入只走 set |
 | 在 `create_task` 之后才 set | run 任务读不到参数 | 必须在 `_spawn_run` **之前** set |
 | 忘记 reset | 当前协程后续请求被污染 | set/reset 用 try/finally 成对出现 |
-| 落盘失败阻断对话 | 磁盘故障导致 run 失败 | 落盘/读盘一律非致命降级 |
+| Redis 不可用阻断对话 | 存储故障导致 run 失败 | save/load 一律 fail-open 非致命降级 |
 | on_reply 里找 messages | 永远拿不到（input_kwargs 仅 inputs/structured_schema） | 提示词覆盖用 `on_system_prompt`（transformer 模式） |
 | ReAct 多轮重复注入提示词 | 每轮 system 消息翻倍 | transformer 模式天然幂等，每轮返回同一 custom_prompt |
 | `vector_search_switch` 用 `not` 判断 | 未传时误判为关闭 | 显式 `is False` 才卸载（默认挂载） |
+| 在 `create_task` 之后 set 认证 | run 任务读不到 ResolvedAuth | 必须在 `_spawn_run` 之前 set |
 
 ## 10. 如何验证
 
@@ -341,16 +363,15 @@ CustomPromptMiddleware._ensure_system_message(msg_objs, "PROMPT")   # True（插
 CustomPromptMiddleware._ensure_system_message(msg_objs, "PROMPT")   # False（去重）
 
 # 3) 中间件覆盖（set_custom_params 后调用 on_tool_call，断言 input_kwargs 被纠正）
-# 4) personal_search_switch=False → psnl_* 参数清空、space_code_list 保留
-# 5) vector_search_switch=False → build_enterprise_tools 不含 cross_search
+# 4) personal_search_switch=true + 空间参数齐备 → build_enterprise_tools 含 personal_search
+# 5) vector_search_switch=False → build_enterprise_tools 不含 vector_search（cross_search 仍含）
 ```
 
 **端到端验证**（运行时）：启动 bocomadp 服务后，`POST /threads/{id}/runs/stream` 携带 custom_params，观察日志：
 
 - `SpacecodeOverride: space_code_list ['WRONG'] -> ['S1']`（覆盖生效）
 - `CustomPromptMiddleware: custom_prompt overrides system prompt (was N chars, now M chars)`（提示词整体覆盖）
-- `deerflow: saved custom_params for session ...`（落盘）
-- 再次请求不带 custom_params 时，覆盖日志仍出现（回退加载生效）
+- 再次请求不带 custom_params 时，覆盖日志仍出现（Redis 回退加载生效）
 
 ## 11. 与 deer-flow 的语义对照
 
@@ -358,9 +379,10 @@ CustomPromptMiddleware._ensure_system_message(msg_objs, "PROMPT")   # False（�
 |---|---|---|---|
 | 空间码注入 | SpacecodeOverrideMiddleware 读落盘文件 | 工具中间件读 ContextVar | 数据源不同（文件 vs 内存），覆盖语义一致 |
 | custom_prompt | 构建时整体替换 system_prompt | `on_system_prompt` 整体覆盖 | 语义一致（无差异） |
-| 检索开关 | 构建时过滤工具列表 | 工具工厂 + 参数层双处理 | personal 开关降维到参数层（无独立个人工具） |
+| 检索开关 | 构建时过滤工具列表 | 工具工厂挂载开关 | vector/online/personal 均以开关决定挂载 |
 | 认证解析 | _resolve_auth_params | resolve_auth_params | 优先级、字段、降级逻辑逐一对齐 |
-| 落盘 | threads/{thread_id}/custom_params.json | sessions/{session_id}/custom_params.json | 路径语义对齐（workspace 布局不同） |
+| 持久化 | threads/{thread_id}/custom_params.json | Redis key `bocomadp:session:{sid}:custom_params` | 文件 → Redis（TTL 4h），auth 同 key 同 TTL |
+| 多实例隔离 | 每进程一份（文件/内存） | 多 worker 共享同一 Redis | 回退加载跨实例不 miss |
 
 ## 12. curl 验证手册（端到端）
 
@@ -383,7 +405,7 @@ curl -s http://localhost:8000/healthz
 - `custom_params` 放在请求体顶层，为任意 JSON 对象。
 - **观察方式**：SSE 输出看 curl 终端；注入/覆盖日志看 **uvicorn 服务端终端**。
 
-### 12.1 首次带 custom_params 请求（落盘 + 提示词注入）
+### 12.1 首次带 custom_params 请求（Redis 写入 + 提示词注入）
 
 ```bash
 curl -N -X POST http://localhost:8000/api/threads/t-verify-1/runs/stream \
@@ -407,7 +429,6 @@ curl -N -X POST http://localhost:8000/api/threads/t-verify-1/runs/stream \
 **服务端日志预期**：
 
 ```text
-deerflow: saved custom_params for session t-verify-1: {...}   ← 落盘生效
 CustomPromptMiddleware: custom_prompt overrides system prompt (was N chars, now M chars)   ← 提示词整体覆盖
 ```
 
@@ -425,7 +446,7 @@ curl -N -X POST http://localhost:8000/api/threads/t-verify-1/runs/stream \
   }'
 ```
 
-**预期**：请求体没有 custom_params，但 `CustomPromptMiddleware: custom_prompt overrides system prompt` 仍出现——证明参数从 workspace 落盘文件回退加载成功。
+**预期**：请求体没有 custom_params，但 `CustomPromptMiddleware: custom_prompt overrides system prompt` 仍出现——证明参数从 Redis（按 session_id）回退加载成功。
 
 ### 12.3 触发检索工具验证空间码覆盖
 
@@ -454,7 +475,7 @@ SpacecodeOverride: user_code ... -> 'U001'
 
 无论模型传什么值，都会被请求方指定的空间码纠正。
 
-### 12.4 新值覆盖旧值（落盘覆盖语义）
+### 12.4 新值覆盖旧值（Redis 覆盖语义）
 
 对**同一个 thread**（t-verify-2）换 `user_code` 再请求，然后回到 12.2 观察回退值：
 
@@ -469,7 +490,7 @@ curl -s -X POST http://localhost:8000/api/threads/t-verify-2/runs/wait \
   }'
 ```
 
-**预期**：落盘文件被整体覆盖（非合并）；此后不带 custom_params 的请求回退到的就是 `U002 / SP0000002`。
+**预期**：Redis 记录被整体覆盖（HSET 更新，非合并）；此后不带 custom_params 的请求回退到的就是 `U002 / SP0000002`。
 
 ### 12.5 检索开关：vector_search_switch=false
 
@@ -487,12 +508,12 @@ curl -N -X POST http://localhost:8000/api/threads/t-verify-3/runs/stream \
 **服务端日志预期**：
 
 ```text
-enterprise tools: cross_search disabled by vector_search_switch=false (session=t-verify-3)
+enterprise tools: vector_search disabled by vector_search_switch=false (session=t-verify-3)
 ```
 
-模型拿不到 cross_search 工具，会直接回复“没有该工具”或改用其他方式。
+`vector_search_switch=false` 仅卸载行内搜索工具（vector_search）；cross_search 仍始终挂载。
 
-### 12.6 检索开关：personal_search_switch=false
+### 12.6 检索开关：personal_search_switch=true + 空间参数齐备
 
 ```bash
 curl -N -X POST http://localhost:8000/api/threads/t-verify-4/runs/stream \
@@ -500,44 +521,49 @@ curl -N -X POST http://localhost:8000/api/threads/t-verify-4/runs/stream \
   -H 'X-User-ID: tester' \
   -d '{
     "assistant_id": "lead_agent",
-    "input": {"type": "human", "content": "请用 cross_search 工具检索“组织架构”"},
+    "input": {"type": "human", "content": "请在个人知识库中检索“组织架构”"},
     "custom_params": {
-      "space_code_list": ["SP0000001"],
-      "psnl_space_code_id": "PSNL-XYZ",
-      "personal_search_switch": false
+      "personal_search_switch": true,
+      "tools_param": {
+        "personalKnowledgeSearch": {
+          "psnlSpaceCodeId": "PSNL-XYZ",
+          "psnlCategoryIdList": ["CATE1"]
+        }
+      }
     }
   }'
 ```
 
-**服务端日志预期**（模型调用工具时）：
+**预期**：`personal_search_switch` 显式 `True` 且空间参数齐备 → 挂载 personal_search
+工具；模型调用时由 `PersonalSpacecodeOverrideMiddleware` 强制覆盖空间参数（日志前缀
+`PersonalSpacecodeOverride:`）。
 
-```text
-SpacecodeOverride: space_code_list [...] -> ['SP0000001']
-SpacecodeOverride: personal_search_switch=false, psnl_space_code_id 'PSNL-XYZ' -> None
-```
+> 仅开关为 True 但空间参数缺失（无 psnlSpaceCodeId 或 psnlCategoryIdList）时不挂载
+> 该工具（见 `build_enterprise_tools`）。
 
-即使 custom_params 同时给了个人空间码，关闭开关也优先清空（关闭优先于覆盖）。
-
-### 12.7 查看落盘文件（持久化证据）
+### 12.7 查看 Redis 存储（持久化证据）
 
 ```bash
-# 在 agent_service 目录下
-find workspaces -name custom_params.json | sort
-cat "$(find workspaces -path '*t-verify-2/custom_params.json' | head -1)"
-# 预期内容（12.4 覆盖后的值）：
+# 连接 AppConfig.redis 对应实例（默认 localhost:6379）
+redis-cli keys 'bocomadp:session:*'
+redis-cli hgetall 'bocomadp:session:t-verify-2:custom_params'
+# 预期 params 字段为 12.4 覆盖后的值：
 # {"user_code": "U002", "space_code_list": ["SP0000002"]}
+redis-cli ttl 'bocomadp:session:t-verify-2:custom_params'   # 剩余 TTL（<4h）
 ```
 
-> 路径结构：`{workspace.workdir}/sessions/{session_id}/custom_params.json`；沙箱/非持久 workspace 重启后文件丢失，自动降级为“仅本次生效”。
+> key 语义：`bocomadp:session:{session_id}:custom_params`，hash 字段 `params`（custom_params）
+> 与 `auth`（ResolvedAuth）同 key 同 TTL（4h 原生过期）。Redis 不可用时 save/load 均
+> fail-open 降级，不阻断 run。
 
 ### 12.8 验证 checklist
 
 | # | 场景 | curl | 通过标准 |
 |---|---|---|---|
-| 1 | 带 params 首次请求 | 12.1 | 日志出现 `saved custom_params` + `custom_prompt overrides system prompt` |
-| 2 | 不带 params 回退 | 12.2 | `custom_prompt overrides system prompt` 仍出现 |
+| 1 | 带 params 首次请求 | 12.1 | `custom_prompt overrides system prompt` 日志出现 |
+| 2 | 不带 params 回退 | 12.2 | `custom_prompt overrides system prompt` 仍出现（Redis 回退） |
 | 3 | 空间码覆盖 | 12.3 | 日志 `SpacecodeOverride: space_code_list ... -> ['SP0000001']` |
-| 4 | 落盘覆盖语义 | 12.4 | 文件内容变为 U002 / SP0000002 |
-| 5 | 行内检索开关 | 12.5 | 日志 `cross_search disabled by vector_search_switch=false` |
-| 6 | 个人检索开关 | 12.6 | 日志 `personal_search_switch=false, psnl_space_code_id ... -> None` |
-| 7 | 落盘文件 | 12.7 | `find` 找到文件且内容正确 |
+| 4 | Redis 覆盖语义 | 12.4 | Redis `params` 字段变为 U002 / SP0000002 |
+| 5 | 行内检索开关 | 12.5 | 日志 `vector_search disabled by vector_search_switch=false` |
+| 6 | 个人检索挂载 | 12.6 | `personal_search_switch=true` + 空间参数齐备 → 挂 personal_search |
+| 7 | Redis 持久化 | 12.7 | `redis-cli hgetall` 取到记录且 TTL<4h |

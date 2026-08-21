@@ -71,12 +71,13 @@ from ..credentials import (
 from ..auth_context import (
     reset_resolved_auth,
     resolve_auth_params,
+    save_auth,
     set_resolved_auth,
 )
 from ..custom_params import (
-    load_custom_params_from_workspace,
+    load_custom_params,
     reset_custom_params,
-    save_custom_params_to_workspace,
+    save_custom_params,
     set_custom_params,
 )
 from ..deps import (
@@ -711,80 +712,20 @@ async def _ensure_session(
 
 
 async def _resolve_custom_params(
-    storage: StorageBase,
-    workspace_manager: WorkspaceManagerBase,
-    user_id: str,
-    agent_id: str,
     session_id: str,
     requested: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """解析本次 run 的 custom_params（对齐 deer-flow ``_resolve_custom_params``）。
+    """解析本次 run 的 custom_params（Redis 存储版）。
 
-    请求携带 custom_params → 落盘到会话绑定的 workspace（后续请求可
-    回退恢复）并直接采用；未携带 → 从会话 workspace 的落盘文件回退
-    加载（HITL 确认续跑等场景空间码约束持续生效）。
-
-    workspace 解析复用与 skill_router 相同的 DB 持久化路径
-    （``session.config.workspace_id``），任意隔离策略下都精确；落盘 /
-    读盘非致命——workspace 不可用或文件缺失时降级为空 dict，不阻断
-    run 创建。
+    请求携带 custom_params → 写入 Redis（按 session_id，TTL 4h 原生过期）
+    并直接采用；未携带 → 从 Redis 回退加载（HITL 确认续跑等场景空间码
+    约束持续生效）。Redis 不可用 fail-open（返回空 dict 不阻断 run）；
+    多 worker 实例共享同一 Redis，回退加载不 miss。
     """
     if requested is not None:
-        # 运行时覆盖——落盘供后续请求恢复（对齐 deer-flow 保存语义）
-        session_record = await storage.get_session(
-            user_id,
-            agent_id,
-            session_id,
-        )
-        if session_record is not None:
-            try:
-                workspace = await workspace_manager.get_workspace(
-                    user_id,
-                    agent_id,
-                    session_id,
-                    session_record.config.workspace_id,
-                )
-                await save_custom_params_to_workspace(
-                    workspace,
-                    session_id,
-                    requested,
-                )
-            except Exception:  # noqa: BLE001 —— 落盘失败不阻断 run 创建
-                logger.warning(
-                    "deerflow: workspace unavailable for session %s; "
-                    "custom_params persist skipped",
-                    session_id,
-                    exc_info=True,
-                )
+        await save_custom_params(session_id, requested)
         return requested
-
-    # 无运行时值——尝试从会话 workspace 回退加载
-    session_record = await storage.get_session(
-        user_id,
-        agent_id,
-        session_id,
-    )
-    if session_record is None:
-        return {}
-    try:
-        workspace = await workspace_manager.get_workspace(
-            user_id,
-            agent_id,
-            session_id,
-            session_record.config.workspace_id,
-        )
-        loaded = await load_custom_params_from_workspace(
-            workspace,
-            session_id,
-        )
-    except Exception:  # noqa: BLE001 —— 读盘失败降级为空 dict
-        logger.warning(
-            "deerflow: workspace unavailable for session %s; "
-            "custom_params fallback skipped",
-            session_id,
-            exc_info=True,
-        )
-        return {}
+    loaded = await load_custom_params(session_id)
     return loaded or {}
 
 
@@ -834,10 +775,14 @@ async def _download_additional_urls(
             )
 
 
-def _set_run_auth_contexts(
+async def _set_run_auth_contexts(
+    session_id: str,
     params: dict[str, Any],
 ) -> dict[str, Token]:
     """spawn 前注入认证上下文：ResolvedAuth + guwp token 联动。
+
+    同时把解析出的 ResolvedAuth 快照写入 Redis（``save_auth``），供会话级
+    回退加载（与 custom_params 同 key 同 TTL，一起过期）。
 
     对齐 deer-flow ``_resolve_auth_params``：把 custom_params 的认证
     字段解析为 :class:`ResolvedAuth` 写入 ContextVar，供 run 任务内的
@@ -851,7 +796,9 @@ def _set_run_auth_contexts(
     （``asyncio.create_task`` 已复制上下文快照，reset 不影响后台任务）。
     """
     tokens: dict[str, Token] = {}
-    tokens["auth"] = set_resolved_auth(resolve_auth_params(params))
+    resolved_auth = resolve_auth_params(params)
+    tokens["auth"] = set_resolved_auth(resolved_auth)
+    await save_auth(session_id, resolved_auth)
     guwp_token = str(params.get("guwp_token") or "")
     if guwp_token:
         from bocomadp.tools.agent_factory_tools import _current_token
@@ -1245,15 +1192,11 @@ async def create_run_stream(
         workspace_manager,
     )
     resolved_params = await _resolve_custom_params(
-        storage,
-        workspace_manager,
-        user_id,
-        agent_id,
         session_id,
         body.custom_params,
     )
     ctx_token = set_custom_params(resolved_params)
-    auth_tokens = _set_run_auth_contexts(resolved_params)
+    auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
         record, _task = _spawn_run(
             run_manager,
@@ -1343,15 +1286,11 @@ async def create_run_wait(
         workspace_manager,
     )
     resolved_params = await _resolve_custom_params(
-        storage,
-        workspace_manager,
-        user_id,
-        agent_id,
         session_id,
         body.custom_params,
     )
     ctx_token = set_custom_params(resolved_params)
-    auth_tokens = _set_run_auth_contexts(resolved_params)
+    auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
         record, task = _spawn_run(
             run_manager,
