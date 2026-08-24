@@ -29,7 +29,7 @@ from ..config.personal_search_config import get_personal_search_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
 from ..deerflow.custom_params import get_custom_params
 
-logger = logging.getLogger(__name__)
+_events_logger = logging.getLogger("as")
 
 
 def _build_request_body(
@@ -87,7 +87,7 @@ def _extract_results(payload: dict[str, Any], keyword: str) -> list[dict[str, An
     response_head = payload.get("RSP_HEAD", {})
     if response_head and response_head.get("TRAN_SUCCESS") != "1":
         # 用户约束：非成功时以 debug 级别打印完整原始响应
-        logger.debug("personal_search origin response: %s", payload)
+        _events_logger.debug("personal_search origin response: %s", payload)
         return [
             {
                 "error": (
@@ -99,7 +99,7 @@ def _extract_results(payload: dict[str, Any], keyword: str) -> list[dict[str, An
 
     all_entries = payload.get("RSP_BODY", {}).get("result", [])
     if not isinstance(all_entries, list):
-        logger.warning(
+        _events_logger.warning(
             "Personal search returned unexpected result payload: %s",
             all_entries,
         )
@@ -138,11 +138,11 @@ async def search_personal_backend(
         response = await client.post(
             config.api_url,
             headers=headers,
-            data={"REQ_MESSAGE": (None, json.dumps(body, ensure_ascii=False))},
+            files={"REQ_MESSAGE": (None, json.dumps(body, ensure_ascii=False))},
         )
         response.raise_for_status()
 
-    logger.debug("Personal search raw response body: %s", response.text)
+    _events_logger.debug("Personal search raw response body: %s", response.text)
     try:
         payload = response.json()
     except ValueError as exc:
@@ -172,7 +172,7 @@ class PersonalSpacecodeOverrideMiddleware(ToolMiddlewareBase):
         if space_code_id is not None and isinstance(space_code_id, str):
             previous = input_kwargs.get("space_code_id")
             input_kwargs["space_code_id"] = space_code_id
-            logger.info(
+            _events_logger.debug(
                 "PersonalSpacecodeOverride: space_code_id %r -> %r",
                 previous,
                 space_code_id,
@@ -189,7 +189,7 @@ class PersonalSpacecodeOverrideMiddleware(ToolMiddlewareBase):
             if normalized:
                 previous = input_kwargs.get("space_code")
                 input_kwargs["space_code"] = normalized
-                logger.info(
+                _events_logger.debug(
                     "PersonalSpacecodeOverride: space_code %r -> %r",
                     previous,
                     normalized,
@@ -231,13 +231,13 @@ async def _personal_search_tool_impl(
             space_code=space_code,
         )
     except httpx.TimeoutException:
-        logger.error("Personal search request timed out.", exc_info=True)
+        _events_logger.error("Personal search request timed out.", exc_info=True)
         return json.dumps(
             [{"error": "personal search request timed out."}],
             ensure_ascii=False,
         )
     except httpx.HTTPError as exc:
-        logger.error("Personal search request failed: %s", exc, exc_info=True)
+        _events_logger.error("Personal search request failed: %s", exc, exc_info=True)
         return json.dumps(
             [{"error": f"personal search request failed: {exc}"}],
             ensure_ascii=False,
@@ -245,7 +245,7 @@ async def _personal_search_tool_impl(
     except ValueError as exc:
         return json.dumps([{"error": f"{exc}"}], ensure_ascii=False)
     except Exception as exc:
-        logger.error("Unexpected personal search error: %s", exc, exc_info=True)
+        _events_logger.error("Unexpected personal search error: %s", exc, exc_info=True)
         return json.dumps(
             [{"error": f"personal search failed: {exc}"}],
             ensure_ascii=False,

@@ -201,6 +201,24 @@ def _convert_input(raw: Any) -> Any:
     )
 
 
+def _attach_files_metadata(input_msg: Any, files: list | None) -> None:
+    """把 ``custom_params.files`` 附加到 human 消息的 metadata。
+
+    UploadsMiddleware 从 human 消息的 ``metadata.files``（或旧版
+    ``additional_kwargs.files``）提取文件引用并渲染 ``<context name="files">``；
+    而 deerflow 兼容路径的消息转换（:func:`_langgraph_message_to_msg`）会丢弃
+    ``additional_kwargs``，故文件引用改经 ``custom_params.files`` 透传，在此统一
+    挂载到 ``Msg.metadata``，与原生 ``/chat/`` 路径的注入通道对齐。事件类输入
+    （确认卡片 / 外部结果续跑，Case B）无新文件，跳过。
+    """
+    if not files:
+        return
+    msgs = input_msg if isinstance(input_msg, list) else [input_msg]
+    for m in msgs:
+        if isinstance(m, Msg):
+            m.metadata["files"] = files
+
+
 def _msg_to_human_chunk(msg: Msg) -> dict[str, Any]:
     """原生 Msg（用户输入）→ LangGraph human 消息 chunk。
 
@@ -1144,6 +1162,10 @@ async def create_run_stream(
         _resolve_agent_id(body),
     )
     converted = _convert_input(body.input)
+    # 文件引用经 custom_params.files 透传：附加到 human 消息 metadata，
+    # 供 UploadsMiddleware 注入 <context name="files">（_langgraph_message_to_msg
+    # 丢弃 additional_kwargs，无法走消息内通道）。
+    _attach_files_metadata(converted, (body.custom_params or {}).get("files"))
     # 请求级模型名（custom_params.llm_model_name，唯一通道），在
     # custom_params 落盘/回退之前解析——首次建会话时 workspace 尚不存在，
     # 直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
@@ -1260,6 +1282,9 @@ async def create_run_wait(
         _resolve_agent_id(body),
     )
     input_msg = _convert_input(body.input)
+    # 同 create_run_stream：custom_params.files 附加到 human 消息 metadata，
+    # 供 UploadsMiddleware 注入 <context name="files">。
+    _attach_files_metadata(input_msg, (body.custom_params or {}).get("files"))
     # 同 create_run_stream：先解析请求级模型名（custom_params 唯一通道）
     # 再懒建会话。
     model_name_hint = _resolve_requested_model_name(body.custom_params)

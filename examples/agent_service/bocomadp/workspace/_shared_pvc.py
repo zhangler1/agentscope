@@ -78,6 +78,28 @@ DEFAULT_USER_UPLOADS_DIR = "uploads"
 
 _K8S_LABEL_UNSAFE_RE = re.compile(r"[^a-zA-Z0-9-_.]")
 
+
+#: 默认 K8s API 请求超时（秒）：kubernetes_asyncio 默认无限等待，
+#: apiserver 假死/网络抖动时协程会永久挂起，此处统一注入超时。
+_K8S_REQUEST_TIMEOUT_SECS = 30.0
+
+
+def _patch_api_client_timeout(api_client: Any, timeout: float) -> None:
+    """给 ApiClient 注入默认请求超时（不影响显式传入的调用）。
+
+    kubernetes_asyncio 的 API 方法把 ``_request_timeout`` 透传给
+    :meth:`call_api`，默认 ``None`` 表示无限等待。包装 ``call_api``
+    在未显式指定时填入默认值，避免 apiserver 假死导致协程永久挂起。
+    """
+    orig_call_api = api_client.call_api
+
+    def call_api(*args: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("_request_timeout"):
+            kwargs["_request_timeout"] = timeout
+        return orig_call_api(*args, **kwargs)
+
+    api_client.call_api = call_api
+
 #: Pod annotation key：池 Pod 最近活跃时间（unix 秒，字符串）。
 #: hash 路由每次选中 Pod 时由 ``_touch_last_active`` 刷新；sweeper
 #: 据此判断 agent 的池是否整体闲置（超 ``pool_idle_ttl`` 全回收）。
@@ -420,6 +442,10 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
                 await k8s_config.load_kube_config()
 
         self._api_client = k8s_client.ApiClient()
+        _patch_api_client_timeout(
+            self._api_client,
+            _K8S_REQUEST_TIMEOUT_SECS,
+        )
         self._v1 = k8s_client.CoreV1Api(self._api_client)
 
         if self._assigned_pod_name:
@@ -674,6 +700,23 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
     # 短 TTL 平衡热更新时效性与 Redis 往返开销
     POOL_SIZE_CACHE_TTL = 5.0
 
+    # ── 超时与告警阈值（秒）──
+    # K8s API 请求默认超时（经由 _patch_api_client_timeout 注入）
+    K8S_REQUEST_TIMEOUT_SECS = 30.0
+    # workspace 初始化（exec/bootstrap/网关）整体超时：初始化发生在
+    # manager 锁内，超时必须退出并释放锁，否则后续所有会话排队等锁。
+    # 注意不能短于首次 bootstrap：沙箱 bootstrap 每条命令上限
+    # 1800s（apt-get/uv/pip 串行，见框架 _bootstrap_cmd_timeout），
+    # 此处只兑底防"无限挂起"，正常耗时靠各细粒度超时（REST 30s、
+    # exec 60s、等 Running 120s）保障，不会被本值掩盖。
+    WORKSPACE_INIT_TIMEOUT_SECS = 2400.0
+    # manager 锁等待告警阈值：超过则打 warning，用于定位锁连坐问题
+    MANAGER_LOCK_WARN_SECS = 10.0
+    # 池路由（选 Pod + 补建 + 预热网关）整体超时：包含等 Running
+    # 120s + 三条 exec（各 60s）+ 健康轮询 15s，最坏累计数百秒，
+    # 600s 兑底不误杀正常路径；超时抛异常走失败路径而非永久挂起
+    POD_ROUTE_TIMEOUT_SECS = 600.0
+
     def __init__(
         self,
         *,
@@ -757,6 +800,28 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
 
     # ── 覆盖 get_workspace ──────────────────────────────────────
 
+    async def _acquire_lock_with_warning(self, stage: str) -> None:
+        """获取 manager 锁；等待超过阈值时打告警。
+
+        锁内包含 ``_build_and_start``（沙箱初始化，可能分钟级）。若某个
+        holder 卡死（如 K8s/exec 挂起），后续所有 ``get_workspace`` 会
+        在此排队——告警日志是定位"锁连坐"问题的关键埋点。
+        """
+        try:
+            await asyncio.wait_for(
+                self._lock.acquire(),
+                timeout=self.MANAGER_LOCK_WARN_SECS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "SharedPvcK8sWorkspaceManager: manager lock busy for "
+                ">%.0fs (stage=%s) — possible stuck holder blocks all "
+                "get_workspace calls",
+                self.MANAGER_LOCK_WARN_SECS,
+                stage,
+            )
+            await self._lock.acquire()
+
     async def get_workspace(
         self,
         user_id: str,
@@ -776,6 +841,13 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         Returns:
             `SharedPvcK8sWorkspace`: 已初始化的 workspace。
         """
+        logger.info(
+            "SharedPvcK8sWorkspaceManager: get_workspace start "
+            "(session=%r, agent=%r, workspace_id=%r)",
+            session_id,
+            agent_id,
+            workspace_id,
+        )
         if workspace_id is None:
             workspace_id = self.assign_workspace_id(
                 user_id=user_id,
@@ -792,12 +864,15 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
 
         # ── 缓存查找（session-scoped key） ──
         cached_ws: SharedPvcK8sWorkspace | None = None
-        async with self._lock:
+        await self._acquire_lock_with_warning("cache lookup")
+        try:
             cached = self._cache.get(workspace_id)
             if cached is not None:
                 ws, _ = cached
                 self._cache[workspace_id] = (ws, time.monotonic())
                 cached_ws = ws
+        finally:
+            self._lock.release()
 
         if cached_ws is not None:
             # ── 挂载前自检：池 Pod 可能已被任意实例的 sweeper ──
@@ -805,6 +880,11 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             # 驱逐走重建。多实例部署下其他实例的缓存无法被本
             # 实例 sweeper 清理（其 sweeper 只扫现存 Pod），
             # 自检是跨实例正确性的唯一保障。
+            logger.info(
+                "SharedPvcK8sWorkspaceManager: cache hit for ws %r; "
+                "probing backend aliveness",
+                workspace_id,
+            )
             if await self._ws_backend_alive(cached_ws):
                 return cached_ws  # type: ignore[return-value]
             logger.info(
@@ -812,21 +892,36 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 "stale; evict and rebuild",
                 workspace_id,
             )
-            async with self._lock:
+            await self._acquire_lock_with_warning("cache evict")
+            try:
                 cur = self._cache.get(workspace_id)
                 if cur is not None and cur[0] is cached_ws:
                     self._cache.pop(workspace_id, None)
+            finally:
+                self._lock.release()
             await self._safe_close(cached_ws)
 
         # ── hash 路由选 Pod（不可用顺延，选中后刷新活跃时间） ──
         pool_size = await self._get_pool_size(agent_id)
+        logger.info(
+            "SharedPvcK8sWorkspaceManager: pool_size=%d for agent %r; "
+            "routing session %r",
+            pool_size,
+            agent_id,
+            session_id,
+        )
         pod_name = ""
         if pool_size > 0:
-            pod_name = await self._route_pod(
-                agent_hash,
-                agent_id,
-                session_id,
-                pool_size,
+            # 整体超时兑底：_route_pod 内含补建 Pod、预热网关（exec）
+            # 等分钟级操作，任一环节挂起都会卡死本次 run
+            pod_name = await asyncio.wait_for(
+                self._route_pod(
+                    agent_hash,
+                    agent_id,
+                    session_id,
+                    pool_size,
+                ),
+                timeout=self.POD_ROUTE_TIMEOUT_SECS,
             )
             logger.info(
                 "SharedPvcK8sWorkspaceManager: routed session %r "
@@ -836,20 +931,40 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 agent_id,
             )
 
-        async with self._lock:
+        # ── 构建/初始化 workspace（锁内；整体超时防止锁被永久持有） ──
+        await self._acquire_lock_with_warning("build workspace")
+        try:
             cached = self._cache.get(workspace_id)
             if cached is not None:
                 ws, _ = cached
                 self._cache[workspace_id] = (ws, time.monotonic())
                 return ws  # type: ignore[return-value]
 
-            ws = await self._build_and_start(
-                workspace_id=workspace_id,
-                shared_pvc_name=shared_pvc_name,
-                session_id=session_id,
-                pod_name=pod_name,
+            logger.info(
+                "SharedPvcK8sWorkspaceManager: building workspace %r "
+                "(pod=%r, init timeout=%.0fs)",
+                workspace_id,
+                pod_name,
+                self.WORKSPACE_INIT_TIMEOUT_SECS,
+            )
+            ws = await asyncio.wait_for(
+                self._build_and_start(
+                    workspace_id=workspace_id,
+                    shared_pvc_name=shared_pvc_name,
+                    session_id=session_id,
+                    pod_name=pod_name,
+                ),
+                timeout=self.WORKSPACE_INIT_TIMEOUT_SECS,
             )
             self._cache[workspace_id] = (ws, time.monotonic())
+        finally:
+            self._lock.release()
+        logger.info(
+            "SharedPvcK8sWorkspaceManager: get_workspace done "
+            "(session=%r, workdir=%s)",
+            session_id,
+            ws.workdir,
+        )
         return ws  # type: ignore[return-value]
 
     async def _build_and_start(
@@ -922,6 +1037,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 except k8s_config.ConfigException:
                     await k8s_config.load_kube_config()
             self._k8s_api_client = k8s_client.ApiClient()
+            _patch_api_client_timeout(
+                self._k8s_api_client,
+                self.K8S_REQUEST_TIMEOUT_SECS,
+            )
             self._k8s_v1 = k8s_client.CoreV1Api(self._k8s_api_client)
 
     async def _get_pool_size(self, agent_id: str) -> int:
@@ -1287,6 +1406,8 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         await backend.exec_shell(
             ["mkdir", "-p", shared_dir],
             cwd="/",
+            # exec 走 WebSocket，挂起时不抛异常；显式超时防永久等待
+            timeout=60.0,
         )
         if not await backend.file_exists(mcp_file):
             payload = json.dumps(
@@ -1316,6 +1437,7 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         await backend.exec_shell(
             ["sh", "-c", "pkill -f '[_]mcp_gateway_app.py' || true"],
             cwd="/",
+            timeout=60.0,
         )
         launch_cmd = (
             f"nohup {shlex.quote(gateway_python)} -u "
@@ -1324,7 +1446,11 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             f"--port {self._gateway_port} "
             f"> {shlex.quote(gateway_log)} 2>&1 &"
         )
-        await backend.exec_shell(["sh", "-c", launch_cmd], cwd="/")
+        await backend.exec_shell(
+            ["sh", "-c", launch_cmd],
+            cwd="/",
+            timeout=60.0,
+        )
 
         # 5. 轮询健康（最多 ~15s）
         deadline = time.monotonic() + 15.0
