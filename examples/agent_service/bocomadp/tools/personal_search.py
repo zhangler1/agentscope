@@ -256,7 +256,8 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
     personal_search_tool = FunctionTool(
         _personal_search_tool_impl,
         # 工具名（按用户要求中文化）
-        name="个人知识库搜索",
+        # [对比测试临时改动] 行外 deepseek-chat 联调：改回英文名。
+        name="personal_knowledge_search",
         is_read_only=True,
         middlewares=[PersonalSpacecodeOverrideMiddleware()],
     )

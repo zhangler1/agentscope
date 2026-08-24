@@ -151,7 +151,8 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
     online_search_tool = FunctionTool(
         _online_search_tool_impl,
         # 工具函数名必须是 ^[a-zA-Z0-9_-]+$（DeepSeek 等 API 强校验）
-        name="联网搜索",
+        # [对比测试临时改动] 行外 deepseek-chat 联调：改回英文名。
+        name="online_search",
         is_read_only=True,
     )
 else:

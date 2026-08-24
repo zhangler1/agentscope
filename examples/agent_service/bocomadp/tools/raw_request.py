@@ -153,7 +153,8 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
         # 注意：行外 DeepSeek 等 API 强校验工具名 ^[a-zA-Z0-9_-]+$，
         # 中文名会被 400 拒收；行内网关不校验，可正常使用。行外环境
         # 如需兼容，可临时改回英文名 raw_request_tool。
-        name="外数查",
+        # [对比测试临时改动] 行外 deepseek-chat 联调：改回英文名。
+        name="raw_request_tool",
         is_read_only=True,
     )
 else:
