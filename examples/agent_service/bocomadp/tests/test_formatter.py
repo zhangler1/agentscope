@@ -181,5 +181,21 @@ def test_tool_result_only_emits_on_end(fmt):
     assert chunk["name"] == "bash"
     assert chunk["tool_call_id"] == "c1"
     assert chunk["id"] == "tool:c1"
+    assert chunk["status"] == "success"  # 无 state 默认成功（对齐官方）
+    assert chunk["artifact"] is None
     assert metadata == {"langgraph_node": "agent"}
     assert evt.event != "custom"
+
+
+def test_tool_result_state_maps_to_status(fmt):
+    """对齐官方 ToolStatus 两值语义：success 之外一律 error。"""
+    for state in ("error", "interrupted", "denied"):
+        out = fmt.translate(
+            _evt(
+                "TOOL_RESULT_END",
+                tool_call_id="c1",
+                reply_id="r1",
+                state=state,
+            ),
+        )
+        assert out[0].data[0]["status"] == "error"

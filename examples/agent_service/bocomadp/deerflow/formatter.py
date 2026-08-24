@@ -13,7 +13,7 @@
 | ``TextBlock*``                | ``messages``           | ``[{"type": "AIMessageChunk", "content", "id"}, metadata]`` |
 | ``ThinkingBlock*``            | ``messages``           | chunk 附 ``additional_kwargs.reasoning_content``，metadata 附 ``reasoning: true`` |
 | ``ToolCallStart/Delta/End``   | ``messages`` + ``updates`` | 流式 ``AIMessageChunk`` 增量帧（``tool_call_chunks`` 首片带 name/id/index、delta 片只带 args，官方前端 SDK 按同 id concat 出 tool_calls）+ end 时 ``{"model": {"messages": [...]}}`` 完整 ai 消息快照（updates 帧，jx_chat 前端消费） |
-| ``ToolResultStart/Text/End``  | ``messages``           | ``[{"type": "tool", "content", "name", "tool_call_id", "id"}, metadata]`` |
+| ``ToolResultStart/Text/End``  | ``messages``           | ``[{"type": "tool", "content", "name", "tool_call_id", "id", "status", "artifact"}, metadata]`` |
 | ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
 | ``ReplyEndEvent(normal)``     | ``end``                | 哨兵（data=None）                          |
@@ -419,6 +419,10 @@ class DeerflowSSEFormatter:
         jx_chat 前端按 name 解析搜索溯源 / 追加 ask_clarification 文本。
         """
         call_id = str(event.get("tool_call_id", ""))
+        # 官方 ToolMessage 带 status/artifact；state 取原生
+        # ToolResultEndEvent.state（success 之外一律 error，对齐官方
+        # ToolStatus 两值语义：error/interrupted/denied → 失败态）。
+        state = str(event.get("state", "success"))
         return [
             _evt(
                 event,
@@ -430,6 +434,10 @@ class DeerflowSSEFormatter:
                         "name": self._tool_call_names.get(call_id, ""),
                         "tool_call_id": call_id,
                         "id": f"tool:{call_id}",  # 独立唯一 id
+                        "status": (
+                            "success" if state == "success" else "error"
+                        ),
+                        "artifact": None,
                     },
                     {"langgraph_node": "agent"},
                 ],
