@@ -57,6 +57,8 @@ from agentscope.message import Msg, TextBlock
 from bocomadp.config import load_models_from_yaml
 from bocomadp.credential.ellm import ELLMCredential
 from bocomadp.logging.trace_context import run_id_context
+from bocomadp.open_agent_access import get_agent_global
+from bocomadp.workspace._shared_pvc import NON_ADP_WORKSPACE_PREFIX
 from bocomadp.routers.uploads import download_urls_to_session
 
 from ..bridge import BusBridge
@@ -417,10 +419,14 @@ async def _check_agent_id(
 
     agent 全部存于原生 storage（config.yaml seed 机制已废弃），校验
     只查 storage（原生 resolve_agent 语义）：该 user_id 下可见 →
-    原样采用；否则 404——不再有 seed 名单或回退默认 agent 之类的
-    配置依赖。
+    原样采用；否则跨 owner 兑底（get_agent_global，除 team worker）——
+    任意用户可对话任意智能体；仍不存在则 404。不再有 seed 名单或回退
+    默认 agent 之类的配置依赖。
     """
     if await storage.get_agent(user_id, agent_id) is not None:
+        return agent_id
+    global_record = await get_agent_global(storage, agent_id)
+    if global_record is not None and global_record.source != "team":
         return agent_id
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
@@ -707,11 +713,15 @@ async def _ensure_session(
                 model_config.model,
             )
         return
-    workspace_id = workspace_manager.assign_workspace_id(
+    # workspace_id 加非 adp 前缀：工作区据此区分会话来源——
+    # deerflow 会话的 agent 级共享 PVC 只读挂载 + 独立池。
+    # 框架 SessionSource 枚举不可扩展（pydantic 校验拒绝任意
+    # 字符串），故用自由字符串的 workspace_id 承载来源标记。
+    workspace_id = f"{NON_ADP_WORKSPACE_PREFIX}{workspace_manager.assign_workspace_id(
         user_id=user_id,
         agent_id=agent_id,
         session_id=session_id,
-    )
+    )}"
     config_kwargs: dict[str, Any] = {"workspace_id": workspace_id}
     if model_config is not None:
         config_kwargs["chat_model_config"] = model_config

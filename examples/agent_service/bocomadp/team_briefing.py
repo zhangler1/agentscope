@@ -181,6 +181,9 @@ async def _name(
 # other callers discard the return value), so wrapping it injects the
 # briefing exactly where the original ``_run_impl`` call did — before the
 # Agent is constructed with ``system_prompt=agent_record.data.system_prompt``.
+# 模块级捕获的只是 import 时的原始方法；真正生效的「下一层」在
+# :func:`patch_team_briefing` 里动态绑定（例如 open_agent_access 先
+# patch 的跨 owner 兜底层），否则兜底层会被本闭包绕过。
 _original_resolve_agent = ResourceAccessService.resolve_agent
 
 
@@ -189,7 +192,14 @@ async def _resolve_agent_with_briefing(
     viewer_id: str,
     agent_id: str,
 ) -> AgentRecord:
-    record = await _original_resolve_agent(self, viewer_id, agent_id)
+    # 动态取下一层（patch 时绑定的当前挂载版本），避免闭包固化
+    # import 时的原始方法而绕过其它包装层（open_agent_access 等）。
+    original = getattr(
+        _resolve_agent_with_briefing,
+        "_original",
+        _original_resolve_agent,
+    )
+    record = await original(self, viewer_id, agent_id)
     from bocomadp import team_store
 
     rel = await team_store.get_team(self._storage, viewer_id, agent_id)
@@ -219,4 +229,10 @@ def patch_team_briefing() -> None:
     if ResourceAccessService.resolve_agent.__name__ != (
         _resolve_agent_with_briefing.__name__
     ):
+        # 绑定「当前挂载的下一层」：调用方（main.py）保证 open 兜底等
+        # 包装先于本函数 patch，这里绑定的就是它们——本层在外、兜底
+        # 在里，兜底返回的 record 也能继续接受 briefing 注入。
+        _resolve_agent_with_briefing._original = (  # type: ignore[attr-defined]
+            ResourceAccessService.resolve_agent
+        )
         ResourceAccessService.resolve_agent = _resolve_agent_with_briefing
