@@ -275,6 +275,26 @@ raw_request:
   timeout: 30
 
 
+# ---------- 通讯录查询（contact_search） ----------
+# 扁平结构：键与 contact_search_config.py 字段一一对应。
+# api_url 支持环境变量引用展开，运行时需设置 CONTACT_SEARCH_API_URL。
+contact_search:
+  api_url: $CONTACT_SEARCH_API_URL
+  timeout: 30
+  headers:                            # 可选：合并覆盖默认头
+    jumpCloud-Env: "BASE"
+
+
+# ---------- 物理系统负责人查询（physical_contact_search） ----------
+# 扁平结构：键与 physical_contact_search_config.py 字段一一对应。
+# api_url 支持环境变量引用展开，运行时需设置 PHYSICAL_CONTACT_SEARCH_API_URL。
+physical_contact_search:
+  api_url: $PHYSICAL_CONTACT_SEARCH_API_URL
+  timeout: 30
+  headers:                            # 可选：合并覆盖默认头
+    jumpCloud-Env: "BASE"
+
+
 # ---------- 文件上传能力 ----------
 # 非图片文件上传 / 格式转换（-> Markdown）/ 上下文注入。
 # base_dir 为独立上传根（不挂在 workspace 下），相对路径基于 BASE_DIR 归一化。
