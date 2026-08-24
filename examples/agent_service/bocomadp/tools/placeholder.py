@@ -5,20 +5,11 @@
 从中提取工具名、描述、参数 schema，无需手写 OpenAPI spec。
 
 接入真实系统时，把函数体替换为对应的 API 调用即可。
+
+注：通讯录查询（原 query_employee_info 占位）已由真实实现
+:mod:`bocomadp.tools.contact_search` 替代，此处不再保留。
 """
 from __future__ import annotations
-
-
-async def query_employee_info(employee_id: str) -> str:
-    """查询员工基本信息（占位）。
-
-    Args:
-        employee_id: 员工工号，如 "10001"。
-
-    Returns:
-        员工姓名、所属部门、岗位等基本信息。
-    """
-    return f"[占位] 工号 {employee_id} 的员工信息：张三，科技部架构组，高级工程师。"
 
 
 async def query_internal_doc(keyword: str) -> str:

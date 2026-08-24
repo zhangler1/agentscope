@@ -15,11 +15,12 @@ import logging
 from agentscope.tool import FunctionTool, ToolBase
 
 from ..deerflow.custom_params import get_custom_params
+from .contact_search import contact_search_tool
 from .cross_search import cross_search_tool  # 已是 FunctionTool 实例（带注入中间件）
 from .online_search import online_search_tool
 from .personal_search import personal_search_tool
+from .physical_contact_search import physical_contact_search_tool
 from .placeholder import (
-    query_employee_info,
     query_internal_doc,
     submit_it_ticket,
 )
@@ -42,6 +43,7 @@ async def build_enterprise_tools(
 
     - ``cross_search`` 始终挂载（2026-08-20 起不再受 vector_search_switch
       控制）。
+    - ``physical_contact_search`` 始终挂载（物理系统负责人查询）。
     - ``vector_search_switch`` 显式 ``False`` → 不挂载行内搜索工具
       （vector_search）；未传 / ``True`` 保持默认挂载。
     - ``online_search_switch`` 显式 ``True`` → 挂载联网搜索工具
@@ -55,7 +57,8 @@ async def build_enterprise_tools(
     """
     params = get_custom_params()
     tools: list[ToolBase] = [
-        FunctionTool(query_employee_info, is_read_only=True),
+        contact_search_tool,
+        physical_contact_search_tool,
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
     ]
