@@ -83,7 +83,9 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
     - 非 :class:`EllmChatModel` 模型直接透传，不做任何处理；
     - :class:`EllmChatModel` 模型：``EllmKeyRefresher`` 惰性刷新 →
       ``set_api_key`` 注入 → 设置 ``inject_think_tag``（请求体
-      ``custom_params.add_think`` 优先，否则按模型名查 Redis 模型表）。
+      ``custom_params.add_think`` 优先，否则按模型名查 Redis 模型表）；
+      并注入 401 回调：强制刷新 key 并重试当前调用一次，刷新失败则
+      标记凭证 key 过期。
     """
 
     def __init__(
@@ -137,9 +139,17 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                     current_model.inject_think_tag = (
                         await _get_think_tag_from_redis(current_model.model)
                     )
-                # 401 时把该凭证的 key 置为过期（当前调用不重试，下一次
-                # 使用该凭证的调用会走惰性刷新）。回调闭包绑定本次
-                # credential_id，避免并发串号。
+                # 401 时的行为：
+                #   1) 强制刷新 key（force_refresh_key，锁保护）并用新 key
+                #      重试当前调用一次；
+                #   2) 若强制刷新失败（未拿到新 key），回调把该凭证的 key
+                #      置为过期（下一次使用该凭证的调用走惰性刷新）。
+                # 两个回调闭包都绑定本次 credential_id，避免并发串号。
+                current_model.set_refresh_key_callback(
+                    lambda: self._refresher.force_refresh_key(
+                        credential_id,
+                    ),
+                )
                 current_model.set_auth_invalidate_callback(
                     lambda: self._refresher.invalidate_key(credential_id),
                 )
