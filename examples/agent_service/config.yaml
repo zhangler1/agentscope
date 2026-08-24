@@ -96,12 +96,28 @@ models:
   #
   # supports_thinking 供 deer-flow 前端模型选择器展示 thinking 开关
   #（默认 false）；仅影响前端展示，后端以 parameters 为准。
-  - provider_id: deepseek
+  - provider_id: bocom_ellm
     display_name: "DeepSeek Chat"
     provider_type: deepseek
     model_name: deepseek-chat
     api_key: ${DEEPSEEK_API_KEY}
     base_url: https://api.deepseek.com
+    is_active: true
+    supports_multimodal: false
+    supports_thinking: true
+    parameters:
+      temperature: 0.7
+      max_tokens: 4096
+      thinking_enable: false
+
+  - provider_id: MiniMax-M2.5
+    display_name: "MiniMax-M2.5"
+    provider_type: bocom_ellm
+    model_name: MiniMax-M2.5
+    api_key: "111111111"
+    base_url: http://12.244.130.39/ELLM.ELLM-ADAPTER.V-1.0/v1
+    scene_code: P2026130
+    api_key_url: http://12.244.130.39/ELLM.ELLM-OMSERVICE.V-1.0/createSceneApiKey.do
     is_active: true
     supports_multimodal: false
     supports_thinking: true
@@ -137,14 +153,14 @@ models:
   # supports_multimodal: true 条目，切勿同时启用两个。
   #
   # --- 行内（企业 ELLM 网关；行内部署时取消注释启用） ---
-  - provider_id: qwen3-vl-30b
+  - provider_id: Qwen3-VL-30B-A3B-Instruct
     display_name: "Qwen3 VL 30B A3B Instruct (多模态)"
     provider_type: bocom_ellm
     model_name: Qwen3-VL-30B-A3B-Instruct
-    api_key: ${ELLM_API_KEY}
-    base_url: ${ELLM_BASE_URL}
-    scene_code: ${ELLM_SCENE_CODE}
-    api_key_url: ${ELLM_API_KEY_URL}
+    api_key: "111111111"
+    base_url: http://12.244.130.39/ELLM.ELLM-ADAPTER.V-1.0/v1
+    scene_code: P2026130
+    api_key_url: http://12.244.130.39/ELLM.ELLM-OMSERVICE.V-1.0/createSceneApiKey.do
     is_active: false
     supports_multimodal: true
     parameters:
@@ -241,14 +257,14 @@ online_search:
   # 指向本地 mock（examples/agent_service/mock_search_server.py）：
   #   python mock_search_server.py  # 监听 0.0.0.0:8001
   # 生产/联调真实网关时改回环境变量引用：api_url: $CUSTOM_SEARCH_API_URL
-  api_url: "http://127.0.0.1:8001/online"
+  api_url: "http://12.244.130.39111111111/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
   timeout: 30
   max_results: 5
 
 # ---------- 个人知识库搜索（personal_search） ----------
 personal_search:
   # 指向本地 mock；真实网关时改回：api_url: $PERSONAL_SEARCH_API_URL
-  api_url: "http://127.0.0.1:8001/personal"
+  api_url: "http://12.244.130.39/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
   timeout: 30                         # 请求超时(秒)
   source_type: "WDZS"                 # 请求体 sourceType
   repository: "personal-search"       # 请求体 repository
@@ -259,7 +275,7 @@ personal_search:
 # ---------- 行内搜索（vector_search） ----------
 vector_search:
   # 指向本地 mock；真实网关时改回：api_url: $VECTOR_SEARCH_API_URL
-  api_url: "http://127.0.0.1:8001/vector"
+  api_url: "http://12.244.130.39/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
   timeout: 30
   page_size: 10
   text_top_n: 7

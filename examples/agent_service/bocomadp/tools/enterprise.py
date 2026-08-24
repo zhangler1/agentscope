@@ -55,7 +55,7 @@ async def build_enterprise_tools(
     """
     params = get_custom_params()
     tools: list[ToolBase] = [
-        FunctionTool(query_employee_info, is_read_only=True),
+        FunctionTool(query_employee_info, name="查询员工信息",is_read_only=True),
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
     ]

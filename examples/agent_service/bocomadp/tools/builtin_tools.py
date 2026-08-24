@@ -389,43 +389,41 @@ async def view_image_tool(
     prompt = _VISION_ANALYSIS_PROMPT.format(
         question=question or "请详细描述这张图片的内容",
     )
-    # try:
-    #     response = await vision_model.client.chat.completions.create(
-    #         model=vision_model.model,
-    #         messages=[
-    #             {
-    #                 "role": "user",
-    #                 "content": [
-    #                     {"type": "text", "text": prompt},
-    #                     {
-    #                         "type": "image_url",
-    #                         "image_url": {
-    #                             "url": f"data:{rec.mime_type};base64,{rec.base64}",
-    #                         },
-    #                     },
-    #                 ],
-    #             },
-    #         ],
-    #         stream=False,
-    #     )
-    # except Exception as exc:  # noqa: BLE001
-    #     logger.exception("view_image_tool: vision model call failed")
-    #     return f"多模态模型调用失败: {exc}"
+    try:
+        response = await vision_model.client.chat.completions.create(
+            model=vision_model.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{rec.mime_type};base64,{rec.base64}",
+                            },
+                        },
+                    ],
+                },
+            ],
+            stream=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _events_logger.exception("view_image_tool: vision model call failed")
+        return f"多模态模型调用失败: {exc}"
 
-    # try:
-    #     text = response.choices[0].message.content or ""
-    # except Exception:  # noqa: BLE001
-    #     text = ""
-    # if not text.strip():
-    #     return f"多模态模型未返回有效内容（{filename}）。"
-    # logger.info(
-    #     "view_image_tool: analyzed %s (%s), result length=%d",
-    #     virtual_path,
-    #     rec.mime_type,
-    #     len(text),
-    # )
-    # return f"图片分析结果 ({filename}):\n\n{text}"
-    text = "这是一张交通银行logo"
+    try:
+        text = response.choices[0].message.content or ""
+    except Exception:  # noqa: BLE001
+        text = ""
+    if not text.strip():
+        return f"多模态模型未返回有效内容（{filename}）。"
+    _events_logger.info(
+        "view_image_tool: analyzed %s (%s), result length=%d",
+        virtual_path,
+        rec.mime_type,
+        len(text),
+    )
     _events_logger.info(
         "VIEW_IMAGE_OUTPUT %s filename=%s mime_type=%s cost_ms=%d "
         "result_len=%d",
@@ -436,3 +434,4 @@ async def view_image_tool(
         len(text),
     )
     return f"图片分析结果 ({filename}):\n\n{text}"
+    
