@@ -42,9 +42,11 @@ from agentscope.app._manager import ChatRunRegistry
 from agentscope.app._service import ChatService
 from agentscope.app.storage import (
     ChatModelConfig,
+    CredentialRecord,
     SessionConfig,
     StorageBase,
 )
+from agentscope.app.storage._utils import _dump_with_secrets
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 from agentscope.credential import CredentialFactory
 from agentscope.event import (
@@ -55,6 +57,7 @@ from agentscope.event import (
 from agentscope.message import Msg, TextBlock
 
 from bocomadp.config import load_models_from_yaml
+from bocomadp.config.app_config import ModelEntry
 from bocomadp.credential.ellm import ELLMCredential
 from bocomadp.logging.trace_context import run_id_context
 from bocomadp.open_agent_access import get_agent_global
@@ -66,7 +69,6 @@ from ..credentials import (
     DEFAULT_CREDENTIAL_OWNER,
     credential_cls_for_entry,
     credential_kwargs_for_entry,
-    default_credential_id,
     is_deerflow_credential_id,
     user_credential_id,
 )
@@ -437,210 +439,332 @@ async def _check_agent_id(
     )
 
 
+def _pick_preferred_credential(
+    records: list[CredentialRecord],
+) -> CredentialRecord | None:
+    """挑选可用凭证记录：type 可反序列化过滤 + ELLM 优先 + id 稳定排序取第一个。
+
+    ``list_credentials`` 的返回顺序随存储实现而定，取第一个前必须
+    显式排序（按记录 id 升序）；ELLM（``bocom_ellm_credential`` 及其
+    子类）优先于其他已注册类型。
+    """
+    usable = []
+    for record in records:
+        data = record.data or {}
+        credential_type = data.get("type")
+        if not credential_type:
+            continue
+        if CredentialFactory.get_credential_class(credential_type) is None:
+            continue
+        usable.append(record)
+    if not usable:
+        return None
+
+    def _is_ellm(record: CredentialRecord) -> bool:
+        credential_cls = CredentialFactory.get_credential_class(
+            (record.data or {}).get("type"),
+        )
+        return credential_cls is not None and issubclass(
+            credential_cls,
+            ELLMCredential,
+        )
+
+    ellm = [record for record in usable if _is_ellm(record)]
+    pool = ellm or usable
+    return sorted(pool, key=lambda record: str(record.id or ""))[0]
+
+
+async def _copy_credential_to_user(
+    storage: StorageBase,
+    user_id: str,
+    record: CredentialRecord,
+) -> CredentialRecord | None:
+    """把 default 用户凭证复制为当前用户的凭证，返回复制后的记录。
+
+    id 沿用 ``deerflow-<user_id>-<provider_id>`` 约定（provider 从源
+    default 凭证 id 解析，解析失败则退化为源 id 拼接）；复制保留
+    api_key /
+    base_url / scene_code / api_key_url 等刷新元数据。
+    """
+    provider = is_deerflow_credential_id(record.id, DEFAULT_CREDENTIAL_OWNER)
+    credential_id = user_credential_id(user_id, provider or record.id)
+    try:
+        source = CredentialFactory.from_dict(dict(record.data or {}))
+    except Exception:  # noqa: BLE001 —— 损坏凭证跳过，不阻断解析
+        logger.warning(
+            "deerflow: default credential %s failed to deserialize; "
+            "skip copy.",
+            record.id,
+            exc_info=True,
+        )
+        return None
+    source.id = credential_id
+    try:
+        await storage.upsert_credential(user_id, source)
+    except Exception:  # noqa: BLE001 —— 复制失败由调用方走条目回退
+        logger.warning(
+            "deerflow: failed to copy default credential %s to user %s.",
+            record.id,
+            user_id,
+            exc_info=True,
+        )
+        return None
+    logger.info(
+        "deerflow: credential %s copied from default %s for user %s.",
+        credential_id,
+        record.id,
+        user_id,
+    )
+    return CredentialRecord(
+        user_id=user_id,
+        data=_dump_with_secrets(source),
+        id=credential_id,
+    )
+
+
+def _entry_for_credential_type(credential_type: str) -> ModelEntry | None:
+    """config.yaml 中与凭证 type 匹配的第一个条目（参数/模型名兜底源）。
+
+    匹配依据凭证类的判别 type（``model_fields["type"]`` 的 Literal
+    默认值，如 ``bocom_ellm_credential``）与条目 provider_type 对应
+    凭证类一致；无匹配返回 None。
+    """
+    for entry in load_models_from_yaml():
+        credential_cls = credential_cls_for_entry(entry)
+        if credential_cls is None:
+            continue
+        type_field = credential_cls.model_fields.get("type")
+        cls_type = (
+            getattr(type_field, "default", None)
+            if type_field is not None
+            else None
+        )
+        if cls_type == credential_type:
+            return entry
+    return None
+
+
+def _pick_fallback_entry(active: Any) -> ModelEntry | None:
+    """凭证全空时的 config.yaml 回退条目。
+
+    优先 active provider 对应条目，否则取第一个可反序列化条目。
+    """
+    entries = load_models_from_yaml()
+    if active is not None:
+        entry = next(
+            (
+                candidate
+                for candidate in entries
+                if candidate.provider_id == active.provider_id
+            ),
+            None,
+        )
+        if entry is not None:
+            return entry
+    return next(
+        (
+            candidate
+            for candidate in entries
+            if credential_cls_for_entry(candidate) is not None
+        ),
+        None,
+    )
+
+
 async def _resolve_chat_model_config(
     storage: StorageBase,
     request: Request,
     user_id: str,
     hint: str = "",
 ) -> ChatModelConfig | None:
-    """把 config.yaml 的模型条目解析为原生 ChatModelConfig。
+    """把请求解析为原生 ChatModelConfig（凭证来自用户凭证表）。
 
-    优先按请求级模型名（``hint``）匹配 config.yaml 模型条目
-    （model_name / provider_id 双键，对齐 deer-flow ``_resolve_model_name``
-    的语义）；未命中告警后回退全局 active provider（ProviderManager）。
-    匹配到条目后按「用户优先、默认复制」解析 credential：用户维度凭证
-    （``deerflow-<user_id>-<provider_id>``）已存在则直接引用，否则从
-    default 用户默认凭证（``deerflow-default-<provider_id>``）复制参数
-    入库，两者都不存在时回退条目参数。无可用条目时返回 None（由原生
-    404 报错兜底，不阻断请求）。
+    凭证选择（新契约，一凭证多模型，不考虑 B 方案）：
+
+    - hint 为约定凭证 id（``deerflow-<user>-<provider>`` 形态）→ 直传引用：
+      本用户维度凭证直接引用；default 形态复制到用户维度后引用；
+    - 其余（模型名 / 空）→ ``list_credentials(user_id)`` 挑选：type
+      可反序列化过滤、ELLM 优先、id 稳定排序取第一个；
+    - 用户凭证为空 → default 用户凭证同规则挑选，复制参数入库为
+      用户维度凭证后引用（复制保留 api_key / scene_code 等元数据）；
+    - 再空 → 回退 config.yaml 条目参数创建（active provider 对应
+      条目优先；api_key 空且非 ELLM 视为不可用）。
+
+    模型名：hint 为模型名时直接透传（凭证不绑定模型）；缺失（空 /
+    凭证 id）时回退凭证 model 字段值 → config.yaml 匹配条目
+    model_name → 全局 active provider；全部缺失返回 None（原生 404
+    兜底，不阻断请求）。parameters 取 config.yaml 中与凭证 type
+    匹配条目的 parameters（无匹配则空）。
     """
-
-    # 全局 active provider 兜底（config.yaml agents 种子机制已移除，
-    # 不再有 agent 级模型绑定来源）
-    provider_id = ""
-    model_name = ""
+    # 全局 active provider 兜底（模型名 + 回退条目）
     pm = getattr(request.app.state, "provider_manager", None)
     active = pm.get_active_model() if pm is not None else None
-    if active is not None:
-        provider_id = active.provider_id
-        model_name = active.model_name
+    hint_is_credential_id = (
+        is_deerflow_credential_id(hint, user_id) is not None
+    )
 
-    # 请求级模型名优先：按 model_name / provider_id 双键匹配 config.yaml
-    # 模型条目（deer-flow 前端的模型名可能对应条目 model_name 或
-    # provider_id）；未命中告警并沿用已解析的 active provider。
-    # 约定 credential id 直传（/api/deerflow/models 返回的 id）则直接
-    # 解析出 provider_id，等价于命中该 config 条目。
-    entry = None
-    static_hit = False
-    credential_provider = None
-    resolved_model = ""  # 动态命中（ELLM）时的真实模型 ID；空 = 未命中
-    if hint:
-        credential_provider = is_deerflow_credential_id(hint, user_id)
-        if credential_provider:
-            provider_id = credential_provider
-            logger.info(
-                "deerflow: credential id %r resolved to provider %r "
-                "(user=%s).",
+    # ── 凭证选择 ──
+    record: CredentialRecord | None = None
+    if hint_is_credential_id:
+        # 约定凭证 id 直传：本用户凭证直接引用；default 形态复制
+        record = await storage.get_credential(user_id, hint)
+        if record is None:
+            default_rec = await storage.get_credential(
+                DEFAULT_CREDENTIAL_OWNER,
                 hint,
-                provider_id,
-                user_id,
             )
-        else:
-            entry = next(
-                (
-                    candidate
-                    for candidate in load_models_from_yaml()
-                    if candidate.model_name == hint
-                    or candidate.provider_id == hint
-                ),
-                None,
-            )
-            if entry is not None:
-                static_hit = True
-                provider_id = entry.provider_id
-                model_name = entry.model_name or model_name
-            else:
-                logger.warning(
-                    "deerflow: model %r not found in config.yaml; "
-                    "fallback to active provider %r (user=%s).",
-                    hint,
-                    provider_id,
+            if default_rec is not None:
+                record = await _copy_credential_to_user(
+                    storage,
                     user_id,
+                    default_rec,
                 )
-    if entry is None:
-        entry = next(
-            (
-                candidate
-                for candidate in load_models_from_yaml()
-                if candidate.provider_id == provider_id
-            ),
-            None,
-        )
-    # 动态模型路由（ELLM 内网模型）：hint 非约定 credential id、也未
-    # 静态命中双键匹配时，把它当作真实模型 ID 路由到 ELLM 类型条目，
-    # 运行时覆盖 model 字段（对齐 deer-flow dynamic_model 语义）。
-    # 目标条目：兜底解析出的条目本身为 ELLM（active 指向 ELLM
-    # provider）→ 直接命中；条目缺失且 provider_id 为空 → 取
-    # config.yaml 中唯一 ELLM 条目（多个告警取第一个）；否则维持
-    # 现状（hint 丢弃）。
-    dynamic_hit = False
-    if hint and not static_hit and credential_provider is None:
-        if entry is not None:
-            entry_cls = credential_cls_for_entry(entry)
-            if entry_cls is not None and issubclass(entry_cls, ELLMCredential):
-                dynamic_hit = True
-        elif not provider_id:
-            ellm_entries = []
-            for candidate in load_models_from_yaml():
-                candidate_cls = credential_cls_for_entry(candidate)
-                if candidate_cls is not None and issubclass(
-                    candidate_cls,
-                    ELLMCredential,
-                ):
-                    ellm_entries.append(candidate)
-            if len(ellm_entries) > 1:
-                logger.warning(
-                    "deerflow: multiple ELLM entries %s; using %r as "
-                    "dynamic model target.",
-                    [c.provider_id for c in ellm_entries],
-                    ellm_entries[0].provider_id,
-                )
-            if ellm_entries:
-                entry = ellm_entries[0]
-                dynamic_hit = True
-        if dynamic_hit:
-            provider_id = entry.provider_id
-            resolved_model = hint
+        if record is not None:
             logger.info(
-                "deerflow: hint %r routed to ELLM provider %r as "
-                "dynamic model (user=%s).",
+                "deerflow: credential id %r resolved directly (user=%s).",
                 hint,
-                entry.provider_id,
                 user_id,
             )
-    if entry is None:
-        logger.warning(
-            "deerflow: no model entry for provider %r; session created "
-            "without chat_model_config.",
-            provider_id,
+    if record is None:
+        # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
+        record = _pick_preferred_credential(
+            await storage.list_credentials(user_id),
         )
-        return None
-
-    credential_cls = credential_cls_for_entry(entry)
-    if credential_cls is None:
-        logger.warning(
-            "deerflow: unknown provider_type %r; session created without "
-            "chat_model_config.",
-            entry.provider_type,
+        if record is not None:
+            logger.info(
+                "deerflow: picked credential %r for user %s.",
+                record.id,
+                user_id,
+            )
+    if record is None:
+        # 用户凭证为空 → default 凭证挑选并复制入库
+        default_rec = _pick_preferred_credential(
+            await storage.list_credentials(DEFAULT_CREDENTIAL_OWNER),
         )
-        return None
-
-    # api_key 空的条目不可用（无密钥可调用）；ELLM 例外——key 动态获取
-    # （首次调用由 EllmKeyRefresher 立即刷新写入）。
-    if not entry.api_key and not issubclass(credential_cls, ELLMCredential):
-        logger.warning(
-            "deerflow: model entry %r has no api_key; session created "
-            "without chat_model_config.",
-            entry.provider_id,
-        )
-        return None
-
-    # 用户优先、默认复制（见 credentials.py 模块注释）：
-    # - 用户维度凭证已存在 → 直接引用（重复则使用本用户的，用户改过
-    #   的 api_key 等生效）；
-    # - 不存在 → 从 default 用户默认凭证复制参数入库（默认凭证入库后
-    #   参数源不再是 config.yaml 直读）；
-    # - default 凭证亦不存在（未入库/被删）→ 回退条目参数。
-    credential_id = user_credential_id(user_id, entry.provider_id)
-    own = await storage.get_credential(user_id, credential_id)
-    if own is None:
-        default_rec = await storage.get_credential(
-            DEFAULT_CREDENTIAL_OWNER,
-            default_credential_id(entry.provider_id),
-        )
-        copied = False
         if default_rec is not None:
-            try:
-                source = CredentialFactory.from_dict(
-                    dict(default_rec.data or {}),
-                )
-                source.id = credential_id
-                await storage.upsert_credential(user_id, source)
-                copied = True
-            except Exception:  # noqa: BLE001 —— 复制失败回退条目参数
-                logger.warning(
-                    "deerflow: failed to copy default credential %s "
-                    "to user %s; falling back to config.yaml entry.",
-                    default_rec.id,
-                    user_id,
-                    exc_info=True,
-                )
-        if not copied:
-            await storage.upsert_credential(
+            record = await _copy_credential_to_user(
+                storage,
                 user_id,
-                credential_cls(
-                    **credential_kwargs_for_entry(
-                        entry,
-                        credential_id,
-                        credential_cls,
-                        model=resolved_model
-                        or entry.model_name
-                        or entry.provider_id,
-                    ),
+                default_rec,
+            )
+
+    entry: ModelEntry | None = None
+    credential = None
+    if record is not None:
+        try:
+            credential = CredentialFactory.from_dict(
+                dict(record.data or {}),
+            )
+        except Exception:  # noqa: BLE001 —— 损坏凭证跳过，不阻断解析
+            logger.warning(
+                "deerflow: credential %s failed to deserialize; "
+                "config unresolved.",
+                record.id,
+                exc_info=True,
+            )
+            return None
+    else:
+        # 凭证全空 → 回退 config.yaml 条目参数创建
+        entry = _pick_fallback_entry(active)
+        if entry is None:
+            logger.warning(
+                "deerflow: no credential for user %s and no config.yaml "
+                "entry; session created without chat_model_config.",
+                user_id,
+            )
+            return None
+        credential_cls = credential_cls_for_entry(entry)
+        if credential_cls is None:
+            logger.warning(
+                "deerflow: unknown provider_type %r; session created "
+                "without chat_model_config.",
+                entry.provider_type,
+            )
+            return None
+        # api_key 空的条目不可用（无密钥可调用）；ELLM 例外——key
+        # 动态获取（首次调用由 EllmKeyRefresher 立即刷新写入）。
+        if not entry.api_key and not issubclass(
+            credential_cls,
+            ELLMCredential,
+        ):
+            logger.warning(
+                "deerflow: model entry %r has no api_key; session created "
+                "without chat_model_config.",
+                entry.provider_id,
+            )
+            return None
+        credential_id = user_credential_id(user_id, entry.provider_id)
+        try:
+            credential = credential_cls(
+                **credential_kwargs_for_entry(
+                    entry,
+                    credential_id,
+                    credential_cls,
+                    model=entry.model_name or entry.provider_id,
                 ),
             )
+            await storage.upsert_credential(user_id, credential)
+        except Exception:  # noqa: BLE001 —— 入库失败回退 None
+            logger.warning(
+                "deerflow: failed to create credential %s from entry "
+                "for user %s.",
+                credential_id,
+                user_id,
+                exc_info=True,
+            )
+            return None
+        record = CredentialRecord(
+            user_id=user_id,
+            data=_dump_with_secrets(credential),
+            id=credential_id,
+        )
         logger.info(
-            "deerflow: credential %s %s for user %s.",
+            "deerflow: credential %s created from entry for user %s.",
             credential_id,
-            "copied from default" if copied else "created from entry",
             user_id,
         )
 
+    credential_type = getattr(credential, "type", None) or (
+        (record.data or {}).get("type") if record is not None else None
+    )
+    if not credential_type:
+        logger.warning(
+            "deerflow: credential %s has no type; config unresolved.",
+            record.id,
+        )
+        return None
+
+    # ── 模型名：hint 模型名直传；缺失回退凭证 model → 条目 → active ──
+    model = hint if (hint and not hint_is_credential_id) else ""
+    if not model:
+        bound = getattr(credential, "model", None)
+        if bound:
+            model = str(bound)
+    if not model and entry is None:
+        entry = _entry_for_credential_type(credential_type)
+    if not model and entry is not None:
+        model = entry.model_name or entry.provider_id
+    if not model and active is not None:
+        model = active.model_name or ""
+    if not model:
+        logger.warning(
+            "deerflow: no model name resolved (hint=%r, credential=%s); "
+            "session created without chat_model_config.",
+            hint,
+            record.id,
+        )
+        return None
+
+    # ── parameters：config.yaml 中与凭证 type 匹配的条目 ──
+    if entry is None:
+        entry = _entry_for_credential_type(credential_type)
+    parameters = dict(entry.parameters or {}) if entry is not None else {}
+
     return ChatModelConfig(
-        type=entry.provider_type,
-        credential_id=credential_id,
-        model=resolved_model or entry.model_name or entry.provider_id,
-        parameters=entry.parameters,
+        type=credential_type,
+        credential_id=record.id,
+        model=model,
+        parameters=parameters,
     )
 
 

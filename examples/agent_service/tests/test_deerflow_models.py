@@ -4,21 +4,16 @@
 
 - ``_resolve_requested_model_name``：llm_model_name 单一通道与空回退；
 - ``ensure_default_credentials``：default 用户维度、幂等 upsert、失败不阻断；
-- ``_resolve_chat_model_config``：按 model_name / provider_id 匹配、
-  未命中回退 active provider、用户凭证优先引用、默认凭证复制入库、
-  default 凭证缺失回退 config.yaml 条目；
-- ``_ensure_session``：首次 backfill、模型切换更新、一致不更新；
-- ``GET /api/deerflow/models``：默认凭证 id 返回、用户凭证优先、
-  X-User-ID 缺省 default、default 凭证缺失跳过。
+- ``_resolve_chat_model_config``：hint 模型名透传、用户凭证表挑选
+  （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退 config.yaml
+  条目；
+- ``_ensure_session``：首次 backfill、模型切换更新、一致不更新。
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from agentscope.app.storage import ChatModelConfig, SessionConfig
 from agentscope.app.storage._utils import _dump_with_secrets
@@ -30,15 +25,12 @@ from bocomadp.deerflow.credentials import (
     ensure_default_credentials,
     user_credential_id,
 )
-from bocomadp.deerflow.routers import models as models_module
 from bocomadp.deerflow.routers.deerflow_chat import (
     CreateRunRequest,
     _ensure_session,
     _resolve_chat_model_config,
     _resolve_requested_model_name,
 )
-from bocomadp.deerflow.routers.models import deerflow_models_router
-
 USER_ID = "u1"
 AGENT_ID = "lead_agent"
 
@@ -115,6 +107,13 @@ class FakeStorage:
 
     async def get_credential(self, user_id: str, credential_id: str):
         return self.credentials.get((user_id, credential_id))
+
+    async def list_credentials(self, user_id: str):
+        return [
+            record
+            for (owner, _), record in self.credentials.items()
+            if owner == user_id
+        ]
 
     async def upsert_credential(self, user_id: str, credential) -> None:
         if self.fail_marker and self.fail_marker in credential.id:
@@ -283,7 +282,8 @@ def _run(coro):
 
 
 def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
-    """hint 命中条目 model_name：使用该条目的 provider/model。"""
+    """hint 为模型名：透传为 config.model；凭证表为空时回退 active
+    provider 对应条目创建用户凭证。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -299,12 +299,12 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
 
     assert config is not None
     assert config.model == "r1"
-    assert config.credential_id == user_credential_id(USER_ID, "ds-r1")
-    assert config.type == "deepseek"
+    assert config.credential_id == user_credential_id(USER_ID, "ds")
+    assert config.type == "deepseek_credential"
 
 
 def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
-    """hint 未命中 model_name 时按 provider_id 匹配（前端传 name）。"""
+    """hint 非约定凭证 id（provider_id）：原样透传为模型名。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -319,14 +319,15 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
     )
 
     assert config is not None
-    assert config.model == "r1"
-    assert config.credential_id == user_credential_id(USER_ID, "ds-r1")
+    assert config.model == "ds-r1"
+    assert config.credential_id == user_credential_id(USER_ID, "ds")
 
 
 def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
     monkeypatch,
 ) -> None:
-    """hint 未命中告警后回退全局 active provider。"""
+    """hint 任意值一律透传为模型名；凭证表为空时凭证回退 active
+    provider 对应条目创建。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -341,7 +342,7 @@ def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
     )
 
     assert config is not None
-    assert config.model == "deepseek-chat"
+    assert config.model == "nope"
     assert config.credential_id == user_credential_id(USER_ID, "ds")
 
 
@@ -500,7 +501,7 @@ def test_ensure_session_updates_config_on_model_switch(
     assert session.config.chat_model_config.model == "r1"
     assert session.config.chat_model_config.credential_id == user_credential_id(
         USER_ID,
-        "ds-r1",
+        "ds",
     )
 
 
@@ -543,95 +544,3 @@ def test_ensure_session_backfills_missing_model_config(
 
     session = storage.sessions[_session_key()]
     assert session.config.chat_model_config.model == "deepseek-chat"
-
-
-# ── GET /api/deerflow/models ──────────────────────────────────────────
-
-
-def _make_models_app(storage: FakeStorage) -> FastAPI:
-    api = FastAPI()
-    api.state.storage = storage
-    api.include_router(deerflow_models_router)
-    app = FastAPI()
-    app.mount("/api", api)
-    return app
-
-
-def test_list_models_returns_default_credential_id(monkeypatch) -> None:
-    """无用户凭证时返回 default 凭证 id（X-User-ID 必填，缺省 401）。"""
-    entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
-    monkeypatch.setattr(
-        models_module,
-        "load_models_from_yaml",
-        lambda: entries,
-    )
-    storage = FakeStorage()
-    for entry in entries:
-        storage.seed_credential(
-            DEFAULT_CREDENTIAL_OWNER,
-            default_credential_id(entry.provider_id),
-        )
-
-    with TestClient(_make_models_app(storage)) as client:
-        response = client.get(
-            "/api/deerflow/models",
-            headers={"X-User-ID": DEFAULT_CREDENTIAL_OWNER},
-        )
-
-    assert response.status_code == 200
-    body = response.json()["models"]
-    assert len(body) == 2
-    assert body[0]["id"] == default_credential_id("ds")
-    assert body[0]["name"] == "ds"
-    assert body[0]["model"] == "deepseek-chat"
-    assert body[0]["supports_thinking"] is True
-    assert body[0]["supports_reasoning_effort"] is False
-
-
-def test_list_models_prefers_user_credential(monkeypatch) -> None:
-    """用户 credential 存在：返回本用户的 id（重复则使用本用户的）。"""
-    entries = [_make_model_entry("ds")]
-    monkeypatch.setattr(
-        models_module,
-        "load_models_from_yaml",
-        lambda: entries,
-    )
-    storage = FakeStorage()
-    storage.seed_credential(
-        DEFAULT_CREDENTIAL_OWNER,
-        default_credential_id("ds"),
-    )
-    storage.seed_credential(USER_ID, user_credential_id(USER_ID, "ds"))
-
-    with TestClient(_make_models_app(storage)) as client:
-        response = client.get(
-            "/api/deerflow/models",
-            headers={"X-User-ID": USER_ID},
-        )
-
-    assert response.status_code == 200
-    models = response.json()["models"]
-    assert len(models) == 1
-    assert models[0]["id"] == user_credential_id(USER_ID, "ds")
-
-
-def test_list_models_skips_entry_without_any_credential(
-    monkeypatch,
-) -> None:
-    """default 凭证亦不存在：跳过该条目并告警。"""
-    entries = [_make_model_entry("ds")]
-    monkeypatch.setattr(
-        models_module,
-        "load_models_from_yaml",
-        lambda: entries,
-    )
-    storage = FakeStorage()
-
-    with TestClient(_make_models_app(storage)) as client:
-        response = client.get(
-            "/api/deerflow/models",
-            headers={"X-User-ID": DEFAULT_CREDENTIAL_OWNER},
-        )
-
-    assert response.status_code == 200
-    assert response.json() == {"models": []}

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""deerflow 模型解析链单测：约定 credential id 直传 + ELLM 空 api_key 放行。
+"""deerflow 模型解析链单测：用户凭证表挑选 + 约定 id 直传 + 模型名透传。
 
 Contract under test:
 
@@ -7,14 +7,18 @@ Contract under test:
   约定 id 形态（``deerflow-<user>-<provider>`` /
   ``deerflow-default-<provider>``）并解析出 provider_id；模型名 / 任意
   uuid / 他人凭证 id 返回 None。
-- ``_resolve_chat_model_config`` 中约定 credential id 直传等价于命中该
-  provider 的 config 条目，继续走「用户优先、默认复制」：default 凭证
-  id → 复制出用户维度凭证并引用（复制保留 scene_code / api_key_url 等
-  刷新元数据）；本用户凭证 id → 直接引用既有凭证，不重复复制。
-- 模型名 / provider_id hint 走既有 config.yaml 双键匹配路径不变；无
-  hint 时回退全局 active provider。
-- ELLM 条目 api_key 空放行（key 动态获取），非 ELLM 条目 api_key 空仍
-  返回 None。
+- ``_resolve_chat_model_config`` 新契约（一凭证多模型）：
+  - hint 为约定凭证 id → 直传引用：本用户凭证直接引用；default 形态
+    复制出用户维度凭证（复制保留 scene_code / api_key_url 等刷新元
+    数据）；
+  - hint 为模型名 / 空 → ``list_credentials(user_id)`` 挑选：type 可
+    反序列化过滤、ELLM 优先、id 稳定排序取第一个；
+  - 用户凭证为空 → default 用户凭证同规则挑选并复制入库；
+  - 再空 → 回退 config.yaml 条目参数创建（ELLM 条目 api_key 空放行，
+    非 ELLM 条目 api_key 空返回 None）。
+- 模型名：hint 模型名直接透传（凭证 model 字段不参与绑定）；缺失时
+  回退凭证 model 字段值 → config.yaml 匹配条目 model_name → 全局
+  active provider。
 """
 
 from __future__ import annotations
@@ -100,6 +104,7 @@ class _FakeStorage:
         data: dict,
     ) -> None:
         self._records[(user_id, credential_id)] = CredentialRecord(
+            id=credential_id,
             user_id=user_id,
             data=data,
             updated_at=datetime.now(),
@@ -119,6 +124,16 @@ class _FakeStorage:
     ) -> str:
         self.upserts.append((user_id, credential))
         return credential.id
+
+    async def list_credentials(
+        self,
+        user_id: str,
+    ) -> list[CredentialRecord]:
+        return [
+            record
+            for (owner, _), record in self._records.items()
+            if owner == user_id
+        ]
 
 
 class _FakeRequest:
@@ -235,7 +250,7 @@ class TestResolveChatModelConfig:
 
         assert config is not None
         assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert config.type == "bocom_ellm"
+        assert config.type == "bocom_ellm_credential"
         assert config.model == "deepseek-v4-flash"
         assert len(storage.upserts) == 1
         user_id, credential = storage.upserts[0]
@@ -274,8 +289,12 @@ class TestResolveChatModelConfig:
         assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
         assert storage.upserts == []
 
-    def test_model_name_hint_matches_config_entry(self, monkeypatch) -> None:
-        """hint 为模型名 → 既有 config.yaml 双键匹配路径不变。"""
+    def test_model_name_hint_passed_through_with_default_copy(
+        self,
+        monkeypatch,
+    ) -> None:
+        """hint 为模型名 → 透传为 config.model；用户凭证表为空 →
+        default 凭证挑选复制路径。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -293,12 +312,16 @@ class TestResolveChatModelConfig:
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
-        assert config.type == "deepseek"
+        assert config.type == "deepseek_credential"
         assert config.model == "deepseek-chat"
         assert len(storage.upserts) == 1  # 从 default 复制
 
-    def test_provider_id_hint_matches_config_entry(self, monkeypatch) -> None:
-        """hint 为 provider_id → 同样命中 config 条目。"""
+    def test_non_credential_hint_always_passed_through(
+        self,
+        monkeypatch,
+    ) -> None:
+        """hint 非约定凭证 id（如 provider_id）→ 一律透传为模型名，
+        不再做 config.yaml 双键匹配。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -316,6 +339,8 @@ class TestResolveChatModelConfig:
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
+        assert config.type == "deepseek_credential"
+        assert config.model == _DEEPSEEK_PROVIDER  # hint 原样透传
 
     def test_non_ellm_empty_api_key_returns_none(self, monkeypatch) -> None:
         """非 ELLM 条目 api_key 空 → 仍返回 None，且不产生 upsert。"""
@@ -389,16 +414,16 @@ class TestResolveChatModelConfig:
         config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
 
         assert config is not None
-        assert config.type == "bocom_ellm"
+        assert config.type == "bocom_ellm_credential"
         assert config.model == "Qwen3-235B-A22B"
         assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
 
-    def test_dynamic_hint_creates_entry_credential(
+    def test_entry_fallback_binds_entry_model_not_hint(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为真实模型 ID + default 凭证缺失 → 条目回退入库成功，
-        ELLMCredential.model == hint（credentials.py 补 model 生效）。"""
+        """凭证全空 → 条目回退入库；凭证 model 取条目 model_name，
+        config.model 仍为 hint 透传值（凭证 model 字段不参与绑定）。"""
         storage = _FakeStorage()
         self._patch_loaders(
             monkeypatch,
@@ -409,15 +434,19 @@ class TestResolveChatModelConfig:
 
         assert config is not None
         assert config.model == "Qwen3-235B-A22B"
+        assert config.type == "bocom_ellm_credential"
         assert len(storage.upserts) == 1
         user_id, credential = storage.upserts[0]
         assert user_id == "user-1"
         assert isinstance(credential, ELLMCredential)
-        assert credential.model == "Qwen3-235B-A22B"
+        assert credential.model == "deepseek-v4-flash"  # 条目 model_name
 
-    def test_dynamic_hint_keeps_non_ellm_binding(self, monkeypatch) -> None:
-        """hint 为真实模型 ID + active 为 deepseek（非 ELLM）→ 维持现状
-        （model 用静态条目名，hint 丢弃）。"""
+    def test_hint_passed_through_for_non_ellm_credential(
+        self,
+        monkeypatch,
+    ) -> None:
+        """hint 为真实模型 ID + 凭证为非 ELLM（deepseek）→ 同样透传，
+        不再丢弃 hint 或用静态条目名。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -442,8 +471,130 @@ class TestResolveChatModelConfig:
         )
 
         assert config is not None
-        assert config.type == "deepseek"
-        assert config.model == "deepseek-chat"
+        assert config.type == "deepseek_credential"
+        assert config.model == "Qwen3-235B-A22B"  # hint 透传
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
+
+    def test_picks_ellm_first_among_user_credentials(
+        self,
+        monkeypatch,
+    ) -> None:
+        """用户多凭证：ELLM 优先于其他可反序列化类型，直接引用不复制。"""
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}",
+            _deepseek_record_data(),
+        )
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_ELLM_PROVIDER}",
+            _ellm_record_data(
+                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
+            ),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_ellm_entry(api_key=""), _deepseek_entry("sk-test")],
+        )
+
+        config = _resolve(storage, "user-1")
+
+        assert config is not None
+        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
+        assert config.type == "bocom_ellm_credential"
+        assert storage.upserts == []
+        # 模型名回退凭证 model 字段值
+        assert config.model == "deepseek-v4-flash"
+
+    def test_model_name_hint_overrides_credential_bound_model(
+        self,
+        monkeypatch,
+    ) -> None:
+        """hint 模型名透传进 config.model；凭证 model 字段值不被覆盖。"""
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_ELLM_PROVIDER}",
+            _ellm_record_data(
+                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
+            ),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_ellm_entry(api_key="")],
+        )
+
+        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+
+        assert config is not None
+        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
+        assert config.model == "Qwen3-235B-A22B"  # hint 透传
+        # 凭证 model 字段保持原值（不做绑定过滤）
+        assert (
+            storage._records[
+                ("user-1", f"deerflow-user-1-{_ELLM_PROVIDER}")
+            ].data["model"]
+            == "deepseek-v4-flash"
+        )
+
+    def test_model_falls_back_to_credential_then_entry_then_active(
+        self,
+        monkeypatch,
+    ) -> None:
+        """hint 缺失时的模型名回退链：凭证 model 字段 → 条目 model_name
+        → active provider。"""
+        # 1) 凭证 model 字段有值 → 用凭证 model
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_ELLM_PROVIDER}",
+            _ellm_record_data(
+                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
+            ),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_ellm_entry(api_key="")],
+        )
+        config = _resolve(storage, "user-1")
+        assert config is not None
+        assert config.model == "deepseek-v4-flash"
+
+        # 2) 凭证无 model 字段 → 条目 model_name
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}",
+            _deepseek_record_data(),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_deepseek_entry("sk-test")],
+        )
+        config = _resolve(storage, "user-1")
+        assert config is not None
+        assert config.model == "deepseek-chat"
+
+        # 3) 凭证无 model 字段 + 无匹配条目 → active provider
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}",
+            _deepseek_record_data(),
+        )
+        self._patch_loaders(monkeypatch, models=[])
+        config = _resolve(
+            storage,
+            "user-1",
+            request=_FakeRequest(
+                active=SimpleNamespace(
+                    provider_id=_DEEPSEEK_PROVIDER,
+                    model_name="active-model",
+                ),
+            ),
+        )
+        assert config is not None
+        assert config.model == "active-model"

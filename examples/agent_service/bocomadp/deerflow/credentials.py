@@ -13,9 +13,9 @@ deer-flow 前端的模型名需要映射到原生 ``ChatModelConfig`` 的
   解析 credential，owner-scoping 不允许跨用户引用 default 的 id），
   已存在时直接引用（重复则使用本用户的，用户改过的 key 生效）。
 
-``_resolve_chat_model_config``（deerflow_chat.py）与
-``/api/deerflow/models``（routers/models.py）共用本模块的 id 约定，
-保证「列表返回的 credential id」与「run 实际引用的 credential id」同源。
+``_resolve_chat_model_config``（deerflow_chat.py）按本模块的 id 约定
+解析并引用凭证，保证「前端传入的 credential id / provider_id」与
+「run 实际引用的 credential id」同源。
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def user_credential_id(user_id: str, provider_id: str) -> str:
 def is_deerflow_credential_id(hint: str, user_id: str) -> str | None:
     """hint 为约定 credential id 时解析出 provider_id。
 
-    识别 ``/api/deerflow/models`` 返回的两种 id 形态：
+    识别约定凭证 id 的两种形态：
 
     - ``deerflow-<user_id>-<provider>`` → provider；
     - ``deerflow-default-<provider>`` → provider（user_id 恰为 default

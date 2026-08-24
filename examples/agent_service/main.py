@@ -78,7 +78,6 @@ from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
 from bocomadp.deerflow.routers.deerflow_chat import deerflow_router
-from bocomadp.deerflow.routers.models import deerflow_models_router
 from bocomadp.deerflow.routers.threads import threads_router
 from bocomadp.routers.uploads import uploads_router
 from bocomadp.routers.channels import channels_router
@@ -961,8 +960,6 @@ app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
 app.include_router(deerflow_router)
-# deer-flow 模型列表（GET /api/deerflow/models，deer-flow Model 格式）
-app.include_router(deerflow_models_router)
 # deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
 app.include_router(auth_stub_router)
 # deer-flow 渠道兼容占位路由（providers/connections 恒空，前端优雅降级）
