@@ -6,23 +6,37 @@
 
 ::
 
-    PVC: as-ws-{agent_hash} (ReadWriteMany)
-         │
-         ├── shared/skills/              ← 所有 Pod 共享
-         ├── shared/.mcp                 ← 所有 Pod 共享
+    PVC: as-ws-{agent_hash} (ReadWriteMany, hash(user::agent))
          │
          ├── sessions/{sess_A}/          ← 分目录隔离，与 Pod 无关
          └── sessions/{sess_B}/
 
-池（hash 路由）
---------------
+    PVC: as-ws-shared-{agent_shared_hash} (ReadWriteMany, hash(agent_id))
+         │
+         ├── shared/skills/              ← 所有 (user, agent) 会话共享
+         └── shared/.mcp                 ← 所有 (user, agent) 会话共享
 
-Manager 根据 ``max_active_pods`` 预创建 N 个 Pod
-（``as-ws-{hash}-0 .. N-1``），会话经 ``hash(session_id) % N``
+池（hash 路由，按 source 分流）
+-------------------------------
+
+Manager 按 ``max_active_pods`` 预创建 N 个 Pod
+（``as-ws-{pool_hash}-0 .. N-1``），会话经 ``hash(session_id) % N``
 固定路由到某个 Pod，**不做任何占用标记**——同一 Pod 可被多个
 会话并发复用（per_agent 共享语义的 N Pod 变体）。Pod 缺失/不可用
 时顺延到下一个；全池空闲超 ``pool_idle_ttl`` 由 sweeper 全部回收
 （PVC 保留，下次访问懒重建）。
+
+会话按来源分两套池（``pool_hash`` 不同，标签值随之分离，sweeper
+按标签分组回收无需感知 source）：
+
+- **adp 池**：``hash(user::agent)``，共享 PVC 挂载为读写；
+- **非 adp 池**（``NON_ADP_SESSION_SOURCE``，如 deerflow）：
+  ``hash(user::agent::deerflow)``，池大小固定 1，共享 PVC 挂载为
+  只读——skills/.mcp 只读，session 工作目录仍在可写的 user PVC。
+
+共享 PVC 初始化（丢弃重装）：首个 adp 会话（rw 挂载）补齐
+``shared/`` 目录与 ``.mcp``；非 adp 会话先到时的写失败降级容忍
+（MCP 暂不可用，adp 会话补齐后自愈）。
 
 零框架改动 — 所有逻辑通过子类覆盖实现，不动 ``agentscope`` 一行代码。
 """
@@ -106,6 +120,14 @@ def _patch_api_client_timeout(api_client: Any, timeout: float) -> None:
 #: annotation 存 K8s 侧，不依赖进程内存，多实例部署下全局一致。
 LAST_ACTIVE_ANNOTATION = "agentscope.pool.last-active-at"
 
+#: 非 adp 来源会话的 workspace_id 前缀（deerflow 创建会话时用
+#: ``deerflow-{uuid}`` 作为 workspace_id）：get_workspace 据此判定
+#: 会话来源——此类会话挂载共享 PVC 为只读、使用独立池（大小固定
+#: 1）。框架 SessionSource 枚举无法扩展成员（pydantic 校验拒绝
+#: 任意字符串，读回时 model_validate 同样拒绝），故用自由字符串
+#: 的 workspace_id 承载来源标记，零框架改动。
+NON_ADP_WORKSPACE_PREFIX = "deerflow-"
+
 
 def _k8s_safe_label(value: str, max_len: int = 63) -> str:
     """清洗 K8s label 值：仅保留字母数字与 ``- _ .``，首尾必须字母数字。
@@ -139,6 +161,10 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         session_id: str = "",
         shared_pvc_access_mode: str = "ReadWriteMany",
         pod_name: str = "",
+        # ── agent 级共享 PVC（skills/.mcp）：空串表示不挂载 ──
+        agent_shared_pvc_name: str = "",
+        # ── 共享 PVC 是否只读挂载（非 adp 会话为 True） ──
+        shared_read_only: bool = False,
         refresh_heartbeat_interval: float = 0.0,
         # ── 透传给父类的所有参数 ──
         workspace_id: str | None = None,
@@ -189,6 +215,8 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         self._session_id: str = session_id
         self._shared_pvc_access_mode: str = shared_pvc_access_mode
         self._assigned_pod_name: str = pod_name
+        self._agent_shared_pvc_name: str = agent_shared_pvc_name
+        self._shared_read_only: bool = shared_read_only
 
         # ── 心跳间隔（pool_idle_ttl 派生，由 Manager 注入）：
         # 供 SlotReleaseMiddleware 在 run 期间周期性刷新池 Pod
@@ -318,7 +346,20 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
         working area, a destination for final deliverables and a home
         for user-uploaded files (used by the upload endpoint).
         """
-        await super()._ensure_workspace_layout()
+        try:
+            await super()._ensure_workspace_layout()
+        except Exception:
+            # 只读挂载 + 共享 PVC 尚未初始化（无 skills/.mcp）时，
+            # 父类 seed .mcp 会写失败；不阻断初始化——目录与配置
+            # 由后续 adp 会话（rw 挂载）补齐，属预期降级。
+            if not self._shared_read_only:
+                raise
+            logger.warning(
+                "%s: shared PVC not initialized yet; skip layout "
+                "seed on read-only mount (workspace=%r)",
+                type(self).__name__,
+                self.workspace_id,
+            )
         backend = self.get_backend()
         await backend.exec_shell(
             [
@@ -331,6 +372,24 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             ],
             cwd="/",
         )
+
+    async def _setup_skills(self) -> None:
+        """技能安装：只读挂载下 ``list_dir``/写入失败均容忍。
+
+        共享 PVC 未初始化时 ``skills/`` 目录不存在，父类
+        ``list_dir`` 会抛异常；rw 挂载（adp 会话）补建后自愈。
+        """
+        if not self._shared_read_only:
+            await super()._setup_skills()
+            return
+        try:
+            await super()._setup_skills()
+        except Exception as e:
+            logger.warning(
+                "%s: skill setup skipped on read-only mount: %s",
+                type(self).__name__,
+                e,
+            )
 
     # ── run 使用标记（供 sweeper 续期，防长 run 被回收） ─────
 
@@ -418,7 +477,22 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             )
             self._mcps = list(await self._gateway.list_mcps())
             return
-        await super()._setup_mcp_gateway()
+        try:
+            await super()._setup_mcp_gateway()
+        except Exception:
+            if not self._shared_read_only:
+                raise
+            # 只读挂载 + 共享 PVC 未初始化：.mcp 缺失时网关起不来，
+            # MCP 功能暂时降级（工具执行不受影响），adp 会话补齐
+            # 共享区后自愈。
+            self._gateway = None
+            logger.warning(
+                "%s: MCP gateway unavailable on read-only mount "
+                "(shared PVC not initialized); degraded until an "
+                "adp session seeds it (workspace=%r)",
+                type(self).__name__,
+                self.workspace_id,
+            )
 
     # ── 覆盖 provisioning: 支持池 Pod 名 ─────────────────────
 
@@ -455,6 +529,8 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
 
         await self._ensure_namespace()
         await self._ensure_pvc()
+        if self._agent_shared_pvc_name:
+            await self._ensure_agent_shared_pvc()
         await self._ensure_pod()
         await self._wait_pod_running()
 
@@ -502,6 +578,35 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
                 logger.info(
                     "SharedPvcK8sWorkspace: PVC %r is being deleted, "
                     "waiting...",
+                    pvc_name,
+                )
+                await self._wait_pvc_deleted(pvc_name)
+                await self._create_pvc(pvc_name)
+        except ApiException as e:
+            if e.status == 404:
+                await self._create_pvc(pvc_name)
+            else:
+                raise
+
+    async def _ensure_agent_shared_pvc(self) -> None:
+        """确保 agent 级共享 PVC（skills/.mcp）存在。
+
+        与 :meth:`_ensure_pvc`（user 级 PVC）逻辑一致，仅 PVC 名
+        不同。共享 PVC 被该 agent 的所有 (user, agent) 会话共用，
+        存续期间永不删除（skills 为 agent 级长期资产）。
+        """
+        from kubernetes_asyncio.client.rest import ApiException
+
+        pvc_name = self._agent_shared_pvc_name
+        try:
+            pvc = await self._v1.read_namespaced_persistent_volume_claim(
+                pvc_name,
+                self._namespace,
+            )
+            if pvc.metadata and pvc.metadata.deletion_timestamp is not None:
+                logger.info(
+                    "SharedPvcK8sWorkspace: shared PVC %r is being "
+                    "deleted, waiting...",
                     pvc_name,
                 )
                 await self._wait_pvc_deleted(pvc_name)
@@ -583,6 +688,17 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
                     name="workspace-data",
                     mount_path=POD_WORKDIR,
                 ),
+                *(
+                    [
+                        k8s_client.V1VolumeMount(
+                            name="workspace-shared",
+                            mount_path=f"{POD_WORKDIR}/shared",
+                            read_only=self._shared_read_only,
+                        ),
+                    ]
+                    if self._agent_shared_pvc_name
+                    else []
+                ),
             ],
             env=container_env,
         )
@@ -597,6 +713,20 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
                         claim_name=claim_name,
                     )
                 ),
+            ),
+            *(
+                [
+                    k8s_client.V1Volume(
+                        name="workspace-shared",
+                        persistent_volume_claim=(
+                            k8s_client.V1PersistentVolumeClaimVolumeSource(
+                                claim_name=self._agent_shared_pvc_name,
+                            )
+                        ),
+                    ),
+                ]
+                if self._agent_shared_pvc_name
+                else []
             ),
         ]
 
@@ -695,6 +825,12 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
 
     # ── 池 label 常量 ──────────────────────────────────────
     POOL_LABEL_AGENT = "agentscope.pool.agent"
+
+    # ── 非 adp 会话池常量 ────────────────────────────────
+    #: 非 adp 会话（如 deerflow）的池大小固定 1：池按 source
+    #: 分流后非 adp 流量走自己的池，单 Pod 排队足够；挂载权限
+    #: 不同决定了池必须分离，而非池内混合。
+    NON_ADP_POOL_SIZE = 1
 
     # ── 池大小缓存 TTL（秒）──
     # 短 TTL 平衡热更新时效性与 Redis 往返开销
@@ -855,12 +991,41 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 session_id=session_id,
             )
 
-        # agent 级 PVC 名称
+        # ── 会话来源：adp → 共享区可写 + adp 池；非 adp →
+        # 共享区只读 + 独立池（挂载权限不同，池必须分离）。
+        # 判定靠 workspace_id 前缀（deerflow 创建会话时写入
+        # ``deerflow-{uuid}``）——不依赖 source 字段（框架枚举
+        # 不可扩展）；存量无前缀会话一律按 adp 处理。 ──
+        is_adp = not workspace_id.startswith(NON_ADP_WORKSPACE_PREFIX)
+
+        # user 级 PVC 名称（hash(user::agent)，不区分 source）
         agent_hash = hashlib.blake2b(
             f"{user_id}::{agent_id}".encode("utf-8"),
             digest_size=8,
         ).hexdigest()
         shared_pvc_name = _k8s_safe_name(agent_hash)
+
+        # agent 级共享 PVC 名称（hash(agent_id)：skills/.mcp）
+        agent_shared_pvc_name = _k8s_safe_name(
+            hashlib.blake2b(
+                agent_id.encode("utf-8"),
+                digest_size=8,
+            ).hexdigest(),
+        )
+
+        # 池 hash：adp 保持现状（与存量池 Pod 一致），非 adp 加
+        # source 维度形成独立池（池 Pod 名/标签随之分离；sweeper
+        # 按标签分组回收，无需感知 source）
+        pool_hash = (
+            agent_hash
+            if is_adp
+            else hashlib.blake2b(
+                f"{user_id}::{agent_id}::{NON_ADP_WORKSPACE_PREFIX}".encode(
+                    "utf-8",
+                ),
+                digest_size=8,
+            ).hexdigest()
+        )
 
         # ── 缓存查找（session-scoped key） ──
         cached_ws: SharedPvcK8sWorkspace | None = None
@@ -902,12 +1067,18 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             await self._safe_close(cached_ws)
 
         # ── hash 路由选 Pod（不可用顺延，选中后刷新活跃时间） ──
-        pool_size = await self._get_pool_size(agent_id)
+        # 池大小：非 adp 固定 1（独立池，单 Pod 排队）
+        pool_size = (
+            await self._get_pool_size(agent_id)
+            if is_adp
+            else self.NON_ADP_POOL_SIZE
+        )
         logger.info(
-            "SharedPvcK8sWorkspaceManager: pool_size=%d for agent %r; "
-            "routing session %r",
+            "SharedPvcK8sWorkspaceManager: pool_size=%d for agent %r "
+            "(source=%s); routing session %r",
             pool_size,
             agent_id,
+            "adp" if is_adp else NON_ADP_WORKSPACE_PREFIX,
             session_id,
         )
         pod_name = ""
@@ -916,10 +1087,13 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             # 等分钟级操作，任一环节挂起都会卡死本次 run
             pod_name = await asyncio.wait_for(
                 self._route_pod(
-                    agent_hash,
+                    pool_hash,
                     agent_id,
                     session_id,
                     pool_size,
+                    user_pvc_name=shared_pvc_name,
+                    agent_shared_pvc_name=agent_shared_pvc_name,
+                    shared_read_only=not is_adp,
                 ),
                 timeout=self.POD_ROUTE_TIMEOUT_SECS,
             )
@@ -953,6 +1127,8 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                     shared_pvc_name=shared_pvc_name,
                     session_id=session_id,
                     pod_name=pod_name,
+                    agent_shared_pvc_name=agent_shared_pvc_name,
+                    shared_read_only=not is_adp,
                 ),
                 timeout=self.WORKSPACE_INIT_TIMEOUT_SECS,
             )
@@ -974,6 +1150,8 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         shared_pvc_name: str,
         session_id: str,
         pod_name: str = "",
+        agent_shared_pvc_name: str = "",
+        shared_read_only: bool = False,
     ) -> SharedPvcK8sWorkspace:
         """构造 :class:`SharedPvcK8sWorkspace` 并初始化。
 
@@ -989,6 +1167,8 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             session_id=session_id,
             shared_pvc_access_mode=self._shared_pvc_access_mode,
             pod_name=pod_name,
+            agent_shared_pvc_name=agent_shared_pvc_name,
+            shared_read_only=shared_read_only,
             # 心跳间隔：run 期间每 pool_idle_ttl/2 刷新一次活跃
             # 信号（下限 30s 防止误配导致过频），见 ws 属性说明。
             refresh_heartbeat_interval=max(self._pool_idle_ttl / 2.0, 30.0),
@@ -1102,6 +1282,11 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         agent_hash: str,
         agent_id: str,
         primary: int = 0,
+        *,
+        user_pvc_name: str = "",
+        agent_shared_pvc_name: str = "",
+        shared_read_only: bool = False,
+        pool_size: int | None = None,
     ) -> dict[str, Any]:
         """确保 agent 的池 Pod 齐备，返回 name→Pod 映射。
 
@@ -1111,14 +1296,20 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         （下次成为 primary 时再修复）。
         """
         await self._k8s_connect()
-        pool_size = await self._get_pool_size(agent_id)
+        if pool_size is None:
+            pool_size = await self._get_pool_size(agent_id)
         existing: dict[str, Any] = {}
         if pool_size <= 0:
             return existing
 
-        # ── 确保共享 PVC 存在（池 Pod 依赖它） ──
-        shared_pvc_name = _k8s_safe_name(agent_hash)
-        await self._ensure_shared_pvc(shared_pvc_name, agent_id)
+        # ── 确保 PVC 存在（池 Pod 依赖它们） ──
+        # user 级 PVC（session 工作目录）：hash(user::agent)，
+        # 与池 hash 独立——非 adp 池的 pool hash 含 source 维度，
+        # 不能用于派生 user PVC 名。
+        user_pvc_name = user_pvc_name or _k8s_safe_name(agent_hash)
+        await self._ensure_shared_pvc(user_pvc_name, agent_id)
+        if agent_shared_pvc_name:
+            await self._ensure_shared_pvc(agent_shared_pvc_name, agent_id)
 
         # 查询现有池 Pod
         from kubernetes_asyncio.client.rest import ApiException
@@ -1149,7 +1340,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             if pod_name in existing:
                 if i == primary:
                     try:
-                        await self._preheat_pod_gateway(pod_name)
+                        await self._preheat_pod_gateway(
+                            pod_name,
+                            shared_read_only=shared_read_only,
+                        )
                     except Exception:
                         logger.warning(
                             "SharedPvcK8sWorkspaceManager: gateway "
@@ -1164,12 +1358,22 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 pod_name,
                 agent_id,
             )
-            await self._create_pool_pod(pod_name, agent_hash, agent_id)
+            await self._create_pool_pod(
+                pod_name,
+                agent_hash,
+                agent_id,
+                agent_shared_pvc_name,
+                shared_read_only,
+                user_pvc_name,
+            )
             if i == primary:
                 # 新建 Pod：同步等待 Running 并启动网关——创建本就需
                 # 等待，预热开销与 Pod 就绪重叠，几乎免费。
                 try:
-                    await self._preheat_pod_gateway(pod_name)
+                    await self._preheat_pod_gateway(
+                        pod_name,
+                        shared_read_only=shared_read_only,
+                    )
                 except Exception:
                     logger.warning(
                         "SharedPvcK8sWorkspaceManager: gateway preheat "
@@ -1179,7 +1383,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                     )
             else:
                 asyncio.create_task(
-                    self._preheat_in_background(pod_name),
+                    self._preheat_in_background(
+                        pod_name,
+                        shared_read_only=shared_read_only,
+                    ),
                 )
             # 读回最新状态入池：新建 Pod 不在 list 快照里，而
             # _route_pod 靠 existing 判断 Running；不读回会误判
@@ -1250,6 +1457,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         agent_id: str,
         session_id: str,
         pool_size: int,
+        *,
+        user_pvc_name: str = "",
+        agent_shared_pvc_name: str = "",
+        shared_read_only: bool = False,
     ) -> str:
         """hash 路由选 Pod：目标不可用顺延到下一个 Running Pod。
 
@@ -1267,6 +1478,10 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
             agent_hash,
             agent_id,
             primary=start,
+            user_pvc_name=user_pvc_name,
+            agent_shared_pvc_name=agent_shared_pvc_name,
+            shared_read_only=shared_read_only,
+            pool_size=pool_size,
         )
 
         for k in range(pool_size):
@@ -1310,8 +1525,18 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                     break
                 raise
             await asyncio.sleep(1.0)
-        await self._create_pool_pod(name, agent_hash, agent_id)
-        await self._preheat_pod_gateway(name)
+        await self._create_pool_pod(
+            name,
+            agent_hash,
+            agent_id,
+            agent_shared_pvc_name,
+            shared_read_only,
+            user_pvc_name,
+        )
+        await self._preheat_pod_gateway(
+            name,
+            shared_read_only=shared_read_only,
+        )
         await self._touch_last_active(name)
         return name
 
@@ -1339,10 +1564,18 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         except ApiException:
             pass
 
-    async def _preheat_in_background(self, pod_name: str) -> None:
+    async def _preheat_in_background(
+        self,
+        pod_name: str,
+        *,
+        shared_read_only: bool = False,
+    ) -> None:
         """后台预热网关：吞异常，避免未捕获任务异常刷日志。"""
         try:
-            await self._preheat_pod_gateway(pod_name)
+            await self._preheat_pod_gateway(
+                pod_name,
+                shared_read_only=shared_read_only,
+            )
         except Exception:
             logger.warning(
                 "SharedPvcK8sWorkspaceManager: background gateway "
@@ -1351,7 +1584,12 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 exc_info=True,
             )
 
-    async def _preheat_pod_gateway(self, pod_name: str) -> None:
+    async def _preheat_pod_gateway(
+        self,
+        pod_name: str,
+        *,
+        shared_read_only: bool = False,
+    ) -> None:
         """等待池 Pod 运行，并确保网关在 Pod 上健康运行。
 
         步骤：等 Running → 确保共享目录与默认 ``.mcp`` 落盘 →
@@ -1418,7 +1656,21 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 indent=2,
                 ensure_ascii=False,
             ).encode("utf-8")
-            await backend.write_file(mcp_file, payload)
+            try:
+                await backend.write_file(mcp_file, payload)
+            except Exception:
+                if shared_read_only:
+                    # 只读挂载 + 共享 PVC 尚未由 adp 会话初始化：
+                    # 无法落盘 .mcp，网关起不来 → 跳过预热，adp
+                    # 会话补齐后自愈。
+                    logger.warning(
+                        "SharedPvcK8sWorkspaceManager: shared PVC "
+                        "not initialized; skip gateway preheat on "
+                        "read-only pool pod %r",
+                        pod_name,
+                    )
+                    return
+                raise
 
         # 3. 探测网关
         gateway = GatewayClient(
@@ -1565,6 +1817,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         pod_name: str,
         agent_hash: str,
         agent_id: str = "",
+        agent_shared_pvc_name: str = "",
+        shared_read_only: bool = False,
+        user_pvc_name: str = "",
     ) -> None:
         """创建单个池 Pod。
 
@@ -1572,6 +1827,7 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         - label 带 pool 标记（``agentscope.pool.agent``）
         - working_dir 固定为 /workspace
         - 无占用标记——hash 路由下同 Pod 可被多会话并发复用
+        - 非 adp 池的共享 PVC 只读挂载（``shared_read_only``）
         """
         await self._k8s_connect()
         from kubernetes_asyncio import client as k8s_client
@@ -1606,20 +1862,46 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                     name="workspace-data",
                     mount_path=POD_WORKDIR,
                 ),
+                *(
+                    [
+                        k8s_client.V1VolumeMount(
+                            name="workspace-shared",
+                            mount_path=f"{POD_WORKDIR}/shared",
+                            read_only=shared_read_only,
+                        ),
+                    ]
+                    if agent_shared_pvc_name
+                    else []
+                ),
             ],
             env=container_env,
         )
 
-        # 共享 PVC volume
-        shared_pvc_name = _k8s_safe_name(agent_hash)
+        # user 级 PVC volume（session 工作目录）：与池 hash 独立，
+        # 非 adp 池的 pool hash 含 source 维度，不能派生 PVC 名。
+        user_pvc_name = user_pvc_name or _k8s_safe_name(agent_hash)
         volumes = [
             k8s_client.V1Volume(
                 name="workspace-data",
                 persistent_volume_claim=(
                     k8s_client.V1PersistentVolumeClaimVolumeSource(
-                        claim_name=shared_pvc_name,
+                        claim_name=user_pvc_name,
                     )
                 ),
+            ),
+            *(
+                [
+                    k8s_client.V1Volume(
+                        name="workspace-shared",
+                        persistent_volume_claim=(
+                            k8s_client.V1PersistentVolumeClaimVolumeSource(
+                                claim_name=agent_shared_pvc_name,
+                            )
+                        ),
+                    ),
+                ]
+                if agent_shared_pvc_name
+                else []
             ),
         ]
 

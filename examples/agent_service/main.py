@@ -97,6 +97,10 @@ from bocomadp.routers.agent_tools import (
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
+from bocomadp.open_agent_access import (
+    patch_open_agent_access,
+    patch_open_session_credentials,
+)
 from bocomadp.team_access import patch_team_access
 from bocomadp.team_briefing import patch_team_briefing
 from bocomadp.projectors import WorkerFailureNotifier
@@ -858,6 +862,12 @@ async def _lifespan_with_builtin_agents(app):
         # 原实现改 src/_service/_session.py 的 delete_agent，现搬迁到
         # bocomadp/session_team_cascade.py。
         patch_session_team_cascade()
+        # 开放智能体交互：任意用户可与任意智能体对话（除 team worker），
+        # 创建/更新会话接口的 agent 归属与凭证归属校验一并放开；
+        # 必须早于 patch_team_briefing 挂载（两者都包装 resolve_agent，
+        # open 兜底在里层才能让 briefing 包装看到兜底结果）。
+        patch_open_agent_access()
+        patch_open_session_credentials()
         # 专家团 briefing（leader 的 system prompt 注入团队成员/交接序）
         # 原实现改 src/_service/_chat.py 的 _run_impl，现搬迁到
         # bocomadp/team_briefing.py，包装 ResourceAccessService.resolve_agent。
