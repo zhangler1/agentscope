@@ -7,13 +7,13 @@ Contract under test:
   （``deerflow-<user>-<provider>`` / ``deerflow-default-<provider>``）
   并解析出 provider_id；模型名 / 任意 uuid / 他人凭证 id 返回 None。
 - ``_resolve_chat_model_config`` 新契约（一凭证多模型）：
-  - hint 非空一律视为模型名透传（不再支持凭证 id 直传）；
+  - ``model_name`` 非空一律视为模型名透传（不再支持凭证 id 直传）；
   - ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
     优先、id 稳定排序取第一个；
   - 用户凭证为空 → default 用户凭证同规则挑选并复制入库；
   - 再空 → 回退 config.yaml 条目参数创建（ELLM 条目 api_key 空放行，
     非 ELLM 条目 api_key 空返回 None）。
-- 模型名：hint 模型名直接透传（凭证 model 字段不参与绑定）；缺失时
+- 模型名：``model_name`` 直接透传（凭证 model 字段不参与绑定）；缺失时
   回退凭证 model 字段值 → config.yaml 匹配条目 model_name → 全局
   active provider。
 """
@@ -151,7 +151,7 @@ class _FakeRequest:
 def _resolve(
     storage: _FakeStorage,
     user_id: str,
-    hint: str = "",
+    model_name: str = "",
     request: _FakeRequest | None = None,
 ) -> ChatModelConfig | None:
     return asyncio.run(
@@ -159,7 +159,7 @@ def _resolve(
             storage,
             request or _FakeRequest(),
             user_id,
-            hint,
+            model_name,
         ),
     )
 
@@ -208,7 +208,7 @@ class TestIsDeerflowCredentialId:
             is None
         )
 
-    def test_empty_hint(self) -> None:
+    def test_empty_value(self) -> None:
         assert is_deerflow_credential_id("", "user-1") is None
 
     def test_missing_provider_segment(self) -> None:
@@ -225,11 +225,11 @@ class TestResolveChatModelConfig:
     ) -> None:
         monkeypatch.setattr(chat_mod, "load_models_from_yaml", lambda: models)
 
-    def test_model_name_hint_passed_through_with_default_copy(
+    def test_model_name_passed_through_with_default_copy(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为模型名 → 透传为 config.model；用户凭证表为空 →
+        """``model_name`` 为模型名 → 透传为 config.model；用户凭证表为空 →
         default 凭证挑选复制路径。"""
         storage = _FakeStorage()
         storage.seed(
@@ -242,7 +242,7 @@ class TestResolveChatModelConfig:
             models=[_deepseek_entry("sk-test")],
         )
 
-        config = _resolve(storage, "user-1", hint="deepseek-chat")
+        config = _resolve(storage, "user-1", model_name="deepseek-chat")
 
         assert config is not None
         assert config.credential_id == (
@@ -252,11 +252,11 @@ class TestResolveChatModelConfig:
         assert config.model == "deepseek-chat"
         assert len(storage.upserts) == 1  # 从 default 复制
 
-    def test_non_credential_hint_always_passed_through(
+    def test_non_credential_model_name_always_passed_through(
         self,
         monkeypatch,
     ) -> None:
-        """hint 非约定凭证 id（如 provider_id）→ 一律透传为模型名，
+        """``model_name`` 非约定凭证 id（如 provider_id）→ 一律透传为模型名，
         不再做 config.yaml 双键匹配。"""
         storage = _FakeStorage()
         storage.seed(
@@ -269,14 +269,14 @@ class TestResolveChatModelConfig:
             models=[_deepseek_entry("sk-test")],
         )
 
-        config = _resolve(storage, "user-1", hint=_DEEPSEEK_PROVIDER)
+        config = _resolve(storage, "user-1", model_name=_DEEPSEEK_PROVIDER)
 
         assert config is not None
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
         assert config.type == "deepseek_credential"
-        assert config.model == _DEEPSEEK_PROVIDER  # hint 原样透传
+        assert config.model == _DEEPSEEK_PROVIDER  # model_name 原样透传
 
     def test_non_ellm_empty_api_key_returns_none(self, monkeypatch) -> None:
         """非 ELLM 条目 api_key 空 → 仍返回 None，且不产生 upsert。"""
@@ -286,13 +286,13 @@ class TestResolveChatModelConfig:
             models=[_deepseek_entry("")],
         )
 
-        config = _resolve(storage, "user-1", hint="deepseek-chat")
+        config = _resolve(storage, "user-1", model_name="deepseek-chat")
 
         assert config is None
         assert storage.upserts == []
 
     def test_active_provider_fallback(self, monkeypatch) -> None:
-        """hint 为空时回退全局 active provider。"""
+        """``model_name`` 为空时回退全局 active provider。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -320,8 +320,8 @@ class TestResolveChatModelConfig:
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
 
-    def test_no_hint_no_provider_returns_none(self, monkeypatch) -> None:
-        """hint 空 + 无 active → None（原生 404 兜底）。"""
+    def test_no_model_name_no_provider_returns_none(self, monkeypatch) -> None:
+        """``model_name`` 空 + 无 active → None（原生 404 兜底）。"""
         storage = _FakeStorage()
         self._patch_loaders(monkeypatch, models=[])
 
@@ -330,12 +330,12 @@ class TestResolveChatModelConfig:
         assert config is None
         assert storage.upserts == []
 
-    def test_dynamic_hint_routes_to_unique_ellm_entry(
+    def test_dynamic_model_name_routes_to_unique_ellm_entry(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为真实模型 ID + 无 active provider + config.yaml 唯一
-        ELLM 条目 → 动态路由，config.model == hint。"""
+        """``model_name`` 为真实模型 ID + 无 active provider + config.yaml 唯一
+        ELLM 条目 → 动态路由，config.model == model_name。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -347,26 +347,26 @@ class TestResolveChatModelConfig:
             models=[_ellm_entry(api_key="")],
         )
 
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+        config = _resolve(storage, "user-1", model_name="Qwen3-235B-A22B")
 
         assert config is not None
         assert config.type == "bocom_ellm_credential"
         assert config.model == "Qwen3-235B-A22B"
         assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
 
-    def test_entry_fallback_binds_entry_model_not_hint(
+    def test_entry_fallback_binds_entry_model_not_model_name(
         self,
         monkeypatch,
     ) -> None:
         """凭证全空 → 条目回退入库；凭证 model 取条目 model_name，
-        config.model 仍为 hint 透传值（凭证 model 字段不参与绑定）。"""
+        config.model 仍为 ``model_name`` 透传值（凭证 model 字段不参与绑定）。"""
         storage = _FakeStorage()
         self._patch_loaders(
             monkeypatch,
             models=[_ellm_entry(api_key="")],
         )
 
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+        config = _resolve(storage, "user-1", model_name="Qwen3-235B-A22B")
 
         assert config is not None
         assert config.model == "Qwen3-235B-A22B"
@@ -377,12 +377,12 @@ class TestResolveChatModelConfig:
         assert isinstance(credential, ELLMCredential)
         assert credential.model == "deepseek-v4-flash"  # 条目 model_name
 
-    def test_hint_passed_through_for_non_ellm_credential(
+    def test_model_name_passed_through_for_non_ellm_credential(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为真实模型 ID + 凭证为非 ELLM（deepseek）→ 同样透传，
-        不再丢弃 hint 或用静态条目名。"""
+        """``model_name`` 为真实模型 ID + 凭证为非 ELLM（deepseek）→
+        同样透传，不再丢弃 ``model_name`` 或用静态条目名。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -397,7 +397,7 @@ class TestResolveChatModelConfig:
         config = _resolve(
             storage,
             "user-1",
-            hint="Qwen3-235B-A22B",
+            model_name="Qwen3-235B-A22B",
             request=_FakeRequest(
                 active=SimpleNamespace(
                     provider_id=_DEEPSEEK_PROVIDER,
@@ -408,7 +408,7 @@ class TestResolveChatModelConfig:
 
         assert config is not None
         assert config.type == "deepseek_credential"
-        assert config.model == "Qwen3-235B-A22B"  # hint 透传
+        assert config.model == "Qwen3-235B-A22B"  # model_name 透传
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
@@ -445,11 +445,11 @@ class TestResolveChatModelConfig:
         # 模型名回退凭证 model 字段值
         assert config.model == "deepseek-v4-flash"
 
-    def test_model_name_hint_overrides_credential_bound_model(
+    def test_model_name_overrides_credential_bound_model(
         self,
         monkeypatch,
     ) -> None:
-        """hint 模型名透传进 config.model；凭证 model 字段值不被覆盖。"""
+        """``model_name`` 模型名透传进 config.model；凭证 model 字段值不被覆盖。"""
         storage = _FakeStorage()
         storage.seed(
             "user-1",
@@ -463,11 +463,11 @@ class TestResolveChatModelConfig:
             models=[_ellm_entry(api_key="")],
         )
 
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+        config = _resolve(storage, "user-1", model_name="Qwen3-235B-A22B")
 
         assert config is not None
         assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert config.model == "Qwen3-235B-A22B"  # hint 透传
+        assert config.model == "Qwen3-235B-A22B"  # model_name 透传
         # 凭证 model 字段保持原值（不做绑定过滤）
         assert (
             storage._records[
@@ -480,7 +480,7 @@ class TestResolveChatModelConfig:
         self,
         monkeypatch,
     ) -> None:
-        """hint 缺失时的模型名回退链：凭证 model 字段 → 条目 model_name
+        """``model_name`` 缺失时的模型名回退链：凭证 model 字段 → 条目 model_name
         → active provider。"""
         # 1) 凭证 model 字段有值 → 用凭证 model
         storage = _FakeStorage()

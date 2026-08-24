@@ -12,7 +12,7 @@
 | ``ReplyStartEvent``           | ``metadata``           | run_id / thread_id / assistant_id 首帧      |
 | ``TextBlock*``                | ``messages``           | ``[{"type": "AIMessageChunk", "content", "id"}, metadata]`` |
 | ``ThinkingBlock*``            | ``messages``           | chunk 附 ``additional_kwargs.reasoning_content``，metadata 附 ``reasoning: true`` |
-| ``ToolCallStart/Delta/End``   | ``messages`` + ``updates`` | ai 消息 ``tool_calls`` 数组（messages 帧，官方前端消费）+ ``{"model": {"messages": [...]}}`` 快照（updates 帧，jx_chat 前端消费） |
+| ``ToolCallStart/Delta/End``   | ``messages`` + ``updates`` | 流式 ``AIMessageChunk`` 增量帧（``tool_call_chunks`` 首片带 name/id/index、delta 片只带 args，官方前端 SDK 按同 id concat 出 tool_calls）+ end 时 ``{"model": {"messages": [...]}}`` 完整 ai 消息快照（updates 帧，jx_chat 前端消费） |
 | ``ToolResultStart/Text/End``  | ``messages``           | ``[{"type": "tool", "content", "name", "tool_call_id", "id"}, metadata]`` |
 | ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
@@ -157,6 +157,9 @@ class DeerflowSSEFormatter:
         self._tool_call_args: dict[str, str] = {}
         # tool_call_id -> 工具名（start 时记录，供 delta/end 复用）
         self._tool_call_names: dict[str, str] = {}
+        # tool_call_id -> chunk index（并行多工具时按出现顺序分配，
+        # 对齐 LangChain tool_call_chunks 的 index 语义）
+        self._tool_call_index: dict[str, int] = {}
         # tool_call_id -> 累积 result 文本（tool_result_text_delta 拼接）
         self._tool_result_text: dict[str, str] = {}
 
@@ -278,29 +281,90 @@ class DeerflowSSEFormatter:
     # ── 工具调用（arguments 片段跨事件累积）────────────────────────────
 
     def _on_tool_call_start(self, event: dict) -> list[StreamEvent]:
+        """工具调用开始 → 首片 AIMessageChunk 增量帧（官方契约）。
+
+        对齐 deer-flow 官方 messages-tuple 流式形态：``type`` 取
+        ``AIMessageChunk``（SDK 切片归一化为 ai 后按同 id concat 合并），
+        首片 ``tool_call_chunks`` 携带 name/id/index（args 留空），后续
+        delta 帧按 index 累积 args 片段。
+        """
         call_id = str(event.get("tool_call_id", ""))
         name = str(event.get("tool_call_name", ""))
         self._tool_call_args[call_id] = ""
         self._tool_call_names[call_id] = name
-        # 仅在 end 时发帧（messages + updates），start/delta 只累积
-        return []
+        if call_id not in self._tool_call_index:
+            self._tool_call_index[call_id] = len(self._tool_call_index)
+        index = self._tool_call_index[call_id]
+        reply_id = event.get("reply_id")
+        chunk: dict[str, Any] = {
+            "type": "AIMessageChunk",
+            "content": "",
+            # 与文本 chunk 同 id：SDK 按 id concat，tool_call_chunks 与
+            # 文本合并进同一条 ai 消息（对齐官方单 run 单 id 形态）。
+            "id": reply_id,
+            "tool_call_chunks": [
+                {
+                    "name": name,
+                    "args": "",
+                    "id": call_id,
+                    "index": index,
+                    "type": "tool_call_chunk",
+                },
+            ],
+        }
+        return [
+            _evt(
+                event,
+                EVENT_MESSAGES,
+                [chunk, {"langgraph_node": "model"}],
+            ),
+        ]
 
     def _on_tool_call_delta(self, event: dict) -> list[StreamEvent]:
+        """工具调用 args 增量 → AIMessageChunk 增量帧。
+
+        对齐官方形态：delta 帧的 ``tool_call_chunks`` 中 name/id 为 null，
+        仅携带 args 片段；SDK concat 时按 index 把 args 逐片拼接。
+        """
         call_id = str(event.get("tool_call_id", ""))
         delta = event.get("delta", "") or ""
         self._tool_call_args[call_id] = (
             self._tool_call_args.get(call_id, "") + delta
         )
-        return []
+        if not delta:
+            return []
+        reply_id = event.get("reply_id")
+        index = self._tool_call_index.get(call_id, 0)
+        chunk: dict[str, Any] = {
+            "type": "AIMessageChunk",
+            "content": "",
+            "id": reply_id,
+            "tool_call_chunks": [
+                {
+                    "name": None,
+                    "args": delta,
+                    "id": None,
+                    "index": index,
+                    "type": "tool_call_chunk",
+                },
+            ],
+        }
+        return [
+            _evt(
+                event,
+                EVENT_MESSAGES,
+                [chunk, {"langgraph_node": "model"}],
+            ),
+        ]
 
     def _on_tool_call_end(self, event: dict) -> list[StreamEvent]:
-        """工具调用完成 → messages 帧 + updates 帧（双发策略）。
+        """工具调用完成 → updates 帧（model 节点完整消息快照）。
 
-        messages 帧对齐 deer-flow 官方格式（ai 完整消息携带 tool_calls
-        数组），官方前端 SDK 消费；updates 帧为 ``{"model": {"messages":
-        [ai_msg]}}`` 快照，jx_chat 前端只消费 updates 事件的
-        ``data.model.messages[0]`` 中 ``type == "ai"`` 的 tool_calls。
-        两帧互不干扰，各取所需。
+        对齐官方：流式过程只发 messages 增量帧（tool_call_chunks），
+        完整 ai 消息（``tool_calls`` 汇总）仅出现在 updates 帧的
+        ``model.messages`` 快照里（jx_chat 前端只消费该快照的
+        ``type == "ai"`` tool_calls，官方前端 SDK 则靠增量帧 concat
+        出 tool_calls）。
         """
         call_id = str(event.get("tool_call_id", ""))
         args_raw = self._tool_call_args.get(call_id, "")
@@ -312,9 +376,10 @@ class DeerflowSSEFormatter:
             args = {}
         reply_id = event.get("reply_id")
         ai_msg: dict[str, Any] = {
-            "type": "ai",  # 完整 AIMessage 形态，对齐官方 values 快照
+            "type": "ai",  # 完整 AIMessage 形态，对齐官方 updates 快照
             "content": "",
-            # 独立 id：SDK 同 id 的 AIMessageChunk.concat 会丢 tool_calls
+            # 独立 id：与流式 chunk（reply_id）区分，避免被 SDK concat
+            # 进流式消息。
             "id": f"{reply_id}:tool:{call_id}",
             "tool_calls": [
                 {
@@ -325,7 +390,6 @@ class DeerflowSSEFormatter:
             ],
         }
         return [
-            _evt(event, EVENT_MESSAGES, [ai_msg, {"langgraph_node": "agent"}]),
             _evt(event, EVENT_UPDATES, {"model": {"messages": [ai_msg]}}),
         ]
 

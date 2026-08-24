@@ -159,9 +159,7 @@ def deps(monkeypatch: pytest.MonkeyPatch) -> dict:
 
 
 def _download_sync(deps: dict, urls: list[str]) -> list:
-    import asyncio
-
-    return asyncio.get_event_loop().run_until_complete(
+    return asyncio.run(
         download_urls_to_session(
             deps["user_id"],
             deps["agent_id"],

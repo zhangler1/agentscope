@@ -575,7 +575,7 @@ async def _resolve_chat_model_config(
     storage: StorageBase,
     request: Request,
     user_id: str,
-    hint: str = "",
+    model_name: str = "",
 ) -> ChatModelConfig | None:
     """把请求解析为原生 ChatModelConfig（凭证来自用户凭证表）。
 
@@ -588,8 +588,8 @@ async def _resolve_chat_model_config(
     - 再空 → 回退 config.yaml 条目参数创建（active provider 对应
       条目优先；api_key 空且非 ELLM 视为不可用）。
 
-    模型名：hint 非空一律视为模型名直接透传（凭证不绑定模型，
-    hint 不再支持凭证 id 直传）；缺失时回退凭证 model 字段值 →
+    模型名：``model_name`` 非空一律直接透传（凭证不绑定模型，
+    不区分凭证 id）；缺失时回退凭证 model 字段值 →
     config.yaml 匹配条目 model_name → 全局 active provider；全部缺失
     返回 None（原生 404 兜底，不阻断请求）。parameters 取 config.yaml
     中与凭证 type 匹配条目的 parameters（无匹配则空）。
@@ -709,8 +709,8 @@ async def _resolve_chat_model_config(
         )
         return None
 
-    # ── 模型名：hint 一律透传；缺失回退凭证 model → 条目 → active ──
-    model = hint
+    # ── 模型名：model_name 一律透传；缺失回退凭证 model → 条目 → active ──
+    model = model_name
     if not model:
         bound = getattr(credential, "model", None)
         if bound:
@@ -723,9 +723,9 @@ async def _resolve_chat_model_config(
         model = active.model_name or ""
     if not model:
         logger.warning(
-            "deerflow: no model name resolved (hint=%r, credential=%s); "
-            "session created without chat_model_config.",
-            hint,
+            "deerflow: no model name resolved (model_name=%r, "
+            "credential=%s); session created without chat_model_config.",
+            model_name,
             record.id,
         )
         return None
@@ -750,15 +750,16 @@ async def _ensure_session(
     user_id: str,
     agent_id: str,
     session_id: str,
-    model_name_hint: str = "",
+    model_name: str = "",
 ) -> None:
     """原生 ChatService.run 要求 session 已存在且带模型配置；缺失时补齐。
 
     workspace_id 由 workspace_manager 的隔离策略分配（与原生 /session/
-    创建路径一致）；chat_model_config 优先按请求级模型名匹配 config.yaml
-    条目，未命中回退全局 active provider（ProviderManager），保证默认
-    会话也能在原生链路上真实调用模型。
-    会话已存在时：配置缺失则回填；请求显式携带模型名（``model_name_hint``
+    创建路径一致）；chat_model_config 由 _resolve_chat_model_config
+    解析（凭证表挑选 → default 复制 → config.yaml 条目创建，模型名
+    缺失时回退全局 active provider），保证默认会话也能在原生链路上
+    真实调用模型。
+    会话已存在时：配置缺失则回填；请求显式携带模型名（``model_name``
     非空）且解析出的 (type, credential_id, model) 与现状不一致时才更新
     （per-run 模型切换）；未携带模型名则保持既有配置不动——原生接口
     建好的会话（如绑定 ELLM 凭证）不被 config.yaml 全局 active
@@ -768,7 +769,7 @@ async def _ensure_session(
     if (
         existing is not None
         and existing.config.chat_model_config is not None
-        and not model_name_hint
+        and not model_name
     ):
         # 会话已存在且带模型配置、本次未显式指定模型名 → 保持既有
         # 配置不动：原生接口建好的会话（如绑定 ELLM 凭证）不能被
@@ -778,7 +779,7 @@ async def _ensure_session(
         storage,
         request,
         user_id,
-        model_name_hint,
+        model_name,
     )
     if existing is not None:
         existing_config = existing.config.chat_model_config
@@ -1293,7 +1294,7 @@ async def create_run_stream(
     # 请求级模型名（custom_params.llm_model_name，唯一通道），在
     # custom_params 落盘/回退之前解析——首次建会话时 workspace 尚不存在，
     # 直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
-    model_name_hint = _resolve_requested_model_name(body.custom_params)
+    model_name = _resolve_requested_model_name(body.custom_params)
     await _ensure_session(
         storage,
         workspace_manager,
@@ -1301,7 +1302,7 @@ async def create_run_stream(
         user_id,
         agent_id,
         session_id,
-        model_name_hint,
+        model_name,
     )
     if isinstance(converted, _HumanInputResponseMarker):
         # 前端确认卡片应答：构造 UserConfirmResultEvent 续跑（Case B）。
@@ -1411,7 +1412,7 @@ async def create_run_wait(
     _attach_files_metadata(input_msg, (body.custom_params or {}).get("files"))
     # 同 create_run_stream：先解析请求级模型名（custom_params 唯一通道）
     # 再懒建会话。
-    model_name_hint = _resolve_requested_model_name(body.custom_params)
+    model_name = _resolve_requested_model_name(body.custom_params)
     await _ensure_session(
         storage,
         workspace_manager,
@@ -1419,7 +1420,7 @@ async def create_run_wait(
         user_id,
         agent_id,
         session_id,
-        model_name_hint,
+        model_name,
     )
     # 同 create_run_stream：请求携带 additional_urls 时先下载到会话
     # uploads 目录；随后 custom_params（含 additional_urls）整体落盘

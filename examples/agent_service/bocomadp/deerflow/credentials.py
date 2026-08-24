@@ -50,11 +50,11 @@ def user_credential_id(user_id: str, provider_id: str) -> str:
     return f"{_CREDENTIAL_PREFIX}-{user_id}-{provider_id}"
 
 
-def is_deerflow_credential_id(hint: str, user_id: str) -> str | None:
+def is_deerflow_credential_id(value: str, user_id: str) -> str | None:
     """值为约定 credential id 时解析出 provider_id。
 
     供 ``_copy_credential_to_user`` 从 default 凭证记录 id 解析
-    provider（``_resolve_chat_model_config`` 的 hint 不再走此识别）。
+    provider（``_resolve_chat_model_config`` 的模型名不再走此识别）。
 
     识别约定凭证 id 的两种形态：
 
@@ -64,17 +64,17 @@ def is_deerflow_credential_id(hint: str, user_id: str) -> str | None:
 
     其余形态（模型名 / 任意 uuid 等）返回 None。
     """
-    hint = (hint or "").strip()
-    if not hint:
+    value = (value or "").strip()
+    if not value:
         return None
     prefix = f"{_CREDENTIAL_PREFIX}-{user_id}-"
-    if hint.startswith(prefix):
-        provider = hint[len(prefix):]
+    if value.startswith(prefix):
+        provider = value[len(prefix):]
         if provider:
             return provider
     default_prefix = f"{_CREDENTIAL_PREFIX}-{DEFAULT_CREDENTIAL_OWNER}-"
-    if hint.startswith(default_prefix):
-        provider = hint[len(default_prefix):]
+    if value.startswith(default_prefix):
+        provider = value[len(default_prefix):]
         if provider:
             return provider
     return None

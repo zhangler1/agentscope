@@ -4,7 +4,7 @@
 
 - ``_resolve_requested_model_name``：llm_model_name 单一通道与空回退；
 - ``ensure_default_credentials``：default 用户维度、幂等 upsert、失败不阻断；
-- ``_resolve_chat_model_config``：hint 模型名透传、用户凭证表挑选
+- ``_resolve_chat_model_config``：模型名透传、用户凭证表挑选
   （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退 config.yaml
   条目；
 - ``_ensure_session``：首次 backfill、模型切换更新、一致不更新。
@@ -282,7 +282,7 @@ def _run(coro):
 
 
 def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
-    """hint 为模型名：透传为 config.model；凭证表为空时回退 active
+    """``model_name`` 为模型名：透传为 config.model；凭证表为空时回退 active
     provider 对应条目创建用户凭证。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
@@ -293,7 +293,7 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
             storage,
             FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            hint="r1",
+            model_name="r1",
         ),
     )
 
@@ -304,7 +304,7 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
 
 
 def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
-    """hint 非约定凭证 id（provider_id）：原样透传为模型名。"""
+    """``model_name`` 非约定凭证 id（provider_id）：原样透传为模型名。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -314,7 +314,7 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
             storage,
             FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            hint="ds-r1",
+            model_name="ds-r1",
         ),
     )
 
@@ -326,7 +326,7 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
 def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
     monkeypatch,
 ) -> None:
-    """hint 任意值一律透传为模型名；凭证表为空时凭证回退 active
+    """``model_name`` 任意值一律透传为模型名；凭证表为空时凭证回退 active
     provider 对应条目创建。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
@@ -337,7 +337,7 @@ def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
             storage,
             FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            hint="nope",
+            model_name="nope",
         ),
     )
 
@@ -441,7 +441,7 @@ def test_resolve_chat_model_config_unknown_entry_returns_none(
 
 def _run_ensure_session(
     storage: FakeStorage,
-    hint: str = "",
+    model_name: str = "",
     request: FakeRequest | None = None,
 ) -> None:
     _run(
@@ -452,7 +452,7 @@ def _run_ensure_session(
             USER_ID,
             AGENT_ID,
             "s1",
-            model_name_hint=hint,
+            model_name=model_name,
         ),
     )
 
@@ -495,7 +495,7 @@ def test_ensure_session_updates_config_on_model_switch(
         ),
     )
 
-    _run_ensure_session(storage, hint="r1")
+    _run_ensure_session(storage, model_name="r1")
 
     session = storage.sessions[_session_key()]
     assert session.config.chat_model_config.model == "r1"
