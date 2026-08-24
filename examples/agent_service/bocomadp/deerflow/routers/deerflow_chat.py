@@ -725,12 +725,27 @@ async def _ensure_session(
     config_kwargs: dict[str, Any] = {"workspace_id": workspace_id}
     if model_config is not None:
         config_kwargs["chat_model_config"] = model_config
-    await storage.upsert_session(
-        user_id=user_id,
-        agent_id=agent_id,
-        config=SessionConfig(**config_kwargs),
-        session_id=session_id,
-    )
+    try:
+        await storage.upsert_session(
+            user_id=user_id,
+            agent_id=agent_id,
+            config=SessionConfig(**config_kwargs),
+            session_id=session_id,
+        )
+    except ValueError as e:
+        # get_session 因 owner 不匹配返回 None，而该 session_id 实际
+        # 归属其他用户——跨用户补建会污染他人会话的模型配置。
+        # 对请求方而言该 thread 不可见，按 404 处理。
+        logger.warning(
+            "deerflow: session %s exists for a different user; "
+            "refusing cross-owner upsert (%s).",
+            session_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        ) from e
     logger.info(
         "deerflow: session %s auto-created for agent %s (user=%s).",
         session_id,
