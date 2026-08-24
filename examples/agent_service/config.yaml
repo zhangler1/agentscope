@@ -45,6 +45,17 @@ db:
 ellm_key_refresh:
   refresh_ahead_secs: 120
 
+# ---------- 上下文压缩（统一压缩模型） ----------
+# 所有会话的上下文压缩统一使用指定凭证 + 模型（框架压缩本身默认开启）。
+# enabled: false（默认）时中间件纯透传，压缩用各会话自身模型（现状）；
+# enabled: true 时两个模型字段必填（缺一启动报错）。
+# 凭证 ID 由使用方提供（代码只按 ID 查库，不做凭证创建）。
+# 压缩参数（trigger/reserve/提示词）仍由各智能体 context_config 自定义，此处不配。
+context_compression:
+  enabled: false
+  credential_id: "deerflow-lwh-deepseek-v4-flash"
+  model_name: "deepseek-v4-flash"
+
 # ---------- Redis（消息总线 / 分布式锁 / 缓存） ----------
 # 存储后端已迁至上方 db（AsyncSQLAlchemyStorage）；Redis 仅保留给
 # RedisMessageBus 等瞬时协调用途。当前 main.py 用 InMemoryMessageBus，
@@ -109,6 +120,20 @@ models:
       temperature: 0.7
       max_tokens: 4096
       thinking_enable: false
+
+  - provider_id: deepseek-v4-flash
+    display_name: deepseek-v4-flash
+    provider_type: bocom_ellm
+    model_name: deepseek-v4-flash
+    api_key: "1111111111"
+    base_url: https://api.deepseek.com
+    scene_code: P2024146
+    api_key_url: http://host.docker.internal:9100/createSceneApiKey.do
+    is_active: true
+    supports_multimodal: false
+    parameters:
+      temperature: 0.3
+      max_tokens: 8192
 
   # --- 取消注释以启用更多 provider ---
   # - provider_id: deepseek-reasoner
