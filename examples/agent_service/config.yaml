@@ -242,7 +242,6 @@ cross_search:
   user_code: "U000000000000000"
   psnl_space_code_id: "PER754964863350213"
   psnl_category_id_list: []
-  second_search_kb_codes: []
   headers:
     Accept: "*/*"
     Accept-Encoding: "gzip, deflate, br"

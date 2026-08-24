@@ -62,7 +62,7 @@ curl -X POST http://192.168.0.106/api/threads/t1/runs/{run_id}/cancel \
 | `agent_id` | 是 | 原生智能体 ID（storage 中注册的 agent，见第 2 节）；缺失 → 400 |
 | `assistant_id` | 否 | LangGraph SDK 别名，接受但忽略（前端适配已废弃） |
 | `input` | 否 | 输入消息：单条消息 dict `{"type":"human","content":"..."}` 或 `{"messages":[...]}` 列表；**不接受纯字符串** |
-| `custom_params` | 否 | 请求级运行时配置（空间码 / custom_prompt / 检索开关 / guwp_token 等），见下节 |
+| `custom_params` | 否 | 请求级运行时配置（custom_prompt / 检索开关 / guwp_token 等），见下节 |
 | `session_id` | 是 | 必须等于路径 `thread_id`（thread_id == session_id 同一资源）；缺失或不一致 → 400 |
 | `stream_mode` / `multitask_strategy` | 否 | 接受但忽略（固定 messages+custom 流、reject 并发策略） |
 | `on_disconnect` | 否 | `cancel`（默认，断线即中断 run）/ `continue`（仅断开订阅） |
@@ -76,10 +76,6 @@ curl -N -X POST http://192.168.0.106/api/threads/t1/runs/stream \
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "你好，介绍一下你自己"},
     "custom_params": {
-      "space_code_list": ["SP0000001"],
-      "team_space_code_list": ["TEAM01"],
-      "user_code": "U001",
-      "search_type": "0",
       "custom_prompt": "你是内部知识助手，回答必须简洁、引用检索结果。",
       "vector_search_switch": true,
       "guwp_token": "demo-guWP-token"
@@ -97,6 +93,53 @@ curl -N -X POST http://192.168.0.106/api/threads/t1/runs/stream \
 创建 / 修改 / 删除走框架内置 `/agent` 路由，`system_prompt` 随智能体记录
 入库；chat / deerflow 运行时按 `agent_id` 从 storage 解析（不可见 → 404）。
 模型选择不再按 agent 绑定：请求级模型名未指定时回退全局 active provider。
+
+### 2.1 智能体跨知识搜索配置（`/agents/{id}/cross-search-config`）
+
+cross_search 工具的参数（空间码、用户编码、检索类型等）为智能体级配置，通过独立接口管理，存储在 PG `agent_cross_search_configs` 表，该智能体的所有会话共享。
+
+优先级：智能体级配置（PG）> config.yaml 全局默认值。
+
+```bash
+# 查询配置
+curl http://192.168.0.106/api/agents/{agent_id}/cross-search-config \
+  -H 'x-user-id: u1'
+# 响应: {"agent_id":"...","configured":true,"config":{...}}
+# 未配置时: {"agent_id":"...","configured":false,"config":null}
+
+# 设置配置（UPSERT）
+curl -X PUT http://192.168.0.106/api/agents/{agent_id}/cross-search-config \
+  -H 'Content-Type: application/json' -H 'x-user-id: u1' \
+  -d '{
+    "user_code": "U001",
+    "search_type": "0",
+    "space_code_list": ["SP0000001"],
+    "team_space_code_list": ["TEAM01"],
+    "psnl_space_code_id": "",
+    "psnl_category_id_list": [],
+    "customized_tag_list": [],
+    "text_top_n": 5,
+    "vector_top_n": 5
+  }'
+
+# 删除配置（恢复 config.yaml 默认值）
+curl -X DELETE http://192.168.0.106/api/agents/{agent_id}/cross-search-config \
+  -H 'x-user-id: u1'
+```
+
+**AgentCrossSearchConfig 字段**：
+
+| 字段 | 类型 | 必填 | 语义 |
+|---|---|---|---|
+| `user_code` | str | 否 | 用户编码（空串回退 config.yaml） |
+| `search_type` | str | 否 | 检索类型：0=混合，1=全文，2=向量 |
+| `space_code_list` | list[str] | 否 | 场景知识空间代码列表 |
+| `team_space_code_list` | list[str] | 否 | 团队知识空间代码列表 |
+| `psnl_space_code_id` | str | 否 | 个人知识空间代码 ID |
+| `psnl_category_id_list` | list[str] | 否 | 个人知识分类 ID 列表 |
+| `customized_tag_list` | list[str] | 否 | 自定义标签列表 |
+| `text_top_n` | int | 否 | 全文检索返回条数（null 回退 config.yaml） |
+| `vector_top_n` | int | 否 | 向量检索返回条数（null 回退 config.yaml） |
 
 ## 3. 模型（`/models`、`/model`）
 
