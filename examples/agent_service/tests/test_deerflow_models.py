@@ -7,7 +7,7 @@
 - ``_resolve_chat_model_config``：模型名透传、用户凭证表挑选
   （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退 config.yaml
   条目；
-- ``_ensure_session``：首次 backfill、模型切换更新、一致不更新。
+- ``_prepare_session_for_run``：首次 backfill、模型切换更新、一致不更新。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from bocomadp.deerflow.credentials import (
 )
 from bocomadp.deerflow.routers.deerflow_chat import (
     CreateRunRequest,
-    _ensure_session,
+    _prepare_session_for_run,
     _resolve_chat_model_config,
     _resolve_requested_model_name,
 )
@@ -436,16 +436,16 @@ def test_resolve_chat_model_config_unknown_entry_returns_none(
     assert config is None
 
 
-# ── _ensure_session ───────────────────────────────────────────────────
+# ── _prepare_session_for_run ─────────────────────────────────────────
 
 
-def _run_ensure_session(
+def _run_prepare_session(
     storage: FakeStorage,
     model_name: str = "",
     request: FakeRequest | None = None,
 ) -> None:
     _run(
-        _ensure_session(
+        _prepare_session_for_run(
             storage,
             FakeWorkspaceManager(),
             request or FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
@@ -461,7 +461,7 @@ def _session_key() -> tuple[str, str, str]:
     return (USER_ID, AGENT_ID, "s1")
 
 
-def test_ensure_session_creates_with_backfilled_model_config(
+def test_prepare_session_creates_with_backfilled_model_config(
     monkeypatch,
 ) -> None:
     """首次创建：session 自动补齐 chat_model_config。"""
@@ -469,14 +469,14 @@ def test_ensure_session_creates_with_backfilled_model_config(
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
 
-    _run_ensure_session(storage)
+    _run_prepare_session(storage)
 
     session = storage.sessions[_session_key()]
     assert session.config.workspace_id == "ws-test"
     assert session.config.chat_model_config.model == "deepseek-chat"
 
 
-def test_ensure_session_updates_config_on_model_switch(
+def test_prepare_session_updates_config_on_model_switch(
     monkeypatch,
 ) -> None:
     """模型切换（三元组不一致）：已有 session 的 config 被更新。"""
@@ -495,7 +495,7 @@ def test_ensure_session_updates_config_on_model_switch(
         ),
     )
 
-    _run_ensure_session(storage, model_name="r1")
+    _run_prepare_session(storage, model_name="r1")
 
     session = storage.sessions[_session_key()]
     assert session.config.chat_model_config.model == "r1"
@@ -505,7 +505,7 @@ def test_ensure_session_updates_config_on_model_switch(
     )
 
 
-def test_ensure_session_no_update_when_config_matches(monkeypatch) -> None:
+def test_prepare_session_no_update_when_config_matches(monkeypatch) -> None:
     """一致三元组（HITL 续跑同 thread 模型名）：不触发更新。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
@@ -524,12 +524,12 @@ def test_ensure_session_no_update_when_config_matches(monkeypatch) -> None:
     # 记录原始 config 引用，upsert 后 sessions 字典会替换条目
     before = storage.sessions[_session_key()]
 
-    _run_ensure_session(storage)
+    _run_prepare_session(storage)
 
     assert storage.sessions[_session_key()] is before
 
 
-def test_ensure_session_backfills_missing_model_config(
+def test_prepare_session_backfills_missing_model_config(
     monkeypatch,
 ) -> None:
     """已有 session 但 chat_model_config 为空：backfill。"""
@@ -540,7 +540,7 @@ def test_ensure_session_backfills_missing_model_config(
         config=SessionConfig(workspace_id="ws1"),
     )
 
-    _run_ensure_session(storage)
+    _run_prepare_session(storage)
 
     session = storage.sessions[_session_key()]
     assert session.config.chat_model_config.model == "deepseek-chat"

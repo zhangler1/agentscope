@@ -15,7 +15,7 @@
 - **DeerFlow 风格 SSE**（`deerflow/`）：`/api/threads/{tid}/runs/*` 四端点（stream / wait / join / cancel），事件/数据/id 帧 + 心跳 + Last-Event-ID 断线续传，执行引擎复用原生 `ChatService`
 - **SSE 协议与翻译**（`deerflow/protocol.py` + `formatter.py`）：AgentScope 事件 → deer-flow 事件（metadata/messages/custom/error/end）
 - **请求级运行时配置**（`custom_params`）：空间码强制覆盖 / custom_prompt 整体替换 / 检索开关 / 认证方案（guwp/jrt/okic/muwp），随 run 请求注入并落盘回退，详见 [custom_params.md](./custom_params.md)
-- **会话与凭证自动供给**：`_ensure_session` 懒建会话；模型凭证按 `deerflow-<user_id>-<provider_id>` 幂等写入 credential 存储（id 带 user_id 维度，避免 SQL 存储全局主键跨用户冲突）
+- **会话与凭证自动供给**：`_prepare_session_for_run` 懒建会话；模型凭证按 `deerflow-<user_id>-<provider_id>` 幂等写入 credential 存储（id 带 user_id 维度，避免 SQL 存储全局主键跨用户冲突）
 - **多模型路由**（`providers/`）：ProviderManager 注册 / 切换 / 列表，配合 `/api/models` 路由
 - **自动注册机制**：工具、中间件、MCP 三类组件均支持 `builtin + custom/` 自动扫描，新增组件只需放文件，重启即生效，无需改 `main.py`
 - **日志三件套**（`logging/`）：ContextVar trace_id 关联、TraceContextFilter、JsonTraceFormatter、ASGI TraceMiddleware
@@ -367,7 +367,7 @@ app.include_router(orders_router)
 
 ```
 POST /api/threads/{tid}/runs/stream
-  → _ensure_session（懒建会话 + 模型凭证自动供给：deerflow-<user_id>-<provider_id>）
+  → _prepare_session_for_run（懒建会话 + 模型凭证自动供给：deerflow-<user_id>-<provider_id>）
   → custom_params 解析（带值落盘 workspace / 不带值回退加载）
   → RunManager 记账（409 并发拒绝）→ 原生 ChatService.run(run_id=...) 后台任务
   → BusBridge 订阅 MessageBus（Redis Stream 回放 + pub/sub live）

@@ -600,17 +600,16 @@ async def _resolve_chat_model_config(
 
     # ── 凭证选择 ──
     record: CredentialRecord | None = None
-    if record is None:
-        # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
-        record = _pick_preferred_credential(
-            await storage.list_credentials(user_id),
+    # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
+    record = _pick_preferred_credential(
+        await storage.list_credentials(user_id),
+    )
+    if record is not None:
+        logger.info(
+            "deerflow: picked credential %r for user %s.",
+            record.id,
+            user_id,
         )
-        if record is not None:
-            logger.info(
-                "deerflow: picked credential %r for user %s.",
-                record.id,
-                user_id,
-            )
     if record is None:
         # 用户凭证为空 → default 凭证挑选并复制入库
         default_rec = _pick_preferred_credential(
@@ -743,7 +742,7 @@ async def _resolve_chat_model_config(
     )
 
 
-async def _ensure_session(
+async def _prepare_session_for_run(
     storage: StorageBase,
     workspace_manager,
     request: Request,
@@ -752,18 +751,22 @@ async def _ensure_session(
     session_id: str,
     model_name: str = "",
 ) -> None:
-    """原生 ChatService.run 要求 session 已存在且带模型配置；缺失时补齐。
+    """为 run 准备会话：懒创建、补齐或更新（原生 ChatService.run 的前置）。
 
-    workspace_id 由 workspace_manager 的隔离策略分配（与原生 /session/
-    创建路径一致）；chat_model_config 由 _resolve_chat_model_config
-    解析（凭证表挑选 → default 复制 → config.yaml 条目创建，模型名
-    缺失时回退全局 active provider），保证默认会话也能在原生链路上
-    真实调用模型。
-    会话已存在时：配置缺失则回填；请求显式携带模型名（``model_name``
-    非空）且解析出的 (type, credential_id, model) 与现状不一致时才更新
-    （per-run 模型切换）；未携带模型名则保持既有配置不动——原生接口
-    建好的会话（如绑定 ELLM 凭证）不被 config.yaml 全局 active
-    provider 静默覆盖。
+    原生 ChatService.run 要求 session 已存在且带 chat_model_config，
+    本函数保证这一前置条件：
+
+    - 会话不存在 → 创建：分配 workspace_id（与原生 /session/ 创建路径
+      一致）+ 按凭证表解析模型配置（_resolve_chat_model_config：凭证表
+      挑选 → default 复制 → config.yaml 条目创建，模型名缺失时回退全局
+      active provider）；
+    - 会话存在但缺配置 → 回填解析出的配置；
+    - 会话存在、本次显式携带模型名（``model_name`` 非空）且解析出的
+      (type, credential_id, model) 与现状不一致 → 更新（per-run 模型
+      切换）；
+    - 会话已存在、本次未携带模型名 → 保持不动——原生接口建好的会话
+      （如绑定 ELLM 凭证）不被 config.yaml 全局 active provider 静默
+      覆盖。
     """
     existing = await storage.get_session(user_id, agent_id, session_id)
     if (
@@ -1295,7 +1298,7 @@ async def create_run_stream(
     # custom_params 落盘/回退之前解析——首次建会话时 workspace 尚不存在，
     # 直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
     model_name = _resolve_requested_model_name(body.custom_params)
-    await _ensure_session(
+    await _prepare_session_for_run(
         storage,
         workspace_manager,
         request,
@@ -1413,7 +1416,7 @@ async def create_run_wait(
     # 同 create_run_stream：先解析请求级模型名（custom_params 唯一通道）
     # 再懒建会话。
     model_name = _resolve_requested_model_name(body.custom_params)
-    await _ensure_session(
+    await _prepare_session_for_run(
         storage,
         workspace_manager,
         request,
