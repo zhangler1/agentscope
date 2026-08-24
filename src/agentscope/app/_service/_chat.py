@@ -514,6 +514,13 @@ class ChatService:
             # (viewer runs a shared user-source agent). It raises 404 when
             # the agent is not visible to the caller.
             # -----------------------------------------------------------------
+            logger.info(
+                "ChatService: run %s: resolving agent %r / session %r "
+                "records",
+                run_id,
+                agent_id,
+                session_id,
+            )
             try:
                 agent_record = await self._access.resolve_agent(
                     user_id,
@@ -537,11 +544,21 @@ class ChatService:
                         f"agent {agent_id!r}."
                     ),
                 )
+            logger.info(
+                "ChatService: run %s: records resolved; acquiring "
+                "workspace ...",
+                run_id,
+            )
             workspace = await self._workspace_manager.get_workspace(
                 user_id,
                 agent_id,
                 session_id,
                 session_record.config.workspace_id,
+            )
+            logger.info(
+                "ChatService: run %s: workspace ready (workdir=%s)",
+                run_id,
+                workspace.workdir,
             )
 
             # Add workspace working directory to the permission context
