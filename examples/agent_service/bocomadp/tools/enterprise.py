@@ -16,7 +16,11 @@ from agentscope.tool import FunctionTool, ToolBase
 
 from ..deerflow.custom_params import get_custom_params
 from .contact_search import contact_search_tool
-from .cross_search import cross_search_tool  # 已是 FunctionTool 实例（带注入中间件）
+from .cross_search import (
+    _current_agent_id as _cross_search_agent_id,
+    _current_user_id as _cross_search_user_id,
+    cross_search_tool,
+)
 from .online_search import online_search_tool
 from .personal_search import personal_search_tool
 from .physical_contact_search import physical_contact_search_tool
@@ -67,6 +71,8 @@ async def build_enterprise_tools(
     ]
 
     # cross_search 始终挂载（2026-08-20 起不再受 vector_search_switch 控制）
+    _cross_search_user_id.set(user_id)
+    _cross_search_agent_id.set(agent_id)
     tools.append(cross_search_tool)
 
     # vector_search_switch 显式 False → 不挂行内搜索；未传 / True 保持默认挂载

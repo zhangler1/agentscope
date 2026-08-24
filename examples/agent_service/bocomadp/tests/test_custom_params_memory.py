@@ -30,7 +30,7 @@ def _run(coro):
 
 
 def test_save_and_load_roundtrip():
-    params = {"space_code_list": ["SP0999999"], "online_search_switch": True}
+    params = {"custom_prompt": "test", "online_search_switch": True}
     _run(save_custom_params("sid-1", params))
     assert _run(load_custom_params("sid-1")) == params
 

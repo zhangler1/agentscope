@@ -95,6 +95,7 @@ from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.team_access import patch_team_access
@@ -946,6 +947,8 @@ app.include_router(platform_health_router)
 app.include_router(skill_router)
 # 智能体沙箱并发管理（写 PG 真源 + 同步 Redis）
 app.include_router(agent_concurrency_router)
+# 智能体跨知识搜索配置管理（写 PG 真源，运行时工具直接读 PG）
+app.include_router(agent_cross_search_config_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）
