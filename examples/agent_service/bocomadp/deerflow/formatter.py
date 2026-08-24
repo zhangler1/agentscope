@@ -10,10 +10,10 @@
 | AgentEvent（原生）            | StreamEvent            | data 载荷                                   |
 |-------------------------------|------------------------|---------------------------------------------|
 | ``ReplyStartEvent``           | ``metadata``           | run_id / thread_id / assistant_id 首帧      |
-| ``TextBlock*``                | ``messages``           | ``[{"type": "ai", "content", "id"}, metadata]`` |
+| ``TextBlock*``                | ``messages``           | ``[{"type": "AIMessageChunk", "content", "id"}, metadata]`` |
 | ``ThinkingBlock*``            | ``messages``           | chunk 附 ``additional_kwargs.reasoning_content``，metadata 附 ``reasoning: true`` |
-| ``ToolCallStart/Delta/End``   | ``custom``             | ``{"type": "on_tool_call", ...}``           |
-| ``ToolResultStart/Text/End``  | ``custom``             | ``{"type": "on_tool_end", ...}``            |
+| ``ToolCallStart/Delta/End``   | ``messages`` + ``updates`` | ai 消息 ``tool_calls`` 数组（messages 帧，官方前端消费）+ ``{"model": {"messages": [...]}}`` 快照（updates 帧，jx_chat 前端消费） |
+| ``ToolResultStart/Text/End``  | ``messages``           | ``[{"type": "tool", "content", "name", "tool_call_id", "id"}, metadata]`` |
 | ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
 | ``ReplyEndEvent(normal)``     | ``end``                | 哨兵（data=None）                          |
@@ -37,6 +37,7 @@ from .protocol import (
     EVENT_ERROR,
     EVENT_MESSAGES,
     EVENT_METADATA,
+    EVENT_UPDATES,
     StreamEvent,
 )
 
@@ -226,20 +227,21 @@ class DeerflowSSEFormatter:
     ) -> StreamEvent:
         """构造 messages 增量帧 ``[chunk, metadata]``。
 
-        chunk 对齐 LangGraph 消息 tuple 协议（deer-flow 官方
-        ``{"type": "ai", "content": ..., "id": ...}``）：
+        chunk 对齐 LangGraph 消息 tuple 协议（deer-flow 官方 Python 端
+        ``AIMessageChunk.model_dump()`` 序列化）：
 
-        - ``type`` 必填：langgraph-sdk ``MessageTupleManager.add`` 首行
-          即 ``serialized.type.endsWith("MessageChunk")``，缺失直接抛
-          TypeError（前端报 "Cannot read properties of undefined"）。
-        - ``id`` 必填：同函数无 id 时仅 warn 并忽略该 chunk，前端收不到
-          消息；以 reply_id 聚合同一回复的增量块。
+        - ``type`` 取 ``AIMessageChunk``：官方 SDK ``MessageTupleManager.add``
+          对其切片归一化为 ``ai``（``endsWith("MessageChunk")`` 检查），
+          jx_chat 前端则精确匹配 ``msg.type === "AIMessageChunk"`` 才累加
+          文本——两套前端都能消费。
+        - ``id`` 必填：无 id 时 SDK 仅 warn 并忽略该 chunk；以 reply_id
+          聚合同一回复的增量块。
         - thinking 增量进 ``additional_kwargs.reasoning_content``
           （content 留空，避免与正文混淆），LangChain chunk concat 对
           字符串自动拼接，对齐 deer-flow 官方 reasoning 语义。
         """
         chunk: dict[str, Any] = {
-            "type": "ai",
+            "type": "AIMessageChunk",
             "content": "" if reasoning else content,
             "id": event.get("reply_id"),
         }
@@ -280,13 +282,8 @@ class DeerflowSSEFormatter:
         name = str(event.get("tool_call_name", ""))
         self._tool_call_args[call_id] = ""
         self._tool_call_names[call_id] = name
-        return [
-            _evt(
-                event,
-                EVENT_CUSTOM,
-                {"type": "on_tool_call", "name": name, "arguments": ""},
-            ),
-        ]
+        # 仅在 end 时发帧（messages + updates），start/delta 只累积
+        return []
 
     def _on_tool_call_delta(self, event: dict) -> list[StreamEvent]:
         call_id = str(event.get("tool_call_id", ""))
@@ -294,31 +291,42 @@ class DeerflowSSEFormatter:
         self._tool_call_args[call_id] = (
             self._tool_call_args.get(call_id, "") + delta
         )
-        return [
-            _evt(
-                event,
-                EVENT_CUSTOM,
-                {
-                    "type": "on_tool_call",
-                    "name": self._tool_call_names.get(call_id, ""),
-                    "arguments": self._tool_call_args[call_id],
-                },
-            ),
-        ]
+        return []
 
     def _on_tool_call_end(self, event: dict) -> list[StreamEvent]:
+        """工具调用完成 → messages 帧 + updates 帧（双发策略）。
+
+        messages 帧对齐 deer-flow 官方格式（ai 完整消息携带 tool_calls
+        数组），官方前端 SDK 消费；updates 帧为 ``{"model": {"messages":
+        [ai_msg]}}`` 快照，jx_chat 前端只消费 updates 事件的
+        ``data.model.messages[0]`` 中 ``type == "ai"`` 的 tool_calls。
+        两帧互不干扰，各取所需。
+        """
         call_id = str(event.get("tool_call_id", ""))
-        arguments = self._tool_call_args.get(call_id, "")
-        return [
-            _evt(
-                event,
-                EVENT_CUSTOM,
+        args_raw = self._tool_call_args.get(call_id, "")
+        try:
+            args = json.loads(args_raw) if args_raw else {}
+            if not isinstance(args, dict):
+                args = {}
+        except Exception:
+            args = {}
+        reply_id = event.get("reply_id")
+        ai_msg: dict[str, Any] = {
+            "type": "ai",  # 完整 AIMessage 形态，对齐官方 values 快照
+            "content": "",
+            # 独立 id：SDK 同 id 的 AIMessageChunk.concat 会丢 tool_calls
+            "id": f"{reply_id}:tool:{call_id}",
+            "tool_calls": [
                 {
-                    "type": "on_tool_call",
                     "name": self._tool_call_names.get(call_id, ""),
-                    "arguments": arguments,
+                    "args": args,
+                    "id": call_id,
                 },
-            ),
+            ],
+        }
+        return [
+            _evt(event, EVENT_MESSAGES, [ai_msg, {"langgraph_node": "agent"}]),
+            _evt(event, EVENT_UPDATES, {"model": {"messages": [ai_msg]}}),
         ]
 
     # ── 工具结果（result 文本跨事件累积）───────────────────────────────
@@ -328,13 +336,8 @@ class DeerflowSSEFormatter:
         name = str(event.get("tool_call_name", ""))
         self._tool_call_names[call_id] = name
         self._tool_result_text[call_id] = ""
-        return [
-            _evt(
-                event,
-                EVENT_CUSTOM,
-                {"type": "on_tool_end", "name": name, "result": ""},
-            ),
-        ]
+        # 仅在 end 时发 tool 消息帧，start/delta 只累积
+        return []
 
     def _on_tool_result_text_delta(self, event: dict) -> list[StreamEvent]:
         call_id = str(event.get("tool_call_id", ""))
@@ -342,29 +345,30 @@ class DeerflowSSEFormatter:
         self._tool_result_text[call_id] = (
             self._tool_result_text.get(call_id, "") + delta
         )
-        return [
-            _evt(
-                event,
-                EVENT_CUSTOM,
-                {
-                    "type": "on_tool_end",
-                    "name": self._tool_call_names.get(call_id, ""),
-                    "result": self._tool_result_text[call_id],
-                },
-            ),
-        ]
+        return []
 
     def _on_tool_result_end(self, event: dict) -> list[StreamEvent]:
+        """工具结果完成 → 官方 tool 消息 messages 帧。
+
+        chunk 对齐 deer-flow 官方 ToolMessage 序列化（``type=tool`` +
+        ``tool_call_id``）；官方前端 SDK 按 tool_call_id 匹配调用步骤，
+        jx_chat 前端按 name 解析搜索溯源 / 追加 ask_clarification 文本。
+        """
         call_id = str(event.get("tool_call_id", ""))
         return [
             _evt(
                 event,
-                EVENT_CUSTOM,
-                {
-                    "type": "on_tool_end",
-                    "name": self._tool_call_names.get(call_id, ""),
-                    "result": self._tool_result_text.get(call_id, ""),
-                },
+                EVENT_MESSAGES,
+                [
+                    {
+                        "type": "tool",
+                        "content": self._tool_result_text.get(call_id, ""),
+                        "name": self._tool_call_names.get(call_id, ""),
+                        "tool_call_id": call_id,
+                        "id": f"tool:{call_id}",  # 独立唯一 id
+                    },
+                    {"langgraph_node": "agent"},
+                ],
             ),
         ]
 
