@@ -30,6 +30,34 @@ def get_active_skill() -> str:
 _SKILL_PREFIX_RE = re.compile(r"^/(\S+)\s*(.*)$", re.S)
 
 
+def _rewrite_question(m: re.Match[str]) -> str:
+    """把 ``/skill_name 问题`` 重写为显式要求使用该技能的任务描述。"""
+    skill_name = m.group(1)
+    question = m.group(2).strip() or "请使用该技能完成工作"
+    return f"请使用 {skill_name} 技能完成以下任务：{question}"
+
+
+def _match_text_blocks(blocks: Any) -> tuple[str, bool]:
+    """在 block 数组（list[dict]）的 text block 里匹配 ``/skill_name`` 前缀。
+
+    命中时原地改写 ``block["text"]`` 为显式任务描述。
+
+    Returns:
+        ``(skill_name, modified)``：技能名与是否发生了改写。
+    """
+    if not isinstance(blocks, list):
+        return "", False
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text", "")
+        m = _SKILL_PREFIX_RE.match(text)
+        if m:
+            block["text"] = _rewrite_question(m)
+            return m.group(1), True
+    return "", False
+
+
 class ActiveSkillMiddleware:
     """ASGI 中间件：解析 ``/skill_name`` 前缀，移除并存入 ContextVar。"""
 
@@ -41,9 +69,13 @@ class ActiveSkillMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # 仅处理 chat 请求（fire-and-forget 入口）
+        # 仅处理 chat 请求（fire-and-forget 入口 / deerflow run stream 入口）
         path = scope.get("path", "")
-        if not (path.endswith("/chat/") or path.endswith("/chat")):
+        if not (
+            path.endswith("/chat/")
+            or path.endswith("/chat")
+            or path.endswith("/runs/stream")
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -71,7 +103,11 @@ class ActiveSkillMiddleware:
             try:
                 return await recv_iter.__anext__()
             except StopAsyncIteration:
-                return {"type": "http.disconnect"}
+                # 重放完 body 后，继续转发原始 receive 的后续消息，而不是
+                # 返回 http.disconnect。否则对 /runs/stream 这类 SSE 流式
+                # 请求，Starlette 会把该消息误判为客户端断开，提前终止
+                # StreamingResponse（表现为只回显 human 帧后 SSE 直接结束）。
+                return await receive()
 
         await self.app(scope, receive_wrapper, send)
 
@@ -97,26 +133,35 @@ class ActiveSkillMiddleware:
         input_data = data.get("input")
         if not isinstance(input_data, dict):
             return raw, ""
-        content = input_data.get("content")
-        if not isinstance(content, list):
-            return raw, ""
 
-        modified = False
         skill_name = ""
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "text":
-                continue
-            text = block.get("text", "")
-            m = _SKILL_PREFIX_RE.match(text)
-            if m:
-                skill_name = m.group(1)
-                question = m.group(2).strip() or "请使用该技能完成工作"
-                # 重写用户消息：显式要求使用该技能，提升 LLM 调用率
-                block["text"] = (
-                    f"请使用 {skill_name} 技能完成以下任务：{question}"
-                )
-                modified = True
-                break
+        modified = False
+
+        # 原生 /chat/：input.content 为 block 数组
+        content = input_data.get("content")
+        if isinstance(content, list):
+            skill_name, modified = _match_text_blocks(content)
+
+        # deerflow /runs/stream：input.messages 为 LangGraph 消息数组，
+        # 每条 content 可能是字符串或 block 数组
+        if not modified:
+            messages = input_data.get("messages")
+            if isinstance(messages, list):
+                for message in messages:
+                    if not isinstance(message, dict):
+                        continue
+                    msg_content = message.get("content")
+                    if isinstance(msg_content, str):
+                        m = _SKILL_PREFIX_RE.match(msg_content)
+                        if m:
+                            message["content"] = _rewrite_question(m)
+                            skill_name = m.group(1)
+                            modified = True
+                            break
+                    elif isinstance(msg_content, list):
+                        skill_name, modified = _match_text_blocks(msg_content)
+                        if modified:
+                            break
 
         if modified:
             return (
