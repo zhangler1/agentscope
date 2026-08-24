@@ -13,18 +13,25 @@
 3. :func:`patch_open_session_credentials`：放开原生创建/更新会话接口
    （``POST /sessions`` / ``PUT /sessions/{id}``）的凭证归属校验——
    ``chat_model_config`` 等引用的 credential 不再要求对调用者可见。
+4. :func:`patch_open_runtime_credentials`：放开运行时凭证解析
+   （chat / embedding / TTS 模型构建时经
+   :meth:`ResourceAccessService.resolve_credential`）的归属校验——
+   own / 共享引用均 miss 后回退全局查询，密钥可跨用户使用。
 
 列表接口（``list_resource`` / ``list_agents``）不受影响：它们不走
-``resolve_agent``，仍只返回调用者自己的智能体。
+``resolve_agent``，仍只返回调用者自己的智能体；凭证列表接口同样
+不受影响（走 ``get_resource``，共享视图仍掩码）。
 
 启动时调用一次（幂等，重复调用无害）::
 
     from bocomadp.open_agent_access import (
         patch_open_agent_access,
         patch_open_session_credentials,
+        patch_open_runtime_credentials,
     )
     patch_open_agent_access()
     patch_open_session_credentials()
+    patch_open_runtime_credentials()
 """
 
 from __future__ import annotations
@@ -115,6 +122,86 @@ def patch_open_agent_access() -> None:
     )
 
 
+async def get_credential_global(storage: Any, credential_id: str) -> Any | None:
+    """跨 owner 按 id 查凭证；非 SQL 主存储时返回 ``None``。
+
+    与 :func:`get_agent_global` 同模式：``CredentialRow`` 主键为全局
+    唯一 id，``storage._session()`` 返回新 AsyncSession；Redis 等按
+    user 分片的主存储返回 ``None``（兜底静默失效）。返回原始
+    ``CredentialRecord``（含明文 ``data``），仅供运行时模型构建使用。
+    """
+    try:
+        from agentscope.app.storage import CredentialRecord
+        from agentscope.app.storage._sql._mappers import _to_record
+        from agentscope.app.storage._sql._tables import CredentialRow
+    except ImportError:
+        return None
+
+    session_factory = getattr(storage, "_session", None)
+    if session_factory is None:
+        logger.warning(
+            "open_agent_access: storage %r has no SQL session factory; "
+            "cross-owner credential lookup disabled",
+            type(storage).__name__,
+        )
+        return None
+    try:
+        async with session_factory() as sess:
+            row = await sess.get(CredentialRow, credential_id)
+    except Exception:  # noqa: BLE001 —— 兜底查询，失败不阻断对话
+        logger.exception("open_agent_access: global credential lookup failed")
+        return None
+    if row is None:
+        return None
+    return _to_record(row, CredentialRecord)
+
+
+def patch_open_runtime_credentials() -> None:
+    """包装 ``ResourceAccessService.resolve_credential``（幂等）。
+
+    own / 共享引用均 miss 后回退全局查询：任意用户运行时的模型构建
+    （chat / embedding / TTS）可引用任意凭证，密钥跨用户使用。
+    凭证列表接口不受影响（走 ``get_resource``，共享视图仍掩码）。
+    """
+    from agentscope.app._service._access import ResourceAccessService
+
+    if getattr(
+        ResourceAccessService.resolve_credential,
+        "_open_credential_patched",
+        False,
+    ):
+        return
+
+    original = ResourceAccessService.resolve_credential
+
+    async def resolve_credential_open(
+        self: Any,
+        viewer_id: str,
+        credential_id: str,
+    ) -> Any:
+        try:
+            return await original(self, viewer_id, credential_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+        storage = getattr(self, "_storage", None)
+        if storage is None:
+            raise
+        record = await get_credential_global(storage, credential_id)
+        if record is not None:
+            return record
+        raise
+
+    resolve_credential_open._open_credential_patched = True  # type: ignore[attr-defined]
+    ResourceAccessService.resolve_credential = (  # type: ignore[assignment]
+        resolve_credential_open
+    )
+    logger.info(
+        "patched %s.resolve_credential with open-credential fallback",
+        ResourceAccessService.__name__,
+    )
+
+
 def patch_open_session_credentials() -> None:
     """放开原生创建/更新会话接口的凭证归属校验（幂等）。
 
@@ -150,5 +237,7 @@ def patch_open_session_credentials() -> None:
 __all__ = [
     "patch_open_agent_access",
     "patch_open_session_credentials",
+    "patch_open_runtime_credentials",
     "get_agent_global",
+    "get_credential_global",
 ]
