@@ -587,11 +587,8 @@ class EllmChatModel(ChatModelBase):
         surfaced.
         """
         try:
-            logger.info("1111111111111111111")
             return await self.client.chat.completions.create(**kwargs)
         except Exception as exc:
-            logger.info(f"exc: {exc}")
-            logger.info(f"vars(exc): {vars(exc)}")
             if not self._is_invalid_key_error(exc):
                 raise
 
