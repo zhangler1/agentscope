@@ -26,6 +26,7 @@ except ImportError:
     FunctionTool = ToolMiddlewareBase = None
 
 from ..config.personal_search_config import get_personal_search_config
+from ._naming import tool_name
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
 from ..deerflow.custom_params import get_custom_params
 
@@ -256,8 +257,8 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
     personal_search_tool = FunctionTool(
         _personal_search_tool_impl,
         # 工具名（按用户要求中文化）
-        # [对比测试临时改动] 行外 deepseek-chat 联调：改回英文名。
-        name="personal_knowledge_search",
+        # 行外 DeepSeek 等 API 强校验：BOCOMADP_TOOL_ASCII_NAMES=1 切英文。
+        name=tool_name("个人知识库搜索", "personal_knowledge_search"),
         is_read_only=True,
         middlewares=[PersonalSpacecodeOverrideMiddleware()],
     )

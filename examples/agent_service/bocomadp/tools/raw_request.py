@@ -30,6 +30,7 @@ except ImportError:
 from ..config.raw_request_config import get_raw_request_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
 from ..deerflow.custom_params import get_custom_params
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -152,9 +153,8 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
         # 工具名显式中文化（对齐 deerflow 原设计：行内模型点名靠中文名）。
         # 注意：行外 DeepSeek 等 API 强校验工具名 ^[a-zA-Z0-9_-]+$，
         # 中文名会被 400 拒收；行内网关不校验，可正常使用。行外环境
-        # 如需兼容，可临时改回英文名 raw_request_tool。
-        # [对比测试临时改动] 行外 deepseek-chat 联调：改回英文名。
-        name="raw_request_tool",
+        # 设置 BOCOMADP_TOOL_ASCII_NAMES=1 切换英文名 raw_request_tool。
+        name=tool_name("外数查", "raw_request_tool"),
         is_read_only=True,
     )
 else:
