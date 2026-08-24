@@ -60,7 +60,7 @@ async def build_enterprise_tools(
     tools: list[ToolBase] = [
         contact_search_tool,
         physical_contact_search_tool,
-        FunctionTool(query_employee_info, name="查询员工信息",is_read_only=True),
+        # FunctionTool(query_employee_info, name="查询员工信息",is_read_only=True),
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
         raw_request_tool,  # 已是 FunctionTool 实例（工具名"外数查"）
