@@ -581,50 +581,25 @@ async def _resolve_chat_model_config(
 
     凭证选择（新契约，一凭证多模型，不考虑 B 方案）：
 
-    - hint 为约定凭证 id（``deerflow-<user>-<provider>`` 形态）→ 直传引用：
-      本用户维度凭证直接引用；default 形态复制到用户维度后引用；
-    - 其余（模型名 / 空）→ ``list_credentials(user_id)`` 挑选：type
-      可反序列化过滤、ELLM 优先、id 稳定排序取第一个；
+    - ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
+      优先、id 稳定排序取第一个；
     - 用户凭证为空 → default 用户凭证同规则挑选，复制参数入库为
       用户维度凭证后引用（复制保留 api_key / scene_code 等元数据）；
     - 再空 → 回退 config.yaml 条目参数创建（active provider 对应
       条目优先；api_key 空且非 ELLM 视为不可用）。
 
-    模型名：hint 为模型名时直接透传（凭证不绑定模型）；缺失（空 /
-    凭证 id）时回退凭证 model 字段值 → config.yaml 匹配条目
-    model_name → 全局 active provider；全部缺失返回 None（原生 404
-    兜底，不阻断请求）。parameters 取 config.yaml 中与凭证 type
-    匹配条目的 parameters（无匹配则空）。
+    模型名：hint 非空一律视为模型名直接透传（凭证不绑定模型，
+    hint 不再支持凭证 id 直传）；缺失时回退凭证 model 字段值 →
+    config.yaml 匹配条目 model_name → 全局 active provider；全部缺失
+    返回 None（原生 404 兜底，不阻断请求）。parameters 取 config.yaml
+    中与凭证 type 匹配条目的 parameters（无匹配则空）。
     """
     # 全局 active provider 兜底（模型名 + 回退条目）
     pm = getattr(request.app.state, "provider_manager", None)
     active = pm.get_active_model() if pm is not None else None
-    hint_is_credential_id = (
-        is_deerflow_credential_id(hint, user_id) is not None
-    )
 
     # ── 凭证选择 ──
     record: CredentialRecord | None = None
-    if hint_is_credential_id:
-        # 约定凭证 id 直传：本用户凭证直接引用；default 形态复制
-        record = await storage.get_credential(user_id, hint)
-        if record is None:
-            default_rec = await storage.get_credential(
-                DEFAULT_CREDENTIAL_OWNER,
-                hint,
-            )
-            if default_rec is not None:
-                record = await _copy_credential_to_user(
-                    storage,
-                    user_id,
-                    default_rec,
-                )
-        if record is not None:
-            logger.info(
-                "deerflow: credential id %r resolved directly (user=%s).",
-                hint,
-                user_id,
-            )
     if record is None:
         # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
         record = _pick_preferred_credential(
@@ -734,8 +709,8 @@ async def _resolve_chat_model_config(
         )
         return None
 
-    # ── 模型名：hint 模型名直传；缺失回退凭证 model → 条目 → active ──
-    model = hint if (hint and not hint_is_credential_id) else ""
+    # ── 模型名：hint 一律透传；缺失回退凭证 model → 条目 → active ──
+    model = hint
     if not model:
         bound = getattr(credential, "model", None)
         if bound:

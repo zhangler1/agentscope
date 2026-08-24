@@ -51,7 +51,10 @@ def user_credential_id(user_id: str, provider_id: str) -> str:
 
 
 def is_deerflow_credential_id(hint: str, user_id: str) -> str | None:
-    """hint 为约定 credential id 时解析出 provider_id。
+    """值为约定 credential id 时解析出 provider_id。
+
+    供 ``_copy_credential_to_user`` 从 default 凭证记录 id 解析
+    provider（``_resolve_chat_model_config`` 的 hint 不再走此识别）。
 
     识别约定凭证 id 的两种形态：
 

@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
-"""deerflow 模型解析链单测：用户凭证表挑选 + 约定 id 直传 + 模型名透传。
+"""deerflow 模型解析链单测：用户凭证表挑选 + 模型名透传。
 
 Contract under test:
 
-- ``is_deerflow_credential_id`` 识别 ``/api/deerflow/models`` 返回的两种
-  约定 id 形态（``deerflow-<user>-<provider>`` /
-  ``deerflow-default-<provider>``）并解析出 provider_id；模型名 / 任意
-  uuid / 他人凭证 id 返回 None。
+- ``is_deerflow_credential_id`` 识别约定凭证 id 形态
+  （``deerflow-<user>-<provider>`` / ``deerflow-default-<provider>``）
+  并解析出 provider_id；模型名 / 任意 uuid / 他人凭证 id 返回 None。
 - ``_resolve_chat_model_config`` 新契约（一凭证多模型）：
-  - hint 为约定凭证 id → 直传引用：本用户凭证直接引用；default 形态
-    复制出用户维度凭证（复制保留 scene_code / api_key_url 等刷新元
-    数据）；
-  - hint 为模型名 / 空 → ``list_credentials(user_id)`` 挑选：type 可
-    反序列化过滤、ELLM 优先、id 稳定排序取第一个；
+  - hint 非空一律视为模型名透传（不再支持凭证 id 直传）；
+  - ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
+    优先、id 稳定排序取第一个；
   - 用户凭证为空 → default 用户凭证同规则挑选并复制入库；
   - 再空 → 回退 config.yaml 条目参数创建（ELLM 条目 api_key 空放行，
     非 ELLM 条目 api_key 空返回 None）。
@@ -227,67 +224,6 @@ class TestResolveChatModelConfig:
         models: list[ModelEntry],
     ) -> None:
         monkeypatch.setattr(chat_mod, "load_models_from_yaml", lambda: models)
-
-    def test_default_credential_id_copied_to_user(self, monkeypatch) -> None:
-        """hint 为 default 凭证 id → 解析 provider → 复制出用户维度凭证
-        并引用；复制保留刷新元数据（scene_code / api_key_url / key）。"""
-        storage = _FakeStorage()
-        storage.seed(
-            "default",
-            f"deerflow-default-{_ELLM_PROVIDER}",
-            _ellm_record_data(),
-        )
-        self._patch_loaders(
-            monkeypatch,
-            models=[_ellm_entry(api_key="")],
-        )
-
-        config = _resolve(
-            storage,
-            "user-1",
-            hint=f"deerflow-default-{_ELLM_PROVIDER}",
-        )
-
-        assert config is not None
-        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert config.type == "bocom_ellm_credential"
-        assert config.model == "deepseek-v4-flash"
-        assert len(storage.upserts) == 1
-        user_id, credential = storage.upserts[0]
-        assert user_id == "user-1"
-        assert isinstance(credential, ELLMCredential)
-        assert credential.id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert credential.api_key.get_secret_value() == "stored-key"
-        assert credential.scene_code == "P2024146"
-        assert credential.api_key_url == (
-            "http://ellm.example/createSceneApiKey.do"
-        )
-
-    def test_user_credential_id_references_existing(self, monkeypatch) -> None:
-        """hint 为本用户凭证 id → 直接引用既有凭证，不重复复制。"""
-        storage = _FakeStorage()
-        storage.seed(
-            "user-1",
-            f"deerflow-user-1-{_ELLM_PROVIDER}",
-            _ellm_record_data(
-                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
-                api_key="user-custom-key",
-            ),
-        )
-        self._patch_loaders(
-            monkeypatch,
-            models=[_ellm_entry(api_key="")],
-        )
-
-        config = _resolve(
-            storage,
-            "user-1",
-            hint=f"deerflow-user-1-{_ELLM_PROVIDER}",
-        )
-
-        assert config is not None
-        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert storage.upserts == []
 
     def test_model_name_hint_passed_through_with_default_copy(
         self,

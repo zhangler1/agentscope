@@ -15,6 +15,8 @@ _download_additional_urls``：
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from bocomadp.deerflow.routers.deerflow_chat import (
@@ -195,14 +197,14 @@ def test_filename_from_url_decodes_and_falls_back():
 # ---------------------------------------------------------------------------
 
 
-def test_download_saves_files_and_records(deps: dict):
+def test_download_saves_files_and_records(deps: dict, monkeypatch: pytest.MonkeyPatch):
     client = FakeAsyncClient(
         {
             "http://oss/a.png": FakeResponse(PNG_BYTES, "image/png"),
             "http://oss/note.txt": FakeResponse(b"hello", "text/plain"),
         },
     )
-    _patch_client(deps, client)
+    _patch_client(deps, client, monkeypatch)
 
     saved = _download_sync(deps, ["http://oss/a.png", "http://oss/note.txt"])
 
@@ -221,7 +223,10 @@ def test_download_saves_files_and_records(deps: dict):
     assert txt.converted is False
 
 
-def test_download_skips_failed_and_oversized_urls(deps: dict):
+def test_download_skips_failed_and_oversized_urls(
+    deps: dict,
+    monkeypatch: pytest.MonkeyPatch,
+):
     deps["cfg"]["max_file_size_bytes"] = 10  # 1 字节都不够放 12 字节内容
     client = FakeAsyncClient(
         {
@@ -230,7 +235,7 @@ def test_download_skips_failed_and_oversized_urls(deps: dict):
             "http://oss/big.txt": FakeResponse(b"x" * 12),
         },
     )
-    _patch_client(deps, client)
+    _patch_client(deps, client, monkeypatch)
 
     saved = _download_sync(
         deps,
@@ -244,7 +249,10 @@ def test_download_skips_failed_and_oversized_urls(deps: dict):
     assert [r.stored_name for r in records] == ["ok.txt"]
 
 
-def test_download_respects_file_count_limit(deps: dict):
+def test_download_respects_file_count_limit(
+    deps: dict,
+    monkeypatch: pytest.MonkeyPatch,
+):
     deps["cfg"]["max_files_per_session"] = 2
     client = FakeAsyncClient(
         {
@@ -253,7 +261,7 @@ def test_download_respects_file_count_limit(deps: dict):
             "http://oss/3.txt": FakeResponse(b"3"),
         },
     )
-    _patch_client(deps, client)
+    _patch_client(deps, client, monkeypatch)
 
     saved = _download_sync(deps, ["http://oss/1.txt", "http://oss/2.txt", "http://oss/3.txt"])
 
@@ -271,7 +279,7 @@ def test_download_persist_failure_skips_url(deps: dict, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(uploads_mod, "_persist_uploaded_bytes", boom)
     client = FakeAsyncClient({"http://oss/a.txt": FakeResponse(b"a")})
-    _patch_client(deps, client)
+    _patch_client(deps, client, monkeypatch)
 
     saved = _download_sync(deps, ["http://oss/a.txt"])
 
@@ -305,10 +313,12 @@ def test_download_additional_urls_downloads_cleaned_urls(
         },
     )
 
-    result = _download_additional_urls(
-        body,
-        "u1", "a1", "s1",
-        deps["storage"], deps["wm"],
+    result = asyncio.run(
+        _download_additional_urls(
+            body,
+            "u1", "a1", "s1",
+            deps["storage"], deps["wm"],
+        ),
     )
 
     # URL 清洗：去空白、过滤非字符串；仅执行下载副作用，返回 None
@@ -330,10 +340,12 @@ def test_download_additional_urls_skips_without_key(
     params = {"lang": "zh"}
     body = CreateRunRequest(agent_id="a1", session_id="s1", custom_params=params)
 
-    result = _download_additional_urls(
-        body,
-        "u1", "a1", "s1",
-        deps["storage"], deps["wm"],
+    result = asyncio.run(
+        _download_additional_urls(
+            body,
+            "u1", "a1", "s1",
+            deps["storage"], deps["wm"],
+        ),
     )
 
     # 未携带 additional_urls：不触发下载（落盘由 _resolve_custom_params
@@ -341,7 +353,17 @@ def test_download_additional_urls_skips_without_key(
     assert result is None
 
 
-def _patch_client(deps: dict, client: FakeAsyncClient) -> None:
+def _patch_client(
+    deps: dict,
+    client: FakeAsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import bocomadp.routers.uploads as uploads_mod
 
-    uploads_mod.httpx.AsyncClient = lambda *a, **k: client
+    # httpx 是全局模块：必须走 monkeypatch（自动撤销），直接赋值会永久
+    # 污染后续测试创建的 httpx.AsyncClient。
+    monkeypatch.setattr(
+        uploads_mod.httpx,
+        "AsyncClient",
+        lambda *a, **k: client,
+    )

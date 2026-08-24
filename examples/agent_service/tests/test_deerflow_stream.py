@@ -50,6 +50,14 @@ class FakeStorage:
     async def upsert_credential(self, user_id: str, credential) -> None:
         return None
 
+    async def get_credential(self, user_id: str, credential_id: str):
+        del user_id, credential_id
+        return None
+
+    async def list_credentials(self, user_id: str):
+        del user_id
+        return []
+
     async def list_messages(
         self,
         user_id: str,
