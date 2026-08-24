@@ -288,14 +288,18 @@ deerflow_router = APIRouter(prefix="/deerflow/threads", tags=["deerflow"])
 
 # ── 请求模型 ──────────────────────────────────────────────────────────
 
+DEFAULT_AGENT_ID = "jhzd_lead_agent"
+"""agent_id 缺省值：jx_chat 前端不传 agent_id（只传已废弃的
+assistant_id），请求落库到默认智能体。"""
+
 
 class CreateRunRequest(BaseModel):
     """创建 run 的请求体。
 
     兼容 LangGraph SDK 的调用契约（前端经 ``useStream`` 发起）：
 
-    - ``assistant_id`` 接受但忽略（前端适配已废弃）；``agent_id`` 必填，
-      缺失时 400。
+    - ``assistant_id`` 接受但忽略（前端适配已废弃）；``agent_id``
+      缺省 :data:`DEFAULT_AGENT_ID`（jx_chat 前端不传该字段）。
     - ``input`` 接受 SDK 的 ``{"messages": [...]}`` / 单条消息 dict，
       转换后等价于原生 ``ChatRequest.input``。
     - ``session_id`` 必填且必须等于 thread_id；deer-flow 扩展参数
@@ -303,9 +307,10 @@ class CreateRunRequest(BaseModel):
       固定流模式与 reject 并发策略（裁剪项 1/2）。
     """
 
-    agent_id: str | None = Field(
-        default=None,
-        description="Agent ID（与原生 /chat/ 一致），必填；缺失时 400。",
+    agent_id: str = Field(
+        default=DEFAULT_AGENT_ID,
+        description="Agent ID（与原生 /chat/ 一致）；缺省 "
+        "jhzd_lead_agent（jx_chat 前端不传该字段时落库到默认智能体）。",
     )
     assistant_id: str | None = Field(
         default=None,
@@ -402,14 +407,12 @@ def _resolve_requested_model_name(
 
 
 def _resolve_agent_id(body: CreateRunRequest) -> str:
-    """agent_id 必填（与原生 /chat/ 一致）；assistant_id 接受但忽略。"""
-    if not body.agent_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="agent_id is required; assistant_id is accepted "
-            "but ignored.",
-        )
-    return body.agent_id
+    """解析 agent_id；缺省为 jhzd_lead_agent（模型默认值）。
+
+    assistant_id 接受但忽略；显式空串时同样回退默认值，保证该字段
+    永不缺失。
+    """
+    return body.agent_id or DEFAULT_AGENT_ID
 
 
 async def _check_agent_id(
