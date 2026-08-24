@@ -100,6 +100,7 @@ from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.open_agent_access import (
     patch_open_agent_access,
     patch_open_session_credentials,
+    patch_open_runtime_credentials,
 )
 from bocomadp.team_access import patch_team_access
 from bocomadp.team_briefing import patch_team_briefing
@@ -864,10 +865,12 @@ async def _lifespan_with_builtin_agents(app):
         patch_session_team_cascade()
         # 开放智能体交互：任意用户可与任意智能体对话（除 team worker），
         # 创建/更新会话接口的 agent 归属与凭证归属校验一并放开；
+        # 运行时凭证解析（chat/embedding/TTS）同样放开，密钥跨用户可用；
         # 必须早于 patch_team_briefing 挂载（两者都包装 resolve_agent，
         # open 兜底在里层才能让 briefing 包装看到兜底结果）。
         patch_open_agent_access()
         patch_open_session_credentials()
+        patch_open_runtime_credentials()
         # 专家团 briefing（leader 的 system prompt 注入团队成员/交接序）
         # 原实现改 src/_service/_chat.py 的 _run_impl，现搬迁到
         # bocomadp/team_briefing.py，包装 ResourceAccessService.resolve_agent。
