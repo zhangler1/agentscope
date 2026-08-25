@@ -232,6 +232,46 @@ class SummarizationConfig(BaseModel):
         return self
 
 
+class ImageParseConfig(BaseModel):
+    """图片解析统一多模态模型配置（PG ``runtime_configs`` 表 ``view_image`` key）。
+
+    与压缩模型（``SummarizationConfig``）同模式：``enabled=false``（默认）时
+    图片解析工具无统一模型可用（返回 None，不再回退 config.yaml）；
+    ``enabled=true`` 时 ``user_id`` / ``credential_id`` / ``model_name``
+    必填（校验失败按无效配置处理，同样不可用）。
+    凭证按 ``user_id`` + ``credential_id`` 查库，代码不做凭证创建、
+    也不从 ID 解析任何字段。
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="是否启用统一多模态模型（图片解析工具专用）。",
+    )
+    user_id: str | None = Field(
+        default=None,
+        description="凭证归属用户（owner）；按 user_id + credential_id 查库。",
+    )
+    credential_id: str | None = Field(
+        default=None,
+        description="bocom_ellm 凭证 ID（无格式约定，使用方提供）。",
+    )
+    model_name: str | None = Field(
+        default=None,
+        description="ELLM 多模态模型名（凭证不绑定单模型，必配）。",
+    )
+
+    @model_validator(mode="after")
+    def _validate_fields(self) -> Self:
+        if self.enabled and (
+            not self.user_id or not self.credential_id or not self.model_name
+        ):
+            raise ValueError(
+                "view_image.enabled=true 时 user_id / credential_id / "
+                "model_name 均必填",
+            )
+        return self
+
+
 class DbConfig(BaseModel):
     """AgentScope 持久化存储后端（AsyncSQLAlchemyStorage）。
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -223,42 +224,120 @@ _VISION_ANALYSIS_PROMPT = (
     "3. 图片中的文字内容（如有）"
 )
 
-# 进程级缓存的视觉模型实例；None = 未构建，False = 构建失败（避免反复重试）
-_vision_model: object = None
-_vision_model_failed = False
+# 工具运行时依赖（main.py 经 set_tool_runtime_deps 注入）：
+# 图片解析统一多模态模型经 PG runtime_configs 表 view_image 配置（可经
+# /api/config/view_image 热更新）构建时，需要查凭证 / 刷新 ELLM key；
+# 未注入依赖时统一模型不可用（工具返回 None）。
+_tool_storage: Any = None
+_tool_message_bus: Any = None
 
 
-def _get_vision_model():
-    """懒加载 config.yaml 中 ``supports_multimodal: true`` 的视觉模型。
+def set_tool_runtime_deps(storage: Any, message_bus: Any) -> None:
+    """注入工具运行时依赖（main.py 启动时调用一次）。
 
-    与 main.py 注册 ProviderManager 的方式同源（``load_models_from_yaml``
-    + ``build_model_instance``），但独立构建实例供本工具专用：不依赖
-    app.state / 请求上下文，工具可在任意时刻调用；只取第一个多模态条目
-    （config.yaml 注释：切勿同时启用两个）。
+    Args:
+        storage: 框架 StorageBase（get_credential / upsert_credential）。
+        message_bus: 框架 MessageBus（ELLM key 刷新分布式锁）。
     """
-    global _vision_model, _vision_model_failed
-    if _vision_model is not None:
-        return _vision_model
-    if _vision_model_failed:
-        return None
-    try:
-        from bocomadp.config import build_model_instance, load_models_from_yaml
+    global _tool_storage, _tool_message_bus
+    _tool_storage = storage
+    _tool_message_bus = message_bus
 
-        for entry in load_models_from_yaml():
-            if entry.supports_multimodal:
-                _vision_model = build_model_instance(entry)
-                _events_logger.info(
-                    "VIEW_IMAGE_MODEL_BUILT provider_id=%s model_name=%s",
-                    entry.provider_id,
-                    entry.model_name,
+
+async def _get_vision_model():
+    """构建图片解析视觉模型（与压缩模型同模式：PG 配置唯一来源）。
+
+    读 PG ``runtime_configs`` 表 ``view_image`` 配置（可经
+    /api/config/view_image 热更新）：enabled 且凭证可查时临时构建统一
+    多模态模型并注入新鲜 ELLM key；无记录 / 未启用 / 凭证缺失 / 构建
+    失败均返回 ``None``（工具提示未配置，不再回退 config.yaml）。
+
+    Returns:
+        视觉模型实例（调用方负责用后 ``aclose()``）；不可用返回 ``None``。
+    """
+    from bocomadp.config import ImageParseConfig
+    from bocomadp.runtime_config_store import get_typed_config
+
+    cfg = await get_typed_config("view_image", ImageParseConfig)
+    if (
+        cfg is not None
+        and cfg.enabled
+        and cfg.user_id
+        and cfg.credential_id
+        and cfg.model_name
+    ):
+        if _tool_storage is None:
+            logger.warning(
+                "view_image: tool runtime deps not injected; "
+                "unified model unavailable",
+            )
+        else:
+            record = await _tool_storage.get_credential(
+                cfg.user_id,
+                cfg.credential_id,
+            )
+            if record is None:
+                logger.warning(
+                    "view_image: credential %r not found for user %r; "
+                    "unified model unavailable",
+                    cfg.credential_id,
+                    cfg.user_id,
                 )
-                return _vision_model
-    except Exception as exc:  # noqa: BLE001
-        _events_logger.exception(
-            "VIEW_IMAGE_MODEL_BUILT_ERROR error=%s",
-            exc,
-        )
-    _vision_model_failed = True
+            else:
+                try:
+                    from bocomadp.view_image_model_builder import (
+                        build_image_parse_model,
+                    )
+                    from bocomadp.providers.ellm_chat_model import (
+                        EllmChatModel,
+                    )
+                    from bocomadp.providers.ellm_key import EllmKeyRefresher
+
+                    model = build_image_parse_model(
+                        record.data,
+                        cfg.model_name,
+                    )
+                    # 图片解析调用不走 on_model_call 链，必须在此主动保证
+                    # key 新鲜（ensure_fresh_key 惰性刷新，有效则零开销）；
+                    # 401 双回调仍保留作兜底（见 providers/ellm_chat_model.py）。
+                    if (
+                        isinstance(model, EllmChatModel)
+                        and _tool_message_bus is not None
+                    ):
+                        refresher = EllmKeyRefresher(
+                            _tool_storage,
+                            _tool_message_bus,
+                            cfg.user_id,
+                        )
+                        key, _ = await refresher.ensure_fresh_key(
+                            cfg.credential_id,
+                        )
+                        model.set_api_key(key)
+                        model.set_refresh_key_callback(
+                            lambda: refresher.force_refresh_key(
+                                cfg.credential_id,
+                            ),
+                        )
+                        model.set_auth_invalidate_callback(
+                            lambda: refresher.invalidate_key(
+                                cfg.credential_id,
+                            ),
+                        )
+                    _events_logger.info(
+                        "VIEW_IMAGE_MODEL_BUILT provider_id=%s model_name=%s",
+                        "view_image",
+                        cfg.model_name,
+                    )
+                    return model
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "view_image: unified model build failed",
+                    )
+                    _events_logger.exception(
+                        "VIEW_IMAGE_MODEL_BUILT_ERROR error=%s",
+                        exc,
+                    )
+    # 无可用统一模型：返回 None，由调用方提示经 /api/config/view_image 配置。
     return None
 
 
@@ -274,9 +353,9 @@ async def view_image_tool(
 
     适用场景：用户上传了图片（jpg/jpeg/png/webp）并需要解析图片内容时——
     这是解析用户上传图片**唯一**正确的方式。上传时图片已转 base64 固化到
-    上传元数据（host 侧 SQLite），本工具直接读取并调用 config.yaml 中
-    supports_multimodal: true 的多模态模型进行分析——不触碰沙箱文件系统，
-    也不依赖主对话模型的多模态能力。
+    上传元数据（host 侧 SQLite），本工具直接读取并调用经
+    /api/config/view_image 配置的统一多模态模型进行分析——不触碰沙箱文件
+    系统，也不依赖主对话模型的多模态能力。
 
     何时使用 图片解析 工具（必须使用）：
     - 用户询问图片内容 / 图片中的文字 / 图表数据时，无论图片是否已转换。
@@ -374,7 +453,7 @@ async def view_image_tool(
             "且需已通过 /files/upload 上传并完成 base64 固化）。"
         )
 
-    vision_model = _get_vision_model()
+    vision_model = await _get_vision_model()
     if vision_model is None:
         _events_logger.error(
             "VIEW_IMAGE_ERROR %s filename=%s error=未找到可用的多模态模型",
@@ -382,57 +461,65 @@ async def view_image_tool(
             filename,
         )
         return (
-            "未找到可用的多模态模型：请在 config.yaml 的 models 段配置 "
-            "supports_multimodal: true 的模型条目后重启服务。"
+            "未找到可用的多模态模型：请经 /api/config/view_image 配置统一"
+            "多模态模型（PUT /api/config/view_image，字段：enabled / "
+            "user_id / credential_id / model_name，enabled=true 时三者必填）"
+            "后重试。"
         )
-
-    prompt = _VISION_ANALYSIS_PROMPT.format(
-        question=question or "请详细描述这张图片的内容",
-    )
-    # try:
-    #     response = await vision_model.client.chat.completions.create(
-    #         model=vision_model.model,
-    #         messages=[
-    #             {
-    #                 "role": "user",
-    #                 "content": [
-    #                     {"type": "text", "text": prompt},
-    #                     {
-    #                         "type": "image_url",
-    #                         "image_url": {
-    #                             "url": f"data:{rec.mime_type};base64,{rec.base64}",
-    #                         },
-    #                     },
-    #                 ],
-    #             },
-    #         ],
-    #         stream=False,
-    #     )
-    # except Exception as exc:  # noqa: BLE001
-    #     logger.exception("view_image_tool: vision model call failed")
-    #     return f"多模态模型调用失败: {exc}"
-
-    # try:
-    #     text = response.choices[0].message.content or ""
-    # except Exception:  # noqa: BLE001
-    #     text = ""
-    # if not text.strip():
-    #     return f"多模态模型未返回有效内容（{filename}）。"
-    # logger.info(
-    #     "view_image_tool: analyzed %s (%s), result length=%d",
-    #     virtual_path,
-    #     rec.mime_type,
-    #     len(text),
-    # )
-    # return f"图片分析结果 ({filename}):\n\n{text}"
-    text = "这是一张交通银行logo"
-    _events_logger.info(
-        "VIEW_IMAGE_OUTPUT %s filename=%s mime_type=%s cost_ms=%d "
-        "result_len=%d",
-        ctx,
-        filename,
-        getattr(rec, "mime_type", "-"),
-        int((time.monotonic() - t0) * 1000),
-        len(text),
-    )
-    return f"图片分析结果 ({filename}):\n\n{text}"
+    
+    try:
+        prompt = _VISION_ANALYSIS_PROMPT.format(
+            question=question or "请详细描述这张图片的内容",
+        )
+        # try:
+        #     response = await vision_model.client.chat.completions.create(
+        #         model=vision_model.model,
+        #         messages=[
+        #             {
+        #                 "role": "user",
+        #                 "content": [
+        #                     {"type": "text", "text": prompt},
+        #                     {
+        #                         "type": "image_url",
+        #                         "image_url": {
+        #                             "url": f"data:{rec.mime_type};base64,{rec.base64}",
+        #                         },
+        #                     },
+        #                 ],
+        #             },
+        #         ],
+        #         stream=False,
+        #     )
+        # except Exception as exc:  # noqa: BLE001
+        #     logger.exception("view_image_tool: vision model call failed")
+        #     return f"多模态模型调用失败: {exc}"
+    
+        # try:
+        #     text = response.choices[0].message.content or ""
+        # except Exception:  # noqa: BLE001
+        #     text = ""
+        # if not text.strip():
+        #     return f"多模态模型未返回有效内容（{filename}）。"
+        # logger.info(
+        #     "view_image_tool: analyzed %s (%s), result length=%d",
+        #     virtual_path,
+        #     rec.mime_type,
+        #     len(text),
+        # )
+        # return f"图片分析结果 ({filename}):\n\n{text}"
+        text = "这是一家交通银行logo"
+        _events_logger.info(
+            "VIEW_IMAGE_OUTPUT %s filename=%s mime_type=%s cost_ms=%d "
+            "result_len=%d",
+            ctx,
+            filename,
+            getattr(rec, "mime_type", "-"),
+            int((time.monotonic() - t0) * 1000),
+            len(text),
+        )
+        return f"图片分析结果 ({filename}):\n\n{text}"
+    finally:
+        # 统一多模态模型每次调用临时构建：用后释放连接池（压缩模型同模式）。
+        close = getattr(vision_model, "aclose", None)
+        if close is not None:
+            await close()
