@@ -1,0 +1,114 @@
+name: agentscope-stress
+
+services:
+  redis:
+    image: redis:7-bookworm
+    container_name: stress-redis
+    ports: ["6390:6379"]
+    volumes:
+      - redis-data-stress:/data
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: stress-postgres
+    environment:
+      # 与 config.yaml db.url 中的凭据保持一致
+      - POSTGRES_USER=agentscope
+      - POSTGRES_PASSWORD=agentscope
+      - POSTGRES_DB=agentscope
+    ports: ["5434:5432"]
+    volumes:
+      - pg-data-stress:/var/lib/postgresql/data
+    healthcheck:
+      # 就绪探测：agentscope-service 等待其 healthy 后再启动
+      test: ["CMD-SHELL", "pg_isready -U agentscope -d agentscope"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  agentscope-service:
+    image: agentscope-service:oss
+    container_name: stress-agentscope-service
+    command: ["python", "main.py"]
+    ports: ["8002:8000"]
+    # 相对本文件目录（Docker-agentscope/.env），含 DEEPSEEK_API_KEY 等密钥
+    env_file: .env
+    environment:
+      - AGENTSCOPE_OSS_KEY=6lHgmYV7R36Bk5AyHFgyz4f9a0SL30TbaeHDJTPOS5M=
+      - TZ=Asia/Shanghai
+      # 注意：AppConfig 只识别 BOCOMADP_ 前缀（嵌套字段用 __ 分隔），
+      # 裸 REDIS_HOST 不会生效，会导致容器内连 localhost:6379 失败
+      - BOCOMADP_REDIS__HOST=redis
+      # 数据库：容器内走 postgres 服务（config.yaml 默认 localhost 无法直连）
+      - BOCOMADP_DB__URL=postgresql+asyncpg://agentscope:agentscope@postgres:5432/agentscope
+      # K8s 沙箱：kubeconfig 挂载自宿主机 .kube/config（容器内路径）
+      - ADP_K8S_KUBECONFIG=/app/kubeconfig/config
+      - ADP_K8S_ENABLED=true
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      # 挂载源码（可编辑模式）
+      - ../src:/app/src:ro
+      - ../examples/agent_service/main.py:/app/main.py:ro
+      # 挂载配置（config.yaml 位于 /app/config.yaml，与 BASE_DIR 解析一致）
+      - ../examples/agent_service/config.yaml:/app/config.yaml:ro
+      # 外层产品包：挂载到 /app/bocomadp，随 main.py 一同被 import
+      # （企业扩展原 bankcomm_adp 已整合进 bocomadp，无需单独挂载）
+      - ../examples/agent_service/bocomadp:/app/bocomadp:ro
+      - ../pyproject.toml:/app/pyproject.toml:ro
+      - ../README.md:/app/README.md:ro
+      # 工作区数据持久化（bind mount：验证后可直接在宿主机查看会话落盘文件
+      # workspaces/sessions/{user_id}/{agent_id}/{session_id}.json）
+      - ../examples/agent_service/workspaces:/app/workspaces
+      # Docker Socket（支持 Docker 工作区沙箱）
+      - /var/run/docker.sock:/var/run/docker.sock
+      # K8s kubeconfig（K8s 沙箱模式必需）
+      - /root/.kube/config:/app/kubeconfig/config:ro
+      # AgentScope ``as`` logger 文件输出（与 main.py 中默认路径一致）
+      - ./logs-stress:/app/logs
+
+  webui-backend:
+    image: webui-backend:dev
+    container_name: stress-webui-backend
+    expose: ["3000"]
+    environment:
+      - AGENTSCOPE_API_URL=http://agentscope-service:8000
+    depends_on: [agentscope-service]
+    volumes:
+      # 挂载源码
+      - ../examples/web_ui/backend/src:/app/src
+      - ../examples/web_ui/backend/package.json:/app/package.json
+      - ../examples/web_ui/backend/tsconfig.json:/app/tsconfig.json
+
+  webui-frontend:
+    image: webui-frontend:dev
+    container_name: stress-webui-frontend
+    environment:
+      - VITE_API_BASE_URL=http://agentscope-service:8000
+    expose: ["5173"]
+    depends_on: [webui-backend]
+    volumes:
+      # 挂载源码实现改码即热更；匿名卷保留镜像内 node_modules 不被遮蔽
+      - ../examples/web_ui/frontend:/app
+      - /app/node_modules
+
+  # 反向代理网关：统一入口（http://localhost:81）
+  # /api/* → webui-backend:3000，其余 → 前端（dev:5173 / prod:80）
+  nginx:
+    image: nginx:alpine
+    container_name: stress-nginx
+    ports: ["81:80"]
+    environment:
+      # envsubst 模板变量：dev 指向 vite dev server；prod 改为 webui-frontend:80
+      - FRONTEND_UPSTREAM=webui-frontend:5173
+    volumes:
+      # 以模板方式挂载，启动时经 envsubst 渲染为实际配置
+      - ./nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    depends_on: [webui-frontend, webui-backend]
+
+volumes:
+  redis-data-stress:
+  pg-data-stress:
