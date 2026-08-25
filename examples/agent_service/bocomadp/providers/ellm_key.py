@@ -50,6 +50,8 @@ from agentscope.app.message_bus import MessageBus
 from agentscope.app.storage import CredentialRecord, StorageBase
 from agentscope.credential import CredentialFactory
 
+from bocomadp.open_agent_access import get_credential_global
+
 logger = logging.getLogger(__name__)
 
 # Values >= this threshold are treated as Unix timestamps (ms);
@@ -241,6 +243,24 @@ class EllmKeyRefresher:
             )
         return True
 
+    async def _get_credential_any_owner(
+        self,
+        credential_id: str,
+    ) -> CredentialRecord | None:
+        """按 (user_id, id) 查，miss 后跨 owner 全局兜底。
+
+        开放智能体交互下会话可能引用其他用户的 ELLM 凭证（凭证跨
+        用户放开）；``get_credential`` 按 user 二元组查询会 miss，
+        回退按全局唯一主键 id 直查（仅 SQL 主存储支持）。
+        """
+        record = await self._storage.get_credential(
+            self._user_id,
+            credential_id,
+        )
+        if record is not None:
+            return record
+        return await get_credential_global(self._storage, credential_id)
+
     async def ensure_fresh_key(
         self,
         credential_id: str,
@@ -262,10 +282,7 @@ class EllmKeyRefresher:
             freshest ``api_key`` / ``apikey_expires_at`` and any runtime
             switches (e.g. ``inject_think_tag``).
         """
-        record = await self._storage.get_credential(
-            self._user_id,
-            credential_id,
-        )
+        record = await self._get_credential_any_owner(credential_id)
         if record is None:
             raise RuntimeError(
                 "EllmKeyRefresher: credential "
@@ -279,10 +296,7 @@ class EllmKeyRefresher:
             lock_key,
             ttl_secs=self._LOCK_TTL_SECS,
         ):
-            record = await self._storage.get_credential(
-                self._user_id,
-                credential_id,
-            )
+            record = await self._get_credential_any_owner(credential_id)
             if record is None:
                 raise RuntimeError(
                     "EllmKeyRefresher: credential "
@@ -319,10 +333,7 @@ class EllmKeyRefresher:
             lock_key,
             ttl_secs=self._LOCK_TTL_SECS,
         ):
-            record = await self._storage.get_credential(
-                self._user_id,
-                credential_id,
-            )
+            record = await self._get_credential_any_owner(credential_id)
             if record is None:
                 raise RuntimeError(
                     "EllmKeyRefresher: credential "
@@ -358,7 +369,10 @@ class EllmKeyRefresher:
         record.data["api_key"] = new_key
         record.data["apikey_expires_at"] = time.time() + ttl_ms / 1000
         credential_obj = CredentialFactory.from_dict(record.data)
-        await self._storage.upsert_credential(self._user_id, credential_obj)
+        # 写回必须落到凭证真实 owner 名下：upsert 只在
+        # (id, user_id) 均命中时原地更新，写错 owner 会尝试
+        # INSERT 同 id 记录（主键冲突），跨用户刷新即失败。
+        await self._storage.upsert_credential(record.user_id, credential_obj)
         return new_key, record
 
     async def invalidate_key(self, credential_id: str) -> None:
@@ -381,15 +395,13 @@ class EllmKeyRefresher:
         Args:
             credential_id (str): The stored ELLM credential record id.
         """
-        record = await self._storage.get_credential(
-            self._user_id,
-            credential_id,
-        )
+        record = await self._get_credential_any_owner(credential_id)
         if record is None:
             return
         record.data["apikey_expires_at"] = None
         credential_obj = CredentialFactory.from_dict(record.data)
-        await self._storage.upsert_credential(self._user_id, credential_obj)
+        # 同 _refresh_key：写回落到凭证真实 owner 名下。
+        await self._storage.upsert_credential(record.user_id, credential_obj)
 
 
 __all__ = ["fetch_ellm_key", "EllmKeyRefresher"]
