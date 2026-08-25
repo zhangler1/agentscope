@@ -259,6 +259,13 @@ raw_request:
   timeout: 30
 
 
+# ---------- 利率汇率（rate_currency：汇率查询 + 利率查询） ----------
+# 根地址与原 deerflow 工程一致；生产环境可用 $RATE_CURRENCY_API_URL 切换。
+rate_currency:
+  api_url: "http://12.244.167.46"
+  timeout: 30
+
+
 # ---------- 通讯录查询（contact_search） ----------
 # 扁平结构：键与 contact_search_config.py 字段一一对应。
 # api_url 支持环境变量引用展开，运行时需设置 CONTACT_SEARCH_API_URL。

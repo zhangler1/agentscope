@@ -46,6 +46,7 @@ _BUSINESS_KEYS: frozenset[str] = frozenset(
         "physical_contact_search",
         "vector_search",
         "raw_request",
+        "rate_currency",
         "uploads",
         "agents",
     },
