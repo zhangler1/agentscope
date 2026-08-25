@@ -190,21 +190,27 @@ class EllmKeyRefreshConfig(BaseModel):
     )
 
 
-class ContextCompressionConfig(BaseModel):
-    """上下文压缩统一模型配置（config.yaml ``context_compression:`` 节点）。
+class SummarizationConfig(BaseModel):
+    """上下文压缩统一模型配置（config.yaml ``summarization:`` 节点）。
 
     ``enabled=false``（默认）时压缩中间件纯透传，压缩用各会话自身模型；
-    ``enabled=true`` 时 ``credential_id`` / ``model_name`` 必填（启动报错）。
-    凭证 ID 由使用方提供，代码只按 ID 查库，不做凭证创建。
+    ``enabled=true`` 时 ``user_id`` / ``credential_id`` / ``model_name``
+    必填（启动报错）。
+    凭证按 ``user_id`` + ``credential_id`` 查库，凭证 ID 无格式约定、
+    可任意；代码不做凭证创建，也不从 ID 解析任何字段。
     """
 
     enabled: bool = Field(
         default=False,
         description="是否启用统一压缩模型（开关的是模型替换，框架压缩本身一直开启）。",
     )
+    user_id: str | None = Field(
+        default=None,
+        description="凭证归属用户（owner）；按 user_id + credential_id 查库。",
+    )
     credential_id: str | None = Field(
         default=None,
-        description="bocom_ellm 凭证 ID（如 deerflow-lwh-deepseek-v4-flash）。",
+        description="bocom_ellm 凭证 ID（无格式约定，使用方提供）。",
     )
     model_name: str | None = Field(
         default=None,
@@ -213,9 +219,11 @@ class ContextCompressionConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_fields(self) -> Self:
-        if self.enabled and (not self.credential_id or not self.model_name):
+        if self.enabled and (
+            not self.user_id or not self.credential_id or not self.model_name
+        ):
             raise ValueError(
-                "context_compression.enabled=true 时 credential_id 与 "
+                "summarization.enabled=true 时 user_id / credential_id / "
                 "model_name 均必填",
             )
         return self
@@ -512,9 +520,9 @@ class AppConfig(BaseSettings):
         default_factory=EllmKeyRefreshConfig,
         description="ELLM apikey 提前刷新窗口配置。",
     )
-    context_compression: ContextCompressionConfig = Field(
-        default_factory=ContextCompressionConfig,
-        description="上下文压缩统一模型配置（context_compression: 节点）。",
+    summarization: SummarizationConfig = Field(
+        default_factory=SummarizationConfig,
+        description="上下文压缩统一模型配置（summarization: 节点）。",
     )
     run_concurrency: RunConcurrencyConfig = Field(
         default_factory=RunConcurrencyConfig,

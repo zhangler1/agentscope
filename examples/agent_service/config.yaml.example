@@ -25,16 +25,6 @@ service:
   port: 8000
   reload: false            # 仅开发期开启自动重载
 
-# ---------- 上下文压缩（统一压缩模型） ----------
-# 所有会话的上下文压缩统一使用指定凭证 + 模型（框架压缩本身默认开启）。
-# enabled: false（默认）时中间件纯透传，压缩用各会话自身模型（现状）；
-# enabled: true 时两个模型字段必填（缺一启动报错）。
-# 凭证 ID 由使用方提供（代码只按 ID 查库，不做凭证创建）。
-# 压缩参数（trigger/reserve/提示词）仍由各智能体 context_config 自定义，此处不配。
-context_compression:
-  enabled: false
-  credential_id: "deerflow-lwh-deepseek-v4-flash"
-  model_name: "deepseek-v4-flash"
 
 # ---------- Redis（AgentScope storage / message bus） ----------
 redis:

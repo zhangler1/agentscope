@@ -26,7 +26,7 @@ from .uploads_config import UploadConfig, VIRTUAL_PATH_PREFIX, get_upload_config
 from .app_config import (
     AppConfig,
     CheckpointsConfig,
-    ContextCompressionConfig,
+    SummarizationConfig,
     GovernanceConfig,
     HooksConfig,
     LocalModelsConfig,
@@ -64,7 +64,7 @@ __all__ = [
     # app_config.py —— 单源化配置（config.yaml 主源 + env 覆盖）
     "AppConfig",
     "CheckpointsConfig",
-    "ContextCompressionConfig",
+    "SummarizationConfig",
     "GovernanceConfig",
     "HooksConfig",
     "LocalModelsConfig",

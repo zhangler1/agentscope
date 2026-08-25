@@ -305,5 +305,163 @@ class TestSetApiKey(IsolatedAsyncioTestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# 401 → forced key refresh → retry once
+# ---------------------------------------------------------------------------
+
+
+class _Fake401(Exception):
+    """A stand-in for the gateway's ``invalid_api_key`` 401 error."""
+
+    status_code = 401
+
+    def __init__(self) -> None:
+        super().__init__("invalid_api_key")
+        self.body = {
+            "error": {
+                "code": "invalid_api_key",
+                "message": "API KEY不存在或已过期",
+            },
+        }
+
+
+class _Fake401DeepSeek(Exception):
+    """A DeepSeek/official-OpenAI-style 401 with ``authentication_error``."""
+
+    status_code = 401
+
+    def __init__(self) -> None:
+        super().__init__("Authentication Fails")
+        self.body = {
+            "error": {
+                "message": "Authentication Fails, Your api key: ****1111 is "
+                "invalid",
+                "type": "authentication_error",
+                "param": None,
+                "code": "invalid_request_error",
+            },
+        }
+
+
+class TestCallApi401Refresh(IsolatedAsyncioTestCase):
+    """``_request_with_retry_on_auth`` force-refreshes the key and retries
+    once on an ``invalid_api_key`` 401."""
+
+    def setUp(self) -> None:
+        self.mock_client = MagicMock()
+        self.mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_completion(text="Hello"),
+        )
+        self.model = _make_model(stream=False)
+        self.model.client = self.mock_client
+
+    async def test_401_refreshes_and_retries_once(self) -> None:
+        """A 401 triggers a forced refresh; the call is retried once with the
+        new key and succeeds.  The invalidation callback is not invoked
+        because the refresh succeeded."""
+        create = self.mock_client.chat.completions.create
+        create.side_effect = [_Fake401(), _mock_completion(text="Hello")]
+
+        self.model.set_api_key("old-key")
+        self.model.set_refresh_key_callback(AsyncMock(return_value="new-key"))
+        invalidated = AsyncMock()
+        self.model.set_auth_invalidate_callback(invalidated)
+
+        resp = await self.model._request_with_retry_on_auth(
+            {"model": "Qwen3-235B-A22B", "stream": False},
+        )
+
+        self.assertEqual(create.await_count, 2)
+        # The retried request carries the freshly refreshed key.
+        retry_kwargs = create.await_args.kwargs
+        self.assertEqual(
+            retry_kwargs["extra_headers"],
+            {"Authorization": "Bearer new-key"},
+        )
+        # The retry succeeded and returned the completion from the 2nd call.
+        self.assertEqual(resp.choices[0].message.content, "Hello")
+        invalidated.assert_not_awaited()
+
+    async def test_401_refresh_failure_invalidates_and_raises(self) -> None:
+        """When the forced refresh does not yield a new key, the call is not
+        retried, the credential is marked expired, and the 401 surfaces."""
+        create = self.mock_client.chat.completions.create
+        create.side_effect = _Fake401()  # keep failing
+
+        self.model.set_api_key("old-key")
+        # Refresh "fails": returns None (no new key).
+        self.model.set_refresh_key_callback(AsyncMock(return_value=None))
+        invalidated = AsyncMock()
+        self.model.set_auth_invalidate_callback(invalidated)
+
+        with self.assertRaises(_Fake401):
+            await self.model._request_with_retry_on_auth(
+                {"model": "Qwen3-235B-A22B", "stream": False},
+            )
+
+        self.assertEqual(create.await_count, 1)  # no retry
+        invalidated.assert_awaited_once()
+
+    async def test_401_without_refresh_callback_raises(self) -> None:
+        """Without a refresh callback (model called outside middleware), a
+        401 is surfaced as-is without retrying."""
+        create = self.mock_client.chat.completions.create
+        create.side_effect = _Fake401()
+
+        invalidated = AsyncMock()
+        self.model.set_auth_invalidate_callback(invalidated)
+
+        with self.assertRaises(_Fake401):
+            await self.model._request_with_retry_on_auth(
+                {"model": "Qwen3-235B-A22B", "stream": False},
+            )
+
+        self.assertEqual(create.await_count, 1)
+        invalidated.assert_not_awaited()
+
+    async def test_deepseek_auth_error_401_also_retries(self) -> None:
+        """A DeepSeek/official-OpenAI 401 (``type: authentication_error``)
+        is also recognised as an invalid-key error and triggers refresh +
+        retry once."""
+        create = self.mock_client.chat.completions.create
+        create.side_effect = [_Fake401DeepSeek(), _mock_completion(text="OK")]
+
+        self.model.set_api_key("old-key")
+        self.model.set_refresh_key_callback(AsyncMock(return_value="new-key"))
+        invalidated = AsyncMock()
+        self.model.set_auth_invalidate_callback(invalidated)
+
+        resp = await self.model._request_with_retry_on_auth(
+            {"model": "Qwen3-235B-A22B", "stream": False},
+        )
+
+        self.assertEqual(create.await_count, 2)
+        retry_kwargs = create.await_args.kwargs
+        self.assertEqual(
+            retry_kwargs["extra_headers"],
+            {"Authorization": "Bearer new-key"},
+        )
+        self.assertEqual(resp.choices[0].message.content, "OK")
+        invalidated.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# aclose
+# ---------------------------------------------------------------------------
+
+
+class TestAclose(IsolatedAsyncioTestCase):
+    """``aclose`` 关闭底层 openai client，释放连接池。"""
+
+    async def test_aclose_closes_client(self) -> None:
+        model = _make_model(stream=False)
+        model.client = MagicMock()
+        model.client.close = AsyncMock()
+
+        await model.aclose()
+
+        model.client.close.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()

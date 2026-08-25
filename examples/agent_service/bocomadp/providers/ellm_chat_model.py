@@ -431,6 +431,16 @@ class EllmChatModel(ChatModelBase):
         """
         self._refresh_key_callback = callback
 
+    async def aclose(self) -> None:
+        """Close the underlying openai client and release its connection pool.
+
+        Used by the summarization middleware after a temporary
+        compression-model instance is done (see
+        ``bocomadp.middleware.summarization``); session-scoped models
+        are recreated per run and do not need this.
+        """
+        await self.client.close()
+
     @staticmethod
     def _is_invalid_key_error(exc: Any) -> bool:
         """Whether an exception is a "key missing/expired" 401.
