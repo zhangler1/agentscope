@@ -4,10 +4,11 @@
 deer-flow 前端的模型名需要映射到原生 ``ChatModelConfig`` 的
 ``credential_id``；本模块定义「默认凭证 + 用户维度凭证」的两级约定：
 
-- **默认凭证**：config.yaml 的模型条目在启动时（lifespan）作为
-  ``default`` 用户的凭证入库，id 形如 ``deerflow-default-<provider_id>``
-  —— 默认模型参数（api_key/base_url）的单一来源，运行时可修改该记录
-  实现全局切换，无需改 config.yaml。
+- **默认凭证**：内置模型条目（``load_model_entries``，原 config.yaml
+  的 ``models`` 节点已迁移至代码）在启动时（lifespan）作为 ``default``
+  用户的凭证幂等入库，id 形如 ``deerflow-default-<provider_id>`` ——
+  默认模型参数（api_key/base_url）的单一来源，运行时可修改该记录实现
+  全局切换，无需改 config.yaml。
 - **用户维度凭证**：id 形如 ``deerflow-<user_id>-<provider_id>``；首次
   使用时从默认凭证复制参数入库（原生 ChatService 按 run 的 user_id
   解析 credential，owner-scoping 不允许跨用户引用 default 的 id），
@@ -26,7 +27,7 @@ from typing import Any, TYPE_CHECKING
 from agentscope.app.storage import StorageBase
 from agentscope.credential import CredentialFactory
 
-from bocomadp.config import load_models_from_yaml
+from bocomadp.config import load_model_entries
 
 if TYPE_CHECKING:  # pragma: no cover —— 仅类型标注
     from bocomadp.config.app_config import ModelEntry
@@ -123,13 +124,13 @@ def credential_kwargs_for_entry(
 
 
 async def ensure_default_credentials(storage: StorageBase) -> None:
-    """把 config.yaml 模型条目作为 default 用户的默认凭证入库。
+    """把内置模型条目作为 default 用户的默认凭证幂等入库。
 
     幂等（upsert）；单条目失败仅告警不阻断启动。入库后默认模型参数
     以 storage 中 default 凭证为单一来源，运行时可修改该记录实现全局
     切换，无需改 config.yaml。
     """
-    for entry in load_models_from_yaml():
+    for entry in load_model_entries():
         try:
             credential_cls = credential_cls_for_entry(entry)
             if credential_cls is None:

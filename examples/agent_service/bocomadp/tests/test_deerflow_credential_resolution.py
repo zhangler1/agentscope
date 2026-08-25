@@ -223,7 +223,7 @@ class TestResolveChatModelConfig:
         monkeypatch,
         models: list[ModelEntry],
     ) -> None:
-        monkeypatch.setattr(chat_mod, "load_models_from_yaml", lambda: models)
+        monkeypatch.setattr(chat_mod, "load_model_entries", lambda: models)
 
     def test_model_name_passed_through_with_default_copy(
         self,

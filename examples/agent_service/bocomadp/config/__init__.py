@@ -44,7 +44,7 @@ from .app_config import (
     build_model_instance,
     get_app_config,
     is_trace_correlation_enabled,
-    load_models_from_yaml,
+    load_model_entries,
 )
 
 __all__ = [
@@ -83,5 +83,5 @@ __all__ = [
     "build_model_instance",
     "get_app_config",
     "is_trace_correlation_enabled",
-    "load_models_from_yaml",
+    "load_model_entries",
 ]

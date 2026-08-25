@@ -201,7 +201,7 @@ def test_ensure_default_credentials_upserts_under_default_user(
     """每个条目以 deerflow-default-<provider_id> 归属 default 用户入库。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     monkeypatch.setattr(
-        "bocomadp.deerflow.credentials.load_models_from_yaml",
+        "bocomadp.deerflow.credentials.load_model_entries",
         lambda: entries,
     )
     storage = FakeStorage()
@@ -223,7 +223,7 @@ def test_ensure_default_credentials_idempotent(monkeypatch) -> None:
     """重复调用走 upsert：记录不增、最新参数覆盖。"""
     entry = _make_model_entry("ds", api_key="sk-v2")
     monkeypatch.setattr(
-        "bocomadp.deerflow.credentials.load_models_from_yaml",
+        "bocomadp.deerflow.credentials.load_model_entries",
         lambda: [entry],
     )
     storage = FakeStorage()
@@ -244,7 +244,7 @@ def test_ensure_default_credentials_failure_does_not_block(
     """单条目失败仅跳过该条，其余条目照常入库。"""
     entries = [_make_model_entry("bad"), _make_model_entry("good")]
     monkeypatch.setattr(
-        "bocomadp.deerflow.credentials.load_models_from_yaml",
+        "bocomadp.deerflow.credentials.load_model_entries",
         lambda: entries,
     )
     storage = FakeStorage()
@@ -270,7 +270,7 @@ def _patch_config_loader(
     models: list[ModelEntry],
 ) -> None:
     monkeypatch.setattr(
-        "bocomadp.deerflow.routers.deerflow_chat.load_models_from_yaml",
+        "bocomadp.deerflow.routers.deerflow_chat.load_model_entries",
         lambda: models,
     )
 

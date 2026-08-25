@@ -174,15 +174,15 @@ main.py
                  如 BOCOMADP_LOGGING__ENHANCE__FORMAT=json
 ```
 
-**② config.yaml → models 节点**（模型 Provider 注册）
+**② 模型 Provider 注册**（代码内置条目，不再从 config.yaml 读取）
 
 ```
 main.py
-  └─ load_models_from_yaml(config.providers.config_file)
-       └─ yaml.safe_load("config.yaml")
-            └─ 取 data["models"] → ModelEntry 列表
-                 └─ api_key 中 ${ENV_VAR} 被 _resolve_env() 替换为实际值
-                 └─ 逐条注册到 ProviderManager
+  └─ load_model_entries()
+       └─ 代码内置 ModelEntry 列表（bocomadp/config/app_config.py）
+            └─ api_key 从环境变量读取（_load_dotenv_once 保证 .env 已加载）
+            └─ 逐条注册到 ProviderManager
+            └─ 启动时由 ensure_default_credentials 幂等刷库为 default 用户凭证
 ```
 
 常用环境变量：
@@ -356,7 +356,7 @@ app.include_router(orders_router)
 1. **配置加载** — `get_app_config()` 读 config.yaml + `.env` + `BOCOMADP_*` 环境变量
 2. **日志初始化** — `configure_logging(config)`
 3. **框架模块初始化** — ToolRegistry → MiddlewareRegistry → McpRegistry → ProviderManager → RunManager → BusBridge
-4. **模型注册** — `load_models_from_yaml("config.yaml")` 自动注册到 ProviderManager
+4. **模型注册** — `load_model_entries()` 从代码内置条目注册到 ProviderManager（凭证启动时幂等刷库）
 5. **工作区与消息总线** — K8s 沙箱模式（默认：K8s/共享 PVC 工作区 + RedisMessageBus）或本地模式（LocalWorkspaceManager + InMemoryMessageBus）
 6. **构建 App** — `create_app()` 自动注册内置路由
 7. **注入 ASGI 中间件** — Trace → AccessLog → Error → CORS

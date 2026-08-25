@@ -56,7 +56,7 @@ from agentscope.event import (
 )
 from agentscope.message import Msg, TextBlock
 
-from bocomadp.config import load_models_from_yaml
+from bocomadp.config import load_model_entries
 from bocomadp.config.app_config import ModelEntry
 from bocomadp.credential.ellm import ELLMCredential
 from bocomadp.logging.trace_context import run_id_context
@@ -526,13 +526,13 @@ async def _copy_credential_to_user(
 
 
 def _entry_for_credential_type(credential_type: str) -> ModelEntry | None:
-    """config.yaml 中与凭证 type 匹配的第一个条目（参数/模型名兜底源）。
+    """模型条目中与凭证 type 匹配的第一个条目（参数/模型名兜底源）。
 
     匹配依据凭证类的判别 type（``model_fields["type"]`` 的 Literal
     默认值，如 ``bocom_ellm_credential``）与条目 provider_type 对应
     凭证类一致；无匹配返回 None。
     """
-    for entry in load_models_from_yaml():
+    for entry in load_model_entries():
         credential_cls = credential_cls_for_entry(entry)
         if credential_cls is None:
             continue
@@ -548,11 +548,11 @@ def _entry_for_credential_type(credential_type: str) -> ModelEntry | None:
 
 
 def _pick_fallback_entry(active: Any) -> ModelEntry | None:
-    """凭证全空时的 config.yaml 回退条目。
+    """凭证全空时的模型条目回退（config.yaml models 清空后为内置条目）。
 
     优先 active provider 对应条目，否则取第一个可反序列化条目。
     """
-    entries = load_models_from_yaml()
+    entries = load_model_entries()
     if active is not None:
         entry = next(
             (

@@ -181,10 +181,10 @@ DOTENV_FILE = BASE_DIR / ".env"
   白名单 `_BUSINESS_KEYS = {models, audit}` 之外的未知键同样报错，
   杜绝 `extra="ignore"` 静默吞错。不走 `load_config_yaml` 的 lru_cache，
   文件内容修改后校验实时生效。
-- `load_models_from_yaml()` / `build_model_instance()`：从 `config.yaml` 的 `models` 节点
-  加载模型条目（读取后先 `$VAR` 展开），经 `CredentialFactory` 动态实例化并
-  注册到 `ProviderManager` —— 即「配置驱动模型注册」。默认路径为
-  `CONFIG_YAML_FILE`（绝对路径），不依赖启动工作目录。
+- `load_model_entries()` / `build_model_instance()`：从代码内置模型条目
+  加载（原 `config.yaml` 的 `models` 节点已迁移至代码），经 `CredentialFactory` 动态实例化并
+  注册到 `ProviderManager` —— 即「代码内置模型注册」；api_key 从环境变量读取。
+  凭证由启动时的 `ensure_default_credentials` 幂等刷库。
 - `is_trace_correlation_enabled()`：trace 关联开关的唯一真源，供 ASGI 中间件与日志配置共用。
 
 > **重要**：`main.py` 中 `RedisStorage` 必须通过 `config.redis.host` / `config.redis.port`
@@ -215,11 +215,11 @@ middleware/audit.py    → on_reply / 写入时再查 get_audit_config()
 ### 6.3 模型配置 → Provider 注册（`app_config.py`）
 
 ```
-main.py → load_models_from_yaml(config.providers.config_file)
+main.py → load_model_entries()
         → build_model_instance(entry) → provider_manager.register(...)
 ```
 
-> 模型条目来自 `config.yaml` 的 `models` 节点，`api_key` / `base_url` 支持 `${ENV_VAR}` 展开；
+> 模型条目来自代码内置定义（`bocomadp/config/app_config.py`），api_key 从环境变量读取（`.env` 自动加载）；
 > 注册失败仅告警不影响启动（fail-soft）。
 
 ---

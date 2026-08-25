@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -26,13 +27,13 @@ from .base import (
     BASE_DIR,
     CONFIG_YAML_FILE,
     DOTENV_FILE,
+    _load_dotenv_once,
     expand_env_vars,
-    load_config_yaml,
     resolve_path,
 )
 
 # 顶层业务节点白名单：这些键**有意**不在 AppConfig schema 内，
-# 由独立读取器消费（models → load_models_from_yaml；
+# 由独立读取器消费（models → load_model_entries；
 # cross_search → get_cross_search_config）。
 # 新增此类业务节点时，必须加入本集合，否则启动校验会 fail-fast。
 _BUSINESS_KEYS: frozenset[str] = frozenset(
@@ -324,9 +325,10 @@ class DbConfig(BaseModel):
 
 
 class ModelEntry(BaseModel):
-    """config.yaml 中单个模型 Provider 条目。
+    """单个模型 Provider 条目。
 
-    启动时由 ``load_models_from_yaml`` 读取，通过 ``CredentialFactory``
+    由 ``load_model_entries`` 提供（代码内置定义，原 config.yaml 的
+    ``models`` 节点已迁移至此），通过 ``CredentialFactory``
     动态实例化 credential + model，注册到 ``ProviderManager``。
     """
 
@@ -368,7 +370,10 @@ class ProviderConfig(BaseModel):
     )
     config_file: str | Path | None = Field(
         default=None,
-        description="模型 Provider 配置文件路径；None 时使用 agent_service/config.yaml。",
+        description=(
+            "已废弃：模型条目来源改为代码内置（load_model_entries），"
+            "不再从文件读取。"
+        ),
     )
     manager_class: str = Field(
         default="bocomadp.providers.ProviderManager",
@@ -477,7 +482,7 @@ class _ExpandedYamlSource(YamlConfigSettingsSource):
 
     继承 ``YamlConfigSettingsSource``（其 ``get_field_value`` 支持嵌套模型
     按字段名递归填充），仅在解析前多一步环境变量展开，保证与
-    ``load_config_yaml`` / ``expand_env_vars`` 的行为一致。
+    ``expand_env_vars`` 的行为一致。
     键校验与读取同源（仅一次文件读取，无 lru_cache），修改文件内容后
     校验实时生效，与热加载语义一致。
     """
@@ -591,28 +596,58 @@ class AppConfig(BaseSettings):
     mcp: McpConfig = Field(default_factory=McpConfig)
 
 
-def load_models_from_yaml(
-    path: str | Path | None = None,
-) -> list[ModelEntry]:
-    """从 YAML 文件加载模型 Provider 列表。
+def _builtin_model_entries() -> list[ModelEntry]:
+    """代码内置的模型条目（原 ``config.yaml`` 的 ``models`` 节点迁移至此）。
 
-    默认读取 ``agent_service/config.yaml``（绝对路径，与启动工作目录无关），
-    读取后先做 ``$VAR`` / ``${VAR}`` 环境变量展开。文件不存在时返回空列表
-    （不影响启动）。
+    凭证不再依赖 ``config.yaml`` 提供：本列表是 ``ProviderManager`` 注册、
+    默认凭证刷库（``ensure_default_credentials``）与多模态工具构建的统一
+    数据源。敏感值从环境变量读取（``_load_dotenv_once`` 保证 ``.env``
+    已加载，外部注入的环境变量优先）。
     """
-    if path:
-        p = Path(path)
-        if not p.exists():
-            return []
-        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        data = expand_env_vars(raw) if isinstance(raw, dict) else {}
-    else:
-        data = expand_env_vars(load_config_yaml())
-    entries_data = data.get("models", [])
-    result: list[ModelEntry] = []
-    for item in entries_data:
-        result.append(ModelEntry(**item))
-    return result
+    _load_dotenv_once()
+    return [
+        # 主对话模型（原 config.yaml deepseek 条目）
+        ModelEntry(
+            provider_id="deepseek",
+            display_name="DeepSeek Chat",
+            provider_type="deepseek",
+            model_name="deepseek-chat",
+            api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+            base_url="https://api.deepseek.com",
+            is_active=True,
+            supports_multimodal=False,
+            supports_thinking=True,
+            parameters={
+                "temperature": 0.7,
+                "max_tokens": 4096,
+                "thinking_enable": False,
+            },
+        ),
+        # 多模态模型（原 config.yaml qwen3-vl-30b 条目，工具专用）
+        ModelEntry(
+            provider_id="qwen3-vl-30b",
+            display_name="Qwen3 VL 30B A3B Instruct (多模态)",
+            provider_type="bocom_ellm",
+            model_name="Qwen3-VL-30B-A3B-Instruct",
+            api_key=os.environ.get("ELLM_API_KEY", ""),
+            base_url=os.environ.get("ELLM_BASE_URL", ""),
+            is_active=False,
+            supports_multimodal=True,
+            parameters={"temperature": 0.3, "max_tokens": 8192},
+        ),
+    ]
+
+
+def load_model_entries() -> list[ModelEntry]:
+    """模型条目统一入口：代码内置条目（原 ``config.yaml`` 的 ``models``
+    节点已迁移至此，yaml 读取不再支持）。
+
+    本列表是 ``ProviderManager`` 注册、默认凭证刷库
+    （``ensure_default_credentials``）与多模态工具构建的统一数据源；
+    凭证由启动时的默认凭证刷库幂等写入 storage，运行时可修改
+    default 用户凭证记录实现全局切换，无需改配置文件。
+    """
+    return _builtin_model_entries()
 
 
 def build_model_instance(entry: ModelEntry):
