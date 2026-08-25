@@ -616,6 +616,7 @@ if is_k8s_enabled():
     message_bus = RedisMessageBus(
         host=config.redis.host,
         port=config.redis.port,
+        max_connections=config.redis.max_connections,
     )
 else:
     # -- 本地模式 —— 工作区直接使用宿主机文件系统（开发/测试用）

@@ -140,6 +140,11 @@ class RedisConfig(BaseModel):
 
     host: str = Field(default="localhost")
     port: int = Field(default=6379)
+    # Redis 连接池上限（redis-py 默认仅 100，压测/生产建议调大）。
+    max_connections: int = Field(
+        default=200,
+        description="Redis 连接池上限。",
+    )
 
 
 class RunConcurrencyConfig(BaseModel):
