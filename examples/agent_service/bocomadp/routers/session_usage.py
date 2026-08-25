@@ -92,7 +92,7 @@ async def get_session_usage(
 
 
 @session_usage_router.get(
-    "/limit/",
+    "/limit",
     summary="Paginated session ids for an agent (direct DB query)",
 )
 async def list_session_ids_paginated(

@@ -43,7 +43,6 @@ except Exception:  # pragma: no cover - agentscope 不可用时降级（如纯�
             return current_prompt
 
 from bocomadp.deerflow.custom_params import get_custom_params
-from bocomadp.middleware.active_skill import get_active_skill
 
 logger = logging.getLogger(__name__)
 
@@ -250,30 +249,10 @@ class CustomPromptMiddleware(MiddlewareBase):
                 )
             return prompt
 
-        # 1.5. 用户指定技能：只保留该技能，去掉其他技能信息
-        skill_name = get_active_skill()
-        if skill_name:
-            single_skills = await self._build_single_skill_section(
-                agent,
-                skill_name,
-            )
-            if single_skills:
-                existing = _extract_section(current_prompt, "agent-skills")
-                if existing:
-                    current_prompt = current_prompt.replace(
-                        existing,
-                        single_skills,
-                    )
-                else:
-                    current_prompt = (
-                        current_prompt.rstrip("\n") + "\n\n" + single_skills
-                    )
-                logger.info(
-                    "CustomPromptMiddleware: active_skill=%s injected "
-                    "(only this skill)",
-                    skill_name,
-                )
-            # 技能不存在 → single_skills 为空，按普通消息继续
+        # 1.5. 用户指定技能：消息改写由 active_skill.py 负责（把 /skill_name
+        #      前缀解析并重写为任务指令）。system prompt 这里**不再**只注入该
+        #      技能，而是保留框架默认注入的全部技能（全量 <agent-skills> 段）。
+        #      （原 _build_single_skill_section 的单技能过滤逻辑已停用）
 
         # 2. 从 PostgreSQL 读取公共提示词（该智能体 → 全局回退）
         agent_id = getattr(agent, "name", "") or ""
