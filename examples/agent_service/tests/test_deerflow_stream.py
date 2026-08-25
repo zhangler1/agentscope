@@ -52,7 +52,10 @@ class FakeStorage:
 
     async def get_agent(self, user_id: str, agent_id: str):
         del user_id, agent_id
-        return SimpleNamespace(id=AGENT_ID)
+        # 与真实 AgentRecord 一致：带 data.name（HITL 挂起防护检测用）。
+        return SimpleNamespace(
+            data=SimpleNamespace(name="对比测试agent"),
+        )
 
     async def upsert_agent(self, user_id: str, record) -> None:
         return None

@@ -859,7 +859,16 @@ class ChatService:
                 # reporter is called directly.
                 if reply_msg is None:
                     # Failed before REPLY_START: nothing to close, so a
-                    # fresh reply carries the failure instead.
+                    # fresh reply carries the failure instead. Log the
+                    # original exception too — the client only sees the
+                    # classified summary, and without this the cause is
+                    # invisible in the logs.
+                    logger.exception(
+                        "Reply failed before REPLY_START for session %r "
+                        "agent %r; reported to the client as setup error.",
+                        session_id,
+                        agent_id,
+                    )
                     await self._report_failure(
                         user_id,
                         session_id,

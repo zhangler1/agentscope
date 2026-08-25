@@ -1280,6 +1280,43 @@ def _streaming_response(
     )
 
 
+def _confirmation_pending_response(awaiting: list) -> StreamingResponse:
+    """HITL 挂起时对普通消息的明确拒绝流（error 帧 + end 哨兵）。
+
+    会话仍在等待工具确认（ASKING）/外部执行（SUBMITTED）时，普通
+    消息会在引擎内被拒（"Agent is waiting ... but received no event"）
+    并泛化成误导性的 setup 错误；这里在路由层拦截，返回稳定命名的
+    错误帧（不创建 run、不占用 RunManager 记账），前端可按 name 给出
+    提示"先处理确认卡"。
+    """
+
+    async def _gen() -> AsyncGenerator[str, None]:
+        yield format_sse(
+            StreamEvent(
+                id="",
+                event=EVENT_ERROR,
+                data={
+                    "message": (
+                        "Agent is waiting for tool confirmation "
+                        f"({', '.join(tc.id for tc in awaiting)}); "
+                        "reply to the confirmation card first."
+                    ),
+                    "name": "ToolConfirmationPending",
+                },
+            ),
+        )
+        yield format_sse(END_SENTINEL)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ── 端点 1：创建 run + 流式 ──────────────────────────────────────────
 
 
@@ -1330,6 +1367,35 @@ async def create_run_stream(
         session_id,
         model_name,
     )
+    if not isinstance(converted, _HumanInputResponseMarker):
+        # HITL 挂起防护：会话仍在等待工具确认（ASKING）/外部执行
+        # （SUBMITTED）时，普通消息会在引擎内被拒并泛化成误导性的
+        # setup 错误。路由层提前拦截，返回明确命名的错误帧；确认
+        # 应答（Case B）本身就是解卡动作，不拦截。
+        session_record = await storage.get_session(
+            user_id,
+            agent_id,
+            session_id,
+        )
+        if session_record is not None:
+            agent_record = await storage.get_agent(user_id, agent_id)
+            agent_name = (
+                agent_record.data.name
+                if agent_record is not None
+                else agent_id
+            )
+            awaiting = session_record.state.get_awaiting_tool_calls(
+                agent_name,
+            )
+            if awaiting:
+                logger.warning(
+                    "deerflow: session %s awaiting %d tool "
+                    "confirmation(s) (%s); rejecting plain message.",
+                    session_id,
+                    len(awaiting),
+                    ", ".join(tc.id for tc in awaiting),
+                )
+                return _confirmation_pending_response(awaiting)
     if isinstance(converted, _HumanInputResponseMarker):
         # 前端确认卡片应答：构造 UserConfirmResultEvent 续跑（Case B）。
         # 原 human 消息仍回显 chunk——前端依赖 messages 事件中的 human
