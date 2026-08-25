@@ -736,6 +736,13 @@ _summarization_mw = SummarizationMiddleware(
     message_bus,
 )
 
+# 图片解析统一多模态模型：与压缩模型同模式（PG runtime_configs 表 view_image key，
+# 可经 /api/config/view_image 热更新，config.yaml 不再配置视觉模型）；注入工具
+# 运行时依赖供查凭证/刷新 ELLM key，无记录/未启用时工具提示未配置。
+from bocomadp.tools.builtin_tools import set_tool_runtime_deps
+
+set_tool_runtime_deps(storage, message_bus)
+
 
 async def _build_agent_middlewares_with_ellm(
     user_id: str,
