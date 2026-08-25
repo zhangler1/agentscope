@@ -293,6 +293,44 @@ class EllmKeyRefresher:
                 return record.data["api_key"], record
             return await self._refresh_key(record)
 
+    async def force_refresh_key(self, credential_id: str) -> str:
+        """Force a fresh key fetch, skipping the fast-path expiry check.
+
+        Unlike :meth:`ensure_fresh_key`, this always hits the gateway for a
+        new key (it does **not** trust a stored ``apikey_expires_at`` that is
+        still in the future) — used when a request was rejected with a 401
+        ``invalid_api_key`` even though the local expiry stamp suggested the
+        key was still valid.
+
+        The refresh runs under the same ``ellm:refresh:<id>`` distributed
+        lock, so concurrent 401-triggered refreshes fetch from the gateway
+        at most once.
+
+        Args:
+            credential_id (str): The stored ELLM credential record id.
+
+        Returns:
+            The freshly fetched ``api_key``.  On a gateway failure the old
+            key is preserved and returned (``_refresh_key`` falls back), and
+            the caller decides whether to surface the error.
+        """
+        lock_key = f"ellm:refresh:{credential_id}"
+        async with self._message_bus.acquire_lock(
+            lock_key,
+            ttl_secs=self._LOCK_TTL_SECS,
+        ):
+            record = await self._storage.get_credential(
+                self._user_id,
+                credential_id,
+            )
+            if record is None:
+                raise RuntimeError(
+                    "EllmKeyRefresher: credential "
+                    f"{credential_id!r} not found for user {self._user_id!r}",
+                )
+            new_key, _ = await self._refresh_key(record)
+            return new_key
+
     async def _refresh_key(
         self,
         record: CredentialRecord,

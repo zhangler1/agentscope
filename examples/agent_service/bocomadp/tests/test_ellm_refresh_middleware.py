@@ -29,7 +29,15 @@ from agentscope.app.storage._utils import _dump_with_secrets
 from agentscope.message import UserMsg
 
 from bocomadp.credential import ELLMCredential
-from bocomadp.middleware.ellm_refresh import EllmKeyRefreshMiddleware
+from bocomadp.deerflow.custom_params import (
+    reset_custom_params,
+    set_custom_params,
+)
+from bocomadp.middleware.ellm_refresh import (
+    EllmKeyRefreshMiddleware,
+    _get_think_tag_from_redis,
+    _parse_add_think,
+)
 from bocomadp.providers.ellm_chat_model import EllmChatModel
 
 _KEY_URL = "http://ellm.example/createSceneApiKey.do"
@@ -143,6 +151,9 @@ class TestInjection:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key-abc", 1_500_000),
+        ), mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=True),
         ):
             result = asyncio.run(
                 mw.on_model_call(
@@ -158,6 +169,66 @@ class TestInjection:
         assert base.inject_think_tag is True
         assert storage.upsert_calls == 1
         assert storage.record.data["api_key"] == "new-key-abc"
+
+    def test_request_add_think_overrides_redis(self) -> None:
+        """Request-level custom_params.add_think takes top priority,
+        even when the Redis model table would say otherwise."""
+        storage = _FakeStorage(_record("k", time.time() - 1800))
+        mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
+        base = _base_model()
+        base.client = mock.MagicMock()
+
+        token = set_custom_params({"add_think": False})
+        try:
+            with mock.patch(
+                "bocomadp.providers.ellm_key.fetch_ellm_key",
+                return_value=("new-key", 1_500_000),
+            ), mock.patch(
+                "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+                new=mock.AsyncMock(return_value=True),  # Redis says True
+            ):
+                asyncio.run(
+                    mw.on_model_call(
+                        agent=None,
+                        input_kwargs={"current_model": base},
+                        next_handler=_dummy_next,
+                    ),
+                )
+        finally:
+            reset_custom_params(token)
+
+        # Request-level False beats Redis True.
+        assert base.inject_think_tag is False
+
+    def test_request_missing_add_think_falls_back_to_redis(self) -> None:
+        """When the request carries no add_think, fall back to the Redis
+        model table."""
+        storage = _FakeStorage(_record("k", time.time() - 1800))
+        mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
+        base = _base_model()
+        base.client = mock.MagicMock()
+
+        token = set_custom_params({"llm_model_name": "deepseek-v4-flash"})
+        try:
+            with mock.patch(
+                "bocomadp.providers.ellm_key.fetch_ellm_key",
+                return_value=("new-key", 1_500_000),
+            ), mock.patch(
+                "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+                new=mock.AsyncMock(return_value=True),
+            ):
+                asyncio.run(
+                    mw.on_model_call(
+                        agent=None,
+                        input_kwargs={"current_model": base},
+                        next_handler=_dummy_next,
+                    ),
+                )
+        finally:
+            reset_custom_params(token)
+
+        # No inject_think in request → Redis model table value wins.
+        assert base.inject_think_tag is True
 
     def test_non_ellm_model_passes_through(self) -> None:
         """Non-EllmChatModel models are returned untouched."""
@@ -215,7 +286,10 @@ class TestEndToEnd:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key-abc", 1_500_000),
-        ) as fetch:
+        ) as fetch, mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=True),
+        ):
             final = asyncio.run(
                 agent.reply(UserMsg(name="user", content="hi")),
             )
