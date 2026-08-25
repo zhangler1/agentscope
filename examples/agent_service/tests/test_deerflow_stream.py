@@ -37,18 +37,39 @@ class FakeStorage:
     async def get_session(self, user_id: str, agent_id: str, session_id: str):
         return self._sessions.get((user_id, agent_id, session_id))
 
-    async def upsert_session(self, user_id, agent_id, config, session_id):
-        self._sessions[(user_id, agent_id, session_id)] = config
+    async def upsert_session(
+        self,
+        user_id,
+        agent_id,
+        config,
+        session_id,
+        state=None,
+    ):
+        self._sessions[(user_id, agent_id, session_id)] = SimpleNamespace(
+            config=config,
+            state=state,
+        )
 
     async def get_agent(self, user_id: str, agent_id: str):
         del user_id, agent_id
-        return SimpleNamespace(id=AGENT_ID)
+        # 与真实 AgentRecord 一致：带 data.name（HITL 挂起防护检测用）。
+        return SimpleNamespace(
+            data=SimpleNamespace(name="对比测试agent"),
+        )
 
     async def upsert_agent(self, user_id: str, record) -> None:
         return None
 
     async def upsert_credential(self, user_id: str, credential) -> None:
         return None
+
+    async def get_credential(self, user_id: str, credential_id: str):
+        del user_id, credential_id
+        return None
+
+    async def list_credentials(self, user_id: str):
+        del user_id
+        return []
 
     async def list_messages(
         self,

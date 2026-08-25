@@ -58,7 +58,7 @@ from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注�
 from bocomadp.config import (
     get_app_config,
     is_trace_correlation_enabled,
-    load_models_from_yaml,
+    load_model_entries,
     build_model_instance,
 )
 from bocomadp.concurrency.guard import ConcurrencyGuard
@@ -78,7 +78,6 @@ from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
 from bocomadp.deerflow.routers.deerflow_chat import deerflow_router
-from bocomadp.deerflow.routers.models import deerflow_models_router
 from bocomadp.deerflow.routers.threads import threads_router
 from bocomadp.routers.uploads import uploads_router
 from bocomadp.routers.channels import channels_router
@@ -248,9 +247,11 @@ if config.mcp.enabled:
 
 provider_manager = ProviderManager()
 
-# 从 config.yaml 加载模型配置并自动注册到 ProviderManager
+# 从代码内置模型条目（原 config.yaml models 节点已迁移）加载并注册到
+# ProviderManager；凭证单一来源迁移至代码，启动时由
+# ensure_default_credentials 幂等刷库。
 if config.providers.enabled:
-    _model_entries = load_models_from_yaml(config.providers.config_file)
+    _model_entries = load_model_entries()
     for _entry in _model_entries:
         try:
             _model = build_model_instance(_entry)
@@ -266,13 +267,13 @@ if config.providers.enabled:
             if _entry.is_active:
                 provider_manager.set_active(_entry.provider_id)
             logger.info(
-                "provider registered from config.yaml: %s (model=%s)",
+                "provider registered: %s (model=%s)",
                 _entry.provider_id,
                 _entry.model_name or _entry.provider_id,
             )
         except Exception:
             logger.warning(
-                "failed to register provider '%s' from config.yaml",
+                "failed to register provider '%s'",
                 _entry.provider_id,
                 exc_info=True,
             )
@@ -862,8 +863,8 @@ async def _lifespan_with_builtin_agents(app):
         # bocomadp/team_toolkit.py；必须先于 patch_get_toolkit 挂载，
         # 让白名单包装看到已注入的完整 Toolkit。
         patch_team_toolkit()
-        # config.yaml 模型条目作为 default 用户默认凭证入库（deerflow
-        # 模型名解析的默认参数单一来源；幂等，失败仅告警不阻断启动）
+        # 内置模型条目作为 default 用户默认凭证幂等入库（deerflow
+        # 模型名解析的默认参数单一来源；失败仅告警不阻断启动）
         await ensure_default_credentials(storage)
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
@@ -961,8 +962,6 @@ app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
 app.include_router(deerflow_router)
-# deer-flow 模型列表（GET /api/deerflow/models，deer-flow Model 格式）
-app.include_router(deerflow_models_router)
 # deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
 app.include_router(auth_stub_router)
 # deer-flow 渠道兼容占位路由（providers/connections 恒空，前端优雅降级）

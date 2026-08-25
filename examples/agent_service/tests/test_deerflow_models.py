@@ -4,12 +4,10 @@
 
 - ``_resolve_requested_model_name``：llm_model_name 单一通道与空回退；
 - ``ensure_default_credentials``：default 用户维度、幂等 upsert、失败不阻断；
-- ``_resolve_chat_model_config``：按 model_name / provider_id 匹配、
-  未命中回退 active provider、用户凭证优先引用、默认凭证复制入库、
-  default 凭证缺失回退 config.yaml 条目；
-- ``_ensure_session``：首次 backfill、模型切换更新、一致不更新；
-- ``GET /api/deerflow/models``：默认凭证 id 返回、用户凭证优先、
-  X-User-ID 缺省 default、default 凭证缺失跳过。
+- ``_resolve_chat_model_config``：模型名透传、用户凭证表挑选
+  （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退 config.yaml
+  条目；
+- ``_prepare_session_for_run``：首次 backfill、模型切换更新、一致不更新。
 """
 
 from __future__ import annotations
@@ -17,11 +15,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-
 from agentscope.app.storage import ChatModelConfig, SessionConfig
 from agentscope.app.storage._utils import _dump_with_secrets
+from agentscope.permission import PermissionMode
 
 from bocomadp.config.app_config import ModelEntry
 from bocomadp.deerflow.credentials import (
@@ -30,15 +26,12 @@ from bocomadp.deerflow.credentials import (
     ensure_default_credentials,
     user_credential_id,
 )
-from bocomadp.deerflow.routers import models as models_module
 from bocomadp.deerflow.routers.deerflow_chat import (
     CreateRunRequest,
-    _ensure_session,
+    _prepare_session_for_run,
     _resolve_chat_model_config,
     _resolve_requested_model_name,
 )
-from bocomadp.deerflow.routers.models import deerflow_models_router
-
 USER_ID = "u1"
 AGENT_ID = "lead_agent"
 
@@ -116,6 +109,13 @@ class FakeStorage:
     async def get_credential(self, user_id: str, credential_id: str):
         return self.credentials.get((user_id, credential_id))
 
+    async def list_credentials(self, user_id: str):
+        return [
+            record
+            for (owner, _), record in self.credentials.items()
+            if owner == user_id
+        ]
+
     async def upsert_credential(self, user_id: str, credential) -> None:
         if self.fail_marker and self.fail_marker in credential.id:
             raise RuntimeError(f"injected failure for {credential.id}")
@@ -138,9 +138,11 @@ class FakeStorage:
         agent_id,
         config,
         session_id,
+        state=None,
     ) -> None:
         self.sessions[(user_id, agent_id, session_id)] = SimpleNamespace(
             config=config,
+            state=state,
         )
 
     async def get_agent(self, user_id: str, agent_id: str):
@@ -202,7 +204,7 @@ def test_ensure_default_credentials_upserts_under_default_user(
     """每个条目以 deerflow-default-<provider_id> 归属 default 用户入库。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     monkeypatch.setattr(
-        "bocomadp.deerflow.credentials.load_models_from_yaml",
+        "bocomadp.deerflow.credentials.load_model_entries",
         lambda: entries,
     )
     storage = FakeStorage()
@@ -224,7 +226,7 @@ def test_ensure_default_credentials_idempotent(monkeypatch) -> None:
     """重复调用走 upsert：记录不增、最新参数覆盖。"""
     entry = _make_model_entry("ds", api_key="sk-v2")
     monkeypatch.setattr(
-        "bocomadp.deerflow.credentials.load_models_from_yaml",
+        "bocomadp.deerflow.credentials.load_model_entries",
         lambda: [entry],
     )
     storage = FakeStorage()
@@ -245,7 +247,7 @@ def test_ensure_default_credentials_failure_does_not_block(
     """单条目失败仅跳过该条，其余条目照常入库。"""
     entries = [_make_model_entry("bad"), _make_model_entry("good")]
     monkeypatch.setattr(
-        "bocomadp.deerflow.credentials.load_models_from_yaml",
+        "bocomadp.deerflow.credentials.load_model_entries",
         lambda: entries,
     )
     storage = FakeStorage()
@@ -271,7 +273,7 @@ def _patch_config_loader(
     models: list[ModelEntry],
 ) -> None:
     monkeypatch.setattr(
-        "bocomadp.deerflow.routers.deerflow_chat.load_models_from_yaml",
+        "bocomadp.deerflow.routers.deerflow_chat.load_model_entries",
         lambda: models,
     )
 
@@ -283,7 +285,8 @@ def _run(coro):
 
 
 def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
-    """hint 命中条目 model_name：使用该条目的 provider/model。"""
+    """``model_name`` 为模型名：透传为 config.model；凭证表为空时回退 active
+    provider 对应条目创建用户凭证。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -293,18 +296,18 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
             storage,
             FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            hint="r1",
+            model_name="r1",
         ),
     )
 
     assert config is not None
     assert config.model == "r1"
-    assert config.credential_id == user_credential_id(USER_ID, "ds-r1")
-    assert config.type == "deepseek"
+    assert config.credential_id == user_credential_id(USER_ID, "ds")
+    assert config.type == "deepseek_credential"
 
 
 def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
-    """hint 未命中 model_name 时按 provider_id 匹配（前端传 name）。"""
+    """``model_name`` 非约定凭证 id（provider_id）：原样透传为模型名。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -314,19 +317,20 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
             storage,
             FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            hint="ds-r1",
+            model_name="ds-r1",
         ),
     )
 
     assert config is not None
-    assert config.model == "r1"
-    assert config.credential_id == user_credential_id(USER_ID, "ds-r1")
+    assert config.model == "ds-r1"
+    assert config.credential_id == user_credential_id(USER_ID, "ds")
 
 
 def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
     monkeypatch,
 ) -> None:
-    """hint 未命中告警后回退全局 active provider。"""
+    """``model_name`` 任意值一律透传为模型名；凭证表为空时凭证回退 active
+    provider 对应条目创建。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -336,12 +340,12 @@ def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
             storage,
             FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
-            hint="nope",
+            model_name="nope",
         ),
     )
 
     assert config is not None
-    assert config.model == "deepseek-chat"
+    assert config.model == "nope"
     assert config.credential_id == user_credential_id(USER_ID, "ds")
 
 
@@ -435,23 +439,23 @@ def test_resolve_chat_model_config_unknown_entry_returns_none(
     assert config is None
 
 
-# ── _ensure_session ───────────────────────────────────────────────────
+# ── _prepare_session_for_run ─────────────────────────────────────────
 
 
-def _run_ensure_session(
+def _run_prepare_session(
     storage: FakeStorage,
-    hint: str = "",
+    model_name: str = "",
     request: FakeRequest | None = None,
 ) -> None:
     _run(
-        _ensure_session(
+        _prepare_session_for_run(
             storage,
             FakeWorkspaceManager(),
             request or FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
             AGENT_ID,
             "s1",
-            model_name_hint=hint,
+            model_name=model_name,
         ),
     )
 
@@ -460,7 +464,7 @@ def _session_key() -> tuple[str, str, str]:
     return (USER_ID, AGENT_ID, "s1")
 
 
-def test_ensure_session_creates_with_backfilled_model_config(
+def test_prepare_session_creates_with_backfilled_model_config(
     monkeypatch,
 ) -> None:
     """首次创建：session 自动补齐 chat_model_config。"""
@@ -468,14 +472,71 @@ def test_ensure_session_creates_with_backfilled_model_config(
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
 
-    _run_ensure_session(storage)
+    _run_prepare_session(storage)
 
     session = storage.sessions[_session_key()]
     assert session.config.workspace_id == "ws-test"
     assert session.config.chat_model_config.model == "deepseek-chat"
 
 
-def test_ensure_session_updates_config_on_model_switch(
+def test_prepare_session_creates_with_default_permission_mode(
+    monkeypatch,
+) -> None:
+    """首次创建：permission_context.mode 取配置项 default_permission_mode。"""
+    entries = [_make_model_entry("ds")]
+    _patch_config_loader(monkeypatch, entries)
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_app_config",
+        lambda: SimpleNamespace(
+            default_permission_mode=PermissionMode.BYPASS,
+        ),
+    )
+    storage = FakeStorage()
+
+    _run_prepare_session(storage)
+
+    session = storage.sessions[_session_key()]
+    assert session.state.permission_context.mode == PermissionMode.BYPASS
+
+
+def test_prepare_session_preserves_state_when_race_created(
+    monkeypatch,
+) -> None:
+    """竞态防护：upsert 前会话已被并发请求建好时不再覆盖。"""
+    entries = [_make_model_entry("ds")]
+    _patch_config_loader(monkeypatch, entries)
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_app_config",
+        lambda: SimpleNamespace(
+            default_permission_mode=PermissionMode.BYPASS,
+        ),
+    )
+    storage = FakeStorage()
+    # 模拟并发请求：_prepare_session_for_run 首次 get_session 返回 None，
+    # 解析模型配置期间另一请求已建好会话。
+    existing = SimpleNamespace(
+        config=SessionConfig(workspace_id="ws-other"),
+    )
+    created = False
+    original_get = storage.get_session
+
+    async def racy_get(user_id: str, agent_id: str, session_id: str):
+        nonlocal created
+        result = await original_get(user_id, agent_id, session_id)
+        if result is None and not created:
+            storage.sessions[_session_key()] = existing
+            created = True
+        return result
+
+    storage.get_session = racy_get
+
+    _run_prepare_session(storage)
+
+    assert storage.sessions[_session_key()] is existing
+
+
+
+def test_prepare_session_updates_config_on_model_switch(
     monkeypatch,
 ) -> None:
     """模型切换（三元组不一致）：已有 session 的 config 被更新。"""
@@ -494,17 +555,17 @@ def test_ensure_session_updates_config_on_model_switch(
         ),
     )
 
-    _run_ensure_session(storage, hint="r1")
+    _run_prepare_session(storage, model_name="r1")
 
     session = storage.sessions[_session_key()]
     assert session.config.chat_model_config.model == "r1"
     assert session.config.chat_model_config.credential_id == user_credential_id(
         USER_ID,
-        "ds-r1",
+        "ds",
     )
 
 
-def test_ensure_session_no_update_when_config_matches(monkeypatch) -> None:
+def test_prepare_session_no_update_when_config_matches(monkeypatch) -> None:
     """一致三元组（HITL 续跑同 thread 模型名）：不触发更新。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
@@ -523,12 +584,12 @@ def test_ensure_session_no_update_when_config_matches(monkeypatch) -> None:
     # 记录原始 config 引用，upsert 后 sessions 字典会替换条目
     before = storage.sessions[_session_key()]
 
-    _run_ensure_session(storage)
+    _run_prepare_session(storage)
 
     assert storage.sessions[_session_key()] is before
 
 
-def test_ensure_session_backfills_missing_model_config(
+def test_prepare_session_backfills_missing_model_config(
     monkeypatch,
 ) -> None:
     """已有 session 但 chat_model_config 为空：backfill。"""
@@ -539,99 +600,7 @@ def test_ensure_session_backfills_missing_model_config(
         config=SessionConfig(workspace_id="ws1"),
     )
 
-    _run_ensure_session(storage)
+    _run_prepare_session(storage)
 
     session = storage.sessions[_session_key()]
     assert session.config.chat_model_config.model == "deepseek-chat"
-
-
-# ── GET /api/deerflow/models ──────────────────────────────────────────
-
-
-def _make_models_app(storage: FakeStorage) -> FastAPI:
-    api = FastAPI()
-    api.state.storage = storage
-    api.include_router(deerflow_models_router)
-    app = FastAPI()
-    app.mount("/api", api)
-    return app
-
-
-def test_list_models_returns_default_credential_id(monkeypatch) -> None:
-    """无用户凭证时返回 default 凭证 id（X-User-ID 必填，缺省 401）。"""
-    entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
-    monkeypatch.setattr(
-        models_module,
-        "load_models_from_yaml",
-        lambda: entries,
-    )
-    storage = FakeStorage()
-    for entry in entries:
-        storage.seed_credential(
-            DEFAULT_CREDENTIAL_OWNER,
-            default_credential_id(entry.provider_id),
-        )
-
-    with TestClient(_make_models_app(storage)) as client:
-        response = client.get(
-            "/api/deerflow/models",
-            headers={"X-User-ID": DEFAULT_CREDENTIAL_OWNER},
-        )
-
-    assert response.status_code == 200
-    body = response.json()["models"]
-    assert len(body) == 2
-    assert body[0]["id"] == default_credential_id("ds")
-    assert body[0]["name"] == "ds"
-    assert body[0]["model"] == "deepseek-chat"
-    assert body[0]["supports_thinking"] is True
-    assert body[0]["supports_reasoning_effort"] is False
-
-
-def test_list_models_prefers_user_credential(monkeypatch) -> None:
-    """用户 credential 存在：返回本用户的 id（重复则使用本用户的）。"""
-    entries = [_make_model_entry("ds")]
-    monkeypatch.setattr(
-        models_module,
-        "load_models_from_yaml",
-        lambda: entries,
-    )
-    storage = FakeStorage()
-    storage.seed_credential(
-        DEFAULT_CREDENTIAL_OWNER,
-        default_credential_id("ds"),
-    )
-    storage.seed_credential(USER_ID, user_credential_id(USER_ID, "ds"))
-
-    with TestClient(_make_models_app(storage)) as client:
-        response = client.get(
-            "/api/deerflow/models",
-            headers={"X-User-ID": USER_ID},
-        )
-
-    assert response.status_code == 200
-    models = response.json()["models"]
-    assert len(models) == 1
-    assert models[0]["id"] == user_credential_id(USER_ID, "ds")
-
-
-def test_list_models_skips_entry_without_any_credential(
-    monkeypatch,
-) -> None:
-    """default 凭证亦不存在：跳过该条目并告警。"""
-    entries = [_make_model_entry("ds")]
-    monkeypatch.setattr(
-        models_module,
-        "load_models_from_yaml",
-        lambda: entries,
-    )
-    storage = FakeStorage()
-
-    with TestClient(_make_models_app(storage)) as client:
-        response = client.get(
-            "/api/deerflow/models",
-            headers={"X-User-ID": DEFAULT_CREDENTIAL_OWNER},
-        )
-
-    assert response.status_code == 200
-    assert response.json() == {"models": []}

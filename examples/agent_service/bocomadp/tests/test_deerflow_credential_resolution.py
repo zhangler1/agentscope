@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
-"""deerflow 模型解析链单测：约定 credential id 直传 + ELLM 空 api_key 放行。
+"""deerflow 模型解析链单测：用户凭证表挑选 + 模型名透传。
 
 Contract under test:
 
-- ``is_deerflow_credential_id`` 识别 ``/api/deerflow/models`` 返回的两种
-  约定 id 形态（``deerflow-<user>-<provider>`` /
-  ``deerflow-default-<provider>``）并解析出 provider_id；模型名 / 任意
-  uuid / 他人凭证 id 返回 None。
-- ``_resolve_chat_model_config`` 中约定 credential id 直传等价于命中该
-  provider 的 config 条目，继续走「用户优先、默认复制」：default 凭证
-  id → 复制出用户维度凭证并引用（复制保留 scene_code / api_key_url 等
-  刷新元数据）；本用户凭证 id → 直接引用既有凭证，不重复复制。
-- 模型名 / provider_id hint 走既有 config.yaml 双键匹配路径不变；无
-  hint 时回退全局 active provider。
-- ELLM 条目 api_key 空放行（key 动态获取），非 ELLM 条目 api_key 空仍
-  返回 None。
+- ``is_deerflow_credential_id`` 识别约定凭证 id 形态
+  （``deerflow-<user>-<provider>`` / ``deerflow-default-<provider>``）
+  并解析出 provider_id；模型名 / 任意 uuid / 他人凭证 id 返回 None。
+- ``_resolve_chat_model_config`` 新契约（一凭证多模型）：
+  - ``model_name`` 非空一律视为模型名透传（不再支持凭证 id 直传）；
+  - ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
+    优先、id 稳定排序取第一个；
+  - 用户凭证为空 → default 用户凭证同规则挑选并复制入库；
+  - 再空 → 回退 config.yaml 条目参数创建（ELLM 条目 api_key 空放行，
+    非 ELLM 条目 api_key 空返回 None）。
+- 模型名：``model_name`` 直接透传（凭证 model 字段不参与绑定）；缺失时
+  回退凭证 model 字段值 → config.yaml 匹配条目 model_name → 全局
+  active provider。
 """
 
 from __future__ import annotations
@@ -100,6 +101,7 @@ class _FakeStorage:
         data: dict,
     ) -> None:
         self._records[(user_id, credential_id)] = CredentialRecord(
+            id=credential_id,
             user_id=user_id,
             data=data,
             updated_at=datetime.now(),
@@ -120,6 +122,16 @@ class _FakeStorage:
         self.upserts.append((user_id, credential))
         return credential.id
 
+    async def list_credentials(
+        self,
+        user_id: str,
+    ) -> list[CredentialRecord]:
+        return [
+            record
+            for (owner, _), record in self._records.items()
+            if owner == user_id
+        ]
+
 
 class _FakeRequest:
     """``app.state.provider_manager`` 可配置的最小 Request stand-in。"""
@@ -139,7 +151,7 @@ class _FakeRequest:
 def _resolve(
     storage: _FakeStorage,
     user_id: str,
-    hint: str = "",
+    model_name: str = "",
     request: _FakeRequest | None = None,
 ) -> ChatModelConfig | None:
     return asyncio.run(
@@ -147,7 +159,7 @@ def _resolve(
             storage,
             request or _FakeRequest(),
             user_id,
-            hint,
+            model_name,
         ),
     )
 
@@ -196,7 +208,7 @@ class TestIsDeerflowCredentialId:
             is None
         )
 
-    def test_empty_hint(self) -> None:
+    def test_empty_value(self) -> None:
         assert is_deerflow_credential_id("", "user-1") is None
 
     def test_missing_provider_segment(self) -> None:
@@ -211,71 +223,14 @@ class TestResolveChatModelConfig:
         monkeypatch,
         models: list[ModelEntry],
     ) -> None:
-        monkeypatch.setattr(chat_mod, "load_models_from_yaml", lambda: models)
+        monkeypatch.setattr(chat_mod, "load_model_entries", lambda: models)
 
-    def test_default_credential_id_copied_to_user(self, monkeypatch) -> None:
-        """hint 为 default 凭证 id → 解析 provider → 复制出用户维度凭证
-        并引用；复制保留刷新元数据（scene_code / api_key_url / key）。"""
-        storage = _FakeStorage()
-        storage.seed(
-            "default",
-            f"deerflow-default-{_ELLM_PROVIDER}",
-            _ellm_record_data(),
-        )
-        self._patch_loaders(
-            monkeypatch,
-            models=[_ellm_entry(api_key="")],
-        )
-
-        config = _resolve(
-            storage,
-            "user-1",
-            hint=f"deerflow-default-{_ELLM_PROVIDER}",
-        )
-
-        assert config is not None
-        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert config.type == "bocom_ellm"
-        assert config.model == "deepseek-v4-flash"
-        assert len(storage.upserts) == 1
-        user_id, credential = storage.upserts[0]
-        assert user_id == "user-1"
-        assert isinstance(credential, ELLMCredential)
-        assert credential.id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert credential.api_key.get_secret_value() == "stored-key"
-        assert credential.scene_code == "P2024146"
-        assert credential.api_key_url == (
-            "http://ellm.example/createSceneApiKey.do"
-        )
-
-    def test_user_credential_id_references_existing(self, monkeypatch) -> None:
-        """hint 为本用户凭证 id → 直接引用既有凭证，不重复复制。"""
-        storage = _FakeStorage()
-        storage.seed(
-            "user-1",
-            f"deerflow-user-1-{_ELLM_PROVIDER}",
-            _ellm_record_data(
-                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
-                api_key="user-custom-key",
-            ),
-        )
-        self._patch_loaders(
-            monkeypatch,
-            models=[_ellm_entry(api_key="")],
-        )
-
-        config = _resolve(
-            storage,
-            "user-1",
-            hint=f"deerflow-user-1-{_ELLM_PROVIDER}",
-        )
-
-        assert config is not None
-        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
-        assert storage.upserts == []
-
-    def test_model_name_hint_matches_config_entry(self, monkeypatch) -> None:
-        """hint 为模型名 → 既有 config.yaml 双键匹配路径不变。"""
+    def test_model_name_passed_through_with_default_copy(
+        self,
+        monkeypatch,
+    ) -> None:
+        """``model_name`` 为模型名 → 透传为 config.model；用户凭证表为空 →
+        default 凭证挑选复制路径。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -287,18 +242,22 @@ class TestResolveChatModelConfig:
             models=[_deepseek_entry("sk-test")],
         )
 
-        config = _resolve(storage, "user-1", hint="deepseek-chat")
+        config = _resolve(storage, "user-1", model_name="deepseek-chat")
 
         assert config is not None
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
-        assert config.type == "deepseek"
+        assert config.type == "deepseek_credential"
         assert config.model == "deepseek-chat"
         assert len(storage.upserts) == 1  # 从 default 复制
 
-    def test_provider_id_hint_matches_config_entry(self, monkeypatch) -> None:
-        """hint 为 provider_id → 同样命中 config 条目。"""
+    def test_non_credential_model_name_always_passed_through(
+        self,
+        monkeypatch,
+    ) -> None:
+        """``model_name`` 非约定凭证 id（如 provider_id）→ 一律透传为模型名，
+        不再做 config.yaml 双键匹配。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -310,12 +269,14 @@ class TestResolveChatModelConfig:
             models=[_deepseek_entry("sk-test")],
         )
 
-        config = _resolve(storage, "user-1", hint=_DEEPSEEK_PROVIDER)
+        config = _resolve(storage, "user-1", model_name=_DEEPSEEK_PROVIDER)
 
         assert config is not None
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
+        assert config.type == "deepseek_credential"
+        assert config.model == _DEEPSEEK_PROVIDER  # model_name 原样透传
 
     def test_non_ellm_empty_api_key_returns_none(self, monkeypatch) -> None:
         """非 ELLM 条目 api_key 空 → 仍返回 None，且不产生 upsert。"""
@@ -325,13 +286,13 @@ class TestResolveChatModelConfig:
             models=[_deepseek_entry("")],
         )
 
-        config = _resolve(storage, "user-1", hint="deepseek-chat")
+        config = _resolve(storage, "user-1", model_name="deepseek-chat")
 
         assert config is None
         assert storage.upserts == []
 
     def test_active_provider_fallback(self, monkeypatch) -> None:
-        """hint 为空时回退全局 active provider。"""
+        """``model_name`` 为空时回退全局 active provider。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -359,8 +320,8 @@ class TestResolveChatModelConfig:
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
 
-    def test_no_hint_no_provider_returns_none(self, monkeypatch) -> None:
-        """hint 空 + 无 active → None（原生 404 兜底）。"""
+    def test_no_model_name_no_provider_returns_none(self, monkeypatch) -> None:
+        """``model_name`` 空 + 无 active → None（原生 404 兜底）。"""
         storage = _FakeStorage()
         self._patch_loaders(monkeypatch, models=[])
 
@@ -369,12 +330,12 @@ class TestResolveChatModelConfig:
         assert config is None
         assert storage.upserts == []
 
-    def test_dynamic_hint_routes_to_unique_ellm_entry(
+    def test_dynamic_model_name_routes_to_unique_ellm_entry(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为真实模型 ID + 无 active provider + config.yaml 唯一
-        ELLM 条目 → 动态路由，config.model == hint。"""
+        """``model_name`` 为真实模型 ID + 无 active provider + config.yaml 唯一
+        ELLM 条目 → 动态路由，config.model == model_name。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -386,38 +347,42 @@ class TestResolveChatModelConfig:
             models=[_ellm_entry(api_key="")],
         )
 
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+        config = _resolve(storage, "user-1", model_name="Qwen3-235B-A22B")
 
         assert config is not None
-        assert config.type == "bocom_ellm"
+        assert config.type == "bocom_ellm_credential"
         assert config.model == "Qwen3-235B-A22B"
         assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
 
-    def test_dynamic_hint_creates_entry_credential(
+    def test_entry_fallback_binds_entry_model_not_model_name(
         self,
         monkeypatch,
     ) -> None:
-        """hint 为真实模型 ID + default 凭证缺失 → 条目回退入库成功，
-        ELLMCredential.model == hint（credentials.py 补 model 生效）。"""
+        """凭证全空 → 条目回退入库；凭证 model 取条目 model_name，
+        config.model 仍为 ``model_name`` 透传值（凭证 model 字段不参与绑定）。"""
         storage = _FakeStorage()
         self._patch_loaders(
             monkeypatch,
             models=[_ellm_entry(api_key="")],
         )
 
-        config = _resolve(storage, "user-1", hint="Qwen3-235B-A22B")
+        config = _resolve(storage, "user-1", model_name="Qwen3-235B-A22B")
 
         assert config is not None
         assert config.model == "Qwen3-235B-A22B"
+        assert config.type == "bocom_ellm_credential"
         assert len(storage.upserts) == 1
         user_id, credential = storage.upserts[0]
         assert user_id == "user-1"
         assert isinstance(credential, ELLMCredential)
-        assert credential.model == "Qwen3-235B-A22B"
+        assert credential.model == "deepseek-v4-flash"  # 条目 model_name
 
-    def test_dynamic_hint_keeps_non_ellm_binding(self, monkeypatch) -> None:
-        """hint 为真实模型 ID + active 为 deepseek（非 ELLM）→ 维持现状
-        （model 用静态条目名，hint 丢弃）。"""
+    def test_model_name_passed_through_for_non_ellm_credential(
+        self,
+        monkeypatch,
+    ) -> None:
+        """``model_name`` 为真实模型 ID + 凭证为非 ELLM（deepseek）→
+        同样透传，不再丢弃 ``model_name`` 或用静态条目名。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -432,7 +397,7 @@ class TestResolveChatModelConfig:
         config = _resolve(
             storage,
             "user-1",
-            hint="Qwen3-235B-A22B",
+            model_name="Qwen3-235B-A22B",
             request=_FakeRequest(
                 active=SimpleNamespace(
                     provider_id=_DEEPSEEK_PROVIDER,
@@ -442,8 +407,130 @@ class TestResolveChatModelConfig:
         )
 
         assert config is not None
-        assert config.type == "deepseek"
-        assert config.model == "deepseek-chat"
+        assert config.type == "deepseek_credential"
+        assert config.model == "Qwen3-235B-A22B"  # model_name 透传
         assert config.credential_id == (
             f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
         )
+
+    def test_picks_ellm_first_among_user_credentials(
+        self,
+        monkeypatch,
+    ) -> None:
+        """用户多凭证：ELLM 优先于其他可反序列化类型，直接引用不复制。"""
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}",
+            _deepseek_record_data(),
+        )
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_ELLM_PROVIDER}",
+            _ellm_record_data(
+                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
+            ),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_ellm_entry(api_key=""), _deepseek_entry("sk-test")],
+        )
+
+        config = _resolve(storage, "user-1")
+
+        assert config is not None
+        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
+        assert config.type == "bocom_ellm_credential"
+        assert storage.upserts == []
+        # 模型名回退凭证 model 字段值
+        assert config.model == "deepseek-v4-flash"
+
+    def test_model_name_overrides_credential_bound_model(
+        self,
+        monkeypatch,
+    ) -> None:
+        """``model_name`` 模型名透传进 config.model；凭证 model 字段值不被覆盖。"""
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_ELLM_PROVIDER}",
+            _ellm_record_data(
+                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
+            ),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_ellm_entry(api_key="")],
+        )
+
+        config = _resolve(storage, "user-1", model_name="Qwen3-235B-A22B")
+
+        assert config is not None
+        assert config.credential_id == f"deerflow-user-1-{_ELLM_PROVIDER}"
+        assert config.model == "Qwen3-235B-A22B"  # model_name 透传
+        # 凭证 model 字段保持原值（不做绑定过滤）
+        assert (
+            storage._records[
+                ("user-1", f"deerflow-user-1-{_ELLM_PROVIDER}")
+            ].data["model"]
+            == "deepseek-v4-flash"
+        )
+
+    def test_model_falls_back_to_credential_then_entry_then_active(
+        self,
+        monkeypatch,
+    ) -> None:
+        """``model_name`` 缺失时的模型名回退链：凭证 model 字段 → 条目 model_name
+        → active provider。"""
+        # 1) 凭证 model 字段有值 → 用凭证 model
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_ELLM_PROVIDER}",
+            _ellm_record_data(
+                credential_id=f"deerflow-user-1-{_ELLM_PROVIDER}",
+            ),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_ellm_entry(api_key="")],
+        )
+        config = _resolve(storage, "user-1")
+        assert config is not None
+        assert config.model == "deepseek-v4-flash"
+
+        # 2) 凭证无 model 字段 → 条目 model_name
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}",
+            _deepseek_record_data(),
+        )
+        self._patch_loaders(
+            monkeypatch,
+            models=[_deepseek_entry("sk-test")],
+        )
+        config = _resolve(storage, "user-1")
+        assert config is not None
+        assert config.model == "deepseek-chat"
+
+        # 3) 凭证无 model 字段 + 无匹配条目 → active provider
+        storage = _FakeStorage()
+        storage.seed(
+            "user-1",
+            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}",
+            _deepseek_record_data(),
+        )
+        self._patch_loaders(monkeypatch, models=[])
+        config = _resolve(
+            storage,
+            "user-1",
+            request=_FakeRequest(
+                active=SimpleNamespace(
+                    provider_id=_DEEPSEEK_PROVIDER,
+                    model_name="active-model",
+                ),
+            ),
+        )
+        assert config is not None
+        assert config.model == "active-model"

@@ -399,7 +399,7 @@ curl -s http://localhost:8000/healthz
 **接口约定**（写 curl 前先了解）：
 
 - 路径：`POST /api/threads/{thread_id}/runs/stream`（SSE 流式）；`POST /api/threads/{thread_id}/runs/wait`（阻塞至完成）。
-- **thread_id == session_id**（同一资源），首次请求自动建会话（`_ensure_session`），无需预先创建。
+- **thread_id == session_id**（同一资源），首次请求自动建会话（`_prepare_session_for_run`），无需预先创建。
 - 鉴权：`X-User-ID` 请求头**可选**，缺省 `"default"`（单租户本地部署）。
 - `input` 兼容 LangGraph SDK 形态：`{"type": "human", "content": "..."}` 或 `{"messages": [...]}`。
 - `custom_params` 放在请求体顶层，为任意 JSON 对象。

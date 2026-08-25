@@ -61,6 +61,17 @@ run_concurrency:
   max_running_per_user: 1
   grace_secs: 30
 
+# ---------- 新会话默认权限模式 ----------
+# 仅影响 deerflow 懒创建的新会话；已有会话不受影响（用
+# PATCH /api/sessions/{session_id} 修改）。取值：
+#   default      每次工具调用弹确认卡（默认，最安全）
+#   accept_edits 工作目录内文件编辑免确认，其余照旧
+#   explore      只读（修改类工具直接拒绝）
+#   bypass       跳过全部权限检查（含安全确认，适合沙箱/信任环境）
+#   dont_ask     不弹确认，需要确认的操作直接拒绝（无人值守）
+# 环境变量覆盖：BOCOMADP_DEFAULT_PERMISSION_MODE=bypass
+default_permission_mode: bypass
+
 # ---------- 组件注册表 ----------
 # 三大 registry（工具 / agent 中间件 / MCP）统一开关：
 # enabled 控制内置组件扫描，load_custom 控制 custom/ 目录自动扫描。
@@ -76,109 +87,11 @@ mcp:
   enabled: true
   load_custom: true
 
-# ---------- 模型 Provider（启动时自动注册到 ProviderManager） ----------
-providers:
-  enabled: true
-  config_file: null        # null 表示使用本文件（config.yaml）；可指向其他 YAML
-
-models:
-  # 支持的 provider_type (简写即可):
-  #   deepseek / openai / anthropic / dashscope / gemini
-  #   ollama / moonshot / xai
-  # 也可写全称: deepseek_credential / openai_credential / ...
-  #
-  # api_key 支持两种写法：
-  #   1. ${ENV_VAR}  — 从环境变量读取（推荐，避免硬编码密钥）
-  #   2. sk-xxx      — 直接写明文（仅限本地开发）
-  #
-  # parameters 中的字段会透传给对应 ChatModel 的 Parameters 模型，
-  # 例如 DeepSeekChatModel.Parameters 支持:
-  #   temperature / max_tokens / top_p / thinking_enable / reasoning_effort
-  #
-  # supports_thinking 供 deer-flow 前端模型选择器展示 thinking 开关
-  #（默认 false）；仅影响前端展示，后端以 parameters 为准。
-  - provider_id: deepseek
-    display_name: "DeepSeek Chat"
-    provider_type: deepseek
-    model_name: deepseek-chat
-    api_key: ${DEEPSEEK_API_KEY}
-    base_url: https://api.deepseek.com
-    is_active: true
-    supports_multimodal: false
-    supports_thinking: true
-    parameters:
-      temperature: 0.7
-      max_tokens: 4096
-      thinking_enable: false
-
-  - provider_id: deepseek-v4-flash
-    display_name: deepseek-v4-flash
-    provider_type: bocom_ellm
-    model_name: deepseek-v4-flash
-    api_key: "1111111111"
-    base_url: https://api.deepseek.com
-    scene_code: P2024146
-    api_key_url: http://host.docker.internal:9100/createSceneApiKey.do
-    is_active: true
-    supports_multimodal: false
-    parameters:
-      temperature: 0.3
-      max_tokens: 8192
-
-  # --- 取消注释以启用更多 provider ---
-  # - provider_id: deepseek-reasoner
-  #   display_name: "DeepSeek Reasoner (R1)"
-  #   provider_type: deepseek
-  #   model_name: deepseek-reasoner
-  #   api_key: ${DEEPSEEK_API_KEY}
-  #   base_url: https://api.deepseek.com
-  #   is_active: false
-  #   supports_multimodal: false
-  #   supports_thinking: true
-  #   parameters:
-  #     thinking_enable: true
-  #     reasoning_effort: high
-
-  # === 多模态模型（工具专用） ===
-  # 统一多模态模型**不再**从 config.yaml 配置：一律经 PG runtime_configs 表
-  # view_image 配置段（PUT /api/config/view_image，字段：enabled / user_id /
-  # credential_id / model_name，enabled=true 时三者必填），凭证按 user_id +
-  # credential_id 查库；无记录/未启用时 view_image_tool 提示未配置（不构建模型）。
-  # 图片解析链路：上传图片（jpg/jpeg/png/webp）→ 上传时转 base64 固化到
-  # 上传元数据（SQLite）→ Agent 调用 list_uploaded_files 发现文件（列表中
-  # 图片标注为 [图片] 并带 virtual_path）→ 调用 view_image_tool(virtual_path,
-  # question) → 工具从元数据直读 base64 并调用统一多模态模型解析。
-  # 注意：不要在 providers/_models/ 中添加对应候选卡——前端凭证表单的 model
-  # 下拉来自候选卡；该模型由后端配置注入，不应出现在前端（前端只配主模型）。
-  #
-  # --- 行内（企业 ELLM 网关；已弃用，勿重新启用——即便启用也不再被消费） ---
-  # - provider_id: qwen3-vl-30b
-  #   display_name: "Qwen3 VL 30B A3B Instruct (多模态)"
-  #   provider_type: bocom_ellm
-  #   model_name: Qwen3-VL-30B-A3B-Instruct
-  #   api_key: ${ELLM_API_KEY}
-  #   base_url: ${ELLM_BASE_URL}
-  #   scene_code: ${ELLM_SCENE_CODE}
-  #   api_key_url: ${ELLM_API_KEY_URL}
-  #   is_active: false
-  #   supports_multimodal: true
-  #   parameters:
-  #     temperature: 0.3
-  #     max_tokens: 8192
-  
-
-  # - provider_id: openai
-  #   display_name: "GPT-4o"
-  #   provider_type: openai
-  #   model_name: gpt-4o
-  #   api_key: ${OPENAI_API_KEY}
-  #   base_url: https://api.openai.com/v1
-  #   is_active: false
-  #   supports_multimodal: true
-  #   parameters:
-  #     temperature: 0.7
-
-
+# ---------- 模型 Provider ----------
+# 模型条目来源已改为代码内置（bocomadp/config/app_config.py 的
+# _builtin_model_entries），启动时由 load_model_entries() 注册到
+# ProviderManager 并由 ensure_default_credentials 幂等刷库；
+# 如需禁用注册，可设置环境变量 BOCOMADP_PROVIDERS__ENABLED=false。
 # ---------- 运行时目录 ----------
 # 工作区目录（AgentScope 沙箱文件读写根目录 + 会话持久化根目录：
 # sessions/{user_id}/{agent_id}/{session_id}.json）
@@ -222,17 +135,17 @@ cross_search:
 # ---------- 联网搜索（online_search，含 custom_search 请求逻辑） ----------
 # 扁平结构：键与 online_search_config.py 字段一一对应。
 online_search:
-  # 指向本地 mock（examples/agent_service/mock_search_server.py）：
-  #   python mock_search_server.py  # 监听 0.0.0.0:8001
-  # 生产/联调真实网关时改回环境变量引用：api_url: $CUSTOM_SEARCH_API_URL
-  api_url: "http://127.0.0.1:8001/online"
+  # 联机网关地址（在 .env 中设置）；本地联调可临时指向 mock：
+  #   api_url: "http://127.0.0.1:8001/online"
+  api_url: $CUSTOM_SEARCH_API_URL
   timeout: 30
   max_results: 5
 
 # ---------- 个人知识库搜索（personal_search） ----------
 personal_search:
-  # 指向本地 mock；真实网关时改回：api_url: $PERSONAL_SEARCH_API_URL
-  api_url: "http://127.0.0.1:8001/personal"
+  # 联机网关地址（在 .env 中设置）；本地联调可临时指向 mock：
+  #   api_url: "http://127.0.0.1:8001/personal"
+  api_url: $PERSONAL_SEARCH_API_URL
   timeout: 30                         # 请求超时(秒)
   source_type: "WDZS"                 # 请求体 sourceType
   repository: "personal-search"       # 请求体 repository
@@ -242,8 +155,9 @@ personal_search:
 
 # ---------- 行内搜索（vector_search） ----------
 vector_search:
-  # 指向本地 mock；真实网关时改回：api_url: $VECTOR_SEARCH_API_URL
-  api_url: "http://127.0.0.1:8001/vector"
+  # 联机网关地址（在 .env 中设置）；本地联调可临时指向 mock：
+  #   api_url: "http://127.0.0.1:8001/vector"
+  api_url: $VECTOR_SEARCH_API_URL
   timeout: 30
   page_size: 10
   text_top_n: 7
@@ -253,9 +167,8 @@ vector_search:
 # ---------- 外数查（raw_request） ----------
 # 扁平结构：键与 raw_request_config.py 字段一一对应。
 raw_request:
-  # 测试环境联机根地址（9 个接口路径固定，域名可切）。
-  # 生产/联调真实网关时改回：api_url: $RAW_REQUEST_API_URL
-  api_url: "http://12.244.66.225"
+  # 联机根地址（在 .env 中设置，9 个接口路径固定，域名可切）。
+  api_url: $RAW_REQUEST_API_URL
   timeout: 30
 
 

@@ -42,9 +42,11 @@ from agentscope.app._manager import ChatRunRegistry
 from agentscope.app._service import ChatService
 from agentscope.app.storage import (
     ChatModelConfig,
+    CredentialRecord,
     SessionConfig,
     StorageBase,
 )
+from agentscope.app.storage._utils import _dump_with_secrets
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 from agentscope.credential import CredentialFactory
 from agentscope.event import (
@@ -53,8 +55,11 @@ from agentscope.event import (
     UserConfirmResultEvent,
 )
 from agentscope.message import Msg, TextBlock
+from agentscope.permission import PermissionContext
+from agentscope.state import AgentState
 
-from bocomadp.config import load_models_from_yaml
+from bocomadp.config import get_app_config, load_model_entries
+from bocomadp.config.app_config import ModelEntry
 from bocomadp.credential.ellm import ELLMCredential
 from bocomadp.logging.trace_context import run_id_context
 from bocomadp.open_agent_access import get_agent_global
@@ -66,7 +71,6 @@ from ..credentials import (
     DEFAULT_CREDENTIAL_OWNER,
     credential_cls_for_entry,
     credential_kwargs_for_entry,
-    default_credential_id,
     is_deerflow_credential_id,
     user_credential_id,
 )
@@ -286,14 +290,18 @@ deerflow_router = APIRouter(prefix="/deerflow/threads", tags=["deerflow"])
 
 # ── 请求模型 ──────────────────────────────────────────────────────────
 
+DEFAULT_AGENT_ID = "jhzd_lead_agent"
+"""agent_id 缺省值：jx_chat 前端不传 agent_id（只传已废弃的
+assistant_id），请求落库到默认智能体。"""
+
 
 class CreateRunRequest(BaseModel):
     """创建 run 的请求体。
 
     兼容 LangGraph SDK 的调用契约（前端经 ``useStream`` 发起）：
 
-    - ``assistant_id`` 接受但忽略（前端适配已废弃）；``agent_id`` 必填，
-      缺失时 400。
+    - ``assistant_id`` 接受但忽略（前端适配已废弃）；``agent_id``
+      缺省 :data:`DEFAULT_AGENT_ID`（jx_chat 前端不传该字段）。
     - ``input`` 接受 SDK 的 ``{"messages": [...]}`` / 单条消息 dict，
       转换后等价于原生 ``ChatRequest.input``。
     - ``session_id`` 必填且必须等于 thread_id；deer-flow 扩展参数
@@ -301,9 +309,10 @@ class CreateRunRequest(BaseModel):
       固定流模式与 reject 并发策略（裁剪项 1/2）。
     """
 
-    agent_id: str | None = Field(
-        default=None,
-        description="Agent ID（与原生 /chat/ 一致），必填；缺失时 400。",
+    agent_id: str = Field(
+        default=DEFAULT_AGENT_ID,
+        description="Agent ID（与原生 /chat/ 一致）；缺省 "
+        "jhzd_lead_agent（jx_chat 前端不传该字段时落库到默认智能体）。",
     )
     assistant_id: str | None = Field(
         default=None,
@@ -400,14 +409,12 @@ def _resolve_requested_model_name(
 
 
 def _resolve_agent_id(body: CreateRunRequest) -> str:
-    """agent_id 必填（与原生 /chat/ 一致）；assistant_id 接受但忽略。"""
-    if not body.agent_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="agent_id is required; assistant_id is accepted "
-            "but ignored.",
-        )
-    return body.agent_id
+    """解析 agent_id；缺省为 jhzd_lead_agent（模型默认值）。
+
+    assistant_id 接受但忽略；显式空串时同样回退默认值，保证该字段
+    永不缺失。
+    """
+    return body.agent_id or DEFAULT_AGENT_ID
 
 
 async def _check_agent_id(
@@ -437,239 +444,340 @@ async def _check_agent_id(
     )
 
 
+def _pick_preferred_credential(
+    records: list[CredentialRecord],
+) -> CredentialRecord | None:
+    """挑选可用凭证记录：type 可反序列化过滤 + ELLM 优先 + id 稳定排序取第一个。
+
+    ``list_credentials`` 的返回顺序随存储实现而定，取第一个前必须
+    显式排序（按记录 id 升序）；ELLM（``bocom_ellm_credential`` 及其
+    子类）优先于其他已注册类型。
+    """
+    usable = []
+    for record in records:
+        data = record.data or {}
+        credential_type = data.get("type")
+        if not credential_type:
+            continue
+        if CredentialFactory.get_credential_class(credential_type) is None:
+            continue
+        usable.append(record)
+    if not usable:
+        return None
+
+    def _is_ellm(record: CredentialRecord) -> bool:
+        credential_cls = CredentialFactory.get_credential_class(
+            (record.data or {}).get("type"),
+        )
+        return credential_cls is not None and issubclass(
+            credential_cls,
+            ELLMCredential,
+        )
+
+    ellm = [record for record in usable if _is_ellm(record)]
+    pool = ellm or usable
+    return sorted(pool, key=lambda record: str(record.id or ""))[0]
+
+
+async def _copy_credential_to_user(
+    storage: StorageBase,
+    user_id: str,
+    record: CredentialRecord,
+) -> CredentialRecord | None:
+    """把 default 用户凭证复制为当前用户的凭证，返回复制后的记录。
+
+    id 沿用 ``deerflow-<user_id>-<provider_id>`` 约定（provider 从源
+    default 凭证 id 解析，解析失败则退化为源 id 拼接）；复制保留
+    api_key /
+    base_url / scene_code / api_key_url 等刷新元数据。
+    """
+    provider = is_deerflow_credential_id(record.id, DEFAULT_CREDENTIAL_OWNER)
+    credential_id = user_credential_id(user_id, provider or record.id)
+    try:
+        source = CredentialFactory.from_dict(dict(record.data or {}))
+    except Exception:  # noqa: BLE001 —— 损坏凭证跳过，不阻断解析
+        logger.warning(
+            "deerflow: default credential %s failed to deserialize; "
+            "skip copy.",
+            record.id,
+            exc_info=True,
+        )
+        return None
+    source.id = credential_id
+    try:
+        await storage.upsert_credential(user_id, source)
+    except Exception:  # noqa: BLE001 —— 复制失败由调用方走条目回退
+        logger.warning(
+            "deerflow: failed to copy default credential %s to user %s.",
+            record.id,
+            user_id,
+            exc_info=True,
+        )
+        return None
+    logger.info(
+        "deerflow: credential %s copied from default %s for user %s.",
+        credential_id,
+        record.id,
+        user_id,
+    )
+    return CredentialRecord(
+        user_id=user_id,
+        data=_dump_with_secrets(source),
+        id=credential_id,
+    )
+
+
+def _entry_for_credential_type(credential_type: str) -> ModelEntry | None:
+    """模型条目中与凭证 type 匹配的第一个条目（参数/模型名兜底源）。
+
+    匹配依据凭证类的判别 type（``model_fields["type"]`` 的 Literal
+    默认值，如 ``bocom_ellm_credential``）与条目 provider_type 对应
+    凭证类一致；无匹配返回 None。
+    """
+    for entry in load_model_entries():
+        credential_cls = credential_cls_for_entry(entry)
+        if credential_cls is None:
+            continue
+        type_field = credential_cls.model_fields.get("type")
+        cls_type = (
+            getattr(type_field, "default", None)
+            if type_field is not None
+            else None
+        )
+        if cls_type == credential_type:
+            return entry
+    return None
+
+
+def _pick_fallback_entry(active: Any) -> ModelEntry | None:
+    """凭证全空时的模型条目回退（config.yaml models 清空后为内置条目）。
+
+    优先 active provider 对应条目，否则取第一个可反序列化条目。
+    """
+    entries = load_model_entries()
+    if active is not None:
+        entry = next(
+            (
+                candidate
+                for candidate in entries
+                if candidate.provider_id == active.provider_id
+            ),
+            None,
+        )
+        if entry is not None:
+            return entry
+    return next(
+        (
+            candidate
+            for candidate in entries
+            if credential_cls_for_entry(candidate) is not None
+        ),
+        None,
+    )
+
+
 async def _resolve_chat_model_config(
     storage: StorageBase,
     request: Request,
     user_id: str,
-    hint: str = "",
+    model_name: str = "",
 ) -> ChatModelConfig | None:
-    """把 config.yaml 的模型条目解析为原生 ChatModelConfig。
+    """把请求解析为原生 ChatModelConfig（凭证来自用户凭证表）。
 
-    优先按请求级模型名（``hint``）匹配 config.yaml 模型条目
-    （model_name / provider_id 双键，对齐 deer-flow ``_resolve_model_name``
-    的语义）；未命中告警后回退全局 active provider（ProviderManager）。
-    匹配到条目后按「用户优先、默认复制」解析 credential：用户维度凭证
-    （``deerflow-<user_id>-<provider_id>``）已存在则直接引用，否则从
-    default 用户默认凭证（``deerflow-default-<provider_id>``）复制参数
-    入库，两者都不存在时回退条目参数。无可用条目时返回 None（由原生
-    404 报错兜底，不阻断请求）。
+    凭证选择（新契约，一凭证多模型，不考虑 B 方案）：
+
+    - ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
+      优先、id 稳定排序取第一个；
+    - 用户凭证为空 → default 用户凭证同规则挑选，复制参数入库为
+      用户维度凭证后引用（复制保留 api_key / scene_code 等元数据）；
+    - 再空 → 回退 config.yaml 条目参数创建（active provider 对应
+      条目优先；api_key 空且非 ELLM 视为不可用）。
+
+    模型名：``model_name`` 非空一律直接透传（凭证不绑定模型，
+    不区分凭证 id）；缺失时回退凭证 model 字段值 →
+    config.yaml 匹配条目 model_name → 全局 active provider；全部缺失
+    返回 None（原生 404 兜底，不阻断请求）。parameters 取 config.yaml
+    中与凭证 type 匹配条目的 parameters（无匹配则空）。
     """
-
-    # 全局 active provider 兜底（config.yaml agents 种子机制已移除，
-    # 不再有 agent 级模型绑定来源）
-    provider_id = ""
-    model_name = ""
+    # 全局 active provider 兜底（模型名 + 回退条目）
     pm = getattr(request.app.state, "provider_manager", None)
     active = pm.get_active_model() if pm is not None else None
-    if active is not None:
-        provider_id = active.provider_id
-        model_name = active.model_name
 
-    # 请求级模型名优先：按 model_name / provider_id 双键匹配 config.yaml
-    # 模型条目（deer-flow 前端的模型名可能对应条目 model_name 或
-    # provider_id）；未命中告警并沿用已解析的 active provider。
-    # 约定 credential id 直传（/api/deerflow/models 返回的 id）则直接
-    # 解析出 provider_id，等价于命中该 config 条目。
-    entry = None
-    static_hit = False
-    credential_provider = None
-    resolved_model = ""  # 动态命中（ELLM）时的真实模型 ID；空 = 未命中
-    if hint:
-        credential_provider = is_deerflow_credential_id(hint, user_id)
-        if credential_provider:
-            provider_id = credential_provider
-            logger.info(
-                "deerflow: credential id %r resolved to provider %r "
-                "(user=%s).",
-                hint,
-                provider_id,
-                user_id,
-            )
-        else:
-            entry = next(
-                (
-                    candidate
-                    for candidate in load_models_from_yaml()
-                    if candidate.model_name == hint
-                    or candidate.provider_id == hint
-                ),
-                None,
-            )
-            if entry is not None:
-                static_hit = True
-                provider_id = entry.provider_id
-                model_name = entry.model_name or model_name
-            else:
-                logger.warning(
-                    "deerflow: model %r not found in config.yaml; "
-                    "fallback to active provider %r (user=%s).",
-                    hint,
-                    provider_id,
-                    user_id,
-                )
-    if entry is None:
-        entry = next(
-            (
-                candidate
-                for candidate in load_models_from_yaml()
-                if candidate.provider_id == provider_id
-            ),
-            None,
-        )
-    # 动态模型路由（ELLM 内网模型）：hint 非约定 credential id、也未
-    # 静态命中双键匹配时，把它当作真实模型 ID 路由到 ELLM 类型条目，
-    # 运行时覆盖 model 字段（对齐 deer-flow dynamic_model 语义）。
-    # 目标条目：兜底解析出的条目本身为 ELLM（active 指向 ELLM
-    # provider）→ 直接命中；条目缺失且 provider_id 为空 → 取
-    # config.yaml 中唯一 ELLM 条目（多个告警取第一个）；否则维持
-    # 现状（hint 丢弃）。
-    dynamic_hit = False
-    if hint and not static_hit and credential_provider is None:
-        if entry is not None:
-            entry_cls = credential_cls_for_entry(entry)
-            if entry_cls is not None and issubclass(entry_cls, ELLMCredential):
-                dynamic_hit = True
-        elif not provider_id:
-            ellm_entries = []
-            for candidate in load_models_from_yaml():
-                candidate_cls = credential_cls_for_entry(candidate)
-                if candidate_cls is not None and issubclass(
-                    candidate_cls,
-                    ELLMCredential,
-                ):
-                    ellm_entries.append(candidate)
-            if len(ellm_entries) > 1:
-                logger.warning(
-                    "deerflow: multiple ELLM entries %s; using %r as "
-                    "dynamic model target.",
-                    [c.provider_id for c in ellm_entries],
-                    ellm_entries[0].provider_id,
-                )
-            if ellm_entries:
-                entry = ellm_entries[0]
-                dynamic_hit = True
-        if dynamic_hit:
-            provider_id = entry.provider_id
-            resolved_model = hint
-            logger.info(
-                "deerflow: hint %r routed to ELLM provider %r as "
-                "dynamic model (user=%s).",
-                hint,
-                entry.provider_id,
-                user_id,
-            )
-    if entry is None:
-        logger.warning(
-            "deerflow: no model entry for provider %r; session created "
-            "without chat_model_config.",
-            provider_id,
-        )
-        return None
-
-    credential_cls = credential_cls_for_entry(entry)
-    if credential_cls is None:
-        logger.warning(
-            "deerflow: unknown provider_type %r; session created without "
-            "chat_model_config.",
-            entry.provider_type,
-        )
-        return None
-
-    # api_key 空的条目不可用（无密钥可调用）；ELLM 例外——key 动态获取
-    # （首次调用由 EllmKeyRefresher 立即刷新写入）。
-    if not entry.api_key and not issubclass(credential_cls, ELLMCredential):
-        logger.warning(
-            "deerflow: model entry %r has no api_key; session created "
-            "without chat_model_config.",
-            entry.provider_id,
-        )
-        return None
-
-    # 用户优先、默认复制（见 credentials.py 模块注释）：
-    # - 用户维度凭证已存在 → 直接引用（重复则使用本用户的，用户改过
-    #   的 api_key 等生效）；
-    # - 不存在 → 从 default 用户默认凭证复制参数入库（默认凭证入库后
-    #   参数源不再是 config.yaml 直读）；
-    # - default 凭证亦不存在（未入库/被删）→ 回退条目参数。
-    credential_id = user_credential_id(user_id, entry.provider_id)
-    own = await storage.get_credential(user_id, credential_id)
-    if own is None:
-        default_rec = await storage.get_credential(
-            DEFAULT_CREDENTIAL_OWNER,
-            default_credential_id(entry.provider_id),
-        )
-        copied = False
-        if default_rec is not None:
-            try:
-                source = CredentialFactory.from_dict(
-                    dict(default_rec.data or {}),
-                )
-                source.id = credential_id
-                await storage.upsert_credential(user_id, source)
-                copied = True
-            except Exception:  # noqa: BLE001 —— 复制失败回退条目参数
-                logger.warning(
-                    "deerflow: failed to copy default credential %s "
-                    "to user %s; falling back to config.yaml entry.",
-                    default_rec.id,
-                    user_id,
-                    exc_info=True,
-                )
-        if not copied:
-            await storage.upsert_credential(
-                user_id,
-                credential_cls(
-                    **credential_kwargs_for_entry(
-                        entry,
-                        credential_id,
-                        credential_cls,
-                        model=resolved_model
-                        or entry.model_name
-                        or entry.provider_id,
-                    ),
-                ),
-            )
+    # ── 凭证选择 ──
+    record: CredentialRecord | None = None
+    # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
+    record = _pick_preferred_credential(
+        await storage.list_credentials(user_id),
+    )
+    if record is not None:
         logger.info(
-            "deerflow: credential %s %s for user %s.",
+            "deerflow: picked credential %r for user %s.",
+            record.id,
+            user_id,
+        )
+    if record is None:
+        # 用户凭证为空 → default 凭证挑选并复制入库
+        default_rec = _pick_preferred_credential(
+            await storage.list_credentials(DEFAULT_CREDENTIAL_OWNER),
+        )
+        if default_rec is not None:
+            record = await _copy_credential_to_user(
+                storage,
+                user_id,
+                default_rec,
+            )
+
+    entry: ModelEntry | None = None
+    credential = None
+    if record is not None:
+        try:
+            credential = CredentialFactory.from_dict(
+                dict(record.data or {}),
+            )
+        except Exception:  # noqa: BLE001 —— 损坏凭证跳过，不阻断解析
+            logger.warning(
+                "deerflow: credential %s failed to deserialize; "
+                "config unresolved.",
+                record.id,
+                exc_info=True,
+            )
+            return None
+    else:
+        # 凭证全空 → 回退 config.yaml 条目参数创建
+        entry = _pick_fallback_entry(active)
+        if entry is None:
+            logger.warning(
+                "deerflow: no credential for user %s and no config.yaml "
+                "entry; session created without chat_model_config.",
+                user_id,
+            )
+            return None
+        credential_cls = credential_cls_for_entry(entry)
+        if credential_cls is None:
+            logger.warning(
+                "deerflow: unknown provider_type %r; session created "
+                "without chat_model_config.",
+                entry.provider_type,
+            )
+            return None
+        # api_key 空的条目不可用（无密钥可调用）；ELLM 例外——key
+        # 动态获取（首次调用由 EllmKeyRefresher 立即刷新写入）。
+        if not entry.api_key and not issubclass(
+            credential_cls,
+            ELLMCredential,
+        ):
+            logger.warning(
+                "deerflow: model entry %r has no api_key; session created "
+                "without chat_model_config.",
+                entry.provider_id,
+            )
+            return None
+        credential_id = user_credential_id(user_id, entry.provider_id)
+        try:
+            credential = credential_cls(
+                **credential_kwargs_for_entry(
+                    entry,
+                    credential_id,
+                    credential_cls,
+                    model=entry.model_name or entry.provider_id,
+                ),
+            )
+            await storage.upsert_credential(user_id, credential)
+        except Exception:  # noqa: BLE001 —— 入库失败回退 None
+            logger.warning(
+                "deerflow: failed to create credential %s from entry "
+                "for user %s.",
+                credential_id,
+                user_id,
+                exc_info=True,
+            )
+            return None
+        record = CredentialRecord(
+            user_id=user_id,
+            data=_dump_with_secrets(credential),
+            id=credential_id,
+        )
+        logger.info(
+            "deerflow: credential %s created from entry for user %s.",
             credential_id,
-            "copied from default" if copied else "created from entry",
             user_id,
         )
 
+    credential_type = getattr(credential, "type", None) or (
+        (record.data or {}).get("type") if record is not None else None
+    )
+    if not credential_type:
+        logger.warning(
+            "deerflow: credential %s has no type; config unresolved.",
+            record.id,
+        )
+        return None
+
+    # ── 模型名：model_name 一律透传；缺失回退凭证 model → 条目 → active ──
+    model = model_name
+    if not model:
+        bound = getattr(credential, "model", None)
+        if bound:
+            model = str(bound)
+    if not model and entry is None:
+        entry = _entry_for_credential_type(credential_type)
+    if not model and entry is not None:
+        model = entry.model_name or entry.provider_id
+    if not model and active is not None:
+        model = active.model_name or ""
+    if not model:
+        logger.warning(
+            "deerflow: no model name resolved (model_name=%r, "
+            "credential=%s); session created without chat_model_config.",
+            model_name,
+            record.id,
+        )
+        return None
+
+    # ── parameters：config.yaml 中与凭证 type 匹配的条目 ──
+    if entry is None:
+        entry = _entry_for_credential_type(credential_type)
+    parameters = dict(entry.parameters or {}) if entry is not None else {}
+
     return ChatModelConfig(
-        type=entry.provider_type,
-        credential_id=credential_id,
-        model=resolved_model or entry.model_name or entry.provider_id,
-        parameters=entry.parameters,
+        type=credential_type,
+        credential_id=record.id,
+        model=model,
+        parameters=parameters,
     )
 
 
-async def _ensure_session(
+async def _prepare_session_for_run(
     storage: StorageBase,
     workspace_manager,
     request: Request,
     user_id: str,
     agent_id: str,
     session_id: str,
-    model_name_hint: str = "",
+    model_name: str = "",
 ) -> None:
-    """原生 ChatService.run 要求 session 已存在且带模型配置；缺失时补齐。
+    """为 run 准备会话：懒创建、补齐或更新（原生 ChatService.run 的前置）。
 
-    workspace_id 由 workspace_manager 的隔离策略分配（与原生 /session/
-    创建路径一致）；chat_model_config 优先按请求级模型名匹配 config.yaml
-    条目，未命中回退全局 active provider（ProviderManager），保证默认
-    会话也能在原生链路上真实调用模型。
-    会话已存在时：配置缺失则回填；请求显式携带模型名（``model_name_hint``
-    非空）且解析出的 (type, credential_id, model) 与现状不一致时才更新
-    （per-run 模型切换）；未携带模型名则保持既有配置不动——原生接口
-    建好的会话（如绑定 ELLM 凭证）不被 config.yaml 全局 active
-    provider 静默覆盖。
+    原生 ChatService.run 要求 session 已存在且带 chat_model_config，
+    本函数保证这一前置条件：
+
+    - 会话不存在 → 创建：分配 workspace_id（与原生 /session/ 创建路径
+      一致）+ 按凭证表解析模型配置（_resolve_chat_model_config：凭证表
+      挑选 → default 复制 → config.yaml 条目创建，模型名缺失时回退全局
+      active provider）；
+    - 会话存在但缺配置 → 回填解析出的配置；
+    - 会话存在、本次显式携带模型名（``model_name`` 非空）且解析出的
+      (type, credential_id, model) 与现状不一致 → 更新（per-run 模型
+      切换）；
+    - 会话已存在、本次未携带模型名 → 保持不动——原生接口建好的会话
+      （如绑定 ELLM 凭证）不被 config.yaml 全局 active provider 静默
+      覆盖。
     """
     existing = await storage.get_session(user_id, agent_id, session_id)
     if (
         existing is not None
         and existing.config.chat_model_config is not None
-        and not model_name_hint
+        and not model_name
     ):
         # 会话已存在且带模型配置、本次未显式指定模型名 → 保持既有
         # 配置不动：原生接口建好的会话（如绑定 ELLM 凭证）不能被
@@ -679,7 +787,7 @@ async def _ensure_session(
         storage,
         request,
         user_id,
-        model_name_hint,
+        model_name,
     )
     if existing is not None:
         existing_config = existing.config.chat_model_config
@@ -713,10 +821,11 @@ async def _ensure_session(
                 model_config.model,
             )
         return
-    # workspace_id 加非 adp 前缀：工作区据此区分会话来源——
-    # deerflow 会话的 agent 级共享 PVC 只读挂载 + 独立池。
-    # 框架 SessionSource 枚举不可扩展（pydantic 校验拒绝任意
-    # 字符串），故用自由字符串的 workspace_id 承载来源标记。
+    # 竞态防护：上方解析模型配置可能耗时，期间并发请求可能已建好
+    # 同一会话；SQL upsert_session 对已存在会话会用传入 state 覆盖
+    # 现有状态（含 HITL 等待中的上下文），再查一次避免误伤。
+    if await storage.get_session(user_id, agent_id, session_id) is not None:
+        return
     workspace_id = f"{NON_ADP_WORKSPACE_PREFIX}{workspace_manager.assign_workspace_id(
         user_id=user_id,
         agent_id=agent_id,
@@ -725,12 +834,34 @@ async def _ensure_session(
     config_kwargs: dict[str, Any] = {"workspace_id": workspace_id}
     if model_config is not None:
         config_kwargs["chat_model_config"] = model_config
-    await storage.upsert_session(
-        user_id=user_id,
-        agent_id=agent_id,
-        config=SessionConfig(**config_kwargs),
-        session_id=session_id,
+    # 新会话注入默认权限模式（配置项 default_permission_mode，缺省
+    # default 与框架默认一致）；已有会话不受影响。
+    default_mode = get_app_config().default_permission_mode
+    init_state = AgentState(
+        permission_context=PermissionContext(mode=default_mode),
     )
+    try:
+        await storage.upsert_session(
+            user_id=user_id,
+            agent_id=agent_id,
+            config=SessionConfig(**config_kwargs),
+            state=init_state,
+            session_id=session_id,
+        )
+    except ValueError as e:
+        # get_session 因 owner 不匹配返回 None，而该 session_id 实际
+        # 归属其他用户——跨用户补建会污染他人会话的模型配置。
+        # 对请求方而言该 thread 不可见，按 404 处理。
+        logger.warning(
+            "deerflow: session %s exists for a different user; "
+            "refusing cross-owner upsert (%s).",
+            session_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        ) from e
     logger.info(
         "deerflow: session %s auto-created for agent %s (user=%s).",
         session_id,
@@ -990,10 +1121,20 @@ def _spawn_run(
         if t.cancelled():
             run_manager.mark_finished(record.run_id, RunStatus.INTERRUPTED)
         elif t.exception() is not None:
+            # 异常穿透了 ChatService.run 的 ``except Exception`` 兜底
+            # （如 cancel 在组装阶段被转换或组装本身失败），记完整
+            # 堆栈便于排障；error 摘要同步存入记账记录。
+            exc = t.exception()
+            logger.error(
+                "deerflow: run %s background task failed: %s",
+                record.run_id,
+                exc,
+                exc_info=exc,
+            )
             run_manager.mark_finished(
                 record.run_id,
                 RunStatus.ERROR,
-                error=str(t.exception()),
+                error=str(exc),
             )
         else:
             run_manager.mark_finished(record.run_id, RunStatus.SUCCESS)
@@ -1139,6 +1280,43 @@ def _streaming_response(
     )
 
 
+def _confirmation_pending_response(awaiting: list) -> StreamingResponse:
+    """HITL 挂起时对普通消息的明确拒绝流（error 帧 + end 哨兵）。
+
+    会话仍在等待工具确认（ASKING）/外部执行（SUBMITTED）时，普通
+    消息会在引擎内被拒（"Agent is waiting ... but received no event"）
+    并泛化成误导性的 setup 错误；这里在路由层拦截，返回稳定命名的
+    错误帧（不创建 run、不占用 RunManager 记账），前端可按 name 给出
+    提示"先处理确认卡"。
+    """
+
+    async def _gen() -> AsyncGenerator[str, None]:
+        yield format_sse(
+            StreamEvent(
+                id="",
+                event=EVENT_ERROR,
+                data={
+                    "message": (
+                        "Agent is waiting for tool confirmation "
+                        f"({', '.join(tc.id for tc in awaiting)}); "
+                        "reply to the confirmation card first."
+                    ),
+                    "name": "ToolConfirmationPending",
+                },
+            ),
+        )
+        yield format_sse(END_SENTINEL)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ── 端点 1：创建 run + 流式 ──────────────────────────────────────────
 
 
@@ -1179,16 +1357,45 @@ async def create_run_stream(
     # 请求级模型名（custom_params.llm_model_name，唯一通道），在
     # custom_params 落盘/回退之前解析——首次建会话时 workspace 尚不存在，
     # 直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
-    model_name_hint = _resolve_requested_model_name(body.custom_params)
-    await _ensure_session(
+    model_name = _resolve_requested_model_name(body.custom_params)
+    await _prepare_session_for_run(
         storage,
         workspace_manager,
         request,
         user_id,
         agent_id,
         session_id,
-        model_name_hint,
+        model_name,
     )
+    if not isinstance(converted, _HumanInputResponseMarker):
+        # HITL 挂起防护：会话仍在等待工具确认（ASKING）/外部执行
+        # （SUBMITTED）时，普通消息会在引擎内被拒并泛化成误导性的
+        # setup 错误。路由层提前拦截，返回明确命名的错误帧；确认
+        # 应答（Case B）本身就是解卡动作，不拦截。
+        session_record = await storage.get_session(
+            user_id,
+            agent_id,
+            session_id,
+        )
+        if session_record is not None:
+            agent_record = await storage.get_agent(user_id, agent_id)
+            agent_name = (
+                agent_record.data.name
+                if agent_record is not None
+                else agent_id
+            )
+            awaiting = session_record.state.get_awaiting_tool_calls(
+                agent_name,
+            )
+            if awaiting:
+                logger.warning(
+                    "deerflow: session %s awaiting %d tool "
+                    "confirmation(s) (%s); rejecting plain message.",
+                    session_id,
+                    len(awaiting),
+                    ", ".join(tc.id for tc in awaiting),
+                )
+                return _confirmation_pending_response(awaiting)
     if isinstance(converted, _HumanInputResponseMarker):
         # 前端确认卡片应答：构造 UserConfirmResultEvent 续跑（Case B）。
         # 原 human 消息仍回显 chunk——前端依赖 messages 事件中的 human
@@ -1297,15 +1504,15 @@ async def create_run_wait(
     _attach_files_metadata(input_msg, (body.custom_params or {}).get("files"))
     # 同 create_run_stream：先解析请求级模型名（custom_params 唯一通道）
     # 再懒建会话。
-    model_name_hint = _resolve_requested_model_name(body.custom_params)
-    await _ensure_session(
+    model_name = _resolve_requested_model_name(body.custom_params)
+    await _prepare_session_for_run(
         storage,
         workspace_manager,
         request,
         user_id,
         agent_id,
         session_id,
-        model_name_hint,
+        model_name,
     )
     # 同 create_run_stream：请求携带 additional_urls 时先下载到会话
     # uploads 目录；随后 custom_params（含 additional_urls）整体落盘

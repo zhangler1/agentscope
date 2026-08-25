@@ -30,6 +30,7 @@ except ImportError:
 
 from ..config.online_search_config import get_online_search_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,8 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
     online_search_tool = FunctionTool(
         _online_search_tool_impl,
         # 工具函数名必须是 ^[a-zA-Z0-9_-]+$（DeepSeek 等 API 强校验）
-        name="联网搜索",
+        # 行外环境设置 BOCOMADP_TOOL_ASCII_NAMES=1 切换英文名。
+        name=tool_name("联网搜索", "online_search"),
         is_read_only=True,
     )
 else:

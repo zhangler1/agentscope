@@ -4,18 +4,19 @@
 deer-flow 前端的模型名需要映射到原生 ``ChatModelConfig`` 的
 ``credential_id``；本模块定义「默认凭证 + 用户维度凭证」的两级约定：
 
-- **默认凭证**：config.yaml 的模型条目在启动时（lifespan）作为
-  ``default`` 用户的凭证入库，id 形如 ``deerflow-default-<provider_id>``
-  —— 默认模型参数（api_key/base_url）的单一来源，运行时可修改该记录
-  实现全局切换，无需改 config.yaml。
+- **默认凭证**：内置模型条目（``load_model_entries``，原 config.yaml
+  的 ``models`` 节点已迁移至代码）在启动时（lifespan）作为 ``default``
+  用户的凭证幂等入库，id 形如 ``deerflow-default-<provider_id>`` ——
+  默认模型参数（api_key/base_url）的单一来源，运行时可修改该记录实现
+  全局切换，无需改 config.yaml。
 - **用户维度凭证**：id 形如 ``deerflow-<user_id>-<provider_id>``；首次
   使用时从默认凭证复制参数入库（原生 ChatService 按 run 的 user_id
   解析 credential，owner-scoping 不允许跨用户引用 default 的 id），
   已存在时直接引用（重复则使用本用户的，用户改过的 key 生效）。
 
-``_resolve_chat_model_config``（deerflow_chat.py）与
-``/api/deerflow/models``（routers/models.py）共用本模块的 id 约定，
-保证「列表返回的 credential id」与「run 实际引用的 credential id」同源。
+``_resolve_chat_model_config``（deerflow_chat.py）按本模块的 id 约定
+解析并引用凭证，保证「前端传入的 credential id / provider_id」与
+「run 实际引用的 credential id」同源。
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any, TYPE_CHECKING
 from agentscope.app.storage import StorageBase
 from agentscope.credential import CredentialFactory
 
-from bocomadp.config import load_models_from_yaml
+from bocomadp.config import load_model_entries
 
 if TYPE_CHECKING:  # pragma: no cover —— 仅类型标注
     from bocomadp.config.app_config import ModelEntry
@@ -50,10 +51,13 @@ def user_credential_id(user_id: str, provider_id: str) -> str:
     return f"{_CREDENTIAL_PREFIX}-{user_id}-{provider_id}"
 
 
-def is_deerflow_credential_id(hint: str, user_id: str) -> str | None:
-    """hint 为约定 credential id 时解析出 provider_id。
+def is_deerflow_credential_id(value: str, user_id: str) -> str | None:
+    """值为约定 credential id 时解析出 provider_id。
 
-    识别 ``/api/deerflow/models`` 返回的两种 id 形态：
+    供 ``_copy_credential_to_user`` 从 default 凭证记录 id 解析
+    provider（``_resolve_chat_model_config`` 的模型名不再走此识别）。
+
+    识别约定凭证 id 的两种形态：
 
     - ``deerflow-<user_id>-<provider>`` → provider；
     - ``deerflow-default-<provider>`` → provider（user_id 恰为 default
@@ -61,17 +65,17 @@ def is_deerflow_credential_id(hint: str, user_id: str) -> str | None:
 
     其余形态（模型名 / 任意 uuid 等）返回 None。
     """
-    hint = (hint or "").strip()
-    if not hint:
+    value = (value or "").strip()
+    if not value:
         return None
     prefix = f"{_CREDENTIAL_PREFIX}-{user_id}-"
-    if hint.startswith(prefix):
-        provider = hint[len(prefix):]
+    if value.startswith(prefix):
+        provider = value[len(prefix):]
         if provider:
             return provider
     default_prefix = f"{_CREDENTIAL_PREFIX}-{DEFAULT_CREDENTIAL_OWNER}-"
-    if hint.startswith(default_prefix):
-        provider = hint[len(default_prefix):]
+    if value.startswith(default_prefix):
+        provider = value[len(default_prefix):]
         if provider:
             return provider
     return None
@@ -120,13 +124,13 @@ def credential_kwargs_for_entry(
 
 
 async def ensure_default_credentials(storage: StorageBase) -> None:
-    """把 config.yaml 模型条目作为 default 用户的默认凭证入库。
+    """把内置模型条目作为 default 用户的默认凭证幂等入库。
 
     幂等（upsert）；单条目失败仅告警不阻断启动。入库后默认模型参数
     以 storage 中 default 凭证为单一来源，运行时可修改该记录实现全局
     切换，无需改 config.yaml。
     """
-    for entry in load_models_from_yaml():
+    for entry in load_model_entries():
         try:
             credential_cls = credential_cls_for_entry(entry)
             if credential_cls is None:
