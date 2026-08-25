@@ -61,6 +61,17 @@ run_concurrency:
   max_running_per_user: 1
   grace_secs: 30
 
+# ---------- 新会话默认权限模式 ----------
+# 仅影响 deerflow 懒创建的新会话；已有会话不受影响（用
+# PATCH /api/sessions/{session_id} 修改）。取值：
+#   default      每次工具调用弹确认卡（默认，最安全）
+#   accept_edits 工作目录内文件编辑免确认，其余照旧
+#   explore      只读（修改类工具直接拒绝）
+#   bypass       跳过全部权限检查（含安全确认，适合沙箱/信任环境）
+#   dont_ask     不弹确认，需要确认的操作直接拒绝（无人值守）
+# 环境变量覆盖：BOCOMADP_DEFAULT_PERMISSION_MODE=bypass
+default_permission_mode: bypass
+
 # ---------- 组件注册表 ----------
 # 三大 registry（工具 / agent 中间件 / MCP）统一开关：
 # enabled 控制内置组件扫描，load_custom 控制 custom/ 目录自动扫描。
@@ -76,11 +87,11 @@ mcp:
   enabled: true
   load_custom: true
 
-# ---------- 模型 Provider（启动时自动注册到 ProviderManager） ----------
-providers:
-
-
-
+# ---------- 模型 Provider ----------
+# 模型条目来源已改为代码内置（bocomadp/config/app_config.py 的
+# _builtin_model_entries），启动时由 load_model_entries() 注册到
+# ProviderManager 并由 ensure_default_credentials 幂等刷库；
+# 如需禁用注册，可设置环境变量 BOCOMADP_PROVIDERS__ENABLED=false。
 # ---------- 运行时目录 ----------
 # 工作区目录（AgentScope 沙箱文件读写根目录 + 会话持久化根目录：
 # sessions/{user_id}/{agent_id}/{session_id}.json）

@@ -17,6 +17,7 @@ from typing import Any
 
 from agentscope.app.storage import ChatModelConfig, SessionConfig
 from agentscope.app.storage._utils import _dump_with_secrets
+from agentscope.permission import PermissionMode
 
 from bocomadp.config.app_config import ModelEntry
 from bocomadp.deerflow.credentials import (
@@ -137,9 +138,11 @@ class FakeStorage:
         agent_id,
         config,
         session_id,
+        state=None,
     ) -> None:
         self.sessions[(user_id, agent_id, session_id)] = SimpleNamespace(
             config=config,
+            state=state,
         )
 
     async def get_agent(self, user_id: str, agent_id: str):
@@ -474,6 +477,63 @@ def test_prepare_session_creates_with_backfilled_model_config(
     session = storage.sessions[_session_key()]
     assert session.config.workspace_id == "ws-test"
     assert session.config.chat_model_config.model == "deepseek-chat"
+
+
+def test_prepare_session_creates_with_default_permission_mode(
+    monkeypatch,
+) -> None:
+    """首次创建：permission_context.mode 取配置项 default_permission_mode。"""
+    entries = [_make_model_entry("ds")]
+    _patch_config_loader(monkeypatch, entries)
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_app_config",
+        lambda: SimpleNamespace(
+            default_permission_mode=PermissionMode.BYPASS,
+        ),
+    )
+    storage = FakeStorage()
+
+    _run_prepare_session(storage)
+
+    session = storage.sessions[_session_key()]
+    assert session.state.permission_context.mode == PermissionMode.BYPASS
+
+
+def test_prepare_session_preserves_state_when_race_created(
+    monkeypatch,
+) -> None:
+    """竞态防护：upsert 前会话已被并发请求建好时不再覆盖。"""
+    entries = [_make_model_entry("ds")]
+    _patch_config_loader(monkeypatch, entries)
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_app_config",
+        lambda: SimpleNamespace(
+            default_permission_mode=PermissionMode.BYPASS,
+        ),
+    )
+    storage = FakeStorage()
+    # 模拟并发请求：_prepare_session_for_run 首次 get_session 返回 None，
+    # 解析模型配置期间另一请求已建好会话。
+    existing = SimpleNamespace(
+        config=SessionConfig(workspace_id="ws-other"),
+    )
+    created = False
+    original_get = storage.get_session
+
+    async def racy_get(user_id: str, agent_id: str, session_id: str):
+        nonlocal created
+        result = await original_get(user_id, agent_id, session_id)
+        if result is None and not created:
+            storage.sessions[_session_key()] = existing
+            created = True
+        return result
+
+    storage.get_session = racy_get
+
+    _run_prepare_session(storage)
+
+    assert storage.sessions[_session_key()] is existing
+
 
 
 def test_prepare_session_updates_config_on_model_switch(

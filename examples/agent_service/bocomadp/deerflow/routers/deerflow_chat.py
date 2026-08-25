@@ -55,8 +55,10 @@ from agentscope.event import (
     UserConfirmResultEvent,
 )
 from agentscope.message import Msg, TextBlock
+from agentscope.permission import PermissionContext
+from agentscope.state import AgentState
 
-from bocomadp.config import load_model_entries
+from bocomadp.config import get_app_config, load_model_entries
 from bocomadp.config.app_config import ModelEntry
 from bocomadp.credential.ellm import ELLMCredential
 from bocomadp.logging.trace_context import run_id_context
@@ -819,10 +821,11 @@ async def _prepare_session_for_run(
                 model_config.model,
             )
         return
-    # workspace_id 加非 adp 前缀：工作区据此区分会话来源——
-    # deerflow 会话的 agent 级共享 PVC 只读挂载 + 独立池。
-    # 框架 SessionSource 枚举不可扩展（pydantic 校验拒绝任意
-    # 字符串），故用自由字符串的 workspace_id 承载来源标记。
+    # 竞态防护：上方解析模型配置可能耗时，期间并发请求可能已建好
+    # 同一会话；SQL upsert_session 对已存在会话会用传入 state 覆盖
+    # 现有状态（含 HITL 等待中的上下文），再查一次避免误伤。
+    if await storage.get_session(user_id, agent_id, session_id) is not None:
+        return
     workspace_id = f"{NON_ADP_WORKSPACE_PREFIX}{workspace_manager.assign_workspace_id(
         user_id=user_id,
         agent_id=agent_id,
@@ -831,11 +834,18 @@ async def _prepare_session_for_run(
     config_kwargs: dict[str, Any] = {"workspace_id": workspace_id}
     if model_config is not None:
         config_kwargs["chat_model_config"] = model_config
+    # 新会话注入默认权限模式（配置项 default_permission_mode，缺省
+    # default 与框架默认一致）；已有会话不受影响。
+    default_mode = get_app_config().default_permission_mode
+    init_state = AgentState(
+        permission_context=PermissionContext(mode=default_mode),
+    )
     try:
         await storage.upsert_session(
             user_id=user_id,
             agent_id=agent_id,
             config=SessionConfig(**config_kwargs),
+            state=init_state,
             session_id=session_id,
         )
     except ValueError as e:
@@ -1111,10 +1121,20 @@ def _spawn_run(
         if t.cancelled():
             run_manager.mark_finished(record.run_id, RunStatus.INTERRUPTED)
         elif t.exception() is not None:
+            # 异常穿透了 ChatService.run 的 ``except Exception`` 兜底
+            # （如 cancel 在组装阶段被转换或组装本身失败），记完整
+            # 堆栈便于排障；error 摘要同步存入记账记录。
+            exc = t.exception()
+            logger.error(
+                "deerflow: run %s background task failed: %s",
+                record.run_id,
+                exc,
+                exc_info=exc,
+            )
             run_manager.mark_finished(
                 record.run_id,
                 RunStatus.ERROR,
-                error=str(t.exception()),
+                error=str(exc),
             )
         else:
             run_manager.mark_finished(record.run_id, RunStatus.SUCCESS)

@@ -37,8 +37,18 @@ class FakeStorage:
     async def get_session(self, user_id: str, agent_id: str, session_id: str):
         return self._sessions.get((user_id, agent_id, session_id))
 
-    async def upsert_session(self, user_id, agent_id, config, session_id):
-        self._sessions[(user_id, agent_id, session_id)] = config
+    async def upsert_session(
+        self,
+        user_id,
+        agent_id,
+        config,
+        session_id,
+        state=None,
+    ):
+        self._sessions[(user_id, agent_id, session_id)] = SimpleNamespace(
+            config=config,
+            state=state,
+        )
 
     async def get_agent(self, user_id: str, agent_id: str):
         del user_id, agent_id

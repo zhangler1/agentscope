@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import YamlConfigSettingsSource
 
+from agentscope.permission import PermissionMode
+
 from .base import (
     BASE_DIR,
     CONFIG_YAML_FILE,
@@ -580,6 +582,14 @@ class AppConfig(BaseSettings):
     run_concurrency: RunConcurrencyConfig = Field(
         default_factory=RunConcurrencyConfig,
         description="/chat 并发控制配置。",
+    )
+    default_permission_mode: PermissionMode = Field(
+        default=PermissionMode.DEFAULT,
+        description=(
+            "新建会话（deerflow 懒创建）的默认权限模式："
+            "default / accept_edits / explore / bypass / dont_ask。"
+            "仅影响新建会话；已有会话用 PATCH /api/sessions/{id} 修改。"
+        ),
     )
 
     # ---- QwenPaw migration placeholders (all default off) ----
