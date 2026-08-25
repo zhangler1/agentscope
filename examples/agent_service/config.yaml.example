@@ -25,6 +25,7 @@ service:
   port: 8000
   reload: false            # 仅开发期开启自动重载
 
+
 # ---------- Redis（AgentScope storage / message bus） ----------
 redis:
   host: localhost
@@ -97,6 +98,33 @@ cross_search:
     Connection: "keep-alive"
     Content-Type: "multipart/form-data"
     jumpcloud-ENV: "BASE"
+
+
+# ---------- 联网搜索（online_search，含 custom_search 请求逻辑） ----------
+# 扁平结构：键与 online_search_config.py 字段一一对应。
+online_search:
+  api_url: $CUSTOM_SEARCH_API_URL   # 环境变量展开，运行时需设置
+  timeout: 30
+  max_results: 5
+
+# ---------- 个人知识库搜索（personal_search） ----------
+personal_search:
+  api_url: $PERSONAL_SEARCH_API_URL  # 必填，请求地址
+  timeout: 30                         # 请求超时(秒)
+  source_type: "WDZS"                 # 请求体 sourceType
+  repository: "personal-search"       # 请求体 repository
+  search_type: "0"                    # 请求体 searchType
+  headers:                            # 可选：合并覆盖默认头
+    jumpCloud-Env: "BASE"
+
+# ---------- 行内搜索（vector_search） ----------
+vector_search:
+  api_url: $VECTOR_SEARCH_API_URL
+  timeout: 30
+  page_size: 10
+  text_top_n: 7
+  vector_top_n: 10
+  space_codes: ["SP0999999", "SP0000214"]
 
 
 # ---------- 文件上传能力 ----------

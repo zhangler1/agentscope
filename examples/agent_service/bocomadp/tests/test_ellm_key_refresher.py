@@ -409,3 +409,86 @@ class TestExpiryCheck:
         assert [key for key, _ in results] == ["new-key", "new-key"]
         fetch.assert_called_once()
         assert len(storage.upsert_calls) == 1
+
+
+class TestForceRefresh:
+    """Forced refresh (used on a 401) always fetches a new key, skipping the
+    fast-path expiry check."""
+
+    def test_force_refresh_fetches_even_when_key_fresh(self) -> None:
+        """Unlike ensure_fresh_key, force_refresh_key hits the gateway even
+        when the stored apikey_expires_at is still in the future."""
+        storage = _FakeStorage(
+            _record(
+                api_key="stored-key",
+                updated_at=datetime.now() - _FRESH_AGO,
+                apikey_expires_at=time.time() + 1000,  # still valid
+            ),
+        )
+        refresher = _make_refresher(storage, InMemoryMessageBus())
+
+        with mock.patch(
+            "bocomadp.providers.ellm_key.fetch_ellm_key",
+            return_value=("new-key", 1_500_000),
+        ) as fetch:
+            key = asyncio.run(
+                refresher.force_refresh_key(_CREDENTIAL_ID),
+            )
+
+        assert key == "new-key"
+        fetch.assert_called_once_with("P2024146", _KEY_URL)
+        # The new key is persisted and its expiry stamp refreshed.
+        assert storage.upsert_calls[0]["api_key"] == "new-key"
+        assert "apikey_expires_at" in storage.upsert_calls[0]
+
+    def test_force_refresh_failure_falls_back_to_old_key(self) -> None:
+        """On a gateway failure the old key is preserved and returned."""
+        storage = _FakeStorage(
+            _record(
+                api_key="stored-key",
+                updated_at=datetime.now() - _FRESH_AGO,
+                apikey_expires_at=time.time() + 1000,
+            ),
+        )
+        refresher = _make_refresher(storage, InMemoryMessageBus())
+
+        with mock.patch(
+            "bocomadp.providers.ellm_key.fetch_ellm_key",
+            side_effect=RuntimeError("gateway unreachable"),
+        ) as fetch:
+            key = asyncio.run(
+                refresher.force_refresh_key(_CREDENTIAL_ID),
+            )
+
+        assert key == "stored-key"
+        fetch.assert_called_once()
+        assert storage.upsert_calls == []  # nothing written back
+
+    def test_force_refresh_concurrent_single_fetch(self) -> None:
+        """Concurrent force refreshes for the same credential fetch from the
+        gateway at most once, thanks to the distributed lock."""
+        storage = _FakeStorage(
+            _record(
+                api_key="old-key",
+                updated_at=datetime.now() - _EXPIRED_AGO,
+            ),
+            barrier=True,
+        )
+        bus = InMemoryMessageBus()
+        refresher_a = _make_refresher(storage, bus)
+        refresher_b = _make_refresher(storage, bus)
+
+        with mock.patch(
+            "bocomadp.providers.ellm_key.fetch_ellm_key",
+            return_value=("new-key", 1_500_000),
+        ) as fetch:
+            async def _refresh_both() -> list[str]:
+                return await asyncio.gather(
+                    refresher_a.force_refresh_key(_CREDENTIAL_ID),
+                    refresher_b.force_refresh_key(_CREDENTIAL_ID),
+                )
+
+            results = asyncio.run(_refresh_both())
+
+        assert results == ["new-key", "new-key"]
+        fetch.assert_called_once()

@@ -68,6 +68,7 @@ from bocomadp.logging.trace_middleware import TraceMiddleware
 from bocomadp.middleware.concurrency_guard import ConcurrencyGuardMiddleware
 from bocomadp.middleware.active_skill import ActiveSkillMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
+from bocomadp.middleware.summarization import SummarizationMiddleware
 from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
@@ -617,6 +618,7 @@ if is_k8s_enabled():
     message_bus = RedisMessageBus(
         host=config.redis.host,
         port=config.redis.port,
+        max_connections=config.redis.max_connections,
     )
 else:
     # -- 本地模式 —— 工作区直接使用宿主机文件系统（开发/测试用）
@@ -729,6 +731,20 @@ _ellm_refresh_mw_factory = build_ellm_refresh_middleware(
     refresh_ahead_secs=config.ellm_key_refresh.refresh_ahead_secs,
 )
 
+# 上下文压缩统一模型中间件：配置真源在 PG runtime_configs 表（summarization key，
+# 可经 /api/config/summarization 热更新）；无记录视为未启用，压缩用会话自身模型。
+_summarization_mw = SummarizationMiddleware(
+    storage,
+    message_bus,
+)
+
+# 图片解析统一多模态模型：与压缩模型同模式（PG runtime_configs 表 view_image key，
+# 可经 /api/config/view_image 热更新，config.yaml 不再配置视觉模型）；注入工具
+# 运行时依赖供查凭证/刷新 ELLM key，无记录/未启用时工具提示未配置。
+from bocomadp.tools.builtin_tools import set_tool_runtime_deps
+
+set_tool_runtime_deps(storage, message_bus)
+
 
 async def _build_agent_middlewares_with_ellm(
     user_id: str,
@@ -737,6 +753,7 @@ async def _build_agent_middlewares_with_ellm(
 ):
     mws = await build_agent_middlewares(user_id, agent_id, session_id)
     mws.extend(await _ellm_refresh_mw_factory(user_id, agent_id, session_id))
+    mws.append(_summarization_mw)
     return mws
 
 
@@ -974,6 +991,9 @@ app.include_router(system_prompt_router)
 # ELLM 模型管理（Redis bocomadp:model:think_tag 增删改查）
 from bocomadp.routers.ellm_models import ellm_models_router
 app.include_router(ellm_models_router)
+# 运行时配置管理（PG runtime_configs 表，/config/{key} 通用 CRUD）
+from bocomadp.routers.runtime_config import runtime_config_router
+app.include_router(runtime_config_router)
 
 
 # ---------------------------------------------------------------------------

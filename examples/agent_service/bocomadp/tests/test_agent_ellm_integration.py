@@ -254,7 +254,10 @@ class TestAgentExpiredRefresh:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key", 1_500_000),
-        ) as fetch:
+        ) as fetch, mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=True),
+        ):
             final_msg = asyncio.run(
                 agent.reply(UserMsg(name="user", content="Hello")),
             )
@@ -307,6 +310,9 @@ class TestAgentExpiredRefresh:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key", 1_500_000),
+        ), mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=True),
         ):
             responses = asyncio.run(_call())
 
@@ -350,7 +356,10 @@ class TestAgentFreshKeyReuse:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key", 1_500_000),
-        ) as fetch:
+        ) as fetch, mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=True),
+        ):
             asyncio.run(agent.reply(UserMsg(name="user", content="Hello")))
 
         # fetch_ellm_key must not be called for a fresh key.
@@ -386,7 +395,10 @@ class TestAgentThinkTagDisabled:
 
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
-        ) as fetch:
+        ) as fetch, mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=False),
+        ):
             final_msg = asyncio.run(
                 agent.reply(UserMsg(name="user", content="Hello")),
             )
@@ -414,6 +426,9 @@ class TestAgentThinkTagDisabled:
 
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
+        ), mock.patch(
+            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
+            new=mock.AsyncMock(return_value=False),
         ):
             final_msg = asyncio.run(
                 agent.reply(UserMsg(name="user", content="Hello")),
