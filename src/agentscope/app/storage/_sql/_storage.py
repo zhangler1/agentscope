@@ -1051,11 +1051,24 @@ class AsyncSQLAlchemyStorage(StorageBase):
         source: SessionSource = SessionSource.USER,
         source_schedule_id: str | None = None,
     ) -> SessionRecord:
-        """Create or update a session — same shape as the Redis backend."""
+        """Create or update a session — same shape as the Redis backend.
+
+        Raises:
+            `ValueError`: if *session_id* is already owned by a different
+                user. A preset id held by another tenant must never be
+                silently overwritten — that would let a caller steal (or
+                corrupt) another user's session, mirroring the owner
+                guard in :meth:`upsert_credential`.
+        """
         if session_id:
             async with self._session() as sess:
                 existing = await sess.get(SessionRow, session_id)
             if existing is not None:
+                if existing.user_id != user_id:
+                    raise ValueError(
+                        f"Session '{session_id}' already exists for a "
+                        f"different user.",
+                    )
                 record = _to_record(existing, SessionRecord)
                 record.config = config
                 if state is not None:

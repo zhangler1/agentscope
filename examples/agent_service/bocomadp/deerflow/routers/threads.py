@@ -15,7 +15,7 @@ SDK 调用契约，但只实现对话闭环必需的最小端点：
 设计要点：
 
 - thread_id 与原生 session_id 同一资源；session 由 ``runs/stream`` 端点
-  首次运行时自动创建（见 ``deerflow_chat._ensure_session``），因此 create
+  首次运行时自动创建（见 ``deerflow_chat._prepare_session_for_run``），因此 create
   端点无状态、search 无注册表可查。
 - history/state 从原生 storage 的 session 消息重建 LangGraph State，供
   SDK 的 ``useStream`` 初始化界面与 ``onFinish`` 收尾（values.messages

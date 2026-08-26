@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -38,6 +39,8 @@ from agentscope.app.workspace_manager import WorkspaceManagerBase
 
 from bocomadp.config.uploads_config import get_upload_config
 from bocomadp.uploads import file_conversion
+
+logger = logging.getLogger(__name__)
 from bocomadp.uploads.db import UploadedFile, UploadedFileCreate, get_uploads_db
 from bocomadp.uploads.manager import (
     FileSizeExceeded,
@@ -224,7 +227,13 @@ _URL_DOWNLOAD_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 def _filename_from_url(url: str) -> str:
     """从 URL 路径提取文件名（URL 解码）；无有效路径段回退 ``downloaded``。"""
     parsed = urlparse(url)
-    name = unquote(Path(parsed.path).name) if parsed.path else ""
+    path = parsed.path or ""
+    # 目录路径（以 / 结尾）没有文件名，回退 downloaded
+    name = (
+        unquote(Path(path).name)
+        if path and not path.endswith("/")
+        else ""
+    )
     return name if name and name not in {".", ".."} else "downloaded"
 
 

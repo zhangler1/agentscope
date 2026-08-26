@@ -290,6 +290,25 @@ class EllmChatModel(ChatModelBase):
             le=1,
         )
 
+        enable_thinking: bool | None = Field(
+            default=None,
+            title="Enable Thinking",
+            description=(
+                "Whether to enable the model's thinking mode, sent as "
+                "``chat_template_kwargs.enable_thinking``. None = no override."
+            ),
+        )
+
+        reasoning_effort: str | None = Field(
+            default=None,
+            title="Reasoning Effort",
+            description=(
+                "Reasoning effort hint (e.g. 'low'/'medium'/'high'), sent "
+                "as the top-level ``reasoning_effort`` request field. "
+                "None = no override."
+            ),
+        )
+
     def __init__(
         self,
         credential: "ELLMCredential",
@@ -560,6 +579,20 @@ class EllmChatModel(ChatModelBase):
 
         if self.parameters.top_p is not None:
             kwargs["top_p"] = self.parameters.top_p
+
+        if self.parameters.enable_thinking is not None:
+            extra_body = dict(kwargs.get("extra_body") or {})
+            chat_template_kwargs = dict(
+                extra_body.get("chat_template_kwargs") or {}
+            )
+            chat_template_kwargs["enable_thinking"] = (
+                self.parameters.enable_thinking
+            )
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
+            kwargs["extra_body"] = extra_body
+
+        if self.parameters.reasoning_effort:
+            kwargs["reasoning_effort"] = self.parameters.reasoning_effort
 
         kwargs.update(generate_kwargs)
 

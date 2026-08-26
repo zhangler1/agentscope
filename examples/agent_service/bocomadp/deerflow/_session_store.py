@@ -23,6 +23,8 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel, Field
+
 if TYPE_CHECKING:
     from .auth_context import ResolvedAuth
 
@@ -31,15 +33,38 @@ logger = logging.getLogger(__name__)
 #: 条目存活时长（秒）。用户约束：4 小时。
 _TTL_SECONDS = 14400
 
-#: Redis key 前缀。
-_KEY_PREFIX = "bocomadp:session"
+#: PG runtime_configs 可配 TTL 的默认值（秒，4h）。
+_DEFAULT_TTL_SECONDS = 14400
 
 #: hash 字段名。
 _FIELD_PARAMS = "params"
 _FIELD_AUTH = "auth"
+_FIELD_RUN_CONTEXT = "run_context"
+
+#: Redis key 前缀。
+_KEY_PREFIX = "bocomadp:session"
 
 #: 懒加载 Redis 客户端；测试注入 fakeredis 实例。
 _redis: Any = None
+
+
+class SessionStoreConfig(BaseModel):
+    """df_session_config_ttl 配置段：会话存储 TTL。"""
+
+    ttl_seconds: int = Field(
+        default=_DEFAULT_TTL_SECONDS,
+        description="会话级存储（custom_params/auth/run_context）TTL 秒数。",
+    )
+
+
+async def _resolve_ttl_seconds() -> int:
+    """从 PG runtime_configs 读取 TTL；无记录/无效/DB 不可用 → 默认 14400。"""
+    from bocomadp.runtime_config_store import get_typed_config
+
+    cfg = await get_typed_config("df_session_config_ttl", SessionStoreConfig)
+    if cfg is None:
+        return _DEFAULT_TTL_SECONDS
+    return cfg.ttl_seconds
 
 
 def _key(session_id: str) -> str:
@@ -91,10 +116,12 @@ async def save_session(
     *,
     params: dict[str, Any] | None = None,
     auth: "ResolvedAuth | None" = None,
+    run_context: dict[str, Any] | None = None,
 ) -> None:
-    """按字段 upsert：HSET 更新传入字段（保留另一字段）+ EXPIRE 刷新 TTL。
+    """按字段 upsert：HSET 更新传入字段（保留其他字段）+ EXPIRE 刷新 TTL。
 
-    fail-open：Redis 异常仅告警，不阻断 run 创建。
+    TTL 从 PG runtime_configs（key ``df_session_config_ttl``）读取，默认
+    14400；Redis/PG 不可用均 fail-open，不阻断 run 创建。
     """
     try:
         r = await _get_redis()
@@ -111,7 +138,13 @@ async def save_session(
                 _FIELD_AUTH,
                 json.dumps(_auth_to_dict(auth), ensure_ascii=False),
             )
-        await r.expire(key, _TTL_SECONDS)
+        if run_context is not None:
+            await r.hset(
+                key,
+                _FIELD_RUN_CONTEXT,
+                json.dumps(run_context, ensure_ascii=False),
+            )
+        await r.expire(key, await _resolve_ttl_seconds())
     except Exception:  # noqa: BLE001 —— 非致命，仅告警
         logger.warning(
             "session store: save failed for session %s (non-fatal)",
@@ -155,12 +188,33 @@ async def load_auth(session_id: str) -> "ResolvedAuth | None":
         return None
 
 
+async def load_run_context(session_id: str) -> dict[str, Any] | None:
+    """读取 run_context；无记录/过期/Redis 不可用 → None。"""
+    try:
+        r = await _get_redis()
+        raw = await r.hget(_key(session_id), _FIELD_RUN_CONTEXT)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 —— 非致命，降级为 None
+        logger.warning(
+            "session store: load run_context failed for session %s (non-fatal)",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
 __all__ = [
     "_FIELD_AUTH",
     "_FIELD_PARAMS",
+    "_FIELD_RUN_CONTEXT",
     "_KEY_PREFIX",
     "_TTL_SECONDS",
     "load_auth",
     "load_params",
+    "load_run_context",
     "save_session",
+    "SessionStoreConfig",
 ]

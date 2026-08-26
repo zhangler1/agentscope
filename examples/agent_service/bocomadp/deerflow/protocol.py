@@ -25,6 +25,9 @@ from typing import Any
 EVENT_METADATA = "metadata"
 """Run 元信息首帧（run_id / thread_id / assistant_id）。"""
 
+EVENT_UPDATES = "updates"
+"""状态更新帧，data 为 ``{node_name: {channel: value}}`` 快照。"""
+
 EVENT_MESSAGES = "messages"
 """消息增量帧，data 为 ``[chunk, metadata]`` 元组。"""
 
@@ -99,6 +102,7 @@ def with_event_id(evt: StreamEvent, event_id: str) -> StreamEvent:
 
 __all__ = [
     "EVENT_METADATA",
+    "EVENT_UPDATES",
     "EVENT_MESSAGES",
     "EVENT_CUSTOM",
     "EVENT_ERROR",

@@ -95,6 +95,49 @@ _BUILTIN_TOOLS: list[dict] = [
     },
 ]
 
+#: 团队/规划工具的静态元数据（name + 简短 description）。
+#: 单一数据源：``_all_tool_names()`` 据此推导可管理的工具名集合，
+#: ``GET /agents/{id}/tools`` 据此输出带 description 的展示条目。
+#: 风格与 ``_BUILTIN_TOOLS`` 一致，不另设名字集合。
+_FRAMEWORK_TOOLS_META: list[dict] = [
+    {
+        "name": "TeamCreate",
+        "description": "以当前会话为领导创建一个新团队，用于拆分子任务并行执行。",
+    },
+    {
+        "name": "AgentCreate",
+        "description": "为团队创建专业化的成员智能体，配置角色、提示词与权限。",
+    },
+    {
+        "name": "TeamSay",
+        "description": "向团队领导者或所有成员发送消息、广播与协调进度。",
+    },
+    {
+        "name": "TeamDelete",
+        "description": "解散当前团队并删除其所有成员智能体与会话（不可逆）。",
+    },
+    {
+        "name": "AgentInvite",
+        "description": "邀请其他可邀请的智能体加入当前团队。",
+    },
+    {
+        "name": "TaskCreate",
+        "description": "为当前会话创建结构化的任务列表以跟踪进度。",
+    },
+    {
+        "name": "TaskList",
+        "description": "列出任务列表中的所有任务。",
+    },
+    {
+        "name": "TaskGet",
+        "description": "按 ID 从任务列表中检索单个任务。",
+    },
+    {
+        "name": "TaskUpdate",
+        "description": "更新任务列表中的任务（状态、内容等）。",
+    },
+]
+
 # ------------------------------------------------------------------
 # Tool whitelist store
 # ------------------------------------------------------------------
@@ -237,6 +280,8 @@ def _all_tool_names(request: Request) -> set[str]:
             name = getattr(mcp, "name", "") or ""
             if name:
                 names.add(name)
+    # 团队/规划工具由框架 get_toolkit 挂载，纳入白名单接口管理。
+    names.update(m["name"] for m in _FRAMEWORK_TOOLS_META)
     return names
 
 
@@ -293,6 +338,18 @@ async def list_agent_tools(
             {
                 "name": name,
                 "description": getattr(tool, "description", "") or "",
+                "enabled": name in enabled_names,
+                "toggleable": True,
+            },
+        )
+
+    # 1b. 团队/规划工具（框架 get_toolkit 挂载）→ 追加进 `tools`，带简短 description
+    for meta in _FRAMEWORK_TOOLS_META:
+        name = meta["name"]
+        tools.append(
+            {
+                "name": name,
+                "description": meta.get("description", ""),
                 "enabled": name in enabled_names,
                 "toggleable": True,
             },
@@ -435,4 +492,5 @@ __all__ = [
     "_get_enabled_tools",
     "_set_enabled_tools",
     "load_tool_whitelists",
+    "_FRAMEWORK_TOOLS_META",
 ]
