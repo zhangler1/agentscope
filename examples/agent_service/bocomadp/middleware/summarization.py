@@ -26,7 +26,7 @@ from bocomadp.providers.ellm_key import EllmKeyRefresher
 from bocomadp.runtime_config_store import get_typed_config
 from bocomadp.summarization_model_builder import build_summarization_model
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("as")
 
 
 class SummarizationMiddleware(MiddlewareBase):
@@ -50,6 +50,9 @@ class SummarizationMiddleware(MiddlewareBase):
         input_kwargs: dict,
         next_handler: Any,
     ) -> None:
+        # 每次压缩触发（模型调用前的 token 校验点）都打印当前 token 与阈值。
+        await self._log_token_check(agent, input_kwargs)
+
         # 配置真源在 PG；无记录 / 读失败视为未启用，透传（压缩用会话自身模型）。
         cfg = await get_typed_config("summarization", SummarizationConfig)
         if cfg is None or not (
@@ -71,6 +74,18 @@ class SummarizationMiddleware(MiddlewareBase):
             record.data,
             cfg.model_name,
             agent.model.context_size,
+        )
+
+        logger.info(
+            "summarization: using unified model "
+            "session_id=%s reply_id=%s agent_id=%s model=%r credential=%r "
+            "(context_size=%s) for compression",
+            self._session_id(agent),
+            self._reply_id(agent),
+            self._agent_id(agent),
+            cfg.model_name,
+            cfg.credential_id,
+            model.context_size,
         )
 
         # 压缩调用不走 on_model_call 链，必须在此主动保证 key 新鲜：
@@ -110,3 +125,54 @@ class SummarizationMiddleware(MiddlewareBase):
         finally:
             agent.model = old_model
             await model.aclose()
+
+    async def _log_token_check(self, agent: Any, input_kwargs: dict[str, Any]) -> None:
+        """打印当前 token 大小与压缩阈值（每次压缩触发时调用）。
+
+        框架在 ``_compress_context_impl`` 里校验 token 是否超阈值（只打印超阈值
+        情况）；此处补充打印每次校验的当前大小 / 阈值 / 是否超阈值，并带上
+        session/reply/agent/user 等识别字段，便于定位。计算失败静默忽略，
+        不影响压缩流程。
+        """
+        try:
+            context_cfg = input_kwargs.get("context_config") or getattr(
+                agent,
+                "context_config",
+                None,
+            )
+            if context_cfg is None:
+                return
+            kwargs = await agent._prepare_model_input()
+            current = await agent.model.count_tokens(**kwargs)
+            threshold = context_cfg.trigger_ratio * agent.model.context_size
+            logger.info(
+                "summarization: token check "
+                "session_id=%s reply_id=%s agent_id=%s "
+                "current=%d threshold=%d exceeded=%s",
+                self._session_id(agent),
+                self._reply_id(agent),
+                self._agent_id(agent),
+                int(current),
+                int(threshold),
+                current >= threshold,
+            )
+        except Exception as e:  # noqa: BLE001 - 仅监控日志，不影响压缩
+            logger.warning(
+                "summarization: token check skipped (%s)",
+                e,
+            )
+
+    @staticmethod
+    def _session_id(agent: Any) -> str:
+        return getattr(getattr(agent, "state", None), "session_id", "-") or "-"
+
+    @staticmethod
+    def _reply_id(agent: Any) -> str:
+        state = getattr(agent, "state", None)
+        if state is None:
+            return "-"
+        return getattr(state, "reply_id", "-") or "-"
+
+    @staticmethod
+    def _agent_id(agent: Any) -> str:
+        return getattr(agent, "name", "-") or "-"
