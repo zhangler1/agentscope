@@ -360,6 +360,26 @@ class CreateRunRequest(BaseModel):
         description="请求级自定义参数（空间码等），注入后台 run 任务，"
         "由工具中间件强制覆盖模型传参。",
     )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="请求级 run 配置（根路径）：推理强度，如 low/medium/high。",
+    )
+    thinking_enabled: bool | None = Field(
+        default=None,
+        description="请求级 run 配置（根路径）：是否启用模型思考模式。",
+    )
+    is_plan_mode: bool | None = Field(
+        default=None,
+        description="请求级 run 配置（根路径）：是否规划模式（静默接受，不使用）。",
+    )
+    subagent_enabled: bool | None = Field(
+        default=None,
+        description="请求级 run 配置（根路径）：是否启用子智能体（静默接受，不使用）。",
+    )
+    mode: str | None = Field(
+        default=None,
+        description="请求级 run 配置（根路径）：运行模式（静默接受，不使用）。",
+    )
     context: dict[str, Any] | None = Field(
         default=None,
         description=(
@@ -1460,13 +1480,13 @@ async def create_run_stream(
         body.custom_params,
     )
     ctx_token = set_custom_params(resolved_params)
-    # 请求级 run 配置（context 5 键）：与 custom_params 并列的独立通道，
-    # 经 ContextVar 注入后台 run 任务；spawn 后 reset（create_task 已复制
-    # 上下文快照，reset 不影响后台任务）。
-    run_context = extract_run_context(body.context)
+    # 请求级 run 配置（请求体根路径 5 键）：与 custom_params 并列的独立
+    # 通道，经 ContextVar 注入后台 run 任务；spawn 后 reset（create_task
+    # 已复制上下文快照，reset 不影响后台任务）。
+    run_context = extract_run_context(body.model_dump())
     if "mode" in run_context:
         logger.debug(
-            "deerflow: context.mode=%r accepted but ignored",
+            "deerflow: request.mode=%r accepted but ignored",
             run_context["mode"],
         )
     resolved_run_context = await _resolve_run_context(
