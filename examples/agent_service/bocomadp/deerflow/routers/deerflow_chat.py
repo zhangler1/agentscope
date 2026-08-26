@@ -86,6 +86,13 @@ from ..custom_params import (
     save_custom_params,
     set_custom_params,
 )
+from ..run_context import (
+    extract_run_context,
+    load_run_context,
+    reset_run_context,
+    save_run_context,
+    set_run_context,
+)
 from ..deps import (
     get_bridge,
     get_deerflow_user_id,
@@ -888,6 +895,24 @@ async def _resolve_custom_params(
     return loaded or {}
 
 
+async def _resolve_run_context(
+    session_id: str,
+    requested: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """解析本次 run 的 run_context（Redis 存储版，与 custom_params 同 key 族）。
+
+    请求携带 → 写入 Redis（hash 字段 ``run_context``，TTL 由 PG
+    ``df_session_config_ttl`` 决定）并直接采用；未携带 → 从 Redis 回退
+    加载（HITL 确认续跑等场景开关状态持续生效）。Redis 不可用 fail-open
+    （返回空 dict 不阻断 run）。
+    """
+    if requested is not None:
+        await save_run_context(session_id, requested)
+        return requested
+    loaded = await load_run_context(session_id)
+    return loaded or {}
+
+
 async def _download_additional_urls(
     body: CreateRunRequest,
     user_id: str,
@@ -1435,6 +1460,20 @@ async def create_run_stream(
         body.custom_params,
     )
     ctx_token = set_custom_params(resolved_params)
+    # 请求级 run 配置（context 5 键）：与 custom_params 并列的独立通道，
+    # 经 ContextVar 注入后台 run 任务；spawn 后 reset（create_task 已复制
+    # 上下文快照，reset 不影响后台任务）。
+    run_context = extract_run_context(body.context)
+    if "mode" in run_context:
+        logger.debug(
+            "deerflow: context.mode=%r accepted but ignored",
+            run_context["mode"],
+        )
+    resolved_run_context = await _resolve_run_context(
+        session_id,
+        run_context or None,
+    )
+    rc_token = set_run_context(resolved_run_context)
     auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
         record, _task = _spawn_run(
@@ -1449,6 +1488,7 @@ async def create_run_stream(
     finally:
         _reset_run_auth_contexts(auth_tokens)
         reset_custom_params(ctx_token)
+        reset_run_context(rc_token)
     logger.info(
         "deerflow: run %s created for thread %s (agent=%s).",
         record.run_id,

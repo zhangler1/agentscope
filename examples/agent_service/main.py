@@ -109,6 +109,7 @@ from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
+from bocomadp.deerflow.model_patch import patch_get_model
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
     agent_router as _framework_agent_router,
@@ -869,6 +870,9 @@ async def _lifespan_with_builtin_agents(app):
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
         patch_get_toolkit()
+        # 请求级模型参数（thinking_enabled/reasoning_effort）：包装框架
+        # get_model，run_context 携带时合并进模型 Parameters。
+        patch_get_model()
         # 资源列表团队成员过滤 + is_self_built 标记——原实现改
         # src/_service/_access.py 的 list_resource，现搬迁到
         # bocomadp/team_access.py；必须先于 patch_agent_list_sort 挂载
