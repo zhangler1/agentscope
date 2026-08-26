@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""请求级 run 配置（context 5 键）上下文与持久化模块。
+"""请求级 run 配置（请求体根路径 5 键）上下文与持久化模块。
 
-对齐 deer-flow 的 ``context`` 契约：run/stream 请求体 ``context`` 携带
-``mode / reasoning_effort / thinking_enabled / is_plan_mode /
-subagent_enabled``。路由层在 spawn 后台 run 任务前经 ContextVar 注入
-（``asyncio.create_task`` 复制当前上下文，值随之传播到 run 任务内）。
+run/stream 请求体**根路径**携带 ``mode / reasoning_effort /
+thinking_enabled / is_plan_mode / subagent_enabled`` 五个字段。路由层在
+spawn 后台 run 任务前经 ContextVar 注入（``asyncio.create_task`` 复制
+当前上下文，值随之传播到 run 任务内）。
 
 其中 ``thinking_enabled`` / ``reasoning_effort`` 由模型构建层
 （``model_patch``）消费，写入模型 Parameters；其余键（``mode`` /
@@ -30,7 +30,7 @@ from ._session_store import (
 
 logger = logging.getLogger(__name__)
 
-#: context 中允许提取的键（其余忽略）。
+#: 请求体根路径中允许提取的键（其余忽略）。
 RUN_CONTEXT_KEYS: tuple[str, ...] = (
     "mode",
     "reasoning_effort",
@@ -46,10 +46,14 @@ _run_context_ctx: ContextVar[dict[str, Any]] = ContextVar(
 
 
 def extract_run_context(context: dict[str, Any] | None) -> dict[str, Any]:
-    """从请求 ``context`` 中提取 5 个已知键，未知键忽略。"""
+    """从请求体根路径中提取 5 个已知键，忽略未知键与值为 None 的键。"""
     if not isinstance(context, dict):
         return {}
-    return {k: context[k] for k in RUN_CONTEXT_KEYS if k in context}
+    return {
+        k: context[k]
+        for k in RUN_CONTEXT_KEYS
+        if k in context and context[k] is not None
+    }
 
 
 def set_run_context(params: dict[str, Any] | None) -> Token:
