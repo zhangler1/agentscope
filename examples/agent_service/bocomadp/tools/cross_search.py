@@ -120,7 +120,7 @@ def _build_req_message(
             else config.vector_top_n
         )
     else:
-        effective_user_code = config.user_code
+        effective_user_code = 9501173 # config.user_code
         effective_search_type = config.search_type
         effective_space_code_list = config.space_code_list
         effective_team_space_code_list = config.team_space_code_list
