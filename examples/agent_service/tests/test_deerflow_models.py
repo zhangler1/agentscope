@@ -5,7 +5,7 @@
 - ``_resolve_requested_model_name``：llm_model_name 单一通道与空回退；
 - ``ensure_default_credentials``：default 用户维度、幂等 upsert、失败不阻断；
 - ``_resolve_chat_model_config``：模型名透传、用户凭证表挑选
-  （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退 config.yaml
+  （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退内置
   条目；
 - ``_prepare_session_for_run``：首次 backfill、模型切换更新、一致不更新。
 """
@@ -152,20 +152,6 @@ class FakeStorage:
         return None
 
 
-class FakeActiveModel:
-    def __init__(self, provider_id: str, model_name: str) -> None:
-        self.provider_id = provider_id
-        self.model_name = model_name
-
-
-class FakeRequest:
-    """最小 Request 替身：app.state.provider_manager.get_active_model。"""
-
-    def __init__(self, active: FakeActiveModel | None = None) -> None:
-        manager = SimpleNamespace(get_active_model=lambda: active)
-        self.app = SimpleNamespace(state=SimpleNamespace(provider_manager=manager))
-
-
 class FakeWorkspaceManager:
     def assign_workspace_id(self, **kwargs) -> str:
         return "ws-test"
@@ -285,8 +271,8 @@ def _run(coro):
 
 
 def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
-    """``model_name`` 为模型名：透传为 config.model；凭证表为空时回退 active
-    provider 对应条目创建用户凭证。"""
+    """``model_name`` 为模型名：透传为 config.model；凭证表为空时回退内置
+    条目创建用户凭证。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -294,7 +280,6 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
             model_name="r1",
         ),
@@ -315,7 +300,6 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
             model_name="ds-r1",
         ),
@@ -326,11 +310,11 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
     assert config.credential_id == user_credential_id(USER_ID, "ds")
 
 
-def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
+def test_resolve_chat_model_config_unmatched_falls_back_to_first_entry(
     monkeypatch,
 ) -> None:
-    """``model_name`` 任意值一律透传为模型名；凭证表为空时凭证回退 active
-    provider 对应条目创建。"""
+    """``model_name`` 任意值一律透传为模型名；凭证表为空时凭证回退第一条
+    可用内置条目创建（无 active provider 兜底）。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -338,7 +322,6 @@ def test_resolve_chat_model_config_unmatched_falls_back_to_active_provider(
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
             model_name="nope",
         ),
@@ -362,7 +345,6 @@ def test_resolve_chat_model_config_reuses_user_credential(
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
         ),
     )
@@ -388,7 +370,6 @@ def test_resolve_chat_model_config_copies_from_default_credential(
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
         ),
     )
@@ -404,7 +385,7 @@ def test_resolve_chat_model_config_copies_from_default_credential(
 def test_resolve_chat_model_config_falls_back_to_entry_without_default(
     monkeypatch,
 ) -> None:
-    """default 凭证亦缺失：回退 config.yaml 条目参数创建用户凭证。"""
+    """default 凭证亦缺失：回退内置条目参数创建用户凭证。"""
     entries = [_make_model_entry("ds", api_key="sk-entry")]
     _patch_config_loader(monkeypatch, entries)
     storage = FakeStorage()
@@ -412,7 +393,6 @@ def test_resolve_chat_model_config_falls_back_to_entry_without_default(
     config = _run(
         _resolve_chat_model_config(
             storage,
-            FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
         ),
     )
@@ -427,12 +407,11 @@ def test_resolve_chat_model_config_falls_back_to_entry_without_default(
 def test_resolve_chat_model_config_unknown_entry_returns_none(
     monkeypatch,
 ) -> None:
-    """无 active provider：返回 None 不阻断。"""
+    """无凭证无条目：返回 None 不阻断（原生 404 兜底）。"""
     _patch_config_loader(monkeypatch, [])
     config = _run(
         _resolve_chat_model_config(
             FakeStorage(),
-            FakeRequest(active=None),
             USER_ID,
         ),
     )
@@ -445,13 +424,11 @@ def test_resolve_chat_model_config_unknown_entry_returns_none(
 def _run_prepare_session(
     storage: FakeStorage,
     model_name: str = "",
-    request: FakeRequest | None = None,
 ) -> None:
     _run(
         _prepare_session_for_run(
             storage,
             FakeWorkspaceManager(),
-            request or FakeRequest(active=FakeActiveModel("ds", "deepseek-chat")),
             USER_ID,
             AGENT_ID,
             "s1",
@@ -475,7 +452,8 @@ def test_prepare_session_creates_with_backfilled_model_config(
     _run_prepare_session(storage)
 
     session = storage.sessions[_session_key()]
-    assert session.config.workspace_id == "ws-test"
+    # workspace_id 带 NON_ADP_WORKSPACE_PREFIX（"deerflow-"）前缀
+    assert session.config.workspace_id == "deerflow-ws-test"
     assert session.config.chat_model_config.model == "deepseek-chat"
 
 

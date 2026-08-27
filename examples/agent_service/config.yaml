@@ -89,9 +89,8 @@ mcp:
 
 # ---------- 模型 Provider ----------
 # 模型条目来源已改为代码内置（bocomadp/config/app_config.py 的
-# _builtin_model_entries），启动时由 load_model_entries() 注册到
-# ProviderManager 并由 ensure_default_credentials 幂等刷库；
-# 如需禁用注册，可设置环境变量 BOCOMADP_PROVIDERS__ENABLED=false。
+# _builtin_model_entries），启动时由 ensure_default_credentials 幂等
+# 刷入 storage，会话运行时由框架按 ChatModelConfig 重建模型实例。
 # ---------- 运行时目录 ----------
 # 工作区目录（AgentScope 沙箱文件读写根目录 + 会话持久化根目录：
 # sessions/{user_id}/{agent_id}/{session_id}.json）
