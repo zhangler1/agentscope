@@ -17,6 +17,8 @@ from agentscope.tool import FunctionTool, ToolBase
 from ..deerflow.custom_params import get_custom_params
 from .contact_search import contact_search_tool
 from .cross_search import cross_search_tool  # 已是 FunctionTool 实例（带注入中间件）
+from .exchange_rate import exchange_rate_tool
+from .interest_rate import interest_rate_tool
 from .online_search import online_search_tool
 from .personal_search import personal_search_tool
 from .physical_contact_search import physical_contact_search_tool
@@ -65,6 +67,8 @@ async def build_enterprise_tools(
         FunctionTool(submit_it_ticket),
         raw_request_tool,  # 已是 FunctionTool 实例（工具名"外数查"）
         read_tool_result_tool,  # 需状态注入,自定义 ToolBase(非 FunctionTool)
+        exchange_rate_tool,   # 已是 FunctionTool 实例（工具名"汇率查询"）
+        interest_rate_tool,   # 已是 FunctionTool 实例（工具名"利率查询"）
     ]
 
     # cross_search 始终挂载（2026-08-20 起不再受 vector_search_switch 控制）
