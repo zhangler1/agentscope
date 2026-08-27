@@ -71,12 +71,12 @@ from agentscope.rag import QdrantStore
 | 阶段 | 内容 |
 |---|---|
 | 1 | 配置 + 日志：`get_app_config()` → `configure_logging()` |
-| 2 | 注册表初始化：Tool / Middleware / Mcp Registry + ProviderManager |
+| 2 | 注册表初始化：Tool / Middleware / Mcp Registry |
 | 3 | 会话 / 运行记账：RunManager + BusBridge（deerflow SSE 依赖） |
 | 4 | 基础设施：storage + Qdrant + workspace manager（K8s 沙箱或本地模式二选一）+ message bus（Redis 或 InMemory） |
 | 5 | `create_app()`：注入全部依赖，自动挂载内置路由 |
 | 6 | `app.state` 挂载：把注册表暴露给路由层 |
-| 7 | 自定义路由：deerflow / health / models / stats / agent_tools / session_usage / uploads 等叠加在内置路由之上 |
+| 7 | 自定义路由：deerflow / health / ellm_models / stats / agent_tools / session_usage / uploads 等叠加在内置路由之上 |
 
 ```
 配置加载 → 注册表 → 运行记账 → 基础设施 → create_app → app.state → 自定义路由
@@ -90,14 +90,14 @@ bocomadp/
 ├── logging/     trace_context(ContextVar) + trace_middleware(ASGI) + formatter
 ├── deerflow/    ★ DeerFlow 风格 SSE：protocol / formatter / bridge / runs /
 │                custom_params / auth_context / deps / routers(threads + chat + auth_stub)
-├── providers/   ProviderManager —— 多模型注册与运行时切换
+├── providers/   ELLM 协议适配与 key 生命周期（ellm_chat_model / ellm_key / _models）
 ├── credential/  自定义凭证类型（ELLMCredential 等）
 ├── tools/       registry(自动扫描) + builtin + enterprise(主动 build)
 │                + cross_search(空间码覆盖中间件) + agent_factory_tools + custom/
 ├── middleware/  registry + agent_middleware + audit + custom_prompt + factory
 │                + error_handler / request_log (2 个 ASGI 中间件)
 ├── mcp/         registry(duck-type 扫描) + builtin_mcps + custom/
-├── routers/     models / health / platform_health / stats / agent_tools /
+├── routers/     ellm_models / health / platform_health / stats / agent_tools /
 │                session_usage / channels / credential_model / skill_router
 │                / uploads / workspace_files / custom
 ├── skills/      BocomSkillHub 企业技能
@@ -136,7 +136,6 @@ async def build_agent_middlewares(user_id, agent_id, session_id):
 
 ```python
 # examples/agent_service/main.py（app.state 挂载段）
-app.state.provider_manager = provider_manager
 app.state.tool_registry = tool_registry
 app.state.mcp_registry = mcp_registry
 app.state.middleware_registry = middleware_registry
@@ -177,7 +176,9 @@ run 任务内的工具中间件 / 提示词中间件 / 工具工厂经 `get_cust
 - 加载链路：`config.yaml` + `.env` + 环境变量 → `AppConfig`（`config/app_config.py`，唯一 schema）
 - 详细设计见 [config_load_design.md](./config_load_design.md)
 
-模型配置从 yaml 加载并自动注册到 `ProviderManager`，支持 `is_active` 标记切换默认激活项。
+模型配置为代码内置条目（`config/app_config.py` 的 `_builtin_model_entries`），
+启动时 `ensure_default_credentials` 幂等刷库为 default 用户凭证，
+deerflow 解析链按凭证挑选（无 ProviderManager / active 切换）。
 
 ---
 
@@ -375,14 +376,14 @@ examples/
 │       ├── logging/     (logging_config / trace_context / trace_middleware)
 │       ├── deerflow/    (protocol / formatter / bridge / runs / custom_params
 │       │                 / auth_context / deps / routers)
-│       ├── providers/   (provider_manager)
+│       ├── providers/   (ellm_chat_model / ellm_key / _models)
 │       ├── credential/  (ellm)
 │       ├── tools/       (registry / builtin_tools / enterprise / cross_search
 │       │                 / agent_factory_tools / placeholder / custom)
 │       ├── middleware/  (registry / agent_middleware / audit / custom_prompt
 │       │                 / factory / error_handler / request_log / custom)
 │       ├── mcp/         (registry / builtin_mcps / custom)
-│       ├── routers/     (models / health / platform_health / stats / agent_tools
+│       ├── routers/     (ellm_models / health / platform_health / stats / agent_tools
 │       │                 / session_usage / channels / credential_model
 │       │                 / skill_router / uploads / workspace_files / custom)
 │       ├── skills/ uploads/ workspace/ docker/ toolkit_whitelist.py

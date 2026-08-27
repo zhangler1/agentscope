@@ -9,12 +9,11 @@
 3. Initialize the framework modules:
    - :class:`ToolRegistry`         — custom tools
    - :class:`MiddlewareRegistry`   — agent middlewares
-   - :class:`ProviderManager`      — multi-model routing
    - :class:`RunManager`           — deerflow run bookkeeping
    - :class:`BusBridge`            — deerflow SSE bridge over MessageBus
 4. Build the AgentScope app via :func:`create_app` (12 built-in routers).
 5. Inject ASGI middlewares via ``extra_middlewares``.
-6. Mount custom routers (deerflow SSE, models, health, stats).
+6. Mount custom routers (deerflow SSE, health, stats).
 7. Register sub-agent templates via ``custom_subagent_templates``.
 
 企业扩展能力（bocomadp）：
@@ -58,8 +57,6 @@ from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注�
 from bocomadp.config import (
     get_app_config,
     is_trace_correlation_enabled,
-    load_model_entries,
-    build_model_instance,
 )
 from bocomadp.concurrency.guard import ConcurrencyGuard
 from bocomadp.logging.logging_config import configure_logging
@@ -75,7 +72,6 @@ from bocomadp.middleware.custom.event_log import EventLogMiddleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.request_log import AccessLogMiddleware
-from bocomadp.providers import ProviderManager
 from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
@@ -85,7 +81,6 @@ from bocomadp.routers.uploads import uploads_router
 from bocomadp.routers.channels import channels_router
 from bocomadp.routers.credential_model import credential_model_router
 from bocomadp.routers.health import health_router
-from bocomadp.routers.models import models_router
 from bocomadp.routers.platform_health import platform_health_router
 from bocomadp.routers.skill_router import skill_router
 from bocomadp.routers.stats import stats_router
@@ -247,39 +242,6 @@ if config.mcp.enabled:
     mcp_registry.load_builtin()
     if config.mcp.load_custom:
         mcp_registry.load_custom()
-
-provider_manager = ProviderManager()
-
-# 从代码内置模型条目（原 config.yaml models 节点已迁移）加载并注册到
-# ProviderManager；凭证单一来源迁移至代码，启动时由
-# ensure_default_credentials 幂等刷库。
-if config.providers.enabled:
-    _model_entries = load_model_entries()
-    for _entry in _model_entries:
-        try:
-            _model = build_model_instance(_entry)
-            provider_manager.register(
-                provider_id=_entry.provider_id,
-                model=_model,
-                model_name=_entry.model_name or _entry.provider_id,
-                display_name=_entry.display_name,
-                supports_multimodal=_entry.supports_multimodal,
-                metadata={"base_url": _entry.base_url} if _entry.base_url else {},
-            )
-            # 非首条或显式标记为活跃的，覆盖默认激活项
-            if _entry.is_active:
-                provider_manager.set_active(_entry.provider_id)
-            logger.info(
-                "provider registered: %s (model=%s)",
-                _entry.provider_id,
-                _entry.model_name or _entry.provider_id,
-            )
-        except Exception:
-            logger.warning(
-                "failed to register provider '%s'",
-                _entry.provider_id,
-                exc_info=True,
-            )
 
 # ── 内置智能体：智能体工厂（agent-creator） ──
 # 专门用于对话式创建/修改智能体，不需要 K8s 沙箱，
@@ -610,10 +572,9 @@ init_factory_tools(tool_registry, mcp_registry)
 
 logger.info(
     "framework modules initialized: "
-    "tools=%d middlewares=%d providers=%d mcps=%d",
+    "tools=%d middlewares=%d mcps=%d",
     len(tool_registry.list_tools()),
     len(middleware_registry.list_middlewares()),
-    len(provider_manager.list_providers()),
     len(mcp_registry.list_mcps()),
 )
 
@@ -937,7 +898,6 @@ app.router.lifespan_context = _lifespan_with_builtin_agents
 # ---------------------------------------------------------------------------
 # 6. 将框架模块挂载到 app.state，供路由层访问
 # ---------------------------------------------------------------------------
-app.state.provider_manager = provider_manager
 app.state.tool_registry = tool_registry
 app.state.mcp_registry = mcp_registry
 app.state.middleware_registry = middleware_registry
@@ -992,7 +952,6 @@ app.include_router(channels_router)
 # deerflow threads 管理端点（create/search/state/history，对话闭环最小集）
 app.include_router(threads_router)
 app.include_router(uploads_router)
-app.include_router(models_router)
 app.include_router(platform_health_router)
 # 外部 skill hub（目录查询 / 我的上传 / 下载安装）
 app.include_router(skill_router)

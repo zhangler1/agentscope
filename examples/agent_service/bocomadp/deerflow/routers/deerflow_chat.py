@@ -576,27 +576,12 @@ def _entry_for_credential_type(credential_type: str) -> ModelEntry | None:
     return None
 
 
-def _pick_fallback_entry(active: Any) -> ModelEntry | None:
-    """凭证全空时的模型条目回退（config.yaml models 清空后为内置条目）。
-
-    优先 active provider 对应条目，否则取第一个可反序列化条目。
-    """
-    entries = load_model_entries()
-    if active is not None:
-        entry = next(
-            (
-                candidate
-                for candidate in entries
-                if candidate.provider_id == active.provider_id
-            ),
-            None,
-        )
-        if entry is not None:
-            return entry
+def _pick_fallback_entry() -> ModelEntry | None:
+    """凭证全空时的模型条目回退（内置条目，取第一个可反序列化条目）。"""
     return next(
         (
             candidate
-            for candidate in entries
+            for candidate in load_model_entries()
             if credential_cls_for_entry(candidate) is not None
         ),
         None,
@@ -605,7 +590,6 @@ def _pick_fallback_entry(active: Any) -> ModelEntry | None:
 
 async def _resolve_chat_model_config(
     storage: StorageBase,
-    request: Request,
     user_id: str,
     model_name: str = "",
 ) -> ChatModelConfig | None:
@@ -617,19 +601,15 @@ async def _resolve_chat_model_config(
       优先、id 稳定排序取第一个；
     - 用户凭证为空 → default 用户凭证同规则挑选，复制参数入库为
       用户维度凭证后引用（复制保留 api_key / scene_code 等元数据）；
-    - 再空 → 回退 config.yaml 条目参数创建（active provider 对应
-      条目优先；api_key 空且非 ELLM 视为不可用）。
+    - 再空 → 回退内置条目参数创建（第一条可反序列化条目；api_key
+      空且非 ELLM 视为不可用）。
 
     模型名：``model_name`` 非空一律直接透传（凭证不绑定模型，
-    不区分凭证 id）；缺失时回退凭证 model 字段值 →
-    config.yaml 匹配条目 model_name → 全局 active provider；全部缺失
-    返回 None（原生 404 兜底，不阻断请求）。parameters 取 config.yaml
-    中与凭证 type 匹配条目的 parameters（无匹配则空）。
+    不区分凭证 id）；缺失时回退凭证 model 字段值 → 内置条目
+    model_name；全部缺失返回 None（原生 404 兜底，不阻断请求）。
+    parameters 取内置条目中与凭证 type 匹配条目的 parameters（无匹配
+    则空）。
     """
-    # 全局 active provider 兜底（模型名 + 回退条目）
-    pm = getattr(request.app.state, "provider_manager", None)
-    active = pm.get_active_model() if pm is not None else None
-
     # ── 凭证选择 ──
     record: CredentialRecord | None = None
     # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
@@ -670,8 +650,8 @@ async def _resolve_chat_model_config(
             )
             return None
     else:
-        # 凭证全空 → 回退 config.yaml 条目参数创建
-        entry = _pick_fallback_entry(active)
+        # 凭证全空 → 回退内置条目参数创建
+        entry = _pick_fallback_entry()
         if entry is None:
             logger.warning(
                 "deerflow: no credential for user %s and no config.yaml "
@@ -750,8 +730,6 @@ async def _resolve_chat_model_config(
         entry = _entry_for_credential_type(credential_type)
     if not model and entry is not None:
         model = entry.model_name or entry.provider_id
-    if not model and active is not None:
-        model = active.model_name or ""
     if not model:
         logger.warning(
             "deerflow: no model name resolved (model_name=%r, "
@@ -777,7 +755,6 @@ async def _resolve_chat_model_config(
 async def _prepare_session_for_run(
     storage: StorageBase,
     workspace_manager,
-    request: Request,
     user_id: str,
     agent_id: str,
     session_id: str,
@@ -790,15 +767,13 @@ async def _prepare_session_for_run(
 
     - 会话不存在 → 创建：分配 workspace_id（与原生 /session/ 创建路径
       一致）+ 按凭证表解析模型配置（_resolve_chat_model_config：凭证表
-      挑选 → default 复制 → config.yaml 条目创建，模型名缺失时回退全局
-      active provider）；
+      挑选 → default 复制 → 内置条目创建；解析失败返回 None）；
     - 会话存在但缺配置 → 回填解析出的配置；
     - 会话存在、本次显式携带模型名（``model_name`` 非空）且解析出的
       (type, credential_id, model) 与现状不一致 → 更新（per-run 模型
       切换）；
     - 会话已存在、本次未携带模型名 → 保持不动——原生接口建好的会话
-      （如绑定 ELLM 凭证）不被 config.yaml 全局 active provider 静默
-      覆盖。
+      （如绑定 ELLM 凭证）不被内置条目解析结果静默覆盖。
     """
     existing = await storage.get_session(user_id, agent_id, session_id)
     if (
@@ -812,7 +787,6 @@ async def _prepare_session_for_run(
         return
     model_config = await _resolve_chat_model_config(
         storage,
-        request,
         user_id,
         model_name,
     )
@@ -1406,7 +1380,6 @@ async def create_run_stream(
     await _prepare_session_for_run(
         storage,
         workspace_manager,
-        request,
         user_id,
         agent_id,
         session_id,
@@ -1568,7 +1541,6 @@ async def create_run_wait(
     await _prepare_session_for_run(
         storage,
         workspace_manager,
-        request,
         user_id,
         agent_id,
         session_id,

@@ -181,10 +181,10 @@ DOTENV_FILE = BASE_DIR / ".env"
   白名单 `_BUSINESS_KEYS = {models, audit}` 之外的未知键同样报错，
   杜绝 `extra="ignore"` 静默吞错。不走 `load_config_yaml` 的 lru_cache，
   文件内容修改后校验实时生效。
-- `load_model_entries()` / `build_model_instance()`：从代码内置模型条目
-  加载（原 `config.yaml` 的 `models` 节点已迁移至代码），经 `CredentialFactory` 动态实例化并
-  注册到 `ProviderManager` —— 即「代码内置模型注册」；api_key 从环境变量读取。
-  凭证由启动时的 `ensure_default_credentials` 幂等刷库。
+- `load_model_entries()`：从代码内置模型条目加载（原 `config.yaml` 的
+  `models` 节点已迁移至代码），作为默认凭证刷库与 deerflow 模型解析回退的
+  统一数据源；api_key 从环境变量读取。启动时 `ensure_default_credentials`
+  幂等刷库（不再有 ProviderManager / build_model_instance）。
 - `is_trace_correlation_enabled()`：trace 关联开关的唯一真源，供 ASGI 中间件与日志配置共用。
 
 > **重要**：`main.py` 中 `RedisStorage` 必须通过 `config.redis.host` / `config.redis.port`
@@ -212,15 +212,15 @@ middleware/audit.py    → on_reply / 写入时再查 get_audit_config()
 
 > 说明：`factory` 在每次 agent 组装时调用一次（按 user/session 返回中间件组合），因此可在运行时动态开启/关闭审计。
 
-### 6.3 模型配置 → Provider 注册（`app_config.py`）
+### 6.3 模型配置 → 默认凭证刷库（`app_config.py`）
 
 ```
-main.py → load_model_entries()
-        → build_model_instance(entry) → provider_manager.register(...)
+main.py → ensure_default_credentials(storage)
+        → load_model_entries() 逐条创建凭证 → 幂等 upsert 为 default 用户凭证
 ```
 
 > 模型条目来自代码内置定义（`bocomadp/config/app_config.py`），api_key 从环境变量读取（`.env` 自动加载）；
-> 注册失败仅告警不影响启动（fail-soft）。
+> 刷库失败仅告警不影响启动（fail-soft）；会话运行时由 `_resolve_chat_model_config` 按凭证挑选（无 active 兜底，解析失败返回 None）。
 
 ---
 
