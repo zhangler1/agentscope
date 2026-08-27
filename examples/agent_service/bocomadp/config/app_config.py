@@ -367,8 +367,9 @@ class ModelEntry(BaseModel):
     """单个模型 Provider 条目。
 
     由 ``load_model_entries`` 提供（代码内置定义，原 config.yaml 的
-    ``models`` 节点已迁移至此），通过 ``CredentialFactory``
-    动态实例化 credential + model，注册到 ``ProviderManager``。
+    ``models`` 节点已迁移至此），作为默认凭证刷库
+    （``ensure_default_credentials``）与 deerflow 模型解析回退的统一
+    数据源。
     """
 
     provider_id: str = Field(description="唯一标识，如 deepseek")
@@ -397,15 +398,11 @@ class ModelEntry(BaseModel):
 
 
 class ProviderConfig(BaseModel):
-    """模型 Provider 路由配置。
-
-    ``config_file`` 指向 YAML 文件，启动时自动加载并注册到
-    ``ProviderManager``。文件不存在时跳过（不影响启动）。
-    """
+    """模型 Provider 相关配置（原 ProviderManager 装配已移除，仅保留开关）。"""
 
     enabled: bool = Field(
         default=True,
-        description="启动时从 config.yaml 加载并注册模型。",
+        description="保留开关：原启动时模型条目装配入口（已废弃，条目由代码内置）。",
     )
     config_file: str | Path | None = Field(
         default=None,
@@ -413,10 +410,6 @@ class ProviderConfig(BaseModel):
             "已废弃：模型条目来源改为代码内置（load_model_entries），"
             "不再从文件读取。"
         ),
-    )
-    manager_class: str = Field(
-        default="bocomadp.providers.ProviderManager",
-        description="Dotted path to the provider manager (set after migration).",
     )
 
 
@@ -646,10 +639,11 @@ class AppConfig(BaseSettings):
 def _builtin_model_entries() -> list[ModelEntry]:
     """代码内置的模型条目（原 ``config.yaml`` 的 ``models`` 节点迁移至此）。
 
-    凭证不再依赖 ``config.yaml`` 提供：本列表是 ``ProviderManager`` 注册、
-    默认凭证刷库（``ensure_default_credentials``）与多模态工具构建的统一
-    数据源。敏感值从环境变量读取（``_load_dotenv_once`` 保证 ``.env``
-    已加载，外部注入的环境变量优先）。
+    凭证不再依赖 ``config.yaml`` 提供：本列表是默认凭证刷库
+    （``ensure_default_credentials``）、deerflow 模型解析回退与多模态
+    工具构建的统一数据源。敏感值从环境变量读取
+    （``_load_dotenv_once`` 保证 ``.env`` 已加载，外部注入的环境变量
+    优先）。
     """
     _load_dotenv_once()
     return [
@@ -689,59 +683,12 @@ def load_model_entries() -> list[ModelEntry]:
     """模型条目统一入口：代码内置条目（原 ``config.yaml`` 的 ``models``
     节点已迁移至此，yaml 读取不再支持）。
 
-    本列表是 ``ProviderManager`` 注册、默认凭证刷库
-    （``ensure_default_credentials``）与多模态工具构建的统一数据源；
-    凭证由启动时的默认凭证刷库幂等写入 storage，运行时可修改
-    default 用户凭证记录实现全局切换，无需改配置文件。
+    本列表是默认凭证刷库（``ensure_default_credentials``）与 deerflow
+    模型解析回退的统一数据源；凭证由启动时的默认凭证刷库幂等写入
+    storage，运行时可修改 default 用户凭证记录实现全局切换，无需改
+    配置文件。
     """
     return _builtin_model_entries()
-
-
-def build_model_instance(entry: ModelEntry):
-    """根据 ModelEntry 动态创建 ChatModel 实例。
-
-    利用 ``CredentialFactory`` 按 ``provider_type`` 查找 credential
-    类，实例化后通过 ``get_chat_model_class()`` 获取对应的
-    ``ChatModelBase`` 子类并构造模型。
-    """
-    from agentscope.credential import CredentialFactory
-
-    # 先用简写匹配（如 deepseek），失败则补 _credential 后缀再试
-    credential_cls = CredentialFactory.get_credential_class(
-        entry.provider_type,
-    )
-    if credential_cls is None and not entry.provider_type.endswith("_credential"):
-        credential_cls = CredentialFactory.get_credential_class(
-            f"{entry.provider_type}_credential",
-        )
-    if credential_cls is None:
-        raise ValueError(
-            f"Unknown provider_type: {entry.provider_type!r} "
-            f"(provider_id={entry.provider_id})",
-        )
-
-    credential_kwargs: dict[str, Any] = {"api_key": entry.api_key}
-    # 仅当 credential 类有 base_url 字段时才传入
-    if entry.base_url and "base_url" in credential_cls.model_fields:
-        credential_kwargs["base_url"] = entry.base_url
-    # 仅当 credential 类有 model 字段时才传入（如 ELLMCredential 必填）
-    if "model" in credential_cls.model_fields:
-        credential_kwargs["model"] = entry.model_name or entry.provider_id
-    credential = credential_cls(**credential_kwargs)
-
-    model_cls = credential_cls.get_chat_model_class()
-    # AgentScope 的 ChatModel 期望 Parameters（pydantic 模型）而非 dict；
-    # 将 config.yaml 的 parameters 字典转换为模型类对应的 Parameters 对象，
-    # 否则调用阶段会报 'dict' object has no attribute 'max_tokens'。
-    parameters = entry.parameters or None
-    if parameters is not None:
-        parameters = model_cls.Parameters(**parameters)
-    model = model_cls(
-        credential=credential,
-        model=entry.model_name or entry.provider_id,
-        parameters=parameters,
-    )
-    return model
 
 
 def is_trace_correlation_enabled(config: AppConfig) -> bool:

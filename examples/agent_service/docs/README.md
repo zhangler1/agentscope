@@ -15,8 +15,7 @@
 - **DeerFlow 风格 SSE**（`deerflow/`）：`/api/threads/{tid}/runs/*` 四端点（stream / wait / join / cancel），事件/数据/id 帧 + 心跳 + Last-Event-ID 断线续传，执行引擎复用原生 `ChatService`
 - **SSE 协议与翻译**（`deerflow/protocol.py` + `formatter.py`）：AgentScope 事件 → deer-flow 事件（metadata/messages/custom/error/end）
 - **请求级运行时配置**（`custom_params`）：空间码强制覆盖 / custom_prompt 整体替换 / 检索开关 / 认证方案（guwp/jrt/okic/muwp），随 run 请求注入并落盘回退，详见 [custom_params.md](./custom_params.md)
-- **会话与凭证自动供给**：`_prepare_session_for_run` 懒建会话；模型凭证按 `deerflow-<user_id>-<provider_id>` 幂等写入 credential 存储（id 带 user_id 维度，避免 SQL 存储全局主键跨用户冲突）
-- **多模型路由**（`providers/`）：ProviderManager 注册 / 切换 / 列表，配合 `/api/models` 路由
+- **会话与凭证自动供给**：`_prepare_session_for_run` 懒建会话；模型凭证按 `deerflow-<user_id>-<provider_id>` 幂等写入 credential 存储（id 带 user_id 维度，避免 SQL 存储全局主键跨用户冲突）；模型解析链无 ProviderManager / active 切换，解析失败直接返回 None 由原生 404 兜底（详见模型层.md）
 - **自动注册机制**：工具、中间件、MCP 三类组件均支持 `builtin + custom/` 自动扫描，新增组件只需放文件，重启即生效，无需改 `main.py`
 - **日志三件套**（`logging/`）：ContextVar trace_id 关联、TraceContextFilter、JsonTraceFormatter、ASGI TraceMiddleware
 - **自定义 ASGI 中间件**（`middleware/`）：访问日志、全局错误处理
@@ -51,8 +50,10 @@ examples/agent_service/
 │   │   ├── deps.py                       # FastAPI 依赖注入
 │   │   └── routers/                      # threads.py / deerflow_chat.py / auth_stub.py
 │   │
-│   ├── providers/                       # 多模型路由
-│   │   └── provider_manager.py          # ProviderManager
+│   ├── providers/                       # ELLM 协议适配与 API key 生命周期
+│   │   ├── ellm_chat_model.py           # EllmChatModel（<think> 注入 / 401 重试 / 候选模型）
+│   │   ├── ellm_key.py                  # fetch_ellm_key + EllmKeyRefresher（惰性刷新）
+│   │   └── _models/                     # 模型卡片 yaml（Redis 模型表降级兜底）
 │   │
 │   ├── credential/                      # 自定义凭证类型（如 ELLMCredential）
 │   │
@@ -81,7 +82,7 @@ examples/agent_service/
 │   │   └── custom/                      # 你的产品 MCP 放这里
 │   │
 │   ├── routers/                         # 自定义路由
-│   │   ├── models.py                    # 模型列表 + 切换
+│   │   ├── ellm_models.py               # 模型候选管理（Redis 模型表 CRUD）
 │   │   ├── health.py                    # 健康检查 (/healthz /readyz)
 │   │   ├── platform_health.py           # 平台健康检查 GET /platform/health
 │   │   ├── stats.py                     # 统计示例
@@ -178,11 +179,10 @@ main.py
 
 ```
 main.py
-  └─ load_model_entries()
-       └─ 代码内置 ModelEntry 列表（bocomadp/config/app_config.py）
+  └─ ensure_default_credentials(storage)
+       └─ 代码内置 ModelEntry 列表（bocomadp/config/app_config.py 的 load_model_entries）
             └─ api_key 从环境变量读取（_load_dotenv_once 保证 .env 已加载）
-            └─ 逐条注册到 ProviderManager
-            └─ 启动时由 ensure_default_credentials 幂等刷库为 default 用户凭证
+            └─ 幂等刷库为 default 用户凭证（deerflow 模型解析回退的单一来源）
 ```
 
 常用环境变量：
@@ -254,8 +254,7 @@ pnpm install && pnpm dev
 | `/api/threads/{tid}/runs/wait` | POST | 创建 run + 阻塞至完成 |
 | `/api/threads/{tid}/runs/{rid}/stream` | GET | join 已有 run（回放 + Last-Event-ID 续传） |
 | `/api/threads/{tid}/runs/{rid}/cancel` | POST | 取消 run（映射原生 interrupt） |
-| `/api/models` | GET | 模型列表 |
-| `/api/models/active` | POST | 切换活跃模型 |
+| `/api/ellm-models` | GET/POST/PUT/DELETE | 模型候选管理（Redis 模型表 `bocomadp:model:think_tag`） |
 | `/api/agents/{agent_id}/tools` | GET/PUT/DELETE | 智能体工具白名单（详见 api.md） |
 | `/api/sessions/{session_id}/usage` | GET | 会话 Token 用量（详见 api.md） |
 | `/healthz` | GET | 存活检查 |
@@ -355,12 +354,12 @@ app.include_router(orders_router)
 
 1. **配置加载** — `get_app_config()` 读 config.yaml + `.env` + `BOCOMADP_*` 环境变量
 2. **日志初始化** — `configure_logging(config)`
-3. **框架模块初始化** — ToolRegistry → MiddlewareRegistry → McpRegistry → ProviderManager → RunManager → BusBridge
-4. **模型注册** — `load_model_entries()` 从代码内置条目注册到 ProviderManager（凭证启动时幂等刷库）
+3. **框架模块初始化** — ToolRegistry → MiddlewareRegistry → McpRegistry → RunManager → BusBridge
+4. **默认凭证刷库** — `ensure_default_credentials(storage)` 把内置模型条目幂等刷为 default 用户凭证（deerflow 模型解析默认参数单一来源）
 5. **工作区与消息总线** — K8s 沙箱模式（默认：K8s/共享 PVC 工作区 + RedisMessageBus）或本地模式（LocalWorkspaceManager + InMemoryMessageBus）
 6. **构建 App** — `create_app()` 自动注册内置路由
 7. **注入 ASGI 中间件** — Trace → AccessLog → Error → CORS
-8. **挂载自定义路由** — health / stats / deerflow / models / platform_health / agent_tools / session_usage / uploads 等
+8. **挂载自定义路由** — health / stats / deerflow / ellm_models / platform_health / agent_tools / session_usage / uploads 等
 9. **企业扩展接入** — `extra_agent_middlewares`（审计）、`extra_agent_tools`（企业工具）
 
 ### DeerFlow 风格 SSE 链路
@@ -386,7 +385,7 @@ POST /api/threads/{tid}/runs/{rid}/cancel  → 原生 session 级 interrupt
 | 4 | run 记账与状态机 | [deerflow/runs.py](../bocomadp/deerflow/runs.py)（RunManager） |
 | 5 | Agent 执行 | 原生 `ChatService`（与 `/chat/` 配置完全一致，无自研执行器） |
 | 6 | 聊天会话管理 | AgentScope 内置 `/sessions` 路由 + [deerflow/routers/deerflow_chat.py](../bocomadp/deerflow/routers/deerflow_chat.py) |
-| 7 | 多模型路由 | [providers/provider_manager.py](../bocomadp/providers/provider_manager.py) + [routers/models.py](../bocomadp/routers/models.py) |
+| 7 | 模型解析链 | [deerflow/routers/deerflow_chat.py](../bocomadp/deerflow/routers/deerflow_chat.py)（凭证挑选 + 模型名回退，无 active 兜底） + [routers/ellm_models.py](../bocomadp/routers/ellm_models.py)（候选管理） |
 | 8 | 场景种子 | config.yaml agents 段 → lifespan 幂等同步进框架 StorageBase |
 | 9 | 请求级运行时配置 | [deerflow/custom_params.py](../bocomadp/deerflow/custom_params.py) + [tools/cross_search.py](../bocomadp/tools/cross_search.py) + [middleware/custom_prompt.py](../bocomadp/middleware/custom_prompt.py) |
 

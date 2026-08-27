@@ -84,8 +84,8 @@ def is_deerflow_credential_id(value: str, user_id: str) -> str | None:
 def credential_cls_for_entry(entry: "ModelEntry") -> type | None:
     """ModelEntry → credential 类（简写匹配失败补 _credential 后缀）。
 
-    与 bocomadp.config.build_model_instance 同构：CredentialFactory 只
-    注册全称类（如 ``deepseek_credential``），config.yaml 简写
+    与 ``ensure_default_credentials`` / ``_pick_fallback_entry`` 同构：
+    CredentialFactory 只注册全称类（如 ``deepseek_credential``），config.yaml 简写
     （``deepseek``）需补后缀再试。
     """
     credential_cls = CredentialFactory.get_credential_class(

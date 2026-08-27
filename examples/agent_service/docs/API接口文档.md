@@ -96,23 +96,28 @@ curl -N -X POST http://192.168.0.106/api/threads/t1/runs/stream \
 智能体全部存于框架 StorageBase（config.yaml `agents` 场景种子机制已移除）。
 创建 / 修改 / 删除走框架内置 `/agent` 路由，`system_prompt` 随智能体记录
 入库；chat / deerflow 运行时按 `agent_id` 从 storage 解析（不可见 → 404）。
-模型选择不再按 agent 绑定：请求级模型名未指定时回退全局 active provider。
+模型选择不再按 agent 绑定：请求级模型名未指定时回退凭证 model 字段 → 内置条目 model_name，全部缺失直接报错（无全局 active provider 兜底）。
 
-## 3. 模型（`/models`、`/model`）
+## 3. 模型候选（`/ellm-models`、`/model`）
 
 ```bash
-# 列出可用模型（config.yaml models 段注册的）
-curl http://192.168.0.106/api/models
-
-# 切换 active 模型
-curl -X POST http://192.168.0.106/api/models/active \
-  -H 'Content-Type: application/json' -d '{"provider_id":"deepseek"}'
+# 模型候选管理（Redis 模型表 bocomadp:model:think_tag）
+curl http://192.168.0.106/api/ellm-models
+curl http://192.168.0.106/api/ellm-models/Qwen3-235B-A22B
+curl -X POST http://192.168.0.106/api/ellm-models \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3-235B-A22B","think_tag":1,"context_size":1000000,"output_size":384000}'
+curl -X PUT http://192.168.0.106/api/ellm-models/Qwen3-235B-A22B \
+  -H 'Content-Type: application/json' -d '{"think_tag":0}'
+curl -X DELETE http://192.168.0.106/api/ellm-models/Qwen3-235B-A22B
 
 # 按凭证查询模型 / 单模型绑定过滤
 curl http://192.168.0.106/api/model/credential
 curl -X PATCH http://192.168.0.106/api/model/credential/{credential_id} \
   -H 'Content-Type: application/json' -d '{}'
 ```
+
+> 原 `/api/models` / `/api/models/active`（ProviderManager 列表与 active 切换）已随 ProviderManager 一并移除。
 
 ## 4. 文件上传（`/uploads`）
 

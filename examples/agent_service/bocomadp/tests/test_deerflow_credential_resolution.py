@@ -14,15 +14,14 @@ Contract under test:
   - 再空 → 回退 config.yaml 条目参数创建（ELLM 条目 api_key 空放行，
     非 ELLM 条目 api_key 空返回 None）。
 - 模型名：``model_name`` 直接透传（凭证 model 字段不参与绑定）；缺失时
-  回退凭证 model 字段值 → config.yaml 匹配条目 model_name → 全局
-  active provider。
+  回退凭证 model 字段值 → 内置条目 model_name；全部缺失返回 None
+  （不再有全局 active provider 兜底）。
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from types import SimpleNamespace
 
 from agentscope.app.storage import ChatModelConfig, CredentialRecord
 
@@ -133,31 +132,14 @@ class _FakeStorage:
         ]
 
 
-class _FakeRequest:
-    """``app.state.provider_manager`` 可配置的最小 Request stand-in。"""
-
-    def __init__(self, active: SimpleNamespace | None = None) -> None:
-        class _State:
-            provider_manager = SimpleNamespace(
-                get_active_model=lambda: active,
-            )
-
-        class _App:
-            state = _State()
-
-        self.app = _App()
-
-
 def _resolve(
     storage: _FakeStorage,
     user_id: str,
     model_name: str = "",
-    request: _FakeRequest | None = None,
 ) -> ChatModelConfig | None:
     return asyncio.run(
         chat_mod._resolve_chat_model_config(
             storage,
-            request or _FakeRequest(),
             user_id,
             model_name,
         ),
@@ -291,37 +273,8 @@ class TestResolveChatModelConfig:
         assert config is None
         assert storage.upserts == []
 
-    def test_active_provider_fallback(self, monkeypatch) -> None:
-        """``model_name`` 为空时回退全局 active provider。"""
-        storage = _FakeStorage()
-        storage.seed(
-            "default",
-            f"deerflow-default-{_DEEPSEEK_PROVIDER}",
-            _deepseek_record_data(),
-        )
-        self._patch_loaders(
-            monkeypatch,
-            models=[_deepseek_entry("sk-test")],
-        )
-
-        config = _resolve(
-            storage,
-            "user-1",
-            request=_FakeRequest(
-                active=SimpleNamespace(
-                    provider_id=_DEEPSEEK_PROVIDER,
-                    model_name="deepseek-chat",
-                ),
-            ),
-        )
-
-        assert config is not None
-        assert config.credential_id == (
-            f"deerflow-user-1-{_DEEPSEEK_PROVIDER}"
-        )
-
     def test_no_model_name_no_provider_returns_none(self, monkeypatch) -> None:
-        """``model_name`` 空 + 无 active → None（原生 404 兜底）。"""
+        """``model_name`` 空 + 无凭证无条目 → None（原生 404 兜底）。"""
         storage = _FakeStorage()
         self._patch_loaders(monkeypatch, models=[])
 
@@ -334,8 +287,8 @@ class TestResolveChatModelConfig:
         self,
         monkeypatch,
     ) -> None:
-        """``model_name`` 为真实模型 ID + 无 active provider + config.yaml 唯一
-        ELLM 条目 → 动态路由，config.model == model_name。"""
+        """``model_name`` 为真实模型 ID + 唯一 ELLM 条目 → 动态路由，
+        config.model == model_name。"""
         storage = _FakeStorage()
         storage.seed(
             "default",
@@ -398,12 +351,6 @@ class TestResolveChatModelConfig:
             storage,
             "user-1",
             model_name="Qwen3-235B-A22B",
-            request=_FakeRequest(
-                active=SimpleNamespace(
-                    provider_id=_DEEPSEEK_PROVIDER,
-                    model_name="deepseek-chat",
-                ),
-            ),
         )
 
         assert config is not None
@@ -476,12 +423,12 @@ class TestResolveChatModelConfig:
             == "deepseek-v4-flash"
         )
 
-    def test_model_falls_back_to_credential_then_entry_then_active(
+    def test_model_falls_back_to_credential_then_entry(
         self,
         monkeypatch,
     ) -> None:
-        """``model_name`` 缺失时的模型名回退链：凭证 model 字段 → 条目 model_name
-        → active provider。"""
+        """``model_name`` 缺失时的模型名回退链：凭证 model 字段 → 条目
+        model_name；全部缺失返回 None（无 active 兜底，直接报错）。"""
         # 1) 凭证 model 字段有值 → 用凭证 model
         storage = _FakeStorage()
         storage.seed(
@@ -514,7 +461,8 @@ class TestResolveChatModelConfig:
         assert config is not None
         assert config.model == "deepseek-chat"
 
-        # 3) 凭证无 model 字段 + 无匹配条目 → active provider
+        # 3) 凭证无 model 字段 + 无匹配条目 → 返回 None（不再有 active
+        #    兜底，直接报错由原生 404 兜底）
         storage = _FakeStorage()
         storage.seed(
             "user-1",
@@ -522,15 +470,5 @@ class TestResolveChatModelConfig:
             _deepseek_record_data(),
         )
         self._patch_loaders(monkeypatch, models=[])
-        config = _resolve(
-            storage,
-            "user-1",
-            request=_FakeRequest(
-                active=SimpleNamespace(
-                    provider_id=_DEEPSEEK_PROVIDER,
-                    model_name="active-model",
-                ),
-            ),
-        )
-        assert config is not None
-        assert config.model == "active-model"
+        config = _resolve(storage, "user-1")
+        assert config is None
