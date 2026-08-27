@@ -70,6 +70,7 @@ from bocomadp.middleware.active_skill import ActiveSkillMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
 from bocomadp.middleware.summarization import SummarizationMiddleware
 from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
+from bocomadp.middleware.custom.event_log import EventLogMiddleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.request_log import AccessLogMiddleware
@@ -451,6 +452,19 @@ async def build_agent_middlewares(
             session_id,
         ),
     )
+    # EventLogMiddleware 需位于洋葱链最内层，使其在 MODEL_INPUT 里记录到
+    # 「最终送给模型」的消息（即 ToolResultPersistence / ToolResultBudget
+    # 替换后的 <persisted-output> 预览），而不是替换前的原始结果。
+    # 它是经 custom/ 自动扫描注册的，位置由本函数决定：从通用列表剔除后
+    # 重新追加到末尾（最内层，真实 model() 调用之前）。
+    event_log = [
+        m for m in middlewares if isinstance(m, EventLogMiddleware)
+    ]
+    if event_log:
+        middlewares = [
+            m for m in middlewares if not isinstance(m, EventLogMiddleware)
+        ]
+        middlewares.extend(event_log)
     return middlewares
 
 
