@@ -240,6 +240,42 @@ class SummarizationConfig(BaseModel):
         return self
 
 
+class ToolResultConfig(BaseModel):
+    """工具超长输出 Redis 持久化配置(runtime_configs 表 ``tool_result`` key)。
+
+    全部字段带默认值:DB 无记录 / 字段缺失 / 读失败时使用代码默认。
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="总开关;false 时两个中间件纯透传(快速回退)。",
+    )
+    ttl_seconds: int = Field(
+        default=14400,
+        description="Redis 键超时秒数(默认 4 小时)。",
+    )
+    per_tool_threshold_chars: int = Field(
+        default=50000,
+        description="单工具结果字符阈值,超过则完整内容持久化并给模型预览。",
+    )
+    message_budget_chars: int = Field(
+        default=200000,
+        description="单轮(同一条 user 消息)所有工具结果合计字符预算,超过则替换最大的结果。",
+    )
+    preview_chars: int = Field(
+        default=2000,
+        description="预览消息保留的字符数。",
+    )
+    read_result_max_output_chars: int = Field(
+        default=100_000,
+        description="读回工具(read_tool_result)单次输出上限(字符),对应 Claude Code 的 DEFAULT_MAX_OUTPUT_TOKENS=25000 token 预算;实际上限取 min(本字段, per_tool_threshold_chars)。",
+    )
+    exempt_tools: list[str] = Field(
+        default_factory=list,
+        description="豁免工具名单(名单内工具永不持久化,内容原样透传)。",
+    )
+
+
 class ImageParseConfig(BaseModel):
     """图片解析统一多模态模型配置（PG ``runtime_configs`` 表 ``view_image`` key）。
 

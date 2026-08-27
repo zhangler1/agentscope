@@ -10,6 +10,7 @@ from bocomadp.deerflow.custom_params import (
     reset_custom_params,
     set_custom_params,
 )
+from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.tools.enterprise import build_enterprise_tools
 
 
@@ -66,3 +67,16 @@ def test_personal_switch_true_with_space_params_mounted():
 def test_basic_enterprise_tools_always_present():
     names = _mount({})
     assert {"query_employee_info", "query_internal_doc", "submit_it_ticket"} <= names
+
+
+def test_tool_result_middlewares_mounted():
+    mws = asyncio.run(build_enterprise_middlewares("u", "a", "s"))
+    names = [type(m).__name__ for m in mws]
+    assert "ToolResultPersistenceMiddleware" in names
+    assert "ToolResultBudgetMiddleware" in names
+
+
+def test_read_tool_result_tool_mounted():
+    tools = asyncio.run(build_enterprise_tools("u", "a", "s"))
+    names = [getattr(t, "name", "") for t in tools]
+    assert "read_tool_result" in names
