@@ -27,6 +27,7 @@ from .placeholder import (
     submit_it_ticket,
 )
 from .raw_request import raw_request_tool
+from .read_tool_result import read_tool_result_tool
 from .vector_search import vector_search_tool
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ async def build_enterprise_tools(
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
         raw_request_tool,  # 已是 FunctionTool 实例（工具名"外数查"）
+        read_tool_result_tool,  # 需状态注入,自定义 ToolBase(非 FunctionTool)
         exchange_rate_tool,   # 已是 FunctionTool 实例（工具名"汇率查询"）
         interest_rate_tool,   # 已是 FunctionTool 实例（工具名"利率查询"）
     ]

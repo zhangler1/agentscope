@@ -15,6 +15,8 @@ from agentscope.middleware import MiddlewareBase
 
 from .custom_prompt import CustomPromptMiddleware
 from .slot_release import SlotReleaseMiddleware
+from .tool_result_budget import ToolResultBudgetMiddleware
+from .tool_result_persistence import ToolResultPersistenceMiddleware
 
 
 async def build_enterprise_middlewares(
@@ -40,6 +42,11 @@ async def build_enterprise_middlewares(
     middlewares: list[MiddlewareBase] = [
         CustomPromptMiddleware(),
     ]
+
+    # 工具超长输出 Redis 持久化(复刻 Claude Code):配置实时读
+    # runtime_configs 表 tool_result 段,enabled=false 时纯透传。
+    middlewares.append(ToolResultPersistenceMiddleware())
+    middlewares.append(ToolResultBudgetMiddleware())
 
     if os.getenv("ADP_K8S_SLOT_RELEASE_ON_RUN_END", "1") == "1":
         middlewares.append(

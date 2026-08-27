@@ -76,9 +76,34 @@ def _ctx_fields(agent: Any) -> str:
 
 
 def _block_text(block: Any) -> str:
-    """从 content block 提取可读文本（TextBlock / ThinkingBlock / str）。"""
+    """从 content block 提取可读文本（TextBlock / ThinkingBlock / ToolCall / ToolResult / str）。
+
+    工具调用/结果的内容不在 ``text``/``thinking`` 上：
+    - ``ToolCallBlock`` 的内容在 ``.input``（JSON 字符串）；
+    - ``ToolResultBlock`` 的内容在 ``.output``（``str`` 或 ``list[TextBlock|DataBlock]``）。
+    提取时带上工具名，便于在 MODEL_INPUT 里看清送进模型的工具上下文。
+    """
     if isinstance(block, str):
         return block
+    # ToolResultBlock：工具结果在 .output
+    output = getattr(block, "output", None)
+    if output is not None:
+        name = getattr(block, "name", "") or ""
+        if isinstance(output, str):
+            return f"[tool_result:{name}] {output}"
+        # output 为 list[TextBlock|DataBlock]：TextBlock 取 .text，其余 str() 兜底
+        inner = " | ".join(
+            b.text
+            if not isinstance(b, str) and getattr(b, "text", None)
+            else (b if isinstance(b, str) else str(b))
+            for b in output
+        )
+        return f"[tool_result:{name}] {inner}"
+    # ToolCallBlock：工具调用参数在 .input
+    if getattr(block, "type", None) == "tool_call":
+        name = getattr(block, "name", "") or ""
+        arguments = getattr(block, "input", "") or ""
+        return f"[tool_call:{name}] {arguments}"
     return getattr(block, "text", "") or getattr(block, "thinking", "")
 
 
