@@ -131,13 +131,23 @@ async def pg_set(key: str, content: str) -> None:
     engine = await _get_engine()
     from sqlalchemy import text
 
+    # ON CONFLICT 是 PG/sqlite 方言；MySQL 用 ON DUPLICATE KEY UPDATE。
+    if engine.dialect.name == "mysql":
+        upsert = (
+            "ON DUPLICATE KEY UPDATE "
+            "content = VALUES(content), updated_at = VALUES(updated_at)"
+        )
+    else:
+        upsert = (
+            "ON CONFLICT (key) DO UPDATE SET "
+            "content = :content, updated_at = :ts"
+        )
+
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 "INSERT INTO system_prompts (key, content, updated_at) "
-                "VALUES (:key, :content, :ts) "
-                "ON DUPLICATE KEY UPDATE "
-                "content = :content, updated_at = :ts",
+                "VALUES (:key, :content, :ts) " + upsert,
             ),
             {"key": key, "content": content, "ts": datetime.now()},
         )

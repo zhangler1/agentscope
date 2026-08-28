@@ -8,6 +8,9 @@
 > - [api.md](./api.md) —— 智能体工具白名单 + 会话 Token 用量接口
 > - [custom_params.md](./custom_params.md) —— custom_params 机制教学文档（请求级运行时配置）
 > - [config_load_design.md](./config_load_design.md) —— 配置加载链路设计
+> - [智能体发布流程.md](./智能体发布流程.md) —— 智能体从开发到发布的完整流程（提示词/工具/技能/模型配置）
+> - [运行时调用链路与TraceId.md](./运行时调用链路与TraceId.md) —— 运行时调用链路与 trace_id 贯穿机制
+> - [配置变更同步机制.md](./配置变更同步机制.md) —— 三层配置体系与多机同步（含 Apollo/Nacos 接入设计）
 > - [examples_架构分析.md](./examples_架构分析.md) —— examples/ 整体架构分析
 
 ## 核心特性

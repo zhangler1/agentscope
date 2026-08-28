@@ -1,7 +1,9 @@
 # AgentScope Agent 服务镜像
 # 构建上下文为仓库根目录（因为需复制 pyproject.toml / src / examples）：
 #   docker build -f examples/agent_service/Dockerfile -t agentscope-service . --network=host
-FROM python:3.14-bookworm
+# 使用 3.12：与本地开发环境（.venv Python 3.12）保持一致；
+# 注意不要升到 3.14 —— magika 的间接依赖 onnxruntime==1.20.1 仅提供 cp311~cp313 wheel
+FROM python:3.12-bookworm
 
 # 配置 apt 清华源（bookworm 使用 deb822 格式的 sources.list.d/debian.sources）
 RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources
@@ -32,10 +34,10 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN uv sync --extra service --extra storage-redis --extra storage-sql --extra storage-mysql --extra workspace-docker --extra workspace-k8s --no-install-project
 
-# 数据库驱动：storage-sql extra 不含具体驱动（aiosqlite / asyncpg / aiomysql 由部署方自选）。
-# storage-mysql extra 已包含 asyncmy（OB 兼容 MySQL 协议）。
-# PostgreSQL 用 asyncpg，这里继续显式安装以保留双驱动切换能力。
-RUN uv pip install asyncpg
+# 数据库驱动：storage-sql extra 不含具体驱动（aiosqlite / asyncpg / aiomysql 由部署方自选），
+# 本项目 db.url 为 mysql+aiomysql://（MySQL/OceanBase 兼容），显式安装 aiomysql；
+# asyncpg 保留供 postgres 回退使用
+RUN uv pip install asyncpg aiomysql
 
 # 第二步：复制完整源码并以可编辑模式安装项目本身
 # 源码通过 volume 挂载，修改即时生效
