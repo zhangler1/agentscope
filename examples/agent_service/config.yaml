@@ -37,7 +37,8 @@ service:
 # 当前：OB 兼容 MySQL 协议，本地先用 MySQL 容器模拟验证（mysql+asyncmy://...@localhost:3306）
 # 将来切真 OB：只改地址为 OB 的（mysql+asyncmy://用户@租户:2881/库名），驱动/建表逻辑不变
 db:
-  url: "mysql+asyncmy://agentscope:agentscope@localhost:3306/agentscope"
+  # url: "postgresql+asyncpg://agentscope:agentscope@localhost:5432/agentscope"
+  url: "mysql+aiomysql://agentscope:agentscope@localhost:3306/agentscope"
   create_tables: true        # dev/单机自动建表；多副本生产改用 alembic upgrade head
   pool_pre_ping: true        # 取连接前探测存活，服务端静默断连时自动重建
   pool_recycle: 1800         # 空闲连接 30 分钟回收，早于防火墙/NAT 空闲超时

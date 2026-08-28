@@ -129,13 +129,23 @@ async def config_set(key: str, payload: dict) -> None:
     await _ensure_table()
     engine = await _get_engine()
 
+    # ON CONFLICT 是 PG/sqlite 方言；MySQL 用 ON DUPLICATE KEY UPDATE。
+    if engine.dialect.name == "mysql":
+        upsert = (
+            "ON DUPLICATE KEY UPDATE "
+            "payload = VALUES(payload), updated_at = VALUES(updated_at)"
+        )
+    else:
+        upsert = (
+            "ON CONFLICT (config_key) DO UPDATE SET "
+            "payload = :payload, updated_at = :ts"
+        )
+
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 f"INSERT INTO {_TABLE} (config_key, payload, updated_at) "
-                "VALUES (:key, :payload, :ts) "
-                "ON DUPLICATE KEY UPDATE "
-                "payload = :payload, updated_at = :ts",
+                "VALUES (:key, :payload, :ts) " + upsert,
             ),
             {"key": key, "payload": _encode(payload), "ts": datetime.now()},
         )
