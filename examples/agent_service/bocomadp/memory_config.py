@@ -23,7 +23,9 @@ _CREATE_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS agent_memory_configs ("
     "user_id VARCHAR(255) NOT NULL, "
     "agent_id VARCHAR(255) NOT NULL, "
-    "memory_update_prompt TEXT NOT NULL DEFAULT '', "
+    # MySQL 不允许 TEXT 列声明 DEFAULT（error 1101）；默认值由应用层
+    # MemoryConfig（default=""）保证，INSERT 恒带值，故不设 DB 默认。
+    "memory_update_prompt TEXT NOT NULL, "
     "memory_enabled BOOLEAN NOT NULL DEFAULT FALSE, "
     "memory_type INTEGER NOT NULL DEFAULT 0, "
     "memory_update_rounds INTEGER NOT NULL DEFAULT 10, "
@@ -99,6 +101,27 @@ async def memory_upsert(
     engine = await _get_engine()
     from sqlalchemy import text
 
+    # ON CONFLICT 是 PG/sqlite 方言；MySQL 用 ON DUPLICATE KEY UPDATE
+    # （VALUES() 语法在 MySQL 5.7/8.0 与 MariaDB 均可用）。
+    if engine.dialect.name == "mysql":
+        upsert = (
+            "ON DUPLICATE KEY UPDATE "
+            "memory_update_prompt = VALUES(memory_update_prompt), "
+            "memory_enabled = VALUES(memory_enabled), "
+            "memory_type = VALUES(memory_type), "
+            "memory_update_rounds = VALUES(memory_update_rounds), "
+            "updated_at = VALUES(updated_at)"
+        )
+    else:
+        upsert = (
+            "ON CONFLICT (user_id, agent_id) DO UPDATE SET "
+            "memory_update_prompt = EXCLUDED.memory_update_prompt, "
+            "memory_enabled = EXCLUDED.memory_enabled, "
+            "memory_type = EXCLUDED.memory_type, "
+            "memory_update_rounds = EXCLUDED.memory_update_rounds, "
+            "updated_at = EXCLUDED.updated_at"
+        )
+
     async with engine.begin() as conn:
         await conn.execute(
             text(
@@ -106,13 +129,7 @@ async def memory_upsert(
                 "(user_id, agent_id, memory_update_prompt, memory_enabled, "
                 " memory_type, memory_update_rounds, updated_at) "
                 "VALUES (:user_id, :agent_id, :prompt, :enabled, "
-                ":mtype, :rounds, :ts) "
-                "ON DUPLICATE KEY UPDATE "
-                "memory_update_prompt = :prompt, "
-                "memory_enabled = :enabled, "
-                "memory_type = :mtype, "
-                "memory_update_rounds = :rounds, "
-                "updated_at = :ts"
+                ":mtype, :rounds, :ts) " + upsert
             ),
             {
                 "user_id": user_id,
