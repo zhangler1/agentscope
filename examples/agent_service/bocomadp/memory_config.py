@@ -23,7 +23,10 @@ _CREATE_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS agent_memory_configs ("
     "user_id VARCHAR(255) NOT NULL, "
     "agent_id VARCHAR(255) NOT NULL, "
-    "memory_update_prompt TEXT NOT NULL DEFAULT '', "
+    # VARCHAR(4000) 而非 TEXT：MySQL 严禁 TEXT/BLOB/JSON/GEOMETRY 列带
+    # DEFAULT 值（错误码 1101），VARCHAR 则兼容 PG/MySQL 双库。
+    # 4000 字符够装记忆提示词（system-hint 通常 < 2k）。
+    "memory_update_prompt VARCHAR(4000) NOT NULL DEFAULT '', "
     "memory_enabled BOOLEAN NOT NULL DEFAULT FALSE, "
     "memory_type INTEGER NOT NULL DEFAULT 0, "
     "memory_update_rounds INTEGER NOT NULL DEFAULT 10, "
