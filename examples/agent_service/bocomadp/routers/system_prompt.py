@@ -136,7 +136,7 @@ async def pg_set(key: str, content: str) -> None:
             text(
                 "INSERT INTO system_prompts (key, content, updated_at) "
                 "VALUES (:key, :content, :ts) "
-                "ON CONFLICT (key) DO UPDATE SET "
+                "ON DUPLICATE KEY UPDATE "
                 "content = :content, updated_at = :ts",
             ),
             {"key": key, "content": content, "ts": datetime.now()},

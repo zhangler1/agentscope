@@ -56,7 +56,7 @@ async def _ensure_table() -> None:
                 "CREATE TABLE IF NOT EXISTS agent_pool_configs ("
                 "agent_id VARCHAR(255) PRIMARY KEY, "
                 "max_active_pods INTEGER NOT NULL, "
-                "updated_at DOUBLE PRECISION NOT NULL"
+                "updated_at DOUBLE NOT NULL"
                 ")",
             ),
         )
@@ -95,7 +95,7 @@ async def pg_upsert(agent_id: str, size: int) -> None:
                 "INSERT INTO agent_pool_configs "
                 "(agent_id, max_active_pods, updated_at) "
                 "VALUES (:agent_id, :size, :ts) "
-                "ON CONFLICT (agent_id) DO UPDATE SET "
+                "ON DUPLICATE KEY UPDATE "
                 "max_active_pods = :size, updated_at = :ts",
             ),
             {"agent_id": agent_id, "size": size, "ts": time.time()},

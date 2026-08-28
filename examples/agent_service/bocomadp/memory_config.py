@@ -107,12 +107,12 @@ async def memory_upsert(
                 " memory_type, memory_update_rounds, updated_at) "
                 "VALUES (:user_id, :agent_id, :prompt, :enabled, "
                 ":mtype, :rounds, :ts) "
-                "ON CONFLICT (user_id, agent_id) DO UPDATE SET "
-                "memory_update_prompt = EXCLUDED.memory_update_prompt, "
-                "memory_enabled = EXCLUDED.memory_enabled, "
-                "memory_type = EXCLUDED.memory_type, "
-                "memory_update_rounds = EXCLUDED.memory_update_rounds, "
-                "updated_at = EXCLUDED.updated_at"
+                "ON DUPLICATE KEY UPDATE "
+                "memory_update_prompt = :prompt, "
+                "memory_enabled = :enabled, "
+                "memory_type = :mtype, "
+                "memory_update_rounds = :rounds, "
+                "updated_at = :ts"
             ),
             {
                 "user_id": user_id,
