@@ -30,10 +30,11 @@ ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 # storage-sql 必需：main.py 使用 AsyncSQLAlchemyStorage（sqlalchemy[asyncio] + alembic）
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN uv sync --extra service --extra storage-redis --extra storage-sql --extra workspace-docker --extra workspace-k8s --no-install-project
+RUN uv sync --extra service --extra storage-redis --extra storage-sql --extra storage-mysql --extra workspace-docker --extra workspace-k8s --no-install-project
 
-# 数据库驱动：storage-sql extra 不含具体驱动（aiosqlite / asyncpg / aiomysql 由部署方自选），
-# 本项目使用 PostgreSQL（config.yaml db.url 为 postgresql+asyncpg://...），显式安装 asyncpg
+# 数据库驱动：storage-sql extra 不含具体驱动（aiosqlite / asyncpg / aiomysql 由部署方自选）。
+# storage-mysql extra 已包含 asyncmy（OB 兼容 MySQL 协议）。
+# PostgreSQL 用 asyncpg，这里继续显式安装以保留双驱动切换能力。
 RUN uv pip install asyncpg
 
 # 第二步：复制完整源码并以可编辑模式安装项目本身

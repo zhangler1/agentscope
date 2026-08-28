@@ -34,13 +34,13 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-# 通用配置表：key -> payload(JSONB)。
+# 通用配置表：key -> payload(JSON)。
 _TABLE = "runtime_configs"
 
 _CREATE_TABLE_SQL = (
     f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
     "key VARCHAR(255) PRIMARY KEY, "
-    "payload JSONB NOT NULL, "
+    "payload JSON NOT NULL, "
     "updated_at TIMESTAMP NOT NULL"
     ")"
 )
@@ -128,7 +128,7 @@ async def config_set(key: str, payload: dict) -> None:
             text(
                 f"INSERT INTO {_TABLE} (key, payload, updated_at) "
                 "VALUES (:key, :payload, :ts) "
-                "ON CONFLICT (key) DO UPDATE SET "
+                "ON DUPLICATE KEY UPDATE "
                 "payload = :payload, updated_at = :ts",
             ),
             {"key": key, "payload": _encode(payload), "ts": datetime.now()},

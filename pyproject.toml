@@ -83,6 +83,12 @@ storage-sql = [
     "sqlalchemy[asyncio]>=2.0",
     "alembic>=1.13",
 ]
+# MySQL / OceanBase 驱动（OB 兼容 MySQL 协议）。
+# 与 storage-sql 搭配使用：pip install agentscope[storage-sql,storage-mysql]
+storage-mysql = [
+    "agentscope[storage-sql]",
+    "asyncmy",
+]
 # S3-compatible blob store
 storage-s3 = ["aioboto3"]
 # ------------ Workspace (sandbox backends) ------------
