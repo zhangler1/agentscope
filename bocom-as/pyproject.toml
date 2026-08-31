@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bocom-as"
+version = "0.1.0"
+description = "交通银行行内定制 agentscope SDK：核心 SDK（src/agentscope）+ 行内模型平台（providers）+ 公共配置（config）"
+requires-python = ">=3.11"
+dependencies = [
+    "agentscope",
+    "redis",
+    "httpx",
+    "pydantic",
+    "fastapi",
+    "openai",
+]
+
+# bocom-as 作为单一发行版打包：config / providers / 未来新增的 memory 等
+# 均为其顶层子包（相互之间以顶层包名互引）。
+[tool.setuptools]
+packages = [
+    "config",
+    "providers",
+    "providers.credential",
+    "providers.middleware",
+    "providers.routers",
+]
+
+[tool.setuptools.package-data]
+providers = ["_models/*.yaml"]

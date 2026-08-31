@@ -1,0 +1,83 @@
+services:
+  redis:
+    image: redis:7-bookworm
+    # 宿主端口可参数化（多实例时用不同端口，如 REDIS_HOST_PORT=6380）
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
+    volumes:
+      - redis-data:/data
+
+  agentscope:
+    # 不 build：复用 agentscope-service:oss 镜像（镜像提供 Python 依赖环境，
+    # SDK / 应用源码全部由 volume 挂载——官方 dev 模式；
+    # 如需固化进镜像，可改用 bocom-docker/Dockerfile（docker compose up --build）
+    image: agentscope-service:oss
+    ports: ["${AGENTSCOPE_HOST_PORT:-8000}:8000"]
+    env_file:
+      # 行内模型平台配置直接复用 bocom-starter/.env（容器内生效，
+      # 注释行自动忽略）；其中 localhost 类地址由下方 environment
+      # 覆盖为容器网络服务名（compose 规范：environment 优先于 env_file）
+      - ../bocom-starter/.env
+    environment:
+      - DASHSCOPE_API_KEY
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      # 容器网络内地址覆盖（.env 中的 localhost 仅适用于宿主机直跑）
+      - REDIS_HOST=redis
+      - ELLM_REDIS_HOST=redis
+      # bocom-as 顶层包（config / providers）经 PYTHONPATH 导入
+      - PYTHONPATH=/app/bocom-as
+    depends_on: [redis]
+    volumes:
+      # 挂载源码（可编辑模式，uvicorn reload 自动生效）
+      - ../src:/app/src:ro
+      - ../bocom-starter/main.py:/app/main.py:ro
+      - ../bocom-as:/app/bocom-as:ro
+      # 工作区数据持久化
+      - workspace-data:/app/workspaces
+      # Docker Socket（支持 Docker 工作区沙箱）
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  webui-backend:
+    image: webui-backend:dev
+    # build:
+    #   context: ../examples/web_ui/backend
+    #   dockerfile: Dockerfile
+    ports: ["${WEBUI_BACKEND_HOST_PORT:-3000}:3000"]
+    environment:
+      - AGENTSCOPE_API_URL=http://agentscope:8000
+    depends_on: [agentscope]
+    volumes:
+      # 挂载源码
+      - ../examples/web_ui/backend/src:/app/src
+      - ../examples/web_ui/backend/package.json:/app/package.json
+      - ../examples/web_ui/backend/tsconfig.json:/app/tsconfig.json
+
+  webui-frontend:
+    image: webui-frontend:dev
+    # build:
+    #   context: ../examples/web_ui/frontend
+    #   dockerfile: Dockerfile
+    # 仅容器网络内可访问，统一由 nginx 网关代理（宿主机 80 由 nginx 独占）
+    # dev 镜像内 vite dev server 监听 5173
+    expose: ["5173"]
+    environment:
+      - VITE_API_URL=http://localhost:3000
+    depends_on: [webui-backend]
+
+  # 反向代理网关：统一入口（http://localhost:80）
+  # /api/* → agentscope（剥掉 /api 前缀），其余 → 前端
+  nginx:
+    image: nginx:alpine
+    # 多实例时若不需要 webui 网关，可用 NGINX_HOST_PORT=0 跳过宿主端口映射
+    ports: ["${NGINX_HOST_PORT:-80}:80"]
+    environment:
+      # envsubst 模板变量：指向 vite dev server 容器内端口（5173）
+      - FRONTEND_UPSTREAM=webui-frontend:5173
+    volumes:
+      # 以模板方式挂载，启动时经 envsubst 渲染为实际配置
+      - ./nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    depends_on: [webui-frontend, webui-backend]
+
+volumes:
+  redis-data:
+  workspace-data:

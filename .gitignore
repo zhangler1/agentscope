@@ -169,3 +169,4 @@ lerna-debug.log*
 
 .qoder/
 Docker-agentscope/logs/audit.jsonl
+bocom-as/src/
