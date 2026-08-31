@@ -5,27 +5,73 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bocom-as"
 version = "0.1.0"
-description = "交通银行行内定制 agentscope SDK：核心 SDK（src/agentscope）+ 行内模型平台（providers）+ 公共配置（config）"
+description = "交通银行行内定制 agentscope 发行版：核心 SDK（src/agentscope）+ 行内模型平台（providers）+ 公共配置（config）"
 requires-python = ">=3.11"
+# 自包含单发行版：SDK 源码随包分发（src/agentscope），依赖全量并入主列表
+# （SDK 全部依赖 + service / storage-redis / workspace-docker 三个部署必需 extras）
 dependencies = [
-    "agentscope",
-    "redis",
+    # ---- agentscope SDK 核心依赖 ----
+    "aioitertools",
+    "anthropic",
+    "dashscope",
+    "docstring_parser",
+    "filetype",
+    "json5",
+    "json_repair",
+    "mcp<2.0.0",
     "httpx",
-    "pydantic",
-    "fastapi",
+    "numpy",
     "openai",
+    "python-datauri",
+    "opentelemetry-api>=1.39.0",
+    "opentelemetry-sdk>=1.39.0",
+    "opentelemetry-exporter-otlp>=1.39.0",
+    "opentelemetry-semantic-conventions>=0.60b0",
+    "python-socketio",
+    "rich",
+    "shortuuid",
+    "python-frontmatter",
+    "jinja2",
+    "aiofiles",
+    "tree_sitter",
+    "tree_sitter_bash",
+    "jsonschema",
+    "pypdf",
+    # The IANA timezone database, which is absent on Windows and slim images
+    "tzdata",
+    # ---- service extra（bocom-starter 应用服务）----
+    "fastapi",
+    "uvicorn",
+    "apscheduler",
+    "ag-ui-protocol>=0.1.10",
+    # ---- storage-redis extra（主存储）----
+    "redis",
+    # ---- workspace-docker extra（Docker 工作区沙箱）----
+    "aiodocker",
 ]
 
-# bocom-as 作为单一发行版打包：config / providers / 未来新增的 memory 等
-# 均为其顶层子包（相互之间以顶层包名互引）。
+# 包发现：src/ 下为 agentscope SDK 包树，./ 下为 config / providers 顶层子包
+# （相互之间以顶层包名互引）。src/agentscope.egg-info 等非包目录自动跳过。
+[tool.setuptools.packages.find]
+where = ["src", "."]
+
 [tool.setuptools]
-packages = [
-    "config",
-    "providers",
-    "providers.credential",
-    "providers.middleware",
-    "providers.routers",
-]
+include-package-data = true
 
 [tool.setuptools.package-data]
-providers = ["_models/*.yaml"]
+# "*" 应用到所有发现的包：py.typed 标记 PEP 561；_models/_cosyvoice_models
+# 为各模型供应商的数据目录（无 __init__.py，非包，随源码分发）。
+"*" = [
+    "py.typed",
+    "_models/*.yaml",
+    "_cosyvoice_models/*.yaml",
+]
+# Docker 工作区沙箱模板文件
+"agentscope.workspace._docker" = ["Dockerfile*.template"]
+# SQL 存储后端的 Alembic 脚手架（无 __init__.py，Alembic 按文件路径加载）
+"agentscope.app.storage._sql" = [
+    "_alembic/alembic.ini",
+    "_alembic/script.py.mako",
+    "_alembic/env.py",
+    "_alembic/versions/*.py",
+]

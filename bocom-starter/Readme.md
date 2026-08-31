@@ -70,6 +70,32 @@ WEBUI_BACKEND_HOST_PORT=3001 docker compose -p bocom2 up -d
 - 查看/日志：`docker compose -p bocom2 ps`、
   `docker compose -p bocom2 logs -f agentscope`。
 
+## 打包交付
+
+最终交付物只包含 4 个包（**agentscope-sdk 根仓库不进交付物**）：
+
+```
+bocom-as/        # 自包含发行版：config / providers / src（agentscope SDK）
+bocom-docker/    # 部署：docker-compose.yml + Dockerfile + nginx/
+bocom-starter/   # 启动程序：main.py + config.yaml + .env + Readme.md
+examples/        # webui 全家桶（webui-backend / webui-frontend）
+```
+
+- **bocom-as 自包含**：[pyproject.toml](../bocom-as/pyproject.toml) 打包
+  `src/agentscope`（SDK）+ `config` + `providers`，依赖全量并入主列表
+  （SDK 全部依赖 + service / storage-redis / workspace-docker），不再依赖
+  外层 agentscope-sdk 仓库；
+- **SDK 同步**：`bocom-as/src` 为 SDK 交付真源——修改 `agentscope-sdk/src`
+  后必须同步拷贝到 `bocom-as/src`，否则交付物与 Docker 挂载拿到的代码
+  不一致；
+- **两种部署模式**：
+  - 快速（oss 镜像）：`docker compose up -d`——复用 `agentscope-service:oss`，
+    源码全部 volume 挂载（dev 可编辑）；
+  - 固化（build 模式）：`docker compose up -d --build`——以交付物根
+    （bocom-docker 父目录）为构建上下文，依赖与 bocom-as 发行版绑定；
+    构建覆盖同 tag 镜像，需保留 oss 先
+    `docker tag agentscope-service:oss agentscope-service:oss.bak`。
+
 ## 行内模型平台 4 条主流程
 
 ### ① 行内模型凭证

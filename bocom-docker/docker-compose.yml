@@ -7,9 +7,15 @@ services:
       - redis-data:/data
 
   agentscope:
-    # 不 build：复用 agentscope-service:oss 镜像（镜像提供 Python 依赖环境，
-    # SDK / 应用源码全部由 volume 挂载——官方 dev 模式；
-    # 如需固化进镜像，可改用 bocom-docker/Dockerfile（docker compose up --build）
+    # 默认复用 agentscope-service:oss 镜像（镜像提供 Python 依赖环境，
+    # SDK / 应用源码全部由 volume 挂载——官方 dev 模式）。
+    # --build 时以交付物根（bocom-docker 父目录，含 bocom-as / bocom-starter）
+    # 为上下文构建镜像（bocom-docker/Dockerfile，依赖与 bocom-as 发行版绑定）；
+    # 构建会覆盖同 tag 镜像，如需保留 oss 镜像先备份：
+    #   docker tag agentscope-service:oss agentscope-service:oss.bak
+    build:
+      context: ..
+      dockerfile: bocom-docker/Dockerfile
     image: agentscope-service:oss
     ports: ["${AGENTSCOPE_HOST_PORT:-8000}:8000"]
     env_file:
