@@ -6,9 +6,10 @@ services:
       - redis-data:/data
 
   agentscope:
-    build:
-      context: ..
-      dockerfile: examples/agent_service/Dockerfile
+    # build:
+    #   context: ..
+    #   dockerfile: examples/agent_service/Dockerfile
+    image: agentscope-service:oss
     ports: ["8000:8000"]
     environment:
       - DASHSCOPE_API_KEY
@@ -28,9 +29,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 
   webui-backend:
-    build:
-      context: ../examples/web_ui/backend
-      dockerfile: Dockerfile
+    image: webui-backend:dev
+    # build:
+    #   context: ../examples/web_ui/backend
+    #   dockerfile: Dockerfile
     ports: ["3000:3000"]
     environment:
       - AGENTSCOPE_API_URL=http://agentscope:8000
@@ -42,13 +44,29 @@ services:
       - ../examples/web_ui/backend/tsconfig.json:/app/tsconfig.json
 
   webui-frontend:
-    build:
-      context: ../examples/web_ui/frontend
-      dockerfile: Dockerfile
-    ports: ["80:80"]
+    image: webui-frontend:dev
+    # build:
+    #   context: ../examples/web_ui/frontend
+    #   dockerfile: Dockerfile
+    # 仅容器网络内可访问，统一由 nginx 网关代理（宿主机 80 由 nginx 独占）
+    # dev 镜像内 vite dev server 监听 5173
+    expose: ["5173"]
     environment:
       - VITE_API_URL=http://localhost:3000
     depends_on: [webui-backend]
+
+  # 反向代理网关：统一入口（http://localhost:80）
+  # /api/* → agentscope（剥掉 /api 前缀），其余 → 前端
+  nginx:
+    image: nginx:alpine
+    ports: ["80:80"]
+    environment:
+      # envsubst 模板变量：指向 vite dev server 容器内端口（5173）
+      - FRONTEND_UPSTREAM=webui-frontend:5173
+    volumes:
+      # 以模板方式挂载，启动时经 envsubst 渲染为实际配置
+      - ./nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    depends_on: [webui-frontend, webui-backend]
 
 volumes:
   redis-data:
