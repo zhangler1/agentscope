@@ -168,3 +168,4 @@ lerna-debug.log*
 **/workspaces/
 
 .qoder/
+Docker-agentscope/logs/audit.jsonl
