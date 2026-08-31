@@ -29,7 +29,7 @@ services:
     depends_on: [redis]
     volumes:
       # 挂载源码（可编辑模式，uvicorn reload 自动生效）
-      - ../src:/app/src:ro
+      - ../bocom-as/src:/app/src:ro
       - ../bocom-starter/main.py:/app/main.py:ro
       - ../bocom-as:/app/bocom-as:ro
       # 工作区数据持久化
