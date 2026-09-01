@@ -17,6 +17,7 @@ flowchart TD
 
     A1 --> A1a["介绍"]
     A1 --> A1b["快速开始"]
+    A1 --> A1c["适用场景"]
     A3 --> A3a["README（工具选型）"]
     A3 --> A3b["使用工具指南"]
     A3 --> A3c["知识召回"]
@@ -26,7 +27,7 @@ flowchart TD
     A6 --> A6b["tracing日志"]
 
     classDef dev fill:#e6d9f2,stroke:#8e44ad,color:#000
-    class ROOT,A1,A1a,A1b,A2,A3,A3a,A3b,A3c,A4,A4a,A5,A5a,A6,A6a,A6b dev
+    class ROOT,A1,A1a,A1b,A1c,A2,A3,A3a,A3b,A3c,A4,A4a,A5,A5a,A6,A6a,A6b dev
 ```
 
 ## 文档导航
@@ -36,6 +37,7 @@ flowchart TD
 | 文档 | 解决的问题 |
 | ---- | ---------- |
 | [介绍](开发规范/01-概览/介绍.md) | 项目背景、与官方 AgentScope 的关系、企业特有对接与改造总览 |
+| [适用场景](开发规范/01-概览/适用场景.md) | L3 智能体框架适用业务判定标准：何时用本框架、何时用行内 L2 |
 | [快速开始](开发规范/01-概览/快速开始.md) | 走通最小闭环：创建智能体、配置 ELLM 模型凭证、配置工具/技能、排查问题 |
 
 ### 02-agentscope官方参考文档（框架参考，按需查阅）
