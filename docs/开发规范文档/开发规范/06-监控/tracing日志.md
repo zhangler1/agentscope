@@ -131,7 +131,7 @@ class LoggingMiddleware(ToolMiddlewareBase):
 | RAG 索引     | 文档状态机的 `error` 字段（单行错误，前端可见）                  |
 | 渠道         | `ChannelStatus.state` 流转 + 平台 SDK 自身日志                   |
 
-> **注意**：日志中不要输出凭证与完整密钥（见 [数据识别和脱敏](../开发规范/06-安全/数据识别和脱敏.md)）；工具参数摘要注意截断与脱敏后再落日志。
+> **注意**：日志中不要输出凭证与完整密钥（凭证管理见 [大语言模型 · 创建凭证](../02-agentscope官方参考文档/04-模型/大语言模型.md)）；工具参数摘要注意截断与脱敏后再落日志。
 
 ## 常见问题（FAQ）
 
@@ -142,7 +142,7 @@ class LoggingMiddleware(ToolMiddlewareBase):
 支持。Workspace 是执行环境抽象，内置 Local/Docker/E2B 等多种实现共享同一接口，同一份智能体代码可无差别运行。多租户场景配合 WorkspaceManager。
 
 **Q：有配套前端吗？**
-分两层：TypeScript SDK（类型与 Python 端对齐，直接消费流式输出）；面向智能体服务的开箱即用 Web UI（`examples/web_ui`）。
+分两层：TypeScript SDK（类型与 Python 端对齐，直接消费流式输出）；面向智能体服务的开箱即用 Web UI。
 
 **Q：除 Python 还有其他语言版本吗？**
 三种独立仓库的实现：Python（`agentscope-ai/agentscope`）、TypeScript（`agentscope-ai/agentscope-typescript`）、Java（`agentscope-ai/agentscope-java`）。
@@ -153,4 +153,4 @@ class LoggingMiddleware(ToolMiddlewareBase):
 **Q：tracing 对性能有影响吗？**
 `BatchSpanProcessor` 异步批量导出，开销可控；`quiet` 档渲染器输出最少。压测环境可对比有/无 TracingMiddleware 的回复耗时差异。
 
-运行状态与业务指标的监控面见 [监控](监控.md)；部署形态见 [CICD 集成](../部署规范/CICD集成.md)。
+运行状态与业务指标的监控面见 [监控](监控.md)。
