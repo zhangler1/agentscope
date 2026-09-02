@@ -1,0 +1,598 @@
+# -*- coding: utf-8 -*-
+"""The Anthropic chat model implementation."""
+import json
+from collections import OrderedDict
+from datetime import datetime
+from typing import Literal, Any, AsyncGenerator, TYPE_CHECKING, List, Type
+
+from pydantic import BaseModel, Field
+
+from .._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
+from .._model_response import ChatResponse
+from .._model_usage import ChatUsage
+from ..._utils._common import _generate_id
+from ...credential import AnthropicCredential
+from ...formatter import FormatterBase, AnthropicChatFormatter
+from ...message import Msg, ThinkingBlock, ToolCallBlock, TextBlock
+from ...tool import ToolChoice
+
+if TYPE_CHECKING:
+    from anthropic.types.message import Message
+    from anthropic import AsyncStream
+else:
+    Message = Any
+    AsyncStream = Any
+
+
+class AnthropicChatModel(ChatModelBase):
+    """The Anthropic chat model."""
+
+    type: Literal["anthropic_chat"] = "anthropic_chat"
+    """The type of the chat model."""
+
+    class Parameters(BaseModel):
+        """The parameters for the Anthropic chat model."""
+
+        max_tokens: int | None = Field(
+            default=None,
+            title="Max Tokens",
+            description=(
+                "The maximum number of tokens to generate in the chat "
+                "completion."
+            ),
+            gt=0,
+        )
+
+        thinking_enable: bool = Field(
+            default=False,
+            title="Thinking",
+            description="The thinking enable for the LLM output.",
+        )
+
+        thinking_budget: int | None = Field(
+            default=None,
+            title="Thinking Budget",
+            description="The thinking budget for the LLM output.",
+            gt=0,
+        )
+
+        thinking_mode: (
+            Literal["adaptive", "enabled", "disabled"] | None
+        ) = Field(
+            default=None,
+            title="Thinking Mode",
+            description=(
+                "How Claude thinks. ``adaptive`` lets the model decide when "
+                "and how deeply, and is the only mode Claude Opus 4.7 and "
+                "later accept — those models reject the ``enabled`` "
+                "(budget-based) mode. Takes precedence over "
+                "``thinking_enable``; leave unset to fall back to it."
+            ),
+        )
+
+        thinking_display: Literal["summarized", "omitted"] | None = Field(
+            default=None,
+            title="Thinking Display",
+            description=(
+                "Whether thinking blocks carry readable summaries or come "
+                "back empty. Claude Opus 4.7 and later default to "
+                "``omitted``, so set ``summarized`` to see the reasoning."
+            ),
+        )
+
+        reasoning_effort: (
+            Literal["low", "medium", "high", "xhigh", "max"] | None
+        ) = Field(
+            default=None,
+            title="Reasoning Effort",
+            description=(
+                "How many tokens Claude spends on the whole response — "
+                "not just thinking, but tool calls and explanation too. "
+                "Sent as Anthropic's ``output_config.effort``. The API "
+                "default is ``high``. Supported levels vary by model — see "
+                "the model card, and note that Claude Sonnet 4.5 and "
+                "Claude Haiku 4.5 do not accept this parameter at all."
+            ),
+        )
+
+    def __init__(
+        self,
+        credential: AnthropicCredential,
+        model: str,
+        parameters: "AnthropicChatModel.Parameters | None" = None,
+        stream: bool = True,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        context_size: int = 200000,
+        formatter: FormatterBase | None = None,
+        client_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize the Anthropic chat model.
+
+        Args:
+            credential (`AnthropicCredential`):
+                The Anthropic credential used to authenticate API calls.
+            model (`str`):
+                The Anthropic model name, e.g. ``claude-opus-4-7``.
+            parameters (`AnthropicChatModel.Parameters | None`, defaults to \
+            `None`):
+                The Anthropic API parameters. When ``None``, the default
+                parameters will be used.
+            stream (`bool`, defaults to `True`):
+                Whether to enable streaming output.
+            max_retries (`int`, defaults to `3`):
+                The maximum number of retries for the Anthropic API.
+            retry_delay (`float`, defaults to `1.0`):
+                Seconds to sleep between retry attempts.
+            context_size (`int`, defaults to `200000`):
+                The model context size used for context compression.
+            formatter (`FormatterBase | None`, defaults to `None`):
+                The formatter that converts ``Msg`` objects to the format
+                required by the Anthropic API. When ``None``, an
+                ``AnthropicChatFormatter`` instance will be used.
+            client_kwargs (`dict[str, Any] | None`, defaults to `None`):
+                Extra keyword arguments forwarded to
+                ``anthropic.AsyncAnthropic`` (e.g. ``timeout``,
+                ``default_headers``, ``http_client``, ``auth_token``).
+        """
+        super().__init__(
+            credential=credential,
+            model=model,
+            parameters=parameters or self.Parameters(),
+            stream=stream,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            context_size=context_size,
+        )
+        self.formatter = formatter or AnthropicChatFormatter()
+        self.client_kwargs = client_kwargs or {}
+
+        import anthropic
+
+        self.client: anthropic.AsyncAnthropic = anthropic.AsyncAnthropic(
+            api_key=self.credential.api_key.get_secret_value(),
+            base_url=self.credential.base_url,
+            **self.client_kwargs,
+        )
+
+    @classmethod
+    def _get_retryable_exceptions(cls) -> tuple[Type[Exception], ...]:
+        import anthropic
+
+        return (
+            anthropic.APIConnectionError,
+            anthropic.APITimeoutError,
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+        )
+
+    @classmethod
+    def _get_structured_output_fallback_exceptions(
+        cls,
+    ) -> tuple[Type[Exception], ...]:
+        import anthropic
+
+        return (anthropic.BadRequestError,)
+
+    def _thinking_mode(self) -> str | None:
+        """Resolve the effective thinking mode.
+
+        ``thinking_mode`` is the modern control; ``thinking_enable`` is the
+        legacy toggle that only ever meant the budget-based mode.
+        """
+        if self.parameters.thinking_mode is not None:
+            return self.parameters.thinking_mode
+        return "enabled" if self.parameters.thinking_enable else None
+
+    async def _call_api(
+        self,
+        model_name: str,
+        messages: list[Msg],
+        tools: list[dict] | None = None,
+        tool_choice: ToolChoice | None = None,
+        **generate_kwargs: Any,
+    ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
+        """Get the response from Anthropic chat completions API by the given
+        arguments.
+
+        Args:
+            model_name (`str`):
+                The model name to use for this call.
+            messages (`list[dict]`):
+                A list of dictionaries, where `role` and `content` fields are
+                required, and `name` field is optional.
+            tools (`list[dict]`, default `None`):
+                The tools JSON schemas.
+            tool_choice (`ToolChoice | None`, optional):
+                Controls which (if any) tool is called by the model.
+            **generate_kwargs (`Any`):
+                The keyword arguments for Anthropic chat completions API.
+
+        Returns:
+            `ChatResponse | AsyncGenerator[ChatResponse, None]`:
+                A ``ChatResponse`` when streaming is disabled, or an async
+                generator of ``ChatResponse`` objects when streaming is
+                enabled.
+        """
+
+        # Anthropic requires max_tokens; fall back to a safe default when
+        # the user hasn't configured one explicitly.
+        max_tokens = self.parameters.max_tokens or 8192
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "max_tokens": max_tokens,
+            "stream": self.stream,
+            **generate_kwargs,
+        }
+
+        mode = self._thinking_mode()
+        if mode is not None and "thinking" not in kwargs:
+            thinking: dict[str, Any] = {"type": mode}
+            if mode == "enabled":
+                # Anthropic requires max_tokens > budget_tokens strictly.
+                budget = self.parameters.thinking_budget or (max_tokens // 2)
+                if budget >= max_tokens:
+                    # Auto-expand max_tokens to satisfy the inequality.
+                    max_tokens = budget + 1024
+                    kwargs["max_tokens"] = max_tokens
+                thinking["budget_tokens"] = budget
+            # ``display`` is invalid alongside ``type: "disabled"``.
+            if mode != "disabled" and self.parameters.thinking_display:
+                thinking["display"] = self.parameters.thinking_display
+            kwargs["thinking"] = thinking
+
+        # Effort travels inside ``output_config``, not as a top-level field.
+        if self.parameters.reasoning_effort and "output_config" not in kwargs:
+            kwargs["output_config"] = {
+                "effort": self.parameters.reasoning_effort,
+            }
+
+        fmt_tools, fmt_tool_choice = self._format_tools(tools, tool_choice)
+        if fmt_tools:
+            kwargs["tools"] = fmt_tools
+        if fmt_tool_choice is not None:
+            kwargs["tool_choice"] = fmt_tool_choice
+
+        formatted_messages = await self.formatter.format(messages)
+
+        # Extract the system message
+        if formatted_messages and formatted_messages[0]["role"] == "system":
+            kwargs["system"] = formatted_messages[0]["content"]
+            formatted_messages = formatted_messages[1:]
+
+        kwargs["messages"] = formatted_messages
+
+        start_datetime = datetime.now()
+
+        response = await self.client.messages.create(**kwargs)
+
+        if self.stream:
+            return self._parse_anthropic_stream_completion_response(
+                start_datetime,
+                response,
+            )
+
+        # Non-streaming response
+        parsed_response = await self._parse_anthropic_completion_response(
+            start_datetime,
+            response,
+        )
+
+        return parsed_response
+
+    async def _parse_anthropic_completion_response(
+        self,
+        start_datetime: datetime,
+        response: Message,
+    ) -> ChatResponse:
+        """Given an Anthropic Message object, extract the content blocks and
+        usages from it.
+
+        Args:
+            start_datetime (`datetime`):
+                The start datetime of the response generation.
+            response (`Message`):
+                Anthropic Message object to parse.
+
+        Returns:
+            `ChatResponse`:
+                A single ``ChatResponse`` with ``is_last=True`` containing
+                the extracted content blocks and usage.
+        """
+        content_blocks: List[ThinkingBlock | TextBlock | ToolCallBlock] = []
+
+        if hasattr(response, "content") and response.content:
+            for content_block in response.content:
+                if (
+                    hasattr(content_block, "type")
+                    and content_block.type == "thinking"
+                ):
+                    thinking_block = ThinkingBlock(
+                        thinking=content_block.thinking,
+                        signature=getattr(
+                            content_block,
+                            "signature",
+                            "",
+                        )
+                        or "",
+                    )
+                    content_blocks.append(thinking_block)
+
+                elif (
+                    hasattr(content_block, "type")
+                    and content_block.type == "redacted_thinking"
+                ):
+                    content_blocks.append(
+                        ThinkingBlock(
+                            thinking="",
+                            redacted_thinking_data=getattr(
+                                content_block,
+                                "data",
+                                "",
+                            ),
+                        ),
+                    )
+
+                elif (
+                    hasattr(content_block, "type")
+                    and content_block.type == "text"
+                ):
+                    content_blocks.append(
+                        TextBlock(text=content_block.text),
+                    )
+
+                elif (
+                    hasattr(content_block, "type")
+                    and content_block.type == "tool_use"
+                ):
+                    content_blocks.append(
+                        ToolCallBlock(
+                            id=content_block.id,
+                            name=content_block.name,
+                            input=json.dumps(
+                                content_block.input,
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+
+        usage = None
+        if response.usage:
+            u = response.usage
+            usage = ChatUsage(
+                input_tokens=u.input_tokens,
+                output_tokens=u.output_tokens,
+                time=(datetime.now() - start_datetime).total_seconds(),
+                cache_creation_input_tokens=getattr(
+                    u,
+                    "cache_creation_input_tokens",
+                    0,
+                )
+                or 0,
+                cache_input_tokens=getattr(
+                    u,
+                    "cache_read_input_tokens",
+                    0,
+                )
+                or 0,
+            )
+
+        resp_kwargs: dict[str, Any] = {
+            "content": content_blocks,
+            "is_last": True,
+            "usage": usage,
+        }
+        response_id = getattr(response, "id", None)
+        if response_id:
+            resp_kwargs["id"] = response_id
+
+        return ChatResponse(**resp_kwargs)
+
+    async def _parse_anthropic_stream_completion_response(
+        self,
+        start_datetime: datetime,
+        response: AsyncStream,
+    ) -> AsyncGenerator[ChatResponse, None]:
+        """Given an Anthropic streaming response, extract the content blocks
+        and usages from it and yield ChatResponse objects.
+
+        Args:
+            start_datetime (`datetime`):
+                The start datetime of the response generation.
+            response (`AsyncStream`):
+                Anthropic AsyncStream object to parse.
+
+        Yields:
+            `ChatResponse`:
+                Incremental ``ChatResponse`` objects with ``is_last=False``
+                followed by a final one with ``is_last=True`` containing the
+                fully accumulated content blocks and usage.
+        """
+
+        usage = None
+        response_id: str = _generate_id()
+        text_id: str = _generate_id()
+        thinking_id: str = _generate_id()
+        # The mapping from index to tool call id
+        tool_call_mapping: dict = OrderedDict()
+
+        async with response as stream:
+            async for event in stream:
+                delta_res = ChatResponse(
+                    content=[],
+                    is_last=False,
+                    id=response_id,
+                )
+
+                if event.type == "message_start":
+                    message = event.message
+
+                    # Update the response ID if exists
+                    response_id = getattr(message, "id", None) or response_id
+                    delta_res.id = response_id
+
+                    if message.usage:
+                        u = message.usage
+                        usage = ChatUsage(
+                            input_tokens=u.input_tokens,
+                            output_tokens=getattr(u, "output_tokens", 0),
+                            time=(
+                                datetime.now() - start_datetime
+                            ).total_seconds(),
+                            cache_creation_input_tokens=getattr(
+                                u,
+                                "cache_creation_input_tokens",
+                                0,
+                            ),
+                            cache_input_tokens=getattr(
+                                u,
+                                "cache_read_input_tokens",
+                                0,
+                            ),
+                        )
+
+                elif event.type == "content_block_start":
+                    if event.content_block.type == "tool_use":
+                        tool_block = event.content_block
+                        # Record the id and name
+                        tool_call_mapping[event.index] = (
+                            tool_block.id,
+                            tool_block.name,
+                        )
+                        # New tool call block with empty input
+                        delta_res.append_tool_call(
+                            block_id=tool_block.id,
+                            name=tool_block.name,
+                            input="",
+                        )
+
+                    elif event.content_block.type == "redacted_thinking":
+                        delta_res.append_thinking(
+                            "",
+                            block_id=_generate_id(),
+                            redacted_thinking_data=getattr(
+                                event.content_block,
+                                "data",
+                                "",
+                            ),
+                        )
+
+                elif event.type == "content_block_delta":
+                    block_index = event.index
+                    delta = event.delta
+
+                    # Text block
+                    if delta.type == "text_delta":
+                        delta_res.append_text(delta.text, block_id=text_id)
+
+                    # Thinking block
+                    elif delta.type == "thinking_delta":
+                        delta_res.append_thinking(
+                            delta.thinking,
+                            block_id=thinking_id,
+                        )
+
+                    # Special handling for Anthropic API that requires
+                    # signature
+                    elif delta.type == "signature_delta":
+                        delta_res.append_thinking(
+                            "",
+                            block_id=thinking_id,
+                            signature=delta.signature,
+                        )
+
+                    # Tool call block
+                    elif (
+                        delta.type == "input_json_delta"
+                        and block_index in tool_call_mapping
+                    ):
+                        block_id, name = tool_call_mapping[block_index]
+                        delta_res.append_tool_call(
+                            block_id=block_id,
+                            name=name,
+                            input=delta.partial_json or "",
+                        )
+
+                elif event.type == "message_delta":
+                    if event.usage and usage:
+                        usage.output_tokens = event.usage.output_tokens
+
+                if delta_res.content:
+                    delta_res.usage = usage
+                    yield delta_res
+
+    def _format_tools(
+        self,
+        tools: list[dict] | None,
+        tool_choice: ToolChoice | None,
+    ) -> tuple[list[dict] | None, dict | None]:
+        """Validate and format tools and tool_choice for Anthropic.
+
+        Converts tool schemas to Anthropic's flat format and maps
+        tool_choice modes to Anthropic's type-based format. When
+        ``tool_choice.tools`` is specified the schemas list is filtered
+        to only those tools. When ``tool_choice.mode`` is a specific tool
+        name (str) the model is forced to call exactly that tool without
+        needing to filter the list, preserving prompt-cache efficiency.
+
+        Args:
+            tools (`list[dict] | None`, optional):
+                The raw tool schemas.
+            tool_choice (`ToolChoice | None`, optional):
+                The tool choice configuration.
+
+        Returns:
+            `tuple[list[dict] | None, dict | None]`:
+                A tuple of (formatted_tools, formatted_tool_choice).
+        """
+        if tool_choice and tools:
+            self._validate_tool_choice(tool_choice, tools)
+            if tool_choice.tools:
+                allowed = set(tool_choice.tools)
+                tools = [t for t in tools if t["function"]["name"] in allowed]
+
+        fmt_tools = None
+        if tools:
+            fmt_tools = []
+            for schema in tools:
+                assert (
+                    "function" in schema
+                ), f"Invalid schema: {schema}, expect key 'function'."
+                assert "name" in schema["function"], (
+                    f"Invalid schema: {schema}, "
+                    "expect key 'name' in 'function' field."
+                )
+                fmt_tools.append(
+                    {
+                        "name": schema["function"]["name"],
+                        "description": schema["function"].get(
+                            "description",
+                            "",
+                        ),
+                        "input_schema": schema["function"].get(
+                            "parameters",
+                            {},
+                        ),
+                    },
+                )
+
+        if not tool_choice:
+            return fmt_tools, None
+
+        mode = tool_choice.mode
+
+        if mode not in _TOOL_CHOICE_LITERAL_MODES:
+            # mode is a specific tool name — force call it
+            return fmt_tools, {"type": "tool", "name": mode}
+
+        type_mapping = {
+            "auto": {"type": "auto"},
+            "none": {"type": "none"},
+            "required": {"type": "any"},
+        }
+        return fmt_tools, type_mapping[mode]
+
+    def _get_disable_thinking_kwargs(self) -> dict:
+        """Anthropic uses ``thinking.type=disabled`` as a top-level kwarg."""
+        return {"thinking": {"type": "disabled"}}
