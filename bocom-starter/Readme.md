@@ -1,24 +1,32 @@
-# bocom-starter — 行内模型平台参考启动程序
+# bocom-agent — 行内模型平台服务
 
-基于 agentscope 官方示例的启动程序，**额外装配行内模型平台**（bocom-as
-发行版：`config` / `providers`），覆盖 4 条主流程：**行内模型凭证、选择模型、
-add_think（think-tag）、api_key 刷新**。
+基于行内 agentscope SDK 的参考服务：`bocom-as` 为行内模型平台扩展
+（**凭证、选择模型、add_think（think-tag）、api_key 刷新**），`bocom-starter`
+为启动程序与交付物。
 
-本文档分两部分：**[一、本地开发](#一本地开发)**（源码直跑、Mock 网关、API
-联调）与 **[二、CI/CD 交付](#二cicd-交付行内)**（上传代码、构建镜像、部署）。
+本文档覆盖：**[一、本地开发](#一本地开发)**（安装、启动与 API 快速上手）、
+**[二、CI/CD 交付](#二cicd-交付行内)**（打包、构建与部署）。
 
-## 目录结构
+> 业务接入指南（本地 / Docker 快速启动、接入路径与框架开发模式）见独立
+> 文档 **[Best-Practice.md](Best-Practice.md)**。
+
+## 仓库结构
 
 ```
-bocomm-agent/              # 交付物根（= Docker 构建上下文）
-├── bocom-as/              # 自包含发行版：config / providers / src（agentscope SDK）
-└── bocom-starter/         # 本启动程序
+bocom-agent/
+├── bocom-as/          # 行内模型平台扩展源码（config + providers）→ 打包为 whl
+└── bocom-starter/     # ★ 交付物（CI/CD 上传本目录）
     ├── main.py            # 服务入口（create_app + 行内模型平台路由）
-    ├── Dockerfile         # 生产自包含镜像（构建上下文 = 交付物根）
-    ├── docker-compose.yml # CI/CD 部署（agentscope 单服务，Redis 用生产实例）
-    ├── .env               # 环境变量示例（默认值，全部可省略）
+    ├── Dockerfile         # 服务镜像：装 agentscope + wheels/bocom_as whl
+    ├── docker-compose.yml # 部署编排（agentscope 单服务，Redis 用生产实例）
+    ├── .env               # 环境变量默认值（示例，全部可省略）
+    ├── wheels/            # bocom_as-0.1.0-py3-none-any.whl（本地包）
     └── Readme.md
 ```
+
+- **agentscope SDK** 从行内 pip 源安装（`==2.0.7.post1`），不随交付物分发源码；
+- **bocom_as** 为本地 whl（含 `config` + `providers` 及模型候选 yaml）；
+- **生产 Redis** 复用行内实例，不自建（地址由部署平台注入）。
 
 ---
 
@@ -26,13 +34,23 @@ bocomm-agent/              # 交付物根（= Docker 构建上下文）
 
 ## 1. 环境准备
 
+依赖：Python ≥ 3.11、uv、Redis（本地 `redis-server` 或行内测试实例）。
+
 ```bash
-# 交付/验证环境：bocom-as 自包含发行版，SDK 源码随包分发（bocom-as/src/agentscope）
-pip install -e bocom-as
+# 行内 pip 源（若已配置到 uv 默认源可省略）
+export PIP_INDEX_URL=https://<行内pip源>/simple
+
+cd bocom-agent/bocom-starter
+
+# 安装行内模型平台扩展（自动解析依赖，含 agentscope SDK）
+uv pip install wheels/bocom_as-0.1.0-py3-none-any.whl
 ```
 
-**依赖 Redis**：本服务强依赖 Redis（会话 / 凭证 / 模型表），本地开发需有
-可用实例——本地 `redis-server` 或行内测试 Redis，用环境变量指定：
+> 需同时修改 `bocom-as/` 源码联调时，改用源码可编辑安装
+> （`cd bocom-as && uv pip install -e . --no-deps`，此时源码包配置与
+> pyproject 为准，代理官方 pip 源行为一致）。
+
+Redis 地址用环境变量指定（默认 `localhost:6379`）：
 
 ```bash
 export REDIS_HOST=localhost        # 应用主存储（会话、凭证等）
@@ -43,11 +61,39 @@ export ELLM_REDIS_PORT=6379
 
 ## 2. 启动服务
 
+两种启动方式：**本地开发启动**（源码直跑 + 热重载，改代码调试用）与
+**Docker 开发启动**（镜像容器运行，贴近生产形态，体验 / 联调用）。
+
+### 2.1 本地开发启动
+
 ```bash
 cd bocom-starter
 uvicorn main:app --reload          # 开发模式（热重载）
 # 或 python main.py（reload 由 UVICORN_RELOAD=true 控制，默认关闭）
 ```
+
+### 2.2 Docker 开发启动
+
+本地构建并运行服务容器（镜像自包含，装 agentscope + wheels whl；Redis
+复用本机容器 / 行内测试实例，与「二、CI/CD」生产部署同一镜像同一命令）：
+
+```bash
+cd bocom-starter
+# 构建需行内 pip 源拉取 agentscope；容器内 localhost 非宿主机，
+# Redis 须指向宿主机或测试实例（environment 注入优先于 .env 默认值）
+PIP_INDEX_URL=https://<行内pip源>/simple \
+REDIS_HOST=host.docker.internal \
+ELLM_REDIS_HOST=host.docker.internal \
+docker compose up -d --build
+```
+
+- **Redis 可达性**：Docker Desktop / WSL2 用 `host.docker.internal` 指向
+  宿主机；Linux 原生 Docker 用宿主机 IP 或 `--add-host`；连行内测试 Redis
+  时直接填测试地址；`.env` 保持 `localhost` 默认即可（仅本地直跑可用）；
+- **验证 / 日志 / 停止**：`http://localhost:8000/docs`；
+  `docker compose logs -f agentscope`、`docker compose down`；
+- 镜像自包含：改代码后需重新构建（`--build`）；纯调代码建议回到 2.1
+  本地直跑（热重载即时生效）。
 
 ## 3. 快速上手：行内凭证 + 行内模型 chat
 
@@ -234,49 +280,60 @@ curl -X DELETE http://localhost:8000/ellm-models/session/sess-xxx/think-tag \
 
 # 二、CI/CD 交付（行内）
 
-## 1. 交付物与上传
+## 1. 打包与上传
 
-交付物只包含 2 个包（`bocom-as` / `bocom-starter`），
-上传整个 `bocomm-agent/` 目录（即构建上下文）：
+**上传内容 = `bocom-starter/` 整个目录**（含 `wheels/`），SDK 源码不随包。
 
+### 1.1 bocom-as 源码变更后：重新打包 whl
+
+```bash
+cd bocom-agent/bocom-as
+rm -f ../bocom-starter/wheels/*.whl        # 保持 wheels/ 单版本
+python -m pip wheel --no-deps -w ../bocom-starter/wheels .
 ```
-bocomm-agent/              # 交付物根（= Docker 构建上下文）
-├── bocom-as/              # 自包含发行版：config / providers / src（agentscope SDK）
-└── bocom-starter/         # 启动程序：main.py + Dockerfile + docker-compose.yml
-                           #          + .env + Readme.md
-```
 
-- **bocom-as 自包含**：[pyproject.toml](../bocom-as/pyproject.toml) 打包
-  `src/agentscope`（SDK）+ `config` + `providers`，依赖全量并入主列表
-  （SDK 全部依赖 + service / storage-redis / workspace-docker）。
+- 版本：改 `bocom-as/pyproject.toml` 的 `version` 字段 → whl 文件名随之
+  变化 → 同步更新 `bocom-starter/Dockerfile` 中的 whl 文件名；
+- agentscope SDK 版本约束也在该 pyproject 声明（`==2.0.7.post1`），升级
+  SDK 时同步更新 Dockerfile 的 `AGENTSCOPE_VERSION` 构建参数。
+
+### 1.2 上传
+
+上传 `bocom-starter/`（Dockerfile + main.py + .env + docker-compose.yml +
+wheels/ + Readme.md），并在行内平台配置启动命令（见下）。
 
 ## 2. 构建镜像
 
+构建上下文 = `bocom-starter/`；行内无外网，**必须注入行内 pip 源**
+（`docker compose build` 时用宿主环境变量 `PIP_INDEX_URL` 透传，效果相同）：
+
 ```bash
-# 在交付物根（bocomm-agent/）下执行；Dockerfile 位于 bocom-starter/
-docker build -t agentscope-service:bocom -f bocom-starter/Dockerfile .
+cd bocom-starter
+docker build -t agentscope-service:bocom \
+  --build-arg PIP_INDEX_URL=https://<行内pip源>/simple .
 ```
 
 镜像特性：
 
-- **自包含**：SDK / config / providers / main.py 全部打进镜像，运行时
-  无需挂载源码；uvicorn 生产默认不 reload；
-- **分层缓存**：先 `COPY pyproject.toml` + `uv sync` 装依赖（依赖列表随
-  bocom-as 发行版维护），再 COPY 源码——只要 pyproject.toml 不变，
-  依赖层命中 Docker 缓存，迭代构建快。
+- **包安装、无源码**：agentscope SDK 从行内 pip 源安装，bocom_as 为本地
+  whl（config + providers），镜像内不拷贝任何项目源码；
+- **分层缓存**：SDK 及其依赖为独立缓存层（`AGENTSCOPE_VERSION` 不变即
+  命中），日常只重建 whl 层与应用层，迭代构建快；
+- uvicorn 生产默认不 reload（main.py 内 `UVICORN_RELOAD` 控制）。
 
 ## 3. 部署启动
 
 ```bash
+# 仓库根执行（context 自动指向 bocom-starter/）：
 docker compose -f bocom-starter/docker-compose.yml up -d
+# 或：cd bocom-starter && docker compose up -d
 ```
 
 - **单服务**：只部署 agentscope；**生产 Redis 复用行内实例，不自建**，
   地址由平台环境变量注入（见下节）；
 - **端口**：宿主 `8000` → 容器 `8000`（可参数化 `AGENTSCOPE_HOST_PORT`）；
-- **持久化**：`workspace-data` 命名 volume 挂载到
-  `/app/bocom-starter/workspaces`（agent 工作区 + 长期记忆 Markdown 文件，
-  容器重建不丢）；
+- **持久化**：`workspace-data` 命名 volume 挂载到 `/app/workspaces`
+  （agent 工作区 + 长期记忆 Markdown 文件，容器重建不丢）；
 - **Docker 工作区沙箱**：已挂载 `/var/run/docker.sock`，agent 工作区可跑
   嵌套 Docker 沙箱；如行内禁止，删除 compose 中对应挂载行即可。
 
