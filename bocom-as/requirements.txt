@@ -1,0 +1,15 @@
+# bocom-as 依赖清单（与 pyproject.toml [project.dependencies] 保持一致）
+# agentscope 从 pip 源安装；本包只含 config / providers。
+agentscope==2.0.7
+
+# ---- bocom-starter 部署必需 ----
+fastapi>=0.141.1
+uvicorn>=0.52.4
+apscheduler>=3.11.3
+ag-ui-protocol>=0.1.10
+redis>=8.1.0 
+aiodocker>=0.27.0
+
+# ---- providers 直接依赖 ----
+httpx>=0.28.1
+pydantic>=2.13.5

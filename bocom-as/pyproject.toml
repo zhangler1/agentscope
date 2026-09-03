@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bocom-as"
 version = "0.1.0"
-description = "交通银行行内模型平台扩展包：公共配置（config）+ 行内模型平台（providers），依赖行内 agentscope SDK"
+description = "交通银行行内模型平台扩展包：公共配置（config）+ 行内模型平台（providers），依赖行内 官方agentscope==2.0.7"
 requires-python = ">=3.11"
-# 行内模型平台扩展：SDK（agentscope）从行内 pip 源安装（==2.0.7.post1），
-# 不再随包分发 SDK 源码；本包只含 config / providers。
+# agentscope从pip 源安装（==2.0.7），
+# 本包只含 config / providers。
 dependencies = [
-    # 行内 SDK（行内 pip 源安装，核心依赖由其自带）
-    "agentscope==2.0.7.post1",
+    # pip 源安装
+    "agentscope==2.0.7",
     # ---- bocom-starter 部署必需（若行内 agentscope 发行已并入 extras，
     # ---- 重复声明无冲突，可精简）----
     "fastapi",

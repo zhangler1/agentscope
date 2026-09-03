@@ -28,7 +28,7 @@ ENV PIP_INDEX_URL=$PIP_INDEX_URL
 
 # 依赖层 1（缓存层，体积大头）：agentscope SDK 及其全量依赖。
 # 版本须与 bocom_as whl 声明的约束一致；SDK 升级时同步此 ARG。
-ARG AGENTSCOPE_VERSION=2.0.7.post1
+ARG AGENTSCOPE_VERSION=2.0.7
 RUN uv venv /app/.venv \
     && uv pip install "agentscope==${AGENTSCOPE_VERSION}"
 

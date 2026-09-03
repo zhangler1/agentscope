@@ -1,0 +1,13 @@
+# bocom-starter 依赖清单
+# 安装方式（wheels/ 内含 bocom_as 本地包，--find-links 使其可被解析）：
+#   pip install -r requirements.txt
+# 或按 Readme.md 直接安装 whl（自动解析以下依赖）：
+#   uv pip install wheels/bocom_as-0.1.0-py3-none-any.whl
+
+# 本地行内模型平台扩展包（声明 agentscope==2.0.7、fastapi、uvicorn、
+# apscheduler、ag-ui-protocol、redis、aiodocker、httpx、pydantic 等依赖，
+# 单独安装本行时其余依赖自动解析）
+./wheels/bocom_as-0.1.0-py3-none-any.whl
+
+# 行内 agentscope SDK（与 bocom_as whl 声明约束一致；须从行内 pip 源安装）
+agentscope==2.0.7
