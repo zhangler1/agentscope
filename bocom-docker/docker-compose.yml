@@ -8,7 +8,9 @@ services:
 
   agentscope:
     # 默认复用 agentscope-service:oss 镜像（镜像提供 Python 依赖环境，
-    # SDK / 应用源码全部由 volume 挂载——官方 dev 模式）。
+    # bocom-starter/main.py 由 volume 挂载——dev 模式）。
+    # 注意：SDK（agentscope）与 bocom-as（config/providers）均已 whl 固化
+    # 在镜像 .venv 内，不再源码挂载；平台变更需重建 whl 并 --build 重建镜像。
     # --build 时以交付物根（bocom-docker 父目录，含 bocom-as / bocom-starter）
     # 为上下文构建镜像（bocom-docker/Dockerfile，依赖与 bocom-as 发行版绑定）；
     # 构建会覆盖同 tag 镜像，如需保留 oss 镜像先备份：
@@ -28,16 +30,14 @@ services:
       - OPENAI_API_KEY
       - ANTHROPIC_API_KEY
       # 容器网络内地址覆盖（.env 中的 localhost 仅适用于宿主机直跑）
-      - REDIS_HOST=redis
+      # 主存储 DATABASE_URL（OB）经 env_file 传入；容器内访问宿主机
+      # OB 需指向 host.docker.internal（Linux 需 extra_hosts host-gateway）
       - ELLM_REDIS_HOST=redis
-      # bocom-as 顶层包（config / providers）经 PYTHONPATH 导入
-      - PYTHONPATH=/app/bocom-as
     depends_on: [redis]
     volumes:
-      # 挂载源码（可编辑模式，uvicorn reload 自动生效）
-      - ../bocom-as/src:/app/src:ro
+      # 挂载 bocom-starter 启动程序（可热改，uvicorn reload 自动生效）；
+      # bocom-as / SDK 为 whl 依赖，固化在镜像内，不在此挂载
       - ../bocom-starter/main.py:/app/main.py:ro
-      - ../bocom-as:/app/bocom-as:ro
       # 工作区数据持久化
       - workspace-data:/app/workspaces
       # Docker Socket（支持 Docker 工作区沙箱）

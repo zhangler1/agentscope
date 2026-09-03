@@ -5,73 +5,52 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bocom-as"
 version = "0.1.0"
-description = "交通银行行内定制 agentscope 发行版：核心 SDK（src/agentscope）+ 行内模型平台（providers）+ 公共配置（config）"
+description = "交通银行行内定制 agentscope 发行版：核心 SDK（whl 依赖）+ 行内模型平台（providers）+ 公共配置（config）"
 requires-python = ">=3.11"
-# 自包含单发行版：SDK 源码随包分发（src/agentscope），依赖全量并入主列表
-# （SDK 全部依赖 + service / storage-redis / workspace-docker 三个部署必需 extras）
+# SDK 以 whl 依赖方式引入（不再源码分发）：agentscope 解析到随发行包
+# wheels/ 内置的本地 whl（见 [tool.uv.sources]）；extras 在 SDK 的 full
+# 聚合基础上按行内基座裁剪：
+# - models（gemini/ollama/xai）：行内自有大模型平台（ELLM）；
+# - memory（mem0/reme）：行内统一记忆；agent 本地长程记忆
+#   AgenticMemoryMiddleware 为 SDK 核心内置，不受影响；
+# - rag 与 vdb 全部（qdrant/elasticsearch/mongodb/milvus）：行内统一
+#   知识库检索（starter 已移除内置知识库功能）；
+# - channel（飞书/钉钉/Discord）：行内无外部 IM 渠道；
+# - storage-s3（aioboto3）：KB blob 存储已随知识库移除。
+# 保留：service（服务）、storage-redis（缓存：ELLM 模型表等）、
+# storage-sql + aiomysql（主存储 OceanBase，MySQL 模式）、tools、
+# workspace（沙箱）。下游应用仅需依赖 bocom-as，无需自行声明 extras。
 dependencies = [
-    # ---- agentscope SDK 核心依赖 ----
-    "aioitertools",
-    "anthropic",
-    "dashscope",
-    "docstring_parser",
-    "filetype",
-    "json5",
-    "json_repair",
-    "mcp<2.0.0",
-    "httpx",
-    "numpy",
-    "openai",
-    "python-datauri",
-    "opentelemetry-api>=1.39.0",
-    "opentelemetry-sdk>=1.39.0",
-    "opentelemetry-exporter-otlp>=1.39.0",
-    "opentelemetry-semantic-conventions>=0.60b0",
-    "python-socketio",
-    "rich",
-    "shortuuid",
-    "python-frontmatter",
-    "jinja2",
-    "aiofiles",
-    "tree_sitter",
-    "tree_sitter_bash",
-    "jsonschema",
-    "pypdf",
-    # The IANA timezone database, which is absent on Windows and slim images
-    "tzdata",
-    # ---- service extra（bocom-starter 应用服务）----
-    "fastapi",
-    "uvicorn",
-    "apscheduler",
-    "ag-ui-protocol>=0.1.10",
-    # ---- storage-redis extra（主存储）----
-    "redis",
-    # ---- workspace-docker extra（Docker 工作区沙箱）----
-    "aiodocker",
+    # 核心 SDK：版本必须与 wheels/ 内 whl 一致（SDK 变更后重建 whl 并同步此处）
+    "agentscope[service,storage-redis,storage-sql,tools,workspace]==2.0.7.post1",
+    # OB（OceanBase MySQL 模式）驱动：storage-sql extra 故意不含具体
+    # 驱动，由发行版固定选型（aiomysql 纯 Python 实现，无编译依赖）。
+    "aiomysql>=0.2",
+    # tools extra 的 ripgrep 自 15.0 起 PyPI 不再发布 Windows wheel（仅
+    # macOS/Linux + sdist），Windows 本地 uv sync 会被迫源码构建而失败。
+    # 约束 <15 走 14.1.0（含全平台 wheel，随包携带 rg 二进制）；Grep
+    # 工具实际以子进程调用 PATH 上的 rg，与版本无强绑定。
+    "ripgrep<15",
 ]
 
-# 包发现：src/ 下为 agentscope SDK 包树，./ 下为 config / providers 顶层子包
-# （相互之间以顶层包名互引）。src/agentscope.egg-info 等非包目录自动跳过。
+# uv 源映射：agentscope 从发行包内本地 whl 离线解析，不查 PyPI。
+# pip/uv pip 用户先 `pip install wheels/agentscope-*.whl` 再装本包即可
+# （依赖已满足时不会重复解析）。
+[tool.uv.sources]
+agentscope = { path = "wheels/agentscope-2.0.7.post1-py3-none-any.whl" }
+
+# 包发现：./ 下为 config / providers 顶层子包（SDK 已改为 whl 依赖，
+# 本包不再打包 src/agentscope）。
 [tool.setuptools.packages.find]
-where = ["src", "."]
+where = ["."]
+include = ["config*", "providers*"]
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.package-data]
-# "*" 应用到所有发现的包：py.typed 标记 PEP 561；_models/_cosyvoice_models
-# 为各模型供应商的数据目录（无 __init__.py，非包，随源码分发）。
+# "*" 应用到所有发现的包：providers/_models 为模型候选数据目录
+# （无 __init__.py，非包，随源码分发）。
 "*" = [
-    "py.typed",
     "_models/*.yaml",
-    "_cosyvoice_models/*.yaml",
-]
-# Docker 工作区沙箱模板文件
-"agentscope.workspace._docker" = ["Dockerfile*.template"]
-# SQL 存储后端的 Alembic 脚手架（无 __init__.py，Alembic 按文件路径加载）
-"agentscope.app.storage._sql" = [
-    "_alembic/alembic.ini",
-    "_alembic/script.py.mako",
-    "_alembic/env.py",
-    "_alembic/versions/*.py",
 ]

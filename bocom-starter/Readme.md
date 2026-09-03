@@ -6,17 +6,16 @@ add_think、api_key 刷新**。
 
 ## 安装
 
-独立 venv（bocom-as 定制 SDK 与 bocomadp 所用 SDK 版本不同，勿混用）：
+bocom-starter 是应用型项目，依赖链全部离线解析自 `bocom-as/wheels/`
+内的双 whl（`starter → bocom_as whl → agentscope whl`），不查 PyPI：
 
 ```bash
-# 1. 安装行内定制 agentscope SDK（bocom-as 依赖的基础 SDK）
-pip install -e agentscope-sdk
-
-# 2. 安装 bocom-as 发行版（整体打包：config / providers 等顶层子包）
-pip install -e bocom-as
+cd bocom-starter
+uv sync
 ```
 
-> 若已通过其他方式安装 bocom-as 定制 SDK，第 1 步可跳过。
+> 手动安装（pip）：先 `pip install ../bocom-as/wheels/*.whl`（两个 whl，
+> 顺序任意），再按需补装其余依赖；推荐直接用 uv sync。
 
 ## 启动
 
@@ -25,7 +24,7 @@ pip install -e bocom-as
 ```bash
 cd bocom-starter
 # 按需编辑 .env（所有项均有默认值，可省略）
-uvicorn main:app --reload
+uv run uvicorn main:app --reload
 ```
 
 ### Docker 部署（bocom-docker）
@@ -35,9 +34,10 @@ cd bocom-docker
 docker compose up -d
 ```
 
-- **镜像**：复用 `agentscope-service:oss`（不构建）；SDK / bocom-as /
-  bocom-starter 源码全部由 volume 挂载（dev 可编辑模式，改动即时生效，
-  uvicorn 自动 reload）；
+- **镜像**：复用 `agentscope-service:oss`（不构建）；bocom-starter/main.py
+  由 volume 挂载（dev 可热改，uvicorn 自动 reload）；SDK（agentscope）与
+  bocom-as（config/providers）均以 whl 固化在镜像 `.venv` 内——平台变更
+  需重建 whl 后 `--build` 重建镜像；
 - **环境变量**：经 `env_file` 复用 `bocom-starter/.env`（`localhost` 类地址
   由 compose `environment` 覆盖为容器网络服务名 `redis`）；修改 `.env`
   后需 `docker compose up -d` 重建容器生效；
@@ -62,7 +62,7 @@ AGENTSCOPE_HOST_PORT=8010 REDIS_HOST_PORT=6380 NGINX_HOST_PORT=81 \
 WEBUI_BACKEND_HOST_PORT=3001 docker compose -p bocom2 up -d
 ```
 
-- **容器内逻辑零改动**：`REDIS_HOST=redis` 在各自 project 网络内解析，
+- **容器内逻辑零改动**：`ELLM_REDIS_HOST=redis` 在各自 project 网络内解析，
   `.env` 不用动；
 - 端口变量可写 `bocom-docker/.env`（仅 compose 变量替换、不进入容器，
   与 `bocom-starter/.env` 互不干扰）；
@@ -75,22 +75,49 @@ WEBUI_BACKEND_HOST_PORT=3001 docker compose -p bocom2 up -d
 最终交付物只包含 4 个包（**agentscope-sdk 根仓库不进交付物**）：
 
 ```
-bocom-as/        # 自包含发行版：config / providers / src（agentscope SDK）
+bocom-as/        # 发行版：config / providers / wheels（双 whl：SDK + bocom-as）
 bocom-docker/    # 部署：docker-compose.yml + Dockerfile + nginx/
-bocom-starter/   # 启动程序：main.py + config.yaml + .env + Readme.md
+bocom-starter/   # 智能体开发脚手架：main.py + pyproject.toml + .env + Readme.md
 examples/        # webui 全家桶（webui-backend / webui-frontend）
 ```
 
-- **bocom-as 自包含**：[pyproject.toml](../bocom-as/pyproject.toml) 打包
-  `src/agentscope`（SDK）+ `config` + `providers`，依赖全量并入主列表
-  （SDK 全部依赖 + service / storage-redis / workspace-docker），不再依赖
-  外层 agentscope-sdk 仓库；
-- **SDK 同步**：`bocom-as/src` 为 SDK 交付真源——修改 `agentscope-sdk/src`
-  后必须同步拷贝到 `bocom-as/src`，否则交付物与 Docker 挂载拿到的代码
-  不一致；
+依赖链（全部离线，不查 PyPI）：
+
+```
+bocom-starter (pyproject.toml, 应用型项目)
+  └─ bocom_as-<v>.whl          ← bocom-as/wheels/（config / providers / _models）
+       └─ agentscope-<v>.whl   ← bocom-as/wheels/（SDK 核心 + extras 元数据）
+```
+
+- **bocom-as whl 依赖**：[pyproject.toml](../bocom-as/pyproject.toml) 打包
+  `config` + `providers`；agentscope SDK 以 whl 依赖引入（版本固定
+  `==2.0.7.post1`，经 `[tool.uv.sources]` 指向 wheels/ 本地解析），extras
+  为 full 按行内基座裁剪：去 models（行内 ELLM 大模型）、memory（行内
+  统一记忆）、rag 与 vdb 全部（行内统一知识库）、channel（无外部 IM）、
+  storage-s3（随知识库移除）；另直依赖 aiomysql（OB MySQL 模式驱动，
+  storage-sql extra 不含驱动）；
+- **bocom-starter whl 依赖**：[pyproject.toml](pyproject.toml) 仅直接依赖
+  `bocom-as` whl；agentscope whl 路径经 `[tool.uv.sources]` 声明供传递
+  解析（`starter → bocom_as whl → agentscope whl`）；
+- **发行版打包（SDK 或 bocom-as 变更后）**：
+
+  ```bash
+  # 1. SDK whl：根仓库构建后拷入（删旧 whl）
+  uv build && cp dist/agentscope-<版本>-py3-none-any.whl bocom-as/wheels/
+  # 2. bocom-as whl：直接输出到 wheels/（--out-dir）
+  uv build --wheel --project bocom-as --out-dir bocom-as/wheels
+  # 3. 同步更新两处 pyproject.toml 的版本号与 [tool.uv.sources] whl 文件名
+  #    （bocom-as 与 bocom-starter），并删除 wheels/ 下旧 whl
+  # 4. 重建镜像：docker compose up -d --build
+  ```
+
+  > `bocom-as/wheels/.gitignore` 是防止 uv build 重新生成忽略规则的占位
+  > 文件（uv 仅在缺失时生成），**勿删**；两个 whl 均需入库跟踪。
+
 - **两种部署模式**：
   - 快速（oss 镜像）：`docker compose up -d`——复用 `agentscope-service:oss`，
-    源码全部 volume 挂载（dev 可编辑）；
+    bocom-starter/main.py volume 挂载（可热改），SDK 与 bocom-as 用镜像内
+    whl 版本；
   - 固化（build 模式）：`docker compose up -d --build`——以交付物根
     （bocom-docker 父目录）为构建上下文，依赖与 bocom-as 发行版绑定；
     构建覆盖同 tag 镜像，需保留 oss 先
@@ -341,8 +368,8 @@ curl -X POST http://localhost:8000/credential/ \
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | 应用主存储（会话、凭证等） |
-| `ELLM_REDIS_HOST` / `ELLM_REDIS_PORT` | `localhost` / `6379` | 行内模型平台 Redis（可独立指定） |
+| `DATABASE_URL` | `mysql+aiomysql://root:@localhost:2881/agentscope?charset=utf8mb4` | 应用主存储 OceanBase（MySQL 模式，aiomysql 驱动） |
+| `ELLM_REDIS_HOST` / `ELLM_REDIS_PORT` | `localhost` / `6379` | 缓存 Redis（行内模型平台模型表，可独立指定） |
 | `ELLM_REDIS_TIMEOUT` | `1.0` | Redis 连接超时（秒） |
 | `ELLM_REDIS_MAX_CONNECTIONS` | `200` | Redis 连接池上限 |
 | `ELLM_MODEL_THINK_TAG_KEY` | `bocomadp:model:think_tag` | 模型 think-tag 表 key（与 bocomadp 数据兼容，可覆盖隔离） |

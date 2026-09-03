@@ -1,0 +1,25 @@
+[project]
+name = "bocom-starter"
+version = "0.1.0"
+description = "交通银行行内智能体开发脚手架：依赖 bocom-as 发行版 whl（SDK + 行内模型平台），在此之上开发智能体应用"
+requires-python = ">=3.11"
+dependencies = [
+    # 唯一直接依赖：行内模型平台发行版 whl（config / providers / _models
+    # yaml 随 whl 分发）。SDK 经 bocom-as 传递获得（service / storage-redis
+    # 缓存 / storage-sql OB 主存储 / tools / workspace）+ aiomysql 驱动；
+    # 模型、记忆、知识库、IM 渠道能力走行内平台。
+    "bocom-as==0.1.0",
+]
+
+[tool.uv]
+# 应用型项目：只安装依赖，main.py 以脚本方式运行（uvicorn main:app），
+# 本身不打包、不安装。
+package = false
+
+[tool.uv.sources]
+# 双 whl 依赖链离线解析（不查 PyPI）：
+#   bocom-starter → bocom_as whl → agentscope whl
+# agentscope 虽非直接依赖，但 bocom-as 自身的 [tool.uv.sources] 对下游
+# 不生效，传递解析（agentscope 及其 extras）仍需在此声明其本地 whl 路径。
+bocom-as = { path = "../bocom-as/wheels/bocom_as-0.1.0-py3-none-any.whl" }
+agentscope = { path = "../bocom-as/wheels/agentscope-2.0.7.post1-py3-none-any.whl" }

@@ -7,20 +7,13 @@ from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 
 from agentscope.app import create_app, SubAgentTemplate
-from agentscope.app.channel import (
-    DingTalkChannel,
-    DiscordChannel,
-    FeishuChannel,
-)
 from agentscope.app.hub import ClawSkillHub, GitHubMCPHub
 from agentscope.app.message_bus import InMemoryMessageBus
-from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
-from agentscope.app.storage import RedisStorage
+from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.middleware import AgenticMemoryMiddleware, MiddlewareBase
 from agentscope.permission import PermissionContext, PermissionMode
-from agentscope.rag import ApproxTokenChunker, QdrantStore
 from agentscope.workspace import WorkspaceBase
 
 # -- 行内模型平台（bocom-as 发行版：config / providers）--------------------
@@ -54,15 +47,17 @@ if os.getenv("AMAP_API_KEY"):
         ),
     )
 
-storage = RedisStorage(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", "6379")),
+# 主存储：OceanBase（MySQL 模式，经 aiomysql 驱动）。DATABASE_URL 可整体
+# 覆盖；默认连本机 OB（2881 端口，root 空密码，OB CE 容器默认）。
+storage = AsyncSQLAlchemyStorage(
+    url=os.getenv(
+        "DATABASE_URL",
+        "mysql+aiomysql://root:@localhost:2881/agentscope?charset=utf8mb4",
+    ),
 )
 
 # 与 create_app 共享同一实例（行内模型 key 刷新中间件复用）。
 message_bus = InMemoryMessageBus()
-
-vector_store = QdrantStore(location=":memory:")
 
 
 async def longterm_memory_factory(
@@ -126,16 +121,6 @@ app = create_app(
         # The default MCP servers that will be added into the workspace
         default_mcps=default_mcps,
     ),
-    # Knowledge base feature — backed by an in-memory Qdrant store. The
-    # CollectionPerKbManager allocates one collection per knowledge base,
-    # so any embedding dimension is allowed.
-    knowledge_base_manager=CollectionPerKbManager(
-        storage=storage,
-        vector_store=vector_store,
-    ),
-    # Chunker classes users can pick from when creating a knowledge base;
-    # the chosen type and parameters are pinned on the knowledge base.
-    knowledge_chunkers=[ApproxTokenChunker],
     # Resource hubs the UI browses under /hub. Neither needs credentials
     # of its own — an individual MCP card declares whatever key it wants
     # from the user in its ``inputs_schema``. Passing a ClawHub token
@@ -190,11 +175,6 @@ so anything you want them to see MUST be sent through `TeamSay`.""",
             allow_methods=["*"],
             allow_headers=["*"],
         ),
-    ],
-    channels=[
-        DingTalkChannel,
-        DiscordChannel,
-        FeishuChannel,
     ],
 )
 
