@@ -10,44 +10,19 @@ requires-python = ">=3.11"
 # 自包含单发行版：SDK 源码随包分发（src/agentscope），依赖全量并入主列表
 # （SDK 全部依赖 + service / storage-redis / workspace-docker 三个部署必需 extras）
 dependencies = [
-    # ---- agentscope SDK 核心依赖 ----
-    "aioitertools",
-    "anthropic",
-    "dashscope",
-    "docstring_parser",
-    "filetype",
-    "json5",
-    "json_repair",
-    "mcp<2.0.0",
-    "httpx",
-    "numpy",
-    "openai",
-    "python-datauri",
-    "opentelemetry-api>=1.39.0",
-    "opentelemetry-sdk>=1.39.0",
-    "opentelemetry-exporter-otlp>=1.39.0",
-    "opentelemetry-semantic-conventions>=0.60b0",
-    "python-socketio",
-    "rich",
-    "shortuuid",
-    "python-frontmatter",
-    "jinja2",
-    "aiofiles",
-    "tree_sitter",
-    "tree_sitter_bash",
-    "jsonschema",
-    "pypdf",
-    # The IANA timezone database, which is absent on Windows and slim images
-    "tzdata",
-    # ---- service extra（bocom-starter 应用服务）----
+    # pip 源安装
+    "agentscope==2.0.7",
+    # ---- bocom-starter 部署必需（若行内 agentscope 发行已并入 extras，
+    # ---- 重复声明无冲突，可精简）----
     "fastapi",
     "uvicorn",
     "apscheduler",
     "ag-ui-protocol>=0.1.10",
-    # ---- storage-redis extra（主存储）----
     "redis",
-    # ---- workspace-docker extra（Docker 工作区沙箱）----
     "aiodocker",
+    # ---- providers 直接依赖 ----
+    "httpx",
+    "pydantic",
 ]
 
 # 包发现：src/ 下为 agentscope SDK 包树，./ 下为 config / providers 顶层子包
