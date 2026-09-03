@@ -1,0 +1,12 @@
+# bocom-starter requirements
+# 启动程序依赖 bocom-as 自包含发行版（SDK + config + providers 全部包），
+# 经相对路径可编辑安装（相对路径以本 requirements.txt 所在目录解析）：
+#   pip install -r requirements.txt
+# 版本号与 bocom-as/requirements.txt 的解析结果保持一致。
+
+# ---- bocom-as 自包含发行版（可编辑安装，含其全部依赖）----
+-e ../bocom-as
+
+# ---- 启动程序直接依赖（bocom-as 已覆盖，显式声明便于独立审视）----
+fastapi==0.141.1
+uvicorn==0.52.4
