@@ -200,7 +200,7 @@ async def _api(
 async def create_agent(
     name: str,
     system_prompt: str,
-    max_iters: int = 20,
+    max_iters: int = 200,
     enabled_tools: list[str] = [],
 ) -> str:
     """创建一个新的智能体配置。
