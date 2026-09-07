@@ -1,7 +1,6 @@
-agentscope==2.0.7
+agentscope==2.0.5
 fastapi
 uvicorn
-apscheduler
 ag-ui-protocol>=0.1.10
 redis
 aiodocker

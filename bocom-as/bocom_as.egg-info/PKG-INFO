@@ -3,10 +3,9 @@ Name: bocom-as
 Version: 0.1.0
 Summary: 交通银行行内定制 agentscope 发行版：核心 SDK（src/agentscope）+ 行内模型平台（providers）+ 公共配置（config）
 Requires-Python: >=3.11
-Requires-Dist: agentscope==2.0.7
+Requires-Dist: agentscope==2.0.5
 Requires-Dist: fastapi
 Requires-Dist: uvicorn
-Requires-Dist: apscheduler
 Requires-Dist: ag-ui-protocol>=0.1.10
 Requires-Dist: redis
 Requires-Dist: aiodocker

@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 # （SDK 全部依赖 + service / storage-redis / workspace-docker 三个部署必需 extras）
 dependencies = [
     # pip 源安装
-    "agentscope==2.0.7",
+    "agentscope==2.0.5",
     # ---- bocom-starter 部署必需（若行内 agentscope 发行已并入 extras，
     # ---- 重复声明无冲突，可精简）----
     "fastapi",

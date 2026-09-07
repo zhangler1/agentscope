@@ -8,7 +8,7 @@
 # 注意：本文件仅锁依赖；bocom-as 本体请单独安装（自包含发行版）。
 
 # ---- 直接依赖（与 pyproject.toml 一致）----
-agentscope==2.0.7
+agentscope==2.0.5
 
 fastapi>=0.141.1
 uvicorn>=0.52.4
