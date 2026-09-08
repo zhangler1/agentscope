@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "交通银行行内定制 agentscope 发行版：核心 SDK（src/agentscope）+ 行内模型平台（providers）"
 requires-python = ">=3.11"
 # 自包含单发行版：SDK 源码随包分发（src/agentscope），依赖全量并入主列表
-# （SDK 全部依赖 + service / storage-redis / workspace-docker 三个部署必需 extras）
+# （SDK 全部依赖 + service / storage-redis / storage-mysql(SQL 存储) /
+# workspace-docker 部署必需 extras）
 dependencies = [
     # pip 源安装
     "agentscope==2.0.5",
@@ -20,6 +21,12 @@ dependencies = [
     "ag-ui-protocol>=0.1.10",
     "redis",
     "aiodocker",
+    # ---- SQL 存储后端（应用主存储，已从 Redis 迁至数据库）----
+    # OceanBase 兼容 MySQL 协议，驱动 aiomysql（官方 storage-mysql extra 同款）；
+    # 具体 async 驱动由部署方自选，此处并入官方 storage-sql / storage-mysql 依赖。
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.13",
+    "aiomysql",
     # ---- providers 直接依赖 ----
     "httpx",
     "pydantic",

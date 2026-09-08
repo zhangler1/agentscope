@@ -15,7 +15,7 @@ from agentscope.app.channel import (
 from agentscope.app.hub import ClawSkillHub, GitHubMCPHub
 from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
-from agentscope.app.storage import RedisStorage
+from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.middleware import AgenticMemoryMiddleware, MiddlewareBase
@@ -51,9 +51,22 @@ if os.getenv("AMAP_API_KEY"):
         ),
     )
 
-storage = RedisStorage(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", "6379")),
+# 主存储：数据库（AsyncSQLAlchemyStorage；OceanBase 兼容 MySQL 协议，
+# 本地/测试可用 MySQL 模拟，切真 OB 只改 DB_URL 地址）。会话/凭证/Agent
+# 等业务数据全部落库，与 Redis 无关；create_tables 启动时自动建表
+# （全新初始化，dev/单机够用；多副本生产改用 alembic upgrade head）。
+storage = AsyncSQLAlchemyStorage(
+    url=os.getenv(
+        "DB_URL",
+        "mysql+aiomysql://agentscope:agentscope@localhost:3306/agentscope",
+    ),
+    create_tables=True,
+    # 连接池健康参数：pre_ping 探测陈旧连接自动重建，recycle 早于
+    # 防火墙/NAT 空闲超时回收，避免连接被服务端静默断开
+    engine_kwargs={
+        "pool_pre_ping": True,
+        "pool_recycle": 1800,
+    },
 )
 
 # 与 create_app 共享同一实例（行内模型 key 刷新中间件复用）。
@@ -106,9 +119,10 @@ async def _combined_agent_middlewares(
 app = create_app(
     storage=storage,
     message_bus=message_bus,
-    # -- To use a Redis-backed message bus instead (recommended for
-    # -- multi-process / production deployments), uncomment the lines
-    # -- below and replace the InMemoryMessageBus() above:
+    # 消息总线：单进程部署 InMemory 即可（主存储已与 Redis 解耦）。
+    # 多进程/多副本部署需跨进程总线时，可换 RedisMessageBus（仅瞬时
+    # 协调用途：inbox / 唤醒 / 锁；需独立 Redis 实例），取消下方注释
+    # 并替换上面的 InMemoryMessageBus()：
     #
     # from agentscope.app.message_bus import RedisMessageBus
     # message_bus=RedisMessageBus(

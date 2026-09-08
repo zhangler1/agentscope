@@ -1,7 +1,8 @@
 # bocom-as requirements（锁定版本）
 # 由 pip 在干净 Python 3.12 环境中解析 bocom-as 0.1.0 的完整依赖闭包生成。
-# 覆盖：pyproject.toml 主依赖列表（agentscope==2.0.7 传递依赖 + service /
-# storage-redis / workspace-docker 三个部署必需 extras）+ providers 直接依赖。
+# 覆盖：pyproject.toml 主依赖列表（agentscope==2.0.5 传递依赖 + service /
+# storage-redis / storage-mysql(SQL 存储) / workspace-docker 部署必需 extras）
+# + providers 直接依赖。
 # 用法：
 #   pip install -r requirements.txt          # 安装依赖（不含 bocom-as 本身）
 #   pip install -e .                         # 再以可编辑模式安装 bocom-as
@@ -16,6 +17,11 @@ apscheduler>=3.11.3
 ag-ui-protocol>=0.1.10
 redis>=8.1.0 
 aiodocker>=0.27.0
+
+# ---- SQL 存储后端（应用主存储：数据库 / OceanBase 兼容 MySQL 协议）----
+sqlalchemy[asyncio]>=2.0
+alembic>=1.13
+aiomysql>=0.2.0
 
 # ---- providers 直接依赖 ----
 httpx>=0.28.1

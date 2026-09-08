@@ -23,7 +23,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # 第一步：只复制 bocom-as 的 pyproject.toml，安装全量依赖（不含项目本身）。
 # 依赖列表随 bocom-as 发行版维护（SDK 依赖 + service / storage-redis /
-# workspace-docker 已并入主列表）；只要 pyproject.toml 不变，这层被 Docker 缓存。
+# storage-mysql(SQL 存储：sqlalchemy/alembic/aiomysql) / workspace-docker
+# 已并入主列表）；只要 pyproject.toml 不变，这层被 Docker 缓存。
 COPY bocom-as/pyproject.toml /app/bocom-as/pyproject.toml
 RUN uv sync --project /app/bocom-as --no-install-project
 

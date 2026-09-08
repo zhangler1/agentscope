@@ -15,7 +15,7 @@ bocomm-agent/              # 交付物根（= Docker 构建上下文）
 └── bocom-starter/         # 本启动程序
     ├── main.py            # 服务入口（create_app + 行内模型平台路由）
     ├── Dockerfile         # 生产自包含镜像（构建上下文 = 交付物根）
-    ├── docker-compose.yml # CI/CD 部署（agentscope 单服务，Redis 用生产实例）
+    ├── docker-compose.yml # CI/CD 部署（agentscope 单服务，数据库用生产实例）
     ├── .env               # 环境变量示例（默认值，全部可省略）
     └── Readme.md
 ```
@@ -31,13 +31,16 @@ bocomm-agent/              # 交付物根（= Docker 构建上下文）
 pip install -e bocom-as
 ```
 
-**依赖 Redis（仅主存储）**：本服务用 Redis 存会话/凭证/Agent 等业务数据；
-**行内模型平台本身不再依赖 Redis**（模型候选来自随包内置的
+**依赖数据库（主存储）**：本服务用数据库存会话/凭证/Agent 等业务数据
+（`AsyncSQLAlchemyStorage`；**OceanBase 兼容 MySQL 协议**，本地/测试可用
+MySQL 模拟，切真 OB 只改 `DB_URL` 地址，驱动/建表逻辑不变）；**行内模型
+平台本身不再依赖 Redis**（模型候选来自随包内置的
 `providers/_models/*.yaml` 模型卡，key 刷新走主存储凭证记录）。
 
 ```bash
-export REDIS_HOST=localhost        # 应用主存储（会话、凭证、Agent 等）
-export REDIS_PORT=6379
+# 应用主存储（会话、凭证、Agent 等）。默认值即下方 localhost:3306
+# （驱动 aiomysql；首次启动自动建表，dev/单机够用）
+export DB_URL=mysql+aiomysql://agentscope:agentscope@localhost:3306/agentscope
 ```
 
 ## 2. 启动服务
@@ -211,8 +214,9 @@ data: {"type": "REPLY_END", "reply_id": "...", "finished_reason": "completed"}
 当前调用一次；刷新失败标记凭证过期，下次调用走惰性刷新恢复。
 日志关键字：`injected refreshed ELLM key`。
 
-> key 刷新依赖的是注入给中间件的 **主存储**（`storage`/`message_bus`），
-> 主存储配 SQL 或 Redis 都行，与模型候选无关。
+> key 刷新依赖的是注入给中间件的 **主存储**（`storage`，现为数据库）与
+> **消息总线**（`message_bus`，单进程 InMemory；多进程部署换
+> RedisMessageBus 后防抖锁跨进程生效），与模型候选无关。
 
 ---
 
@@ -232,7 +236,8 @@ bocomm-agent/              # 交付物根（= Docker 构建上下文）
 
 - **bocom-as 自包含**：[pyproject.toml](../bocom-as/pyproject.toml) 打包
   `src/agentscope`（SDK）+ `config` + `providers`，依赖全量并入主列表
-  （SDK 全部依赖 + service / storage-redis / workspace-docker）。
+  （SDK 全部依赖 + service / storage-redis / storage-mysql(SQL 存储) /
+  workspace-docker）。
 
 ## 2. 构建镜像
 
@@ -255,8 +260,8 @@ docker build -t agentscope-service:bocom -f bocom-starter/Dockerfile .
 docker compose -f bocom-starter/docker-compose.yml up -d
 ```
 
-- **单服务**：只部署 agentscope；**生产 Redis 复用行内实例，不自建**，
-  地址由平台环境变量注入（见下节）；
+- **单服务**：只部署 agentscope；**生产数据库（OceanBase，兼容 MySQL
+  协议）复用行内实例，不自建**，连接 URL 由平台环境变量注入（见下节）；
 - **端口**：宿主 `9000`（默认，可用 `AGENTSCOPE_HOST_PORT` 覆盖）→ 容器 `8000`；
 - **持久化**：`workspace-data` 命名 volume 挂载到
   `/app/bocom-starter/workspaces`（agent 工作区 + 长期记忆 Markdown 文件，
@@ -271,7 +276,7 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | ✅ | 生产 Redis（应用主存储：会话、凭证、Agent 等） |
+| `DB_URL` | ✅ | 生产数据库 URL（应用主存储：会话、凭证、Agent 等；`mysql+aiomysql://...`，OceanBase 兼容 MySQL 协议） |
 | `DASHSCOPE_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 按需 | 各模型供应商 key |
 
 > 未注入的变量不进入容器，退化为 `bocom-starter/.env` 中的默认值
@@ -285,7 +290,7 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
   AGENTSCOPE_HOST_PORT=8010 docker compose -f bocom-starter/docker-compose.yml -p bocom2 up -d
   ```
 
-  各实例共享生产 Redis（会话/凭证数据隔离由业务侧控制）；
+  各实例共享生产数据库（会话/凭证数据隔离由业务侧控制）；
 - **日志**：`docker compose -f bocom-starter/docker-compose.yml logs -f
   agentscope`；API 文档见 `http://<宿主>:9000/docs`。
 
@@ -295,10 +300,10 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | 应用主存储（会话、凭证、Agent 等）；Docker 部署时由平台注入生产地址 |
+| `DB_URL` | `mysql+aiomysql://agentscope:agentscope@localhost:3306/agentscope` | 应用主存储（会话、凭证、Agent 等；AsyncSQLAlchemyStorage，OceanBase 兼容 MySQL 协议）；Docker 部署时由平台注入生产地址 |
 | `UVICORN_RELOAD` | `false` | 是否开启 uvicorn 热重载（本地开发设 `true`） |
 
-> `.env` 由宿主应用加载（本仓库提供示例）。行内模型平台（bocom-as
-> `providers`）不再依赖独立 Redis / 额外配置：模型候选来自随包内置
-> 模型卡，api_key 刷新窗口默认 300s（`build_ellm_refresh_middleware`
-> 的 `refresh_ahead_secs`，非必填）。
+> `.env` 由宿主应用加载（本仓库提供示例）。应用主存储为数据库（见上表），
+> Redis 不再承担任何业务存储；行内模型平台（bocom-as `providers`）不依赖
+> 额外配置：模型候选来自随包内置模型卡，api_key 刷新窗口默认 300s
+> （`build_ellm_refresh_middleware` 的 `refresh_ahead_secs`，非必填）。
