@@ -34,12 +34,15 @@ class FakeRedis:
     """In-memory stand-in for the redis.asyncio client.
 
     Supports only the commands ConcurrencyGuard uses:
-    incr / decr / hset / hdel / hgetall / exists / get / set / eval / pipeline.
+    incr / decr / hset / hdel / hgetall / exists / get / set / eval / pipeline
+    — plus the sorted-set / delete primitives used by bocomadp.memory.state
+    (zadd / zscore / zrem / zrangebyscore / delete) and ``set`` NX/EX flags.
     """
 
     def __init__(self) -> None:
         self._strings: dict[str, int] = {}
         self._hashes: dict[str, dict[str, str]] = {}
+        self._zsets: dict[str, dict[str, float]] = {}
 
     async def incr(self, key: str) -> int:
         self._strings[key] = self._strings.get(key, 0) + 1
@@ -49,8 +52,23 @@ class FakeRedis:
         self._strings[key] = self._strings.get(key, 0) - 1
         return self._strings[key]
 
-    async def set(self, key: str, value: int) -> None:
+    async def set(
+        self,
+        key: str,
+        value: int | str,
+        ex: int | None = None,
+        nx: bool = False,
+        exat: int | None = None,
+    ) -> bool | None:
+        """SET with optional NX / EX.  Simulates Redis semantics:
+        success returns ``True``; ``NX`` on an existing key returns ``None``.
+        """
+        del ex, exat  # TTL not tracked in the in-memory stand-in
+        exists = key in self._strings or key in self._hashes or key in self._zsets
+        if nx and exists:
+            return None
         self._strings[key] = value
+        return True
 
     async def hset(self, key: str, field: str, value: str) -> int:
         h = self._hashes.setdefault(key, {})
@@ -83,7 +101,59 @@ class FakeRedis:
         return str(val) if val is not None else None
 
     async def exists(self, *keys: str) -> int:
-        return sum(1 for k in keys if k in self._strings or k in self._hashes)
+        return sum(
+            1
+            for k in keys
+            if k in self._strings or k in self._hashes or k in self._zsets
+        )
+
+    async def delete(self, *keys: str) -> int:
+        removed = 0
+        for key in keys:
+            for store in (self._strings, self._hashes, self._zsets):
+                if store.pop(key, None) is not None:
+                    removed += 1
+        return removed
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        z = self._zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if member not in z:
+                added += 1
+            z[member] = float(score)
+        return added
+
+    async def zscore(self, key: str, member: str) -> float | None:
+        return self._zsets.get(key, {}).get(member)
+
+    async def zrem(self, key: str, *members: str) -> int:
+        z = self._zsets.get(key)
+        if z is None:
+            return 0
+        removed = 0
+        for member in members:
+            if z.pop(member, None) is not None:
+                removed += 1
+        if not z:
+            del self._zsets[key]
+        return removed
+
+    async def zrangebyscore(
+        self,
+        key: str,
+        mn: float | str,
+        mx: float | str = "+inf",
+        withscores: bool = False,
+    ) -> list:
+        z = self._zsets.get(key, {})
+        lo = -float("inf") if mn == "-inf" else float(mn)
+        hi = float("inf") if mx == "+inf" else float(mx)
+        items = [(m, s) for m, s in z.items() if lo <= s <= hi]
+        items.sort(key=lambda t: t[1])
+        if withscores:
+            return items
+        return [m for m, _ in items]
 
     def pipeline(self) -> _FakePipeline:
         return _FakePipeline(self)
