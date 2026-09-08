@@ -182,8 +182,9 @@ class EllmKeyRefresher:
 
     All key state lives in the user-scoped credential record identified by
     ``credential_id``; the record's ``data`` dict is expected to carry
-    ``api_key``, ``scene_code``, ``api_key_url`` and (optionally)
-    ``inject_think_tag``.
+    ``api_key``, ``scene_code`` and ``api_key_url``. The ``<think>``
+    injection switch is NOT stored on the credential — it is resolved at
+    call time from the session override / Redis model table.
     """
 
     _LOCK_TTL_SECS = _LOCK_TTL_SECS
@@ -279,8 +280,7 @@ class EllmKeyRefresher:
 
         Returns:
             A tuple ``(api_key, record)``; ``record.data`` carries the
-            freshest ``api_key`` / ``apikey_expires_at`` and any runtime
-            switches (e.g. ``inject_think_tag``).
+            freshest ``api_key`` / ``apikey_expires_at``.
         """
         record = await self._get_credential_any_owner(credential_id)
         if record is None:

@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
-"""按凭证查询可用模型（含"凭证绑定单模型"过滤）。
+"""ELLM 凭证的配置查询与部分更新。
 
-类似官方 ``GET /model/?provider=...``，但额外传 ``credential_id``：
-
-- 凭证带 ``model`` 字段（B 方案：一凭证一模型）→ **只返回该模型**；
-- 凭证没有 ``model`` 字段 → 返回该类型全部候选（``_models/*.yaml``）。
-
-用法::
-
-    GET /model/credential?credential_id=<id>&user_id=zy
+- ``GET  /model/credential?credential_id=...`` —— 按凭证 id 返回其实际
+  存储配置（不含模型候选：凭证不绑定模型，候选模型由官方
+  ``GET /model/?provider=...`` 提供）；
+- ``PATCH /model/credential/{id}`` —— 只覆盖前端传入字段、其余保持原值
+  的合并式更新（区别于官方 ``PATCH /credential/{id}`` 的整体替换）。
 """
 from __future__ import annotations
 
@@ -17,7 +14,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agentscope.app._router._schema import ListModelsResponse
 from agentscope.app._service import ResourceAccessService
 from agentscope.app.deps import (
     get_current_user_id,
@@ -30,55 +26,49 @@ from agentscope.credential import CredentialFactory
 credential_model_router = APIRouter(prefix="/model", tags=["credential-model"])
 
 
+class CredentialConfigResponse(BaseModel):
+    """按凭证 id 查询到的凭证实际配置。"""
+
+    credential_id: str = Field(description="凭证 id。")
+    data: dict[str, Any] = Field(
+        description=(
+            "该凭证实际存储的配置字段（type/name/base_url/scene_code/"
+            "api_key_url/apikey_expires_at/...）。不含模型候选。"
+        ),
+    )
+
+
 @credential_model_router.get(
     "/credential",
-    response_model=ListModelsResponse,
-    summary="List models for a credential",
+    response_model=CredentialConfigResponse,
+    summary="Get a credential's effective configuration",
     description=(
-        "Resolve the credential by id, then return its candidate models: "
-        "the single bound model when the credential carries a ``model`` "
-        "field, otherwise every candidate from ``_models/*.yaml``."
+        "Resolve the credential by id (ownership/sharing check) and "
+        "return its stored configuration fields. Model candidates are "
+        "served by the official ``GET /model/?provider=...`` — the "
+        "credential itself does not bind a model."
     ),
 )
-async def list_credential_models(
+async def get_credential_config(
     credential_id: str = Query(
         ...,
-        description="The credential to inspect.",
+        description="The credential whose configuration to return.",
     ),
     user_id: str = Depends(get_current_user_id),
     access: ResourceAccessService = Depends(get_resource_access_service),
-) -> ListModelsResponse:
-    """按凭证返回可调用模型。
+) -> CredentialConfigResponse:
+    """返回凭证的实际配置。
 
-    ``resolve_credential`` 校验归属/共享（不可见 → 404），返回原始
-    记录（含完整 payload）。从 payload 反序列化凭证后：
-
-    - 凭证带 ``model`` → 从该类型候选里筛出对应模型（只返回一个）；
-    - 不带 → 返回该类型全部候选。
+    ``resolve_credential`` 校验归属/共享（不可见 → 404）；随后反序列化
+    原始 payload 并返回其全部存储字段（与 ``PATCH`` 响应同构）。
     """
     record = await access.resolve_credential(user_id, credential_id)
 
     credential = CredentialFactory.from_dict(record.data)
-    model_cls = credential.get_chat_model_class()
-    cards = model_cls.list_models()
-
-    bound = getattr(credential, "model", None)
-    if bound:
-        cards = [
-            card
-            for card in cards
-            if card.name == bound
-        ]
-        if not cards:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Credential's model {bound!r} not found in "
-                    "candidates."
-                ),
-            )
-
-    return ListModelsResponse(models=cards, total=len(cards))
+    return CredentialConfigResponse(
+        credential_id=record.data.get("id") or credential_id,
+        data=_dump_credential_data(credential),
+    )
 
 
 class ELLMCredentialPatch(BaseModel):
@@ -108,7 +98,7 @@ class ELLMCredentialPatchResponse(BaseModel):
         "credential payload — unpassed fields keep their current values "
         "(unlike the official ``PATCH /credential/{id}`` which replaces "
         "the whole payload). The merged result is re-validated as an "
-        "``ELLMCredential`` (e.g. ``model`` must stay in candidates)."
+        "``ELLMCredential`` (required fields must be present)."
     ),
 )
 async def patch_ellm_credential(
@@ -122,7 +112,7 @@ async def patch_ellm_credential(
 
     - ``resolve_credential`` 校验归属/共享，不可见 → 404；
     - 非 ``bocom_ellm_credential`` 类型 → 400；
-    - 合并后整体重新校验（``model`` 必须仍在候选等），非法 → 422；
+    - 合并后整体重新校验（必填字段齐全等），非法 → 422；
     - ``id``/``type`` 永远保持原值，不可被覆盖。
     """
     record = await access.resolve_credential(user_id, credential_id)
@@ -142,7 +132,7 @@ async def patch_ellm_credential(
     merged["id"] = existing.get("id") or credential_id
     merged["type"] = "bocom_ellm_credential"
 
-    # 合并后整体校验（model 候选、必填字段等），非法 → 422。
+    # 合并后整体校验（必填字段齐全等），非法 → 422。
     credential = CredentialFactory.from_dict(merged)
     credential.id = existing.get("id") or credential_id
 
