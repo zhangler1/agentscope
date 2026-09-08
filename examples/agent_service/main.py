@@ -53,6 +53,7 @@ from agentscope.mcp import MCPClient, StdioMCPConfig
 from agentscope.rag import QdrantStore
 
 from bocomadp.agents.templates import load_subagent_templates
+import bocomadp.memory as memory_module
 from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注册自定义供应商
 from bocomadp.config import (
     get_app_config,
@@ -104,7 +105,6 @@ from bocomadp.team_briefing import patch_team_briefing
 from bocomadp.projectors import WorkerFailureNotifier
 from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
-from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 from bocomadp.deerflow.model_patch import patch_get_model
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
@@ -529,13 +529,28 @@ class _BuiltinAgentStorageProxy:
         return await self._inner.delete_session("default", agent_id, session_id)
 
     async def delete_agent(self, user_id: str, agent_id: str) -> bool:
-        """Delete via framework storage, then drop the per-agent tool
-        whitelist so the persisted whitelist file keeps no orphans.
+        """Delete via framework storage, then clean up side records:
+        per-agent tool whitelist + session memory config / Redis state.
 
         The framework's ``DELETE /agent/{id}`` (and team cascades)
         all funnel through this storage call; the bocomadp-only
         ``/agents`` router is unused by the product.
+
+        Memory cleanup (best-effort, never blocks the delete result):
+        - DB ``agent_memory_configs`` row: ``memory_store.memory_delete``;
+        - Redis per-session state (``active_sessions`` member / ``turns`` /
+          extract lock): enumerated from the agent's sessions *before* the
+          delete (sessions vanish afterwards), then removed per sid.
+          Platform-side delete remains a placeholder (local delete only).
         """
+        # ① 删除前快照该 agent 的会话 id（删除后取不到），供记忆 Redis 清理；
+        #    枚举与容错实现收口在 memory 包（list_agent_session_ids）。
+        session_ids = await memory_module.list_agent_session_ids(
+            user_id,
+            agent_id,
+            storage=self._inner,
+        )
+
         ok = await self._inner.delete_agent(user_id, agent_id)
         if ok:
             try:
@@ -549,6 +564,20 @@ class _BuiltinAgentStorageProxy:
             except Exception:  # 白名单清理失败不影响删除结果
                 logger.warning(
                     "failed to drop tool whitelist for %s",
+                    agent_id,
+                    exc_info=True,
+                )
+            try:
+                # 记忆清理收口到 memory 包（DB 配置行 + Redis 会话态）；
+                # 平台侧删除仍为占位（仅本地清理）。session_ids 已在上方快照。
+                await memory_module.cleanup_agent_memory(
+                    user_id,
+                    agent_id,
+                    session_ids=session_ids,
+                )
+            except Exception:  # 记忆清理失败不影响删除结果
+                logger.warning(
+                    "failed to drop memory records for agent %s",
                     agent_id,
                     exc_info=True,
                 )
@@ -726,6 +755,14 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
+# 会话记忆运行时依赖：redis client（供心跳/计数/锁）与 storage（取消息）。
+# InMemory 本地模式 _get_redis_client() 返回 None → 记忆中间件仅检索注入，
+# 计数/提取降级关闭；Redis 模式全量生效。
+memory_module.configure_memory_runtime(
+    redis_client_fn=_get_redis_client,
+    storage=storage,
+)
+
 
 async def _build_agent_middlewares_with_ellm(
     user_id: str,
@@ -735,6 +772,14 @@ async def _build_agent_middlewares_with_ellm(
     mws = await build_agent_middlewares(user_id, agent_id, session_id)
     mws.extend(await _ellm_refresh_mw_factory(user_id, agent_id, session_id))
     mws.append(_summarization_mw)
+    # 会话记忆中间件：memory_enabled 才装配（检索注入 + 轮数/静默触发）
+    mws.extend(
+        await memory_module.build_memory_middlewares(
+            user_id,
+            agent_id,
+            session_id,
+        ),
+    )
     return mws
 
 
@@ -939,7 +984,10 @@ app.include_router(agent_router)
 # （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
 # 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
 # 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
-install_agent_memory_router(app)
+# 会话记忆能力装配：/memory/config 路由 + lifespan 启动静默扫描器
+# （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
+# _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
+memory_module.install_memory(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
@@ -1007,9 +1055,22 @@ if __name__ == "__main__":
         config.logging.enhance.format,
         config.service.reload,
     )
-    uvicorn.run(
-        "main:root_app",
-        host=config.service.host,
-        port=config.service.port,
-        reload=config.service.reload,
-    )
+    # 传 app 对象而非 "main:root_app" 字符串：python main.py 时本模块先以
+    # __main__ 执行一遍，若再让 uvicorn 按字符串 import "main"，顶层代码会
+    # 被完整重跑第二遍（重复建 engine/装 lifespan、install_memory 等模块级
+    # 日志全部打两遍）。传对象则不二次 import。
+    # reload 热更需要 import 字符串，dev 可接受双跑；生产 reload=false 传对象。
+    if config.service.reload:
+        uvicorn.run(
+            "main:root_app",
+            host=config.service.host,
+            port=config.service.port,
+            reload=True,
+        )
+    else:
+        uvicorn.run(
+            root_app,
+            host=config.service.host,
+            port=config.service.port,
+            reload=False,
+        )

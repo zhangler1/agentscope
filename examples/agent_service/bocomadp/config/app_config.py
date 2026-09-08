@@ -38,6 +38,8 @@ from .base import (
 # 由独立读取器消费（models → load_model_entries；
 # cross_search → get_cross_search_config）。
 # 新增此类业务节点时，必须加入本集合，否则启动校验会 fail-fast。
+# （memory 已由 AppConfig.memory: MemoryEndpointConfig 声明消费，
+#   保留在白名单内以免遗留/拼写校验误报，两者不冲突。）
 _BUSINESS_KEYS: frozenset[str] = frozenset(
     {
         "models",
@@ -52,6 +54,7 @@ _BUSINESS_KEYS: frozenset[str] = frozenset(
         "rate_currency",
         "uploads",
         "agents",
+        "memory",
     },
 )
 
@@ -256,20 +259,20 @@ class ToolResultConfig(BaseModel):
         description="Redis 键超时秒数(默认 4 小时)。",
     )
     per_tool_threshold_chars: int = Field(
-        default=50000,
+        default=20000,
         description="单工具结果字符阈值,超过则完整内容持久化并给模型预览。",
     )
     message_budget_chars: int = Field(
-        default=200000,
+        default=80000,
         description="单轮(同一条 user 消息)所有工具结果合计字符预算,超过则替换最大的结果。",
     )
     preview_chars: int = Field(
-        default=2000,
+        default=1000,
         description="预览消息保留的字符数。",
     )
     read_result_max_output_chars: int = Field(
-        default=100_000,
-        description="读回工具(read_tool_result)单次输出上限(字符),对应 Claude Code 的 DEFAULT_MAX_OUTPUT_TOKENS=25000 token 预算;实际上限取 min(本字段, per_tool_threshold_chars)。",
+        default=2000,
+        description="读回工具(read_tool_result)单次输出上限(字符);实际上限取 min(本字段, per_tool_threshold_chars)。",
     )
     exempt_tools: list[str] = Field(
         default_factory=list,
@@ -315,6 +318,33 @@ class ImageParseConfig(BaseModel):
                 "model_name 均必填",
             )
         return self
+
+
+class MemoryEndpointConfig(BaseModel):
+    """会话记忆平台 HTTP 端点配置（config.yaml ``memory:`` 节点）。
+
+    完整 URL 不拼接：注册 / 检索 / 录入接口的绝对地址直接给到对应字段
+    （路径如 ``/registerAgent.do`` 等已含在 URL 中）。空值表示未配置，
+    平台客户端（``bocomadp/memory/platform.py``）按需读取并抛错。
+    """
+
+    register_url: str = Field(
+        default="",
+        description="平台注册接口完整 URL（registerAgent.do）。",
+    )
+    retrieve_url: str = Field(
+        default="",
+        description="平台检索接口完整 URL（searchMemory.do）。",
+    )
+    extract_url: str = Field(
+        default="",
+        description="平台录入接口完整 URL（saveMemoriesStandard.do）。",
+    )
+    request_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="平台 HTTP 请求超时（秒）。",
+    )
 
 
 class DbConfig(BaseModel):
@@ -601,6 +631,10 @@ class AppConfig(BaseSettings):
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     db: DbConfig = Field(default_factory=DbConfig)
+    memory: MemoryEndpointConfig = Field(
+        default_factory=MemoryEndpointConfig,
+        description="会话记忆平台端点（register/retrieve/extract URL）。",
+    )
     ellm_key_refresh: EllmKeyRefreshConfig = Field(
         default_factory=EllmKeyRefreshConfig,
         description="ELLM apikey 提前刷新窗口配置。",

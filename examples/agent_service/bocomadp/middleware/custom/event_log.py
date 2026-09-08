@@ -114,7 +114,7 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _format_messages(messages: Any) -> str:
-    """把 messages 列表格式化成单行可读文本。"""
+    """把 messages 列表逐条格式化成多行可读文本（每条消息独立成行）。"""
     parts: list[str] = []
     for msg in messages or []:
         role = getattr(msg, "role", "?")
@@ -127,7 +127,8 @@ def _format_messages(messages: Any) -> str:
         else:
             text = _block_text(content)
         parts.append(f"[{role}:{name}] {_truncate(text, _MAX_CONTENT)}")
-    return " || ".join(parts) or "-"
+    # 消息之间用换行分隔，避免 user/assistant 等挤在同一行难以阅读
+    return "\n".join(parts) or "-"
 
 
 def _response_text(content: Any) -> str:
