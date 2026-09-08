@@ -3,7 +3,8 @@
 #   docker build -t agentscope-service:bocom -f bocom-starter/Dockerfile .
 # 镜像自包含：代码全部打进镜像，运行时无需挂载源码（生产模式）。
 FROM python:3.11-bookworm
-
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 # 安装系统依赖（curl: uv 安装器；ripgrep: LocalWorkspace 的 Grep 工具）
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates ripgrep \
@@ -28,8 +29,13 @@ RUN uv sync --project /app/bocom-as --no-install-project
 
 # 第二步：复制 bocom-as 完整源码（config / providers / src=agentscope SDK），
 # 以可编辑模式安装（editable 注册 agentscope / config / providers 全部包）。
+# 注意：dependencies 中的 PyPI `agentscope==2.0.5`（元依赖，用于拉齐官方依赖
+# 树）会先以同名目录落地 site-packages，遮蔽 fork 的 src/agentscope（官方
+# 2.0.5 无 app.channel 等行内扩展）→ 装完 fork 后必须卸载官方同名包，
+# 令 import agentscope 指向 /app/bocom-as/src/agentscope（官方第三方依赖保留）。
 COPY bocom-as /app/bocom-as
-RUN uv pip install --no-deps -e /app/bocom-as
+RUN uv pip install --no-deps -e /app/bocom-as \
+    && uv pip uninstall -y agentscope
 
 # 第三步：复制 bocom-starter 启动程序。
 COPY bocom-starter /app/bocom-starter

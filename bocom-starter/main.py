@@ -23,13 +23,10 @@ from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.rag import ApproxTokenChunker, QdrantStore
 from agentscope.workspace import WorkspaceBase
 
-# -- 行内模型平台（bocom-as 发行版：config / providers）--------------------
-from config import get_ellm_settings
+# -- 行内模型平台（bocom-as 发行版：providers）------------------------------
 from providers.credential import ELLMCredential  # noqa: F401 — 导入即注册
 from providers.middleware.ellm_refresh import build_ellm_refresh_middleware
-from providers.routers.ellm_models import ellm_models_router
 from providers.routers.credential_model import credential_model_router
-from providers.routers.session_think_tag import session_think_tag_router
 
 default_mcps = [
     MCPClient(
@@ -83,11 +80,11 @@ async def longterm_memory_factory(
 
 
 # 行内模型平台：ELLM api key 刷新中间件工厂（惰性预刷 + 401 强制刷新重试）。
-# 参数取自 bocom-as/config（环境变量 ELLM_* 可覆盖，见 .env）。
+# refresh_ahead_secs 非必填，默认 300s（key 过期前提前刷新窗口）；如需调整，
+# 可给 build_ellm_refresh_middleware(storage, message_bus, refresh_ahead_secs=...)。
 _ellm_refresh_factory = build_ellm_refresh_middleware(
     storage,
     message_bus,
-    refresh_ahead_secs=get_ellm_settings().refresh_ahead_secs,
 )
 
 
@@ -200,13 +197,8 @@ so anything you want them to see MUST be sent through `TeamSay`.""",
 
 
 # 行内模型平台路由：
-# - /ellm-models：模型候选管理（GET/POST/PUT/DELETE，Redis 模型表）
-# - /ellm-models/session/{session_id}/think-tag：会话级 think-tag 覆盖
-#   （优先级：会话级覆盖 > Redis 模型表 > 默认 False）
-# - /model/credential：按凭证查候选模型（GET）、凭证部分更新（PATCH）
-app.include_router(ellm_models_router)
+# - /model/credential：凭证配置查询（GET）、凭证部分更新（PATCH）
 app.include_router(credential_model_router)
-app.include_router(session_think_tag_router)
 
 
 if __name__ == "__main__":

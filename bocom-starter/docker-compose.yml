@@ -15,8 +15,8 @@ services:
     image: agentscope-service:bocom
     ports: ["${AGENTSCOPE_HOST_PORT:-8000}:8000"]
     env_file:
-      # 默认值复用 .env（注释行自动忽略）；生产 Redis 地址与行内配置
-      # （ELLM_*、各 API key）由 CI/CD 平台环境变量注入
+      # 默认值复用 .env（注释行自动忽略）；生产 Redis 地址与各 API key
+      # 由 CI/CD 平台环境变量注入
       - .env
     environment:
       - DASHSCOPE_API_KEY
@@ -26,8 +26,6 @@ services:
       # 宿主未注入时容器内退化为 .env 默认值——仅本地直跑/端口转发场景可用）
       - REDIS_HOST
       - REDIS_PORT
-      - ELLM_REDIS_HOST
-      - ELLM_REDIS_PORT
       # bocom-as 顶层包（config / providers）经 PYTHONPATH 导入
       - PYTHONPATH=/app/bocom-as
     volumes:

@@ -4,11 +4,9 @@
 每次模型调用前，通过 :class:`EllmKeyRefresher` 惰性检查/刷新 ELLM
 apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落），
 再用 ``EllmChatModel.set_api_key`` 把新鲜 key 注入到当前模型实例的
-请求头（``Authorization: Bearer <key>``），并设置 ``inject_think_tag``
-开关——优先级：会话级覆盖（``PUT/DELETE
-/ellm-models/session/{session_id}/think-tag`` 管理的会话级 think-tag
-覆盖，写入 Redis）> Redis 模型表 ``bocomadp:model:think_tag``（按模型
-名）> 默认 False。不换类、不重建 client，模型调用链保持不变。
+请求头（``Authorization: Bearer <key>``）。``<think>`` 注入由模型构造
+参数 ``inject_think_tag`` 决定，本中间件不再查询任何 Redis 模型配置。
+不换类、不重建 client，模型调用链保持不变。
 
 挂载方式::
 
@@ -46,36 +44,10 @@ except ImportError:  # pragma: no cover — offline syntax fallback
         async def get_middleware_key(self) -> str:
             return self.__class__.__name__
 
-
 MiddlewareBase._is_agent_middleware = True  # type: ignore[attr-defined]
 
-from providers.ellm_chat_model import (  # noqa: E402
-    EllmChatModel,
-    _get_session_add_think_from_redis,
-    _get_think_tag_from_redis,
-)
-
-
-def _parse_add_think(value: Any) -> bool | None:
-    """严格解析 ``add_think`` 值，无法识别返回 ``None``。
-
-    避免 ``bool("false")`` 为 True 的陷阱：仅接受 bool / 数字 /
-    常见布尔字符串；``None`` 表示未指定或无法识别，由调用方回退
-    下一优先级（Redis 模型表）。
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        low = value.strip().lower()
-        if low in ("1", "true", "yes", "on"):
-            return True
-        if low in ("0", "false", "no", "off"):
-            return False
-    return None
+from providers.ellm_chat_model import EllmChatModel  # noqa: E402
+from providers.ellm_key import EllmKeyRefresher  # noqa: E402
 
 
 class EllmKeyRefreshMiddleware(MiddlewareBase):
@@ -83,10 +55,8 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
 
     - 非 :class:`EllmChatModel` 模型直接透传，不做任何处理；
     - :class:`EllmChatModel` 模型：``EllmKeyRefresher`` 惰性刷新 →
-      ``set_api_key`` 注入 → 设置 ``inject_think_tag``（会话级覆盖
-      ``_get_session_add_think_from_redis(session_id)`` 优先，否则按模型
-      名查 Redis 模型表）；并注入 401 回调：强制刷新 key 并重试当前调用
-      一次，刷新失败则标记凭证 key 过期。
+      ``set_api_key`` 注入；并注入 401 回调：强制刷新 key 并重试当前
+      调用一次，刷新失败则标记凭证 key 过期。
     """
 
     def __init__(
@@ -94,12 +64,8 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
         storage: Any,
         message_bus: Any,
         user_id: str,
-        session_id: str,
-        refresh_ahead_secs: float = 0.0,
+        refresh_ahead_secs: float = 300.0,
     ) -> None:
-        from providers.ellm_key import EllmKeyRefresher
-
-        self._session_id = session_id
         self._refresher = EllmKeyRefresher(
             storage,
             message_bus,
@@ -126,23 +92,6 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                     credential_id,
                 )
                 current_model.set_api_key(key)
-                # inject_think_tag 优先级：
-                #   1) 会话级覆盖（PUT/DELETE
-                #      /ellm-models/session/{session_id}/think-tag 管理，
-                #      写入 Redis，第一优先级）；
-                #   2) Redis 模型表 bocomadp:model:think_tag（按模型名）；
-                #   3) 默认 False。
-                # 会话无覆盖（未设置/已清除/Redis 无记录）时第 1 级返回
-                # None，自动回退到第 2/3 级。
-                session_think = await _get_session_add_think_from_redis(
-                    self._session_id,
-                )
-                if session_think is not None:
-                    current_model.inject_think_tag = session_think
-                else:
-                    current_model.inject_think_tag = (
-                        await _get_think_tag_from_redis(current_model.model)
-                    )
                 # 401 时的行为：
                 #   1) 强制刷新 key（force_refresh_key，锁保护）并用新 key
                 #      重试当前调用一次；
@@ -169,15 +118,15 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
 def build_ellm_refresh_middleware(
     storage: Any,
     message_bus: Any,
-    refresh_ahead_secs: float = 0.0,
+    refresh_ahead_secs: float = 300.0,
 ) -> Any:
     """构造 ``AgentMiddlewareFactory``，供 ``create_app(extra_agent_middlewares=...)`` 使用。
 
     Args:
         storage: StorageBase 实例（bocom-starter main.py 已持有）。
         message_bus: MessageBus 实例。
-        refresh_ahead_secs: ELLM key 提前刷新窗口（秒），来自
-            ``config.get_ellm_settings().refresh_ahead_secs``。
+        refresh_ahead_secs: ELLM key 提前刷新窗口（秒），非必填，
+            默认 300.0（key 过期前 300s 提前刷新）。
 
     Returns:
         ``AgentMiddlewareFactory`` —— ``async (user_id, agent_id, session_id)
@@ -189,17 +138,16 @@ def build_ellm_refresh_middleware(
         agent_id: str,
         session_id: str,
     ) -> list:
+        del agent_id, session_id
         return [
             EllmKeyRefreshMiddleware(
                 storage,
                 message_bus,
                 user_id,
-                session_id,
                 refresh_ahead_secs=refresh_ahead_secs,
             )
         ]
 
     return factory
-
 
 __all__ = ["EllmKeyRefreshMiddleware", "build_ellm_refresh_middleware"]

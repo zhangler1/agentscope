@@ -21,6 +21,7 @@ from agentscope.app.deps import (
     get_storage,
 )
 from agentscope.app.storage import StorageBase
+from agentscope.app.storage._utils import _dump_with_secrets
 from agentscope.credential import CredentialFactory
 
 credential_model_router = APIRouter(prefix="/model", tags=["credential-model"])
@@ -145,6 +146,4 @@ async def patch_ellm_credential(
 
 def _dump_credential_data(credential: Any) -> dict[str, Any]:
     """序列化凭证为 payload data（SecretStr 解明文）。"""
-    from agentscope.app.storage._utils import _dump_with_secrets
-
     return _dump_with_secrets(credential)

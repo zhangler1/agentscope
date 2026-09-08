@@ -8,8 +8,8 @@
   ``http://host.docker.internal:8001/v1``）；
 - 聊天模型直接复用官方的 :class:`OpenAIChatModel`（``get_chat_model_class``）；
 - 凭证**不绑定模型**：运行时的模型名由 agent/会话配置
-  ``chat_model_config.model`` 提供，其候选来自模型表
-  ``bocomadp:model:think_tag``（见 ``providers/ellm_chat_model.py``）。
+  ``chat_model_config.model`` 提供，候选模型见随包分发的
+  ``providers/_models/*.yaml``（``EllmChatModel.list_models``）。
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from pydantic import ConfigDict, Field, SecretStr
 
 from agentscope.credential import CredentialBase
 from agentscope.model import ChatModelBase
+from providers.ellm_chat_model import EllmChatModel
 
 
 class ELLMCredential(CredentialBase):
@@ -79,6 +80,4 @@ class ELLMCredential(CredentialBase):
         子类化使 :meth:`list_models` 读取本包 ``providers/_models/*.yaml``
         候选卡（而不是官方 OpenAI 的候选）。
         """
-        from providers.ellm_chat_model import EllmChatModel
-
         return EllmChatModel

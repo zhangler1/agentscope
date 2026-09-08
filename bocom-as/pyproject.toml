@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bocom-as"
 version = "0.1.0"
-description = "交通银行行内定制 agentscope 发行版：核心 SDK（src/agentscope）+ 行内模型平台（providers）+ 公共配置（config）"
+description = "交通银行行内定制 agentscope 发行版：核心 SDK（src/agentscope）+ 行内模型平台（providers）"
 requires-python = ">=3.11"
 # 自包含单发行版：SDK 源码随包分发（src/agentscope），依赖全量并入主列表
 # （SDK 全部依赖 + service / storage-redis / workspace-docker 三个部署必需 extras）

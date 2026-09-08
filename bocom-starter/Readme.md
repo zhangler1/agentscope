@@ -1,8 +1,8 @@
 # bocom-starter — 行内模型平台参考启动程序
 
 基于 agentscope 官方示例的启动程序，**额外装配行内模型平台**（bocom-as
-发行版：`config` / `providers`），覆盖 4 条主流程：**行内模型凭证、选择模型、
-add_think（think-tag）、api_key 刷新**。
+发行版：`config` / `providers`），覆盖 3 条主流程：**行内模型凭证、选择模型并
+chat、api_key 自动刷新**。
 
 本文档分两部分：**[一、本地开发](#一本地开发)**（源码直跑、Mock 网关、API
 联调）与 **[二、CI/CD 交付](#二cicd-交付行内)**（上传代码、构建镜像、部署）。
@@ -31,14 +31,13 @@ bocomm-agent/              # 交付物根（= Docker 构建上下文）
 pip install -e bocom-as
 ```
 
-**依赖 Redis**：本服务强依赖 Redis（会话 / 凭证 / 模型表），本地开发需有
-可用实例——本地 `redis-server` 或行内测试 Redis，用环境变量指定：
+**依赖 Redis（仅主存储）**：本服务用 Redis 存会话/凭证/Agent 等业务数据；
+**行内模型平台本身不再依赖 Redis**（模型候选来自随包内置的
+`providers/_models/*.yaml` 模型卡，key 刷新走主存储凭证记录）。
 
 ```bash
-export REDIS_HOST=localhost        # 应用主存储（会话、凭证等）
+export REDIS_HOST=localhost        # 应用主存储（会话、凭证、Agent 等）
 export REDIS_PORT=6379
-export ELLM_REDIS_HOST=localhost   # 行内模型平台 Redis（默认与主存储同实例）
-export ELLM_REDIS_PORT=6379
 ```
 
 ## 2. 启动服务
@@ -69,12 +68,9 @@ curl -X POST http://localhost:8000/credential/ \
   -d '{
     "data": {
       "type": "bocom_ellm_credential",
-      "api_key": "sk-xxx",
       "base_url": "http://ellm-gateway.example/v1",
-      "model": "deepseek-v4-flash",
       "scene_code": "P2024146",
-      "api_key_url": "http://ellm.example/ELLM-OMSERVICE/createSceneApiKey.do",
-      "inject_think_tag": true
+      "api_key_url": "http://ellm.example/ELLM-OMSERVICE/createSceneApiKey.do"
     }
   }'
 # → {"credential_id": "cred-xxx"}
@@ -84,15 +80,21 @@ curl -X POST http://localhost:8000/credential/ \
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `api_key` | ✅ | `SecretStr`，传普通字符串即可 |
+| `type` | 否 | 固定 `bocom_ellm_credential` |
 | `base_url` | ✅ | OpenAI 兼容端点（**以 `/v1` 结尾**） |
-| `model` | ✅ | 行内模型名（须在 `GET /ellm-models` 候选中） |
-| `scene_code` / `api_key_url` | 否 | api_key 自动刷新用（不填不影响 chat） |
-| `inject_think_tag` | 否 | 是否注入 `<think>`（默认 false） |
+| `scene_code` | ✅ | 场景编码（api_key 自动刷新用） |
+| `api_key_url` | ✅ | 取 key 的网关地址（api_key 自动刷新用） |
+| `api_key` | 否 | 省略时用默认占位值 `sk-xxx`；运行时由中间件注入真实 key |
+| `organization` | 否 | 组织 ID（可空） |
 | `apikey_expires_at` | 否 | 过期时间戳；不填视为已过期（每次调用触发刷新） |
 
+> 凭证**不绑定模型**：运行时可用的候选模型来自随包内置
+> `providers/_models/*.yaml` 模型卡，通过官方
+> `GET /model/?provider=bocom_ellm_credential` 查询。模型表 / 会话级
+> think-tag 等 Redis 管理端点已移除（`/ellm-models` 不再存在）。
+
 查询/管理：`GET /credential/` 列表、`GET /credential/schemas` 确认注册、
-`GET /model/credential?credential_id=...` 按凭证查候选模型、
+`GET /model/credential?credential_id=...` 查询凭证实际配置、
 `PATCH /model/credential/{id}` 部分更新（仅覆盖传入字段，api_key 刷新
 也写回同一凭证记录）。
 
@@ -108,13 +110,13 @@ curl -X POST http://localhost:8000/agent/ \
 
 ### 3.3 创建会话并绑定行内模型
 
-模型候选来自 Redis 模型表（`bocomadp:model:think_tag`，field=模型名、
-value=JSON `{think_tag, context_size, output_size}`；Redis 不可用时降级
-`providers/_models/*.yaml`），由 `/ellm-models` 管理：
+模型候选来自随包内置的 `providers/_models/*.yaml`（SDK 形态下模型名也可
+在代码中直接指定）：
 
 ```bash
-# 查看候选；POST/PUT/DELETE 同路径管理（field=模型名）
-curl -H 'x-user-id: test-user' http://localhost:8000/ellm-models
+# 查看该 provider 下当前候选（内置模型卡）
+curl -H 'x-user-id: test-user' \
+  "http://localhost:8000/model/?provider=bocom_ellm_credential"
 ```
 
 ```bash
@@ -189,11 +191,6 @@ data: {"type": "TEXT_BLOCK_END", ...}
 data: {"type": "REPLY_END", "reply_id": "...", "finished_reason": "completed"}
 ```
 
-- think-tag 开启时 `TEXT_BLOCK_*` 前有 `THINKING_BLOCK_*` 三连（首文本段
-  即 `<think>` 内容）；工具调用见 `TOOL_CALL_*` … `TOOL_RESULT_END`；
-  HITL 暂停见 `REQUIRE_USER_CONFIRM`（携带 `reply_id`，用
-  `UserConfirmResultEvent` 恢复）。
-
 **常见错误**：
 
 | 现象 | 原因 |
@@ -204,31 +201,18 @@ data: {"type": "REPLY_END", "reply_id": "...", "finished_reason": "completed"}
 | 404 | session/agent 不存在或不属于该用户 |
 | SSE 里 `MODEL_CALL_END` 带 error / run 中断 | 模型调用失败（连接/鉴权），看服务端日志 |
 
-### 3.5 会话级 think-tag 覆盖（可选）
+### 3.5 api_key 自动刷新（无需人工干预）
 
-覆盖优先级：**会话级覆盖 > Redis 模型表 > 凭证 `inject_think_tag` > 默认
-false**。会话级覆盖写 Redis，TTL 4h：
-
-```bash
-# 开启（body {"think_tag": true|false}）/ 查询 / 清除
-curl -X PUT http://localhost:8000/ellm-models/session/sess-xxx/think-tag \
-  -H 'Content-Type: application/json' \
-  -H 'x-user-id: test-user' -d '{"think_tag": true}'
-curl -H 'x-user-id: test-user' http://localhost:8000/ellm-models/session/sess-xxx/think-tag
-curl -X DELETE http://localhost:8000/ellm-models/session/sess-xxx/think-tag \
-  -H 'x-user-id: test-user'
-```
-
-开启后同会话流式响应的首个文本段出现 `<think>` 前缀。
-
-### 3.6 api_key 自动刷新（无需人工干预）
-
-每次模型调用前中间件惰性检查：`apikey_expires_at` 过期（含
-`ELLM_KEY_REFRESH_AHEAD_SECS` 提前窗口）→ `MessageBus.acquire_lock` 防抖
+每次模型调用前中间件惰性检查：`apikey_expires_at` 过期（默认在 key
+过期前 300s 提前刷新；`refresh_ahead_secs` 非必填，需要调整时传入
+`build_ellm_refresh_middleware`）→ `MessageBus.acquire_lock` 防抖
 → 同步调 `fetch_ellm_key(api_key_url, scene_code)` 取新 key → 写回凭证
 记录 → `set_api_key` 注入请求头；401 `invalid_api_key` 时强制刷新并重试
 当前调用一次；刷新失败标记凭证过期，下次调用走惰性刷新恢复。
 日志关键字：`injected refreshed ELLM key`。
+
+> key 刷新依赖的是注入给中间件的 **主存储**（`storage`/`message_bus`），
+> 主存储配 SQL 或 Redis 都行，与模型候选无关。
 
 ---
 
@@ -273,7 +257,7 @@ docker compose -f bocom-starter/docker-compose.yml up -d
 
 - **单服务**：只部署 agentscope；**生产 Redis 复用行内实例，不自建**，
   地址由平台环境变量注入（见下节）；
-- **端口**：宿主 `8000` → 容器 `8000`（可参数化 `AGENTSCOPE_HOST_PORT`）；
+- **端口**：宿主 `9000`（默认，可用 `AGENTSCOPE_HOST_PORT` 覆盖）→ 容器 `8000`；
 - **持久化**：`workspace-data` 命名 volume 挂载到
   `/app/bocom-starter/workspaces`（agent 工作区 + 长期记忆 Markdown 文件，
   容器重建不丢）；
@@ -287,11 +271,8 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | ✅ | 生产 Redis（应用主存储：会话、凭证等） |
-| `ELLM_REDIS_HOST` / `ELLM_REDIS_PORT` | 否 | 行内模型平台 Redis（默认与主存储同实例） |
+| `REDIS_HOST` / `REDIS_PORT` | ✅ | 生产 Redis（应用主存储：会话、凭证、Agent 等） |
 | `DASHSCOPE_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 按需 | 各模型供应商 key |
-| `ELLM_MODEL_THINK_TAG_KEY` | 否 | 模型 think-tag 表 key（默认 `bocomadp:model:think_tag`，与 bocomadp 数据兼容） |
-| `ELLM_KEY_REFRESH_AHEAD_SECS` | 否 | api_key 提前刷新窗口（默认 120s） |
 
 > 未注入的变量不进入容器，退化为 `bocom-starter/.env` 中的默认值
 > （`localhost` 类默认值仅适合本地直跑，生产必须注入真实地址）。
@@ -304,23 +285,20 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
   AGENTSCOPE_HOST_PORT=8010 docker compose -f bocom-starter/docker-compose.yml -p bocom2 up -d
   ```
 
-  各实例共享生产 Redis（模型表 / 会话数据隔离由业务侧控制）；
+  各实例共享生产 Redis（会话/凭证数据隔离由业务侧控制）；
 - **日志**：`docker compose -f bocom-starter/docker-compose.yml logs -f
-  agentscope`；API 文档见 `http://<宿主>:8000/docs`。
+  agentscope`；API 文档见 `http://<宿主>:9000/docs`。
 
 ---
 
-## 环境变量（见 .env 示例）
+## 环境变量汇总
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | 应用主存储（会话、凭证等）；Docker 部署时由平台注入生产地址 |
-| `ELLM_REDIS_HOST` / `ELLM_REDIS_PORT` | `localhost` / `6379` | 行内模型平台 Redis（可独立指定）；Docker 部署时由平台注入 |
-| `ELLM_REDIS_TIMEOUT` | `1.0` | Redis 连接超时（秒） |
-| `ELLM_REDIS_MAX_CONNECTIONS` | `200` | Redis 连接池上限 |
-| `ELLM_MODEL_THINK_TAG_KEY` | `bocomadp:model:think_tag` | 模型 think-tag 表 key（与 bocomadp 数据兼容，可覆盖隔离） |
-| `ELLM_KEY_REFRESH_AHEAD_SECS` | `120.0` | api_key 提前刷新窗口（秒） |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | 应用主存储（会话、凭证、Agent 等）；Docker 部署时由平台注入生产地址 |
 | `UVICORN_RELOAD` | `false` | 是否开启 uvicorn 热重载（本地开发设 `true`） |
 
-> bocom-as 的 `config.get_ellm_settings()` 每次调用重建、环境变量热读；
-> `.env` 由宿主应用加载（本仓库提供示例），config 不主动加载。
+> `.env` 由宿主应用加载（本仓库提供示例）。行内模型平台（bocom-as
+> `providers`）不再依赖独立 Redis / 额外配置：模型候选来自随包内置
+> 模型卡，api_key 刷新窗口默认 300s（`build_ellm_refresh_middleware`
+> 的 `refresh_ahead_secs`，非必填）。

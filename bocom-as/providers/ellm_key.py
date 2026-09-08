@@ -158,7 +158,6 @@ def _parse_key_response(scene_code: str, data: dict[str, Any]) -> tuple[str, int
     )
     return api_key, ttl_ms
 
-
 # Distributed-lock lease for a single key refresh — a crash while holding
 # it delays the next refresh by at most this long.
 _LOCK_TTL_SECS = 30
@@ -183,9 +182,9 @@ class EllmKeyRefresher:
     All key state lives in the user-scoped credential record identified by
     ``credential_id``; the record's ``data`` dict is expected to carry
     ``api_key``, ``scene_code`` and ``api_key_url``. The ``<think>``
-    injection switch is NOT stored on the credential — it is resolved at
-    call time from the session override / Redis model table.
-    """
+    injection switch is NOT stored on the credential — ``inject_think_tag``
+    is a model constructor parameter (``EllmChatModel(inject_think_tag=...)``).
+        """
 
     _LOCK_TTL_SECS = _LOCK_TTL_SECS
 
@@ -194,7 +193,7 @@ class EllmKeyRefresher:
         storage: StorageBase,
         message_bus: MessageBus,
         user_id: str,
-        refresh_ahead_secs: float = 0.0,
+        refresh_ahead_secs: float = 300.0,
     ) -> None:
         """Initialize the refresher.
 
@@ -206,8 +205,8 @@ class EllmKeyRefresher:
                 (``acquire_lock``); ``InMemoryMessageBus`` in tests.
             user_id (str): Owner of the credential records.
             refresh_ahead_secs (float): Refresh the key this many seconds
-                before its real expiry (default ``0.0`` = refresh only
-                after the key has actually expired, the legacy behavior).
+                before its real expiry (default ``300.0``, i.e. refresh
+                5 minutes ahead of the recorded expiry).
         """
         self._storage = storage
         self._message_bus = message_bus
@@ -402,6 +401,5 @@ class EllmKeyRefresher:
         credential_obj = CredentialFactory.from_dict(record.data)
         # 同 _refresh_key：写回落到凭证真实 owner 名下。
         await self._storage.upsert_credential(record.user_id, credential_obj)
-
 
 __all__ = ["fetch_ellm_key", "EllmKeyRefresher"]
