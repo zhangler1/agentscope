@@ -56,7 +56,7 @@ async def _ensure_table() -> None:
                 "CREATE TABLE IF NOT EXISTS agent_pool_configs ("
                 "agent_id VARCHAR(255) PRIMARY KEY, "
                 "max_active_pods INTEGER NOT NULL, "
-                "updated_at DOUBLE PRECISION NOT NULL"
+                "updated_at DOUBLE NOT NULL"
                 ")",
             ),
         )
@@ -89,14 +89,25 @@ async def pg_upsert(agent_id: str, size: int) -> None:
     engine = await _get_engine()
     from sqlalchemy import text
 
+    # ON CONFLICT 是 PG/sqlite 方言；MySQL 用 ON DUPLICATE KEY UPDATE。
+    if engine.dialect.name == "mysql":
+        upsert = (
+            "ON DUPLICATE KEY UPDATE "
+            "max_active_pods = VALUES(max_active_pods), "
+            "updated_at = VALUES(updated_at)"
+        )
+    else:
+        upsert = (
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "max_active_pods = :size, updated_at = :ts"
+        )
+
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 "INSERT INTO agent_pool_configs "
                 "(agent_id, max_active_pods, updated_at) "
-                "VALUES (:agent_id, :size, :ts) "
-                "ON CONFLICT (agent_id) DO UPDATE SET "
-                "max_active_pods = :size, updated_at = :ts",
+                "VALUES (:agent_id, :size, :ts) " + upsert,
             ),
             {"agent_id": agent_id, "size": size, "ts": time.time()},
         )

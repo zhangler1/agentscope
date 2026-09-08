@@ -27,6 +27,7 @@ except ImportError:
 
 from ..config.rate_currency_config import get_rate_currency_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +130,11 @@ async def _exchange_rate_tool_impl(
 if FunctionTool is not None and ToolMiddlewareBase is not None:
     exchange_rate_tool = FunctionTool(
         _exchange_rate_tool_impl,
-        # 工具名（按用户要求中文化，对齐"外数查"/"行内搜索"命名）
-        name="汇率查询",
+        # 工具名显式中文化（对齐 deerflow 原设计：行内模型点名靠中文名）。
+        # 注意：行外 DeepSeek 等 API 强校验工具名 ^[a-zA-Z0-9_-]+$，
+        # 中文名会被 400 拒收；行内网关不校验，可正常使用。行外环境
+        # 设置 BOCOMADP_TOOL_ASCII_NAMES=1 切换英文名 exchange_rate。
+        name=tool_name("汇率查询", "exchange_rate"),
         is_read_only=True,
     )
 else:

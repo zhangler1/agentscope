@@ -2,13 +2,14 @@
 """运行时配置（RuntimeConfigs）通用读写层 —— PostgreSQL 持久化真源。
 
 把**应用级、全局单份、运行时可变**的配置段统一存到 PG 的 ``runtime_configs`` 表
-（``key`` / ``payload`` / ``updated_at``），提供按 ``key`` 的通用增删改查，不绑定
-任何具体配置段。``summarization`` 等配置段通过本层按不同 ``key`` 存取，新增配置段
-只需新增一个 ``key``，不改表结构。
+（``config_key`` / ``payload`` / ``updated_at``），提供按 ``config_key`` 的通用增删改查，
+不绑定任何具体配置段。``summarization`` 等配置段通过本层按不同 ``config_key`` 存取，
+新增配置段只需新增一个 ``config_key``，不改表结构。
 
 存储模式与 ``system_prompt.py`` / ``memory_config.py`` 一致：懒加载独立 async
 engine + 幂等建表 + 纯 ``text`` SQL，绕过框架表管理与 Alembic 迁移。payload 以
-JSON 字符串落库（PG ``JSONB`` 可兼容存储；SQLite 测试场景亦可用）。
+JSON 字符串落库 **TEXT 列**（代码层 ``json.dumps/loads`` 序列化；不用原生 JSON
+类型以兼容 OceanBase 3.x / MySQL / PG / SQLite 全场景）。
 
 用法::
 
@@ -34,13 +35,18 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-# 通用配置表：key -> payload(JSONB)。
+# 通用配置表：key -> payload(JSON)。
 _TABLE = "runtime_configs"
 
 _CREATE_TABLE_SQL = (
     f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
-    "key VARCHAR(255) PRIMARY KEY, "
-    "payload JSONB NOT NULL, "
+    # ``key`` 是 MySQL 保留字，直接用会报 1064 语法错误；
+    # 列名改 ``config_key`` 避免反引号/双引号的方言差异，MySQL/OB/PG/SQLite 全兼容。
+    "config_key VARCHAR(255) PRIMARY KEY, "
+    # payload 用 TEXT 而非 JSON：OceanBase 3.x 无原生 JSON 列类型，
+    # 且代码层已手工 _encode/_decode 做 json.dumps/loads，
+    # TEXT 兼容 MySQL/OB/PG/SQLite 全场景（OB 4.x 亦可用）。
+    "payload TEXT NOT NULL, "
     "updated_at TIMESTAMP NOT NULL"
     ")"
 )
@@ -105,7 +111,7 @@ async def config_get(key: str) -> dict | None:
             row = (
                 await conn.execute(
                     text(
-                        f"SELECT payload FROM {_TABLE} WHERE key = :key",
+                        f"SELECT payload FROM {_TABLE} WHERE config_key = :key",
                     ),
                     {"key": key},
                 )
@@ -123,13 +129,23 @@ async def config_set(key: str, payload: dict) -> None:
     await _ensure_table()
     engine = await _get_engine()
 
+    # ON CONFLICT 是 PG/sqlite 方言；MySQL 用 ON DUPLICATE KEY UPDATE。
+    if engine.dialect.name == "mysql":
+        upsert = (
+            "ON DUPLICATE KEY UPDATE "
+            "payload = VALUES(payload), updated_at = VALUES(updated_at)"
+        )
+    else:
+        upsert = (
+            "ON CONFLICT (config_key) DO UPDATE SET "
+            "payload = :payload, updated_at = :ts"
+        )
+
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                f"INSERT INTO {_TABLE} (key, payload, updated_at) "
-                "VALUES (:key, :payload, :ts) "
-                "ON CONFLICT (key) DO UPDATE SET "
-                "payload = :payload, updated_at = :ts",
+                f"INSERT INTO {_TABLE} (config_key, payload, updated_at) "
+                "VALUES (:key, :payload, :ts) " + upsert,
             ),
             {"key": key, "payload": _encode(payload), "ts": datetime.now()},
         )
@@ -142,7 +158,7 @@ async def config_delete(key: str) -> bool:
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            text(f"DELETE FROM {_TABLE} WHERE key = :key"),
+            text(f"DELETE FROM {_TABLE} WHERE config_key = :key"),
             {"key": key},
         )
     return result.rowcount > 0
@@ -156,7 +172,7 @@ async def config_list() -> dict[str, dict]:
 
         async with engine.connect() as conn:
             rows = (
-                await conn.execute(text(f"SELECT key, payload FROM {_TABLE}"))
+                await conn.execute(text(f"SELECT config_key, payload FROM {_TABLE}"))
             ).all()
         result: dict[str, dict] = {}
         for r in rows:

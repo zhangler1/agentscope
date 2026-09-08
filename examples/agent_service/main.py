@@ -9,12 +9,11 @@
 3. Initialize the framework modules:
    - :class:`ToolRegistry`         — custom tools
    - :class:`MiddlewareRegistry`   — agent middlewares
-   - :class:`ProviderManager`      — multi-model routing
    - :class:`RunManager`           — deerflow run bookkeeping
    - :class:`BusBridge`            — deerflow SSE bridge over MessageBus
 4. Build the AgentScope app via :func:`create_app` (12 built-in routers).
 5. Inject ASGI middlewares via ``extra_middlewares``.
-6. Mount custom routers (deerflow SSE, models, health, stats).
+6. Mount custom routers (deerflow SSE, health, stats).
 7. Register sub-agent templates via ``custom_subagent_templates``.
 
 企业扩展能力（bocomadp）：
@@ -54,12 +53,11 @@ from agentscope.mcp import MCPClient, StdioMCPConfig
 from agentscope.rag import QdrantStore
 
 from bocomadp.agents.templates import load_subagent_templates
+import bocomadp.memory as memory_module
 from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注册自定义供应商
 from bocomadp.config import (
     get_app_config,
     is_trace_correlation_enabled,
-    load_model_entries,
-    build_model_instance,
 )
 from bocomadp.concurrency.guard import ConcurrencyGuard
 from bocomadp.logging.logging_config import configure_logging
@@ -70,10 +68,11 @@ from bocomadp.middleware.active_skill import ActiveSkillMiddleware
 from bocomadp.middleware.error_handler import ErrorHandlingMiddleware
 from bocomadp.middleware.summarization import SummarizationMiddleware
 from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
+from agentscope.middleware import TracingMiddleware
+from bocomadp.middleware.custom.event_log import EventLogMiddleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.request_log import AccessLogMiddleware
-from bocomadp.providers import ProviderManager
 from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
@@ -83,7 +82,6 @@ from bocomadp.routers.uploads import uploads_router
 from bocomadp.routers.channels import channels_router
 from bocomadp.routers.credential_model import credential_model_router
 from bocomadp.routers.health import health_router
-from bocomadp.routers.models import models_router
 from bocomadp.routers.platform_health import platform_health_router
 from bocomadp.routers.skill_router import skill_router
 from bocomadp.routers.stats import stats_router
@@ -108,7 +106,6 @@ from bocomadp.team_briefing import patch_team_briefing
 from bocomadp.projectors import WorkerFailureNotifier
 from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
-from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 from bocomadp.deerflow.model_patch import patch_get_model
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
@@ -246,39 +243,6 @@ if config.mcp.enabled:
     mcp_registry.load_builtin()
     if config.mcp.load_custom:
         mcp_registry.load_custom()
-
-provider_manager = ProviderManager()
-
-# 从代码内置模型条目（原 config.yaml models 节点已迁移）加载并注册到
-# ProviderManager；凭证单一来源迁移至代码，启动时由
-# ensure_default_credentials 幂等刷库。
-if config.providers.enabled:
-    _model_entries = load_model_entries()
-    for _entry in _model_entries:
-        try:
-            _model = build_model_instance(_entry)
-            provider_manager.register(
-                provider_id=_entry.provider_id,
-                model=_model,
-                model_name=_entry.model_name or _entry.provider_id,
-                display_name=_entry.display_name,
-                supports_multimodal=_entry.supports_multimodal,
-                metadata={"base_url": _entry.base_url} if _entry.base_url else {},
-            )
-            # 非首条或显式标记为活跃的，覆盖默认激活项
-            if _entry.is_active:
-                provider_manager.set_active(_entry.provider_id)
-            logger.info(
-                "provider registered: %s (model=%s)",
-                _entry.provider_id,
-                _entry.model_name or _entry.provider_id,
-            )
-        except Exception:
-            logger.warning(
-                "failed to register provider '%s'",
-                _entry.provider_id,
-                exc_info=True,
-            )
 
 # ── 内置智能体：智能体工厂（agent-creator） ──
 # 专门用于对话式创建/修改智能体，不需要 K8s 沙箱，
@@ -452,6 +416,23 @@ async def build_agent_middlewares(
             session_id,
         ),
     )
+    # 需要在洋葱链最内层（真实 model() 调用之前）记录的中间件，使其在
+    # MODEL_INPUT / Langfuse input 里拿到「最终送给模型」的消息（即
+    # ToolResultPersistence / ToolResultBudget 替换后的 <persisted-output>
+    # 预览），而不是替换前的原始结果。它们经 custom/ 自动扫描注册，位置由
+    # 本函数决定：从通用列表剔除后统一追加到末尾（最内层）。
+    inner = [
+        m
+        for m in middlewares
+        if isinstance(m, (EventLogMiddleware, TracingMiddleware))
+    ]
+    if inner:
+        middlewares = [
+            m
+            for m in middlewares
+            if not isinstance(m, (EventLogMiddleware, TracingMiddleware))
+        ]
+        middlewares.extend(inner)
     return middlewares
 
 
@@ -549,13 +530,28 @@ class _BuiltinAgentStorageProxy:
         return await self._inner.delete_session("default", agent_id, session_id)
 
     async def delete_agent(self, user_id: str, agent_id: str) -> bool:
-        """Delete via framework storage, then drop the per-agent tool
-        whitelist so the persisted whitelist file keeps no orphans.
+        """Delete via framework storage, then clean up side records:
+        per-agent tool whitelist + session memory config / Redis state.
 
         The framework's ``DELETE /agent/{id}`` (and team cascades)
         all funnel through this storage call; the bocomadp-only
         ``/agents`` router is unused by the product.
+
+        Memory cleanup (best-effort, never blocks the delete result):
+        - DB ``agent_memory_configs`` row: ``memory_store.memory_delete``;
+        - Redis per-session state (``active_sessions`` member / ``turns`` /
+          extract lock): enumerated from the agent's sessions *before* the
+          delete (sessions vanish afterwards), then removed per sid.
+          Platform-side delete remains a placeholder (local delete only).
         """
+        # ① 删除前快照该 agent 的会话 id（删除后取不到），供记忆 Redis 清理；
+        #    枚举与容错实现收口在 memory 包（list_agent_session_ids）。
+        session_ids = await memory_module.list_agent_session_ids(
+            user_id,
+            agent_id,
+            storage=self._inner,
+        )
+
         ok = await self._inner.delete_agent(user_id, agent_id)
         if ok:
             try:
@@ -569,6 +565,20 @@ class _BuiltinAgentStorageProxy:
             except Exception:  # 白名单清理失败不影响删除结果
                 logger.warning(
                     "failed to drop tool whitelist for %s",
+                    agent_id,
+                    exc_info=True,
+                )
+            try:
+                # 记忆清理收口到 memory 包（DB 配置行 + Redis 会话态）；
+                # 平台侧删除仍为占位（仅本地清理）。session_ids 已在上方快照。
+                await memory_module.cleanup_agent_memory(
+                    user_id,
+                    agent_id,
+                    session_ids=session_ids,
+                )
+            except Exception:  # 记忆清理失败不影响删除结果
+                logger.warning(
+                    "failed to drop memory records for agent %s",
                     agent_id,
                     exc_info=True,
                 )
@@ -592,10 +602,9 @@ init_factory_tools(tool_registry, mcp_registry)
 
 logger.info(
     "framework modules initialized: "
-    "tools=%d middlewares=%d providers=%d mcps=%d",
+    "tools=%d middlewares=%d mcps=%d",
     len(tool_registry.list_tools()),
     len(middleware_registry.list_middlewares()),
-    len(provider_manager.list_providers()),
     len(mcp_registry.list_mcps()),
 )
 
@@ -747,6 +756,14 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
+# 会话记忆运行时依赖：redis client（供心跳/计数/锁）与 storage（取消息）。
+# InMemory 本地模式 _get_redis_client() 返回 None → 记忆中间件仅检索注入，
+# 计数/提取降级关闭；Redis 模式全量生效。
+memory_module.configure_memory_runtime(
+    redis_client_fn=_get_redis_client,
+    storage=storage,
+)
+
 
 async def _build_agent_middlewares_with_ellm(
     user_id: str,
@@ -756,6 +773,14 @@ async def _build_agent_middlewares_with_ellm(
     mws = await build_agent_middlewares(user_id, agent_id, session_id)
     mws.extend(await _ellm_refresh_mw_factory(user_id, agent_id, session_id))
     mws.append(_summarization_mw)
+    # 会话记忆中间件：memory_enabled 才装配（检索注入 + 轮数/静默触发）
+    mws.extend(
+        await memory_module.build_memory_middlewares(
+            user_id,
+            agent_id,
+            session_id,
+        ),
+    )
     return mws
 
 
@@ -919,7 +944,6 @@ app.router.lifespan_context = _lifespan_with_builtin_agents
 # ---------------------------------------------------------------------------
 # 6. 将框架模块挂载到 app.state，供路由层访问
 # ---------------------------------------------------------------------------
-app.state.provider_manager = provider_manager
 app.state.tool_registry = tool_registry
 app.state.mcp_registry = mcp_registry
 app.state.middleware_registry = middleware_registry
@@ -961,7 +985,10 @@ app.include_router(agent_router)
 # （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
 # 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
 # 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
-install_agent_memory_router(app)
+# 会话记忆能力装配：/memory/config 路由 + lifespan 启动静默扫描器
+# （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
+# _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
+memory_module.install_memory(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
@@ -974,7 +1001,6 @@ app.include_router(channels_router)
 # deerflow threads 管理端点（create/search/state/history，对话闭环最小集）
 app.include_router(threads_router)
 app.include_router(uploads_router)
-app.include_router(models_router)
 app.include_router(platform_health_router)
 # 外部 skill hub（目录查询 / 我的上传 / 下载安装）
 app.include_router(skill_router)
@@ -1032,9 +1058,22 @@ if __name__ == "__main__":
         config.logging.enhance.format,
         config.service.reload,
     )
-    uvicorn.run(
-        "main:root_app",
-        host=config.service.host,
-        port=config.service.port,
-        reload=config.service.reload,
-    )
+    # 传 app 对象而非 "main:root_app" 字符串：python main.py 时本模块先以
+    # __main__ 执行一遍，若再让 uvicorn 按字符串 import "main"，顶层代码会
+    # 被完整重跑第二遍（重复建 engine/装 lifespan、install_memory 等模块级
+    # 日志全部打两遍）。传对象则不二次 import。
+    # reload 热更需要 import 字符串，dev 可接受双跑；生产 reload=false 传对象。
+    if config.service.reload:
+        uvicorn.run(
+            "main:root_app",
+            host=config.service.host,
+            port=config.service.port,
+            reload=True,
+        )
+    else:
+        uvicorn.run(
+            root_app,
+            host=config.service.host,
+            port=config.service.port,
+            reload=False,
+        )

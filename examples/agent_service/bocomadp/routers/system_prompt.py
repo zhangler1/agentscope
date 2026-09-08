@@ -7,8 +7,8 @@
 
 存储方式：PostgreSQL（``system_prompts`` 表，持久化真源）。
 与 ``middleware/custom_prompt.py`` 读取端共用同一张表：
-- 全局提示词: ``key = 'global'``
-- 智能体提示词: ``key = {agent_id}``
+- 全局提示词: ``config_key = 'global'``
+- 智能体提示词: ``config_key = {agent_id}``
 
 存储模式与 ``pool_config.py`` / ``memory_config.py`` 一致：懒加载独立
 async engine + 幂等建表 + text SQL。历史：旧版用 Redis（message_bus），
@@ -96,7 +96,8 @@ async def _ensure_table() -> None:
         await conn.execute(
             text(
                 "CREATE TABLE IF NOT EXISTS system_prompts ("
-                "key VARCHAR(255) PRIMARY KEY, "
+                # ``key`` 是 MySQL/OB 保留字（1064 语法错误），用 ``config_key`` 全兼容。
+                "config_key VARCHAR(255) PRIMARY KEY, "
                 "content TEXT NOT NULL, "
                 "updated_at TIMESTAMP NOT NULL"
                 ")"
@@ -115,7 +116,7 @@ async def pg_get(key: str) -> str | None:
                 await conn.execute(
                     text(
                         "SELECT content FROM system_prompts "
-                        "WHERE key = :key",
+                        "WHERE config_key = :key",
                     ),
                     {"key": key},
                 )
@@ -131,13 +132,23 @@ async def pg_set(key: str, content: str) -> None:
     engine = await _get_engine()
     from sqlalchemy import text
 
+    # ON CONFLICT 是 PG/sqlite 方言；MySQL 用 ON DUPLICATE KEY UPDATE。
+    if engine.dialect.name == "mysql":
+        upsert = (
+            "ON DUPLICATE KEY UPDATE "
+            "content = VALUES(content), updated_at = VALUES(updated_at)"
+        )
+    else:
+        upsert = (
+            "ON CONFLICT (config_key) DO UPDATE SET "
+            "content = :content, updated_at = :ts"
+        )
+
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "INSERT INTO system_prompts (key, content, updated_at) "
-                "VALUES (:key, :content, :ts) "
-                "ON CONFLICT (key) DO UPDATE SET "
-                "content = :content, updated_at = :ts",
+                "INSERT INTO system_prompts (config_key, content, updated_at) "
+                "VALUES (:key, :content, :ts) " + upsert,
             ),
             {"key": key, "content": content, "ts": datetime.now()},
         )
@@ -150,7 +161,7 @@ async def pg_delete(key: str) -> bool:
 
     async with engine.begin() as conn:
         result = await conn.execute(
-            text("DELETE FROM system_prompts WHERE key = :key"),
+            text("DELETE FROM system_prompts WHERE config_key = :key"),
             {"key": key},
         )
     return result.rowcount > 0
@@ -165,7 +176,7 @@ async def pg_list_all() -> dict[str, str]:
         async with engine.connect() as conn:
             rows = (
                 await conn.execute(
-                    text("SELECT key, content FROM system_prompts"),
+                    text("SELECT config_key, content FROM system_prompts"),
                 )
             ).all()
         return {str(r[0]): str(r[1]) for r in rows}

@@ -34,8 +34,11 @@ service:
   reload: false            # 仅开发期开启 uvicorn 自动重载
 
 # ---------- 数据库（AgentScope 持久化存储 / AsyncSQLAlchemyStorage） ----------
+# 当前：OB 兼容 MySQL 协议，本地先用 MySQL 容器模拟验证（mysql+asyncmy://...@localhost:3306）
+# 将来切真 OB：只改地址为 OB 的（mysql+asyncmy://用户@租户:2881/库名），驱动/建表逻辑不变
 db:
-  url: "postgresql+asyncpg://agentscope:agentscope@localhost:5432/agentscope"
+  # url: "postgresql+asyncpg://agentscope:agentscope@localhost:5432/agentscope"
+  url: "mysql+aiomysql://agentscope:agentscope@localhost:3306/agentscope"
   create_tables: true        # dev/单机自动建表；多副本生产改用 alembic upgrade head
   pool_pre_ping: true        # 取连接前探测存活，服务端静默断连时自动重建
   pool_recycle: 1800         # 空闲连接 30 分钟回收，早于防火墙/NAT 空闲超时
@@ -89,9 +92,8 @@ mcp:
 
 # ---------- 模型 Provider ----------
 # 模型条目来源已改为代码内置（bocomadp/config/app_config.py 的
-# _builtin_model_entries），启动时由 load_model_entries() 注册到
-# ProviderManager 并由 ensure_default_credentials 幂等刷库；
-# 如需禁用注册，可设置环境变量 BOCOMADP_PROVIDERS__ENABLED=false。
+# _builtin_model_entries），启动时由 ensure_default_credentials 幂等
+# 刷入 storage，会话运行时由框架按 ChatModelConfig 重建模型实例。
 # ---------- 运行时目录 ----------
 # 工作区目录（AgentScope 沙箱文件读写根目录 + 会话持久化根目录：
 # sessions/{user_id}/{agent_id}/{session_id}.json）

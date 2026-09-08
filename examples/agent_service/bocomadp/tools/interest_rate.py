@@ -32,6 +32,7 @@ except ImportError:
 
 from ..config.rate_currency_config import get_rate_currency_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,7 @@ async def interest_rate_backend(
                        "请使用 'deposit'(存款) 或 'loan'(贷款)"}],
             ensure_ascii=False,
         )
+
     if not cfg.api_url:
         return json.dumps(
             [{"error": "利率查询API URL未配置，请在 config.yaml 的 "
@@ -251,8 +253,11 @@ async def _interest_rate_tool_impl(
 if FunctionTool is not None and ToolMiddlewareBase is not None:
     interest_rate_tool = FunctionTool(
         _interest_rate_tool_impl,
-        # 工具名（按用户要求中文化，对齐"外数查"/"行内搜索"命名）
-        name="利率查询",
+        # 工具名显式中文化（对齐 deerflow 原设计：行内模型点名靠中文名）。
+        # 注意：行外 DeepSeek 等 API 强校验工具名 ^[a-zA-Z0-9_-]+$，
+        # 中文名会被 400 拒收；行内网关不校验，可正常使用。行外环境
+        # 设置 BOCOMADP_TOOL_ASCII_NAMES=1 切换英文名 interest_rate。
+        name=tool_name("利率查询", "interest_rate"),
         is_read_only=True,
     )
 else:

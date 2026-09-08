@@ -19,7 +19,7 @@ AgentScope 的 ``on_system_prompt`` transformer 钩子，并在其上叠加
 
 存储迁移说明：公共提示词已由 Redis 迁移到 PostgreSQL（持久化真源），
 写入端为管理 API ``routers/system_prompt.py``，读取端为本中间件。
-两者共用 ``system_prompts`` 表（``key`` = agent_id 或 ``global``）。
+两者共用 ``system_prompts`` 表（``config_key`` = agent_id 或 ``global``）。
 
 历史教训：早期版本用 ``on_reply`` 做消息级注入，但该钩子的
 ``input_kwargs`` 仅含 ``inputs`` / ``structured_schema``（消息在
@@ -118,7 +118,8 @@ async def _ensure_table() -> None:
         await conn.execute(
             text(
                 "CREATE TABLE IF NOT EXISTS system_prompts ("
-                "key VARCHAR(255) PRIMARY KEY, "
+                # ``key`` 是 MySQL/OB 保留字（1064 语法错误），用 ``config_key`` 全兼容。
+                "config_key VARCHAR(255) PRIMARY KEY, "
                 "content TEXT NOT NULL, "
                 "updated_at TIMESTAMP NOT NULL"
                 ")",
@@ -137,7 +138,7 @@ async def _get_pg_prompt(agent_id: str) -> str:
                 await conn.execute(
                     text(
                         "SELECT content FROM system_prompts "
-                        "WHERE key = :key",
+                        "WHERE config_key = :key",
                     ),
                     {"key": agent_id},
                 )
@@ -147,7 +148,7 @@ async def _get_pg_prompt(agent_id: str) -> str:
                     await conn.execute(
                         text(
                             "SELECT content FROM system_prompts "
-                            "WHERE key = :key",
+                            "WHERE config_key = :key",
                         ),
                         {"key": "global"},
                     )

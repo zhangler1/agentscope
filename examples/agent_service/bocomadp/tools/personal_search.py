@@ -258,7 +258,7 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
         _personal_search_tool_impl,
         # 工具名（按用户要求中文化）
         # 行外 DeepSeek 等 API 强校验：BOCOMADP_TOOL_ASCII_NAMES=1 切英文。
-        name=tool_name("个人知识库搜索", "personal_knowledge_search"),
+        name=tool_name("个人知识库搜索", "personal_search"),
         is_read_only=True,
         middlewares=[PersonalSpacecodeOverrideMiddleware()],
     )

@@ -18,7 +18,6 @@ import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from agentscope.app import create_app
@@ -26,44 +25,41 @@ from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 
-from bocomadp import memory_config, team_store
+from bocomadp import team_store
 from bocomadp.routers.agent import agent_router
-from bocomadp.routers.agent_api import install_agent_memory_router
+# 框架内置 agent_router 只用于"摘除"（与 main.py 装配一致：专家团能力
+# 由 bocomadp 版 agent_router 覆盖）。
+from agentscope.app._router._agent import (
+    agent_router as _framework_agent_router,
+)
 
 HEADERS = {"X-User-ID": "test-user"}
 
 
+def _remove_framework_agent_routes(app) -> None:
+    """摘除框架内置 /agent 路由（main.py 同款逻辑），避免其抢占 /agent/ CRUD。
+
+    FastAPI 0.141+ include_router 用 _IncludedRouter 懒包装（持有
+    original_router），须按引用身份判断；旧版则按路径判断。
+    """
+    fw_paths = {
+        r.path
+        for r in _framework_agent_router.routes
+        if getattr(r, "path", "").startswith("/agent")
+    }
+
+    def _is_fw(r) -> bool:
+        original = getattr(r, "original_router", None)
+        if original is not None:
+            return original is _framework_agent_router
+        return getattr(r, "path", "") in fw_paths
+
+    app.router.routes[:] = [r for r in app.router.routes if not _is_fw(r)]
+
+
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    """完整 app（sqlite 存储 + 侧边记忆表 + 团队关系表）+ 包裹路由接管。"""
-    side_engine = create_async_engine(
-        f"sqlite+aiosqlite:///{tmp_path / 'mem_side.db'}",
-    )
-
-    async def _init_side():
-        async with side_engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "CREATE TABLE IF NOT EXISTS agent_memory_configs ("
-                    "user_id VARCHAR(255) NOT NULL, "
-                    "agent_id VARCHAR(255) NOT NULL, "
-                    "memory_update_prompt TEXT NOT NULL DEFAULT '', "
-                    "memory_enabled BOOLEAN NOT NULL DEFAULT FALSE, "
-                    "memory_type INTEGER NOT NULL DEFAULT 0, "
-                    "memory_update_rounds INTEGER NOT NULL DEFAULT 10, "
-                    "updated_at DATETIME NOT NULL, "
-                    "PRIMARY KEY (user_id, agent_id)"
-                    ")",
-                ),
-            )
-
-    asyncio.run(_init_side())
-
-    async def fake_engine():
-        return side_engine
-
-    monkeypatch.setattr(memory_config, "_get_engine", fake_engine)
-
+def client(tmp_path):
+    """完整 app（sqlite 存储 + 团队关系表）+ bocomadp agent_router 装配。"""
     storage = AsyncSQLAlchemyStorage(
         f"sqlite+aiosqlite:///{tmp_path / 'mem_main.db'}",
         create_tables=True,
@@ -81,11 +77,11 @@ def client(tmp_path, monkeypatch):
         workspace_manager=LocalWorkspaceManager(str(tmp_path / "ws")),
         enable_index_worker=False,
     )
-    # 与 main.py 装配一致：先挂 bocomadp agent_router（团队端点
-    # /agent/{id}/team/*、/agent/schema/v2 等），再由记忆包裹路由接管
-    # /agent/ 的 4 条 CRUD。顺序不能反，否则团队端点 404。
+    # 与 main.py 装配一致：先摘除框架内置 /agent 路由，再挂 bocomadp
+    # agent_router（团队端点 /agent/{id}/team/*、/agent/schema/v2 等 +
+    # /agent/ CRUD），避免框架路由抢占。
+    _remove_framework_agent_routes(app)
     app.include_router(agent_router)
-    install_agent_memory_router(app)
     with TestClient(app) as test_client:
         yield test_client
 

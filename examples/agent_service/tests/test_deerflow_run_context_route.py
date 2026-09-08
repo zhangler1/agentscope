@@ -3,6 +3,7 @@
 import asyncio
 
 from bocomadp.deerflow.routers import deerflow_chat as chat_mod
+from bocomadp.deerflow.run_context import extract_run_context
 
 
 def test_resolve_saves_when_requested(monkeypatch):
@@ -45,3 +46,23 @@ def test_resolve_fail_open(monkeypatch):
 
     monkeypatch.setattr(chat_mod, "load_run_context", fake_load)
     assert asyncio.run(chat_mod._resolve_run_context("s1", None)) == {}
+
+
+def test_extract_from_root_path_filters_none():
+    """请求体根路径 5 键提取：只取有值键，值为 None 的忽略。"""
+    body = chat_mod.CreateRunRequest(
+        session_id="s1",
+        reasoning_effort="high",
+        thinking_enabled=True,
+        is_plan_mode=False,      # False 是有效值，应保留
+        subagent_enabled=None,   # None 应被忽略
+        mode="low",
+    )
+    out = extract_run_context(body.model_dump())
+    assert out == {
+        "reasoning_effort": "high",
+        "thinking_enabled": True,
+        "is_plan_mode": False,
+        "mode": "low",
+    }
+    assert "subagent_enabled" not in out
