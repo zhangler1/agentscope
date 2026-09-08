@@ -48,6 +48,11 @@ db:
 ellm_key_refresh:
   refresh_ahead_secs: 120
 
+memory:
+  register_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/registerAgent.do"
+  retrieve_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/searchMemory.do"
+  extract_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/saveMemoriesStandard.do"
+  request_timeout_seconds: 30
 
 # ---------- Redis（消息总线 / 分布式锁 / 缓存） ----------
 # 存储后端已迁至上方 db（AsyncSQLAlchemyStorage）；Redis 仅保留给

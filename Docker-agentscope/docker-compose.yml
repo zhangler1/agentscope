@@ -53,9 +53,9 @@ services:
     #   context: ..
     #   dockerfile: examples/agent_service/Dockerfile
     # image: agentscope-service:latest
-    image: agentscope-service:oss
+    image: agentscope-service:mysql
     command: ["python", "main.py"]
-    ports: ["8001:8000"]
+    ports: ["8000:8000"]
     # 相对本文件目录（Docker-agentscope/.env），含 DEEPSEEK_API_KEY 等密钥
     env_file: .env
     environment:
@@ -69,8 +69,8 @@ services:
       - BOCOMADP_DB__URL=mysql+aiomysql://agentscope:agentscope@mysql:3306/agentscope
       # K8s 沙箱：kubeconfig 挂载自宿主机 .kube/config（容器内路径）
       - ADP_K8S_KUBECONFIG=/app/kubeconfig/config
-      - ADP_K8S_ENABLED=false
-      - BOCOMADP_TOOL_ASCII_NAMES=1
+      - ADP_K8S_ENABLED=true
+      - BOCOMADP_TOOL_ASCII_NAMES=0
     depends_on:
       redis:
         condition: service_started
