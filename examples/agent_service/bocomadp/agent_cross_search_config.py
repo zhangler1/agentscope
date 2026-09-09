@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Per-agent 跨知识搜索配置存储：PG 表（仿 memory_config.py）。
+"""Per-agent 跨知识搜索配置存储：MySQL 表（仿 memory_config.py）。
 
-写入路径（PUT /agents/{id}/cross-search-config）：PG UPSERT。
-读取路径（cross_search 工具运行时）：PG 查询，无记录返回 None，
+写入路径（PUT /agents/{id}/cross-search-config）：MySQL UPSERT。
+读取路径（cross_search 工具运行时）：MySQL 查询，无记录返回 None，
 工具回退到 config.yaml 默认值。
 
 cross_search 配置仅被管理 API 和工具运行时读写，不在请求级
@@ -30,7 +30,7 @@ _CREATE_TABLE_SQL = (
     "customized_tag_list TEXT NOT NULL DEFAULT '[]', "
     "text_top_n INTEGER, "
     "vector_top_n INTEGER, "
-    "updated_at TIMESTAMP NOT NULL, "
+    "updated_at DATETIME NOT NULL, "
     "PRIMARY KEY (user_id, agent_id)"
     ")"
 )
@@ -117,17 +117,17 @@ async def cross_search_config_upsert(
                 " :space_code_list, :team_space_code_list, :psnl_space_code_id, "
                 " :psnl_category_id_list, :customized_tag_list, "
                 " :text_top_n, :vector_top_n, :ts) "
-                "ON CONFLICT (user_id, agent_id) DO UPDATE SET "
-                "user_code = EXCLUDED.user_code, "
-                "search_type = EXCLUDED.search_type, "
-                "space_code_list = EXCLUDED.space_code_list, "
-                "team_space_code_list = EXCLUDED.team_space_code_list, "
-                "psnl_space_code_id = EXCLUDED.psnl_space_code_id, "
-                "psnl_category_id_list = EXCLUDED.psnl_category_id_list, "
-                "customized_tag_list = EXCLUDED.customized_tag_list, "
-                "text_top_n = EXCLUDED.text_top_n, "
-                "vector_top_n = EXCLUDED.vector_top_n, "
-                "updated_at = EXCLUDED.updated_at"
+                "ON DUPLICATE KEY UPDATE "
+                "user_code = VALUES(user_code), "
+                "search_type = VALUES(search_type), "
+                "space_code_list = VALUES(space_code_list), "
+                "team_space_code_list = VALUES(team_space_code_list), "
+                "psnl_space_code_id = VALUES(psnl_space_code_id), "
+                "psnl_category_id_list = VALUES(psnl_category_id_list), "
+                "customized_tag_list = VALUES(customized_tag_list), "
+                "text_top_n = VALUES(text_top_n), "
+                "vector_top_n = VALUES(vector_top_n), "
+                "updated_at = VALUES(updated_at)"
             ),
             {
                 "user_id": user_id,
