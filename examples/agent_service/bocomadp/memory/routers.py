@@ -85,8 +85,9 @@ async def put_agent_config(
 ) -> dict[str, Any]:
     """写某智能体记忆配置：本地部分合并 + 全量落库 + 平台同步决策。
 
-    - 无 caller（未注册）→ 调平台注册，返回 caller 一并落库；
-    - 已有 caller 且本次改提示词 → 占位同步（仅本地 + 日志）；
+    - 记忆**已启用**（memory_enabled=true）且无 caller（未注册）→ 调平台
+      注册，返回 caller 一并落库；memory_enabled=false 时不注册；
+    - 已注册（caller 非空）且本次改提示词 → 占位同步（仅本地 + 日志）；
     - payload 全量存储（含默认值字段），库内可直接核对完整配置。
     """
     data = body.model_dump(exclude_none=True)
@@ -100,8 +101,9 @@ async def put_agent_config(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
-    # 平台同步决策
-    if not cfg.caller:
+    # 平台同步决策：仅记忆启用（memory_enabled=true）且未注册才调平台注册；
+    # memory_enabled=false 时不做任何平台注册（避免白注册）。
+    if cfg.memory_enabled and not cfg.caller:
         try:
             caller = await pf.register_agent({
                 "agentId": agent_id,
@@ -121,7 +123,8 @@ async def put_agent_config(
                 detail="memory platform sync failed",
             ) from exc
         cfg = cfg.model_copy(update={"caller": caller})
-    elif "memory_prompt" in data:
+    elif cfg.caller and "memory_prompt" in data:
+        # 已注册 agent 修改提示词 → 占位同步（仅本地 + 日志，不真调平台）
         _sync_prompt_placeholder(agent_id, cfg.memory_prompt)
     try:
         await memory_store.memory_upsert(user_id, agent_id, cfg)
