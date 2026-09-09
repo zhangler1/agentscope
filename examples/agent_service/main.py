@@ -202,14 +202,7 @@ default_mcps = [
             args=["@playwright/mcp@latest"],
         ),
         is_stateful=True,
-    ),
-    MCPClient(
-        name="mobile-bank",
-        mcp_config=HttpMCPConfig(
-            url="http://12.244.107.162:8000/mcp"
-        ),
-        is_stateful=False,
-    ),
+    )
 ]
 
 # ---------------------------------------------------------------------------
