@@ -49,7 +49,7 @@ from agentscope.app.workspace_manager import (
     IsolationPolicy,
     LocalWorkspaceManager,
 )
-from agentscope.mcp import MCPClient, StdioMCPConfig
+from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.rag import QdrantStore
 
 from bocomadp.agents.templates import load_subagent_templates
@@ -202,6 +202,13 @@ default_mcps = [
             args=["@playwright/mcp@latest"],
         ),
         is_stateful=True,
+    ),
+    MCPClient(
+        name="mobile-bank",
+        mcp_config=HttpMCPConfig(
+            url="http://12.244.107.162:8000/mcp"
+        ),
+        is_stateful=False,
     ),
 ]
 
