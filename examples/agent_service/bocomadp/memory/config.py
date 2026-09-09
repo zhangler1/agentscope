@@ -17,6 +17,14 @@ RUNTIME_CONFIG_KEY = "memory"
 class MemoryRuntimeConfig(BaseModel):
     """记忆后台运行参数（全部带默认值：无记录时使用代码默认）。"""
 
+    default_memory_prompt: str = Field(
+        default="",
+        description=(
+            "默认记忆提示词（全局维度）：供未单独配置 memory_prompt 的智能体"
+            "作为缺省值参考；当前仅存储与可读，不参与内部处理逻辑。"
+        ),
+    )
+
     idle_minutes: int = Field(
         default=15,
         ge=1,
