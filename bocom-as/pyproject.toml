@@ -5,27 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bocom-as"
 version = "0.1.0"
-description = "交通银行行内模型平台扩展包：公共配置（config）+ 行内模型平台（providers），依赖行内 官方agentscope==2.0.7"
-requires-python = ">=3.11"
-# agentscope从pip 源安装（==2.0.7），
+description = "交通银行行内模型平台扩展包：公共配置（config）+ 行内模型平台（providers），依赖行内 官方agentscope==2.0.5"
+requires-python = ">=3.12"
+# agentscope从pip 源安装（==2.0.5），
 # 本包只含 config / providers。
 dependencies = [
     # pip 源安装
-    "agentscope==2.0.7",
+    "agentscope==2.0.5",
     # ---- bocom-starter 部署必需（若行内 agentscope 发行已并入 extras，
     # ---- 重复声明无冲突，可精简）----
-    "fastapi",
-    "uvicorn",
-    "apscheduler",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
+    "apscheduler>=3.11.3",
     "ag-ui-protocol>=0.1.10",
-    "redis",
-    "aiodocker",
+    "redis>=8.1.0 ",
+    "aiodocker>=0.27.0",
     # ---- providers 直接依赖 ----
-    "httpx",
-    "pydantic",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.5",
 ]
 
-# 包发现：仅 ./ 下的 config / providers 顶层子包（src/agentscope 不在发行范围，
+# 包发现：仅 ./ 下的 config / providers 
 # 相互之间以顶层包名互引）。
 [tool.setuptools.packages.find]
 where = ["."]
