@@ -21,6 +21,7 @@ from bocomadp.memory.config import MemoryRuntimeConfig
 from bocomadp.memory.state import (
     ACTIVE_ZSET,
     clear_extract_state,
+    encode_member,
     lock_key,
     turns_key,
 )
@@ -100,12 +101,17 @@ def _to_role_content(messages: list[Msg]) -> list[dict[str, str]]:
 
 async def _is_session_active(
     redis: Any,
+    user_id: str,
+    agent_id: str,
     session_id: str,
     idle_seconds: float,
     now: float | None = None,
 ) -> bool:
     """会话最后心跳距今 < idle_seconds 视为仍活跃。"""
-    last = await redis.zscore(ACTIVE_ZSET, session_id)
+    last = await redis.zscore(
+        ACTIVE_ZSET,
+        encode_member(user_id, agent_id, session_id),
+    )
     if last is None:
         return False
     return (now if now is not None else time.time()) - float(last) < idle_seconds
@@ -136,6 +142,8 @@ async def run_extract(
     try:
         if recheck_active and await _is_session_active(
             redis,
+            user_id,
+            agent_id,
             session_id,
             rt_cfg.idle_minutes * 60,
         ):
@@ -145,7 +153,7 @@ async def run_extract(
             return False
 
         # W = turns（INCR 计数值）；无计数视为无可提取内容
-        turns_raw = await redis.get(turns_key(session_id))
+        turns_raw = await redis.get(turns_key(user_id, agent_id, session_id))
         turns = int(turns_raw) if turns_raw else 0
         if turns < 1:
             return False
@@ -174,7 +182,7 @@ async def run_extract(
         await _save_with_retry(param, retry_delays)
 
         # 成功 → 清理状态并释放锁（turns 清零，下一批从 1 重新计数）
-        await clear_extract_state(redis, session_id)
+        await clear_extract_state(redis, user_id, agent_id, session_id)
         release = True
         logger.info(
             "memory: extracted session=%s turns=%d messages=%d",
@@ -186,7 +194,7 @@ async def run_extract(
     finally:
         # 统一释放提取锁（成功/失败/放弃都释放；失败保留 turns 由
         # 后续轮数/扫描再试，锁 TTL 兜底防并发）
-        await redis.delete(lock_key(session_id))
+        await redis.delete(lock_key(user_id, agent_id, session_id))
 
 
 async def _save_with_retry(

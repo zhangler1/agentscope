@@ -93,7 +93,7 @@ async def put_agent_config(
     data = body.model_dump(exclude_none=True)
     # agentName 仅在注册时透传平台（不入库）；缺省回退 agent_id。
     agent_name = data.pop("agentName", None) or agent_id
-    existing = await memory_store.memory_get(user_id, agent_id)
+    existing = await memory_store.memory_get(agent_id)
     try:
         cfg = _merge(existing, data)
     except ValidationError as exc:  # 非法字段类型 → 422
@@ -142,7 +142,7 @@ async def get_agent_config(
     user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     """读某智能体记忆配置；无记录返回 404。"""
-    cfg = await memory_store.memory_get(user_id, agent_id)
+    cfg = await memory_store.memory_get(agent_id)
     if cfg is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -157,7 +157,7 @@ async def delete_agent_config(
     user_id: str = Depends(get_current_user_id),
 ) -> Response:
     """删除某智能体记忆配置（本地删 + 平台删除占位日志）。"""
-    await memory_store.memory_delete(user_id, agent_id)
+    await memory_store.memory_delete(agent_id)
     _sync_delete_placeholder(agent_id, user_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

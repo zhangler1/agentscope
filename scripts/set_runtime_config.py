@@ -23,7 +23,7 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 #: 后端接口基础地址（不带末尾斜杠）。完整写接口为 PUT {API_BASE}/config/{key}
-API_BASE = "http://localhost:9000/api"
+API_BASE = "http://localhost:8000/api"
 
 #: 调用方用户 ID，作为 X-User-ID 请求头（接口 get_current_user_id 必需）。
 USER_ID = "lwh"
@@ -40,19 +40,36 @@ CONFIGS: list[dict] = [
             "ttl_seconds": 14400
         },
     },
+    # {
+    #     "key": "summarization",
+    #     "payload": {
+    #         "enabled": True,
+    #         "user_id": "lwh",
+    #         "credential_id": "87405761bd544aa99bc4aba9da0e8a08",
+    #         "model_name": "deepseek-v4-flash"
+    #     },
+    # },
     {
-        "key": "summarization",
+        "key": "tool_result",
         "payload": {
             "enabled": True,
-            "user_id": "lwh",
-            "credential_id": "87405761bd544aa99bc4aba9da0e8a08",
-            "model_name": "deepseek-v4-flash"
+            "ttl_seconds": 14400,
+            "per_tool_threshold_chars": 20000,
+            "message_budget_chars": 80000,
+            "preview_chars": 1000,
+            "read_result_max_output_chars": 2000,
+            "exempt_tools": []
+        }
+    },
+    {
+        "key": "memory",
+        "payload": {
+            "default_memory_prompt": "全局记忆配置",
+            "idle_minutes": 1,
+            "sweep_interval_seconds": 5,
+            "max_tokens": 90000
         },
     },
-    # {
-    #     "key": "personal_search",
-    #     "payload": {"top_k": 5},
-    # },
 ]
 
 # ---------------------------------------------------------------------------

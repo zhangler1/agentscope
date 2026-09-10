@@ -162,8 +162,8 @@ async def memory_upsert(
         )
 
 
-async def memory_get(user_id: str, agent_id: str) -> MemoryConfig | None:
-    """读取一条记忆配置；无记录返回 None（调用方合并默认值）。"""
+async def memory_get(agent_id: str) -> MemoryConfig | None:
+    """读取某 agent 的记忆配置（agent 级、按 agent_id 定位）；无记录返回 None。"""
     await _ensure_table()
     engine = await _get_engine()
     async with engine.connect() as conn:
@@ -171,9 +171,9 @@ async def memory_get(user_id: str, agent_id: str) -> MemoryConfig | None:
             await conn.execute(
                 text(
                     "SELECT payload FROM agent_memory_configs "
-                    "WHERE agent_id = :agent_id AND user_id = :user_id",
+                    "WHERE agent_id = :agent_id",
                 ),
-                {"agent_id": agent_id, "user_id": user_id},
+                {"agent_id": agent_id},
             )
         ).mappings().first()
     if row is None:
@@ -184,38 +184,36 @@ async def memory_get(user_id: str, agent_id: str) -> MemoryConfig | None:
     return MemoryConfig(**data)
 
 
-async def memory_delete(user_id: str, agent_id: str) -> bool:
-    """删除一条记忆配置；返回是否删除成功（不存在返回 False）。"""
+async def memory_delete(agent_id: str) -> bool:
+    """删除某 agent 的记忆配置（按 agent_id 定位）；返回是否删除成功。"""
     await _ensure_table()
     engine = await _get_engine()
     async with engine.begin() as conn:
         result = await conn.execute(
             text(
                 "DELETE FROM agent_memory_configs "
-                "WHERE agent_id = :agent_id AND user_id = :user_id",
+                "WHERE agent_id = :agent_id",
             ),
-            {"agent_id": agent_id, "user_id": user_id},
+            {"agent_id": agent_id},
         )
     return result.rowcount > 0
 
 
-async def memory_list_enabled() -> list[tuple[str, str, MemoryConfig]]:
-    """列出全部开启记忆的 (user_id, agent_id, config)。
+async def memory_list_enabled() -> list[tuple[str, MemoryConfig]]:
+    """列出全部开启记忆的 (agent_id, config)，供静默扫描器枚举候选。
 
-    供静默扫描器（MemorySweeper）枚举候选智能体：返回所有 payload 中
-    ``memory_enabled`` 为真的配置。配置量小，整表读取后按模型过滤即可，
-    不依赖各数据库 JSON 过滤方言。
+    配置是 agent 级：user_id 仅为归属标记、不参与本查询，杜绝调用方误把它
+    当作会话 owner（spec 3.3/5.3）。扫描器从 active_sessions 反查真实 owner，
+    故此处不再返回 user_id。配置量小，整表读取后按模型过滤即可，不依赖各
+    数据库 JSON 过滤方言。
     """
     await _ensure_table()
     engine = await _get_engine()
-    result: list[tuple[str, str, MemoryConfig]] = []
+    result: list[tuple[str, MemoryConfig]] = []
     async with engine.connect() as conn:
         rows = (
             await conn.execute(
-                text(
-                    "SELECT user_id, agent_id, payload "
-                    "FROM agent_memory_configs",
-                ),
+                text("SELECT agent_id, payload FROM agent_memory_configs"),
             )
         ).mappings().all()
     for row in rows:
@@ -223,7 +221,7 @@ async def memory_list_enabled() -> list[tuple[str, str, MemoryConfig]]:
         data = payload if isinstance(payload, dict) else json.loads(payload)
         cfg = MemoryConfig(**data)
         if cfg.memory_enabled:
-            result.append((str(row["user_id"]), str(row["agent_id"]), cfg))
+            result.append((str(row["agent_id"]), cfg))
     return result
 
 

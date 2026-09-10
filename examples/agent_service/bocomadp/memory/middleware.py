@@ -208,9 +208,30 @@ class MemoryMiddleware(MiddlewareBase):
         if self._redis is None:
             return
         try:
-            await mark_active(self._redis, self.session_id)
-            turns = await incr_turn(self._redis, self.session_id)
-            if self._should_trigger(turns):
+            await mark_active(
+                self._redis,
+                self.user_id,
+                self.agent_id,
+                self.session_id,
+            )
+            turns = await incr_turn(
+                self._redis,
+                self.user_id,
+                self.agent_id,
+                self.session_id,
+            )
+            update_rounds = self._cfg.update_rounds
+            hit = self._should_trigger(turns)
+            logger.debug(
+                "memory: turn threshold check session=%s reply_id=%s "
+                "turns=%d update_rounds=%d hit=%s",
+                self.session_id,
+                reply_id,
+                turns,
+                update_rounds,
+                hit,
+            )
+            if hit:
                 await self._maybe_trigger(turns, reply_id)
         except Exception:  # noqa: BLE001 — 计数/触发失败不影响回复
             logger.warning(
@@ -226,7 +247,12 @@ class MemoryMiddleware(MiddlewareBase):
 
     async def _maybe_trigger(self, turns: int, reply_id: str = "-") -> None:
         """抢锁成功后触发后台提取；无触发回调则不做事（锁保留防重复）。"""
-        if not await try_acquire_lock(self._redis, self.session_id):
+        if not await try_acquire_lock(
+            self._redis,
+            self.user_id,
+            self.agent_id,
+            self.session_id,
+        ):
             return
         if self._trigger is None:
             return
@@ -249,7 +275,12 @@ class MemoryMiddleware(MiddlewareBase):
         reply_id = self._reply_id(agent)
         if self._redis is not None:
             try:
-                await mark_active(self._redis, self.session_id)
+                await mark_active(
+                    self._redis,
+                    self.user_id,
+                    self.agent_id,
+                    self.session_id,
+                )
             except Exception:  # noqa: BLE001 — 心跳失败静默
                 logger.debug(
                     "memory: heartbeat failed session=%s reply_id=%s",

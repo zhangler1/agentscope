@@ -58,18 +58,27 @@ def test_upsert_persists_full_payload(sqlite_db):
     assert _json.loads(raw) == MemoryConfig().model_dump()
 
 
+def test_memory_config_is_agent_scoped_across_users(sqlite_db):
+    """记忆配置按 agent_id 定位：不同 user 也能读/删同一 agent 的配置。"""
+    _run(memory_store.memory_upsert("u1", "a1", MemoryConfig(memory_enabled=True)))
+    got = _run(memory_store.memory_get("a1"))  # 非写入者 user 也能读到
+    assert got is not None and got.memory_enabled is True
+    assert _run(memory_store.memory_delete("a1")) is True
+    assert _run(memory_store.memory_get("a1")) is None
+
+
 def test_upsert_get_delete_roundtrip(sqlite_db):
     _run(memory_store.memory_upsert("u1", "a1", MemoryConfig(memory_enabled=True)))
-    got = _run(memory_store.memory_get("u1", "a1"))
+    got = _run(memory_store.memory_get("a1"))
     assert got is not None and got.memory_enabled is True and got.top_k == 5
-    assert _run(memory_store.memory_delete("u1", "a1")) is True
-    assert _run(memory_store.memory_get("u1", "a1")) is None
+    assert _run(memory_store.memory_delete("a1")) is True
+    assert _run(memory_store.memory_get("a1")) is None
 
 
 def test_extra_allow_keeps_new_fields(sqlite_db):
     cfg = MemoryConfig(memory_enabled=True, **{"brand_new_field": "x"})
     _run(memory_store.memory_upsert("u1", "a1", cfg))
-    got = _run(memory_store.memory_get("u1", "a1"))
+    got = _run(memory_store.memory_get("a1"))
     assert got.brand_new_field == "x"  # extra=allow 动态字段保留
 
 
@@ -77,3 +86,13 @@ def test_runtime_config_defaults():
     from bocomadp.memory.config import MemoryRuntimeConfig
 
     assert MemoryRuntimeConfig().max_tokens == 90000
+
+
+def test_memory_list_enabled_returns_agent_cfg_pairs(sqlite_db):
+    """memory_list_enabled 返回 (agent_id, cfg)；关闭项不返回。"""
+    _run(memory_store.memory_upsert("u1", "a1", MemoryConfig(memory_enabled=True)))
+    _run(memory_store.memory_upsert("u2", "a2", MemoryConfig(memory_enabled=False)))
+    rows = _run(memory_store.memory_list_enabled())
+    assert len(rows) == 1
+    assert rows[0][0] == "a1"
+    assert rows[0][1].memory_enabled is True
