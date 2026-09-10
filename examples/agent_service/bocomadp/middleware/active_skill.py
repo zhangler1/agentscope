@@ -1,65 +1,149 @@
 # -*- coding: utf-8 -*-
-"""ActiveSkillMiddleware —— 解析用户消息中的 ``/skill_name`` 前缀。
+"""ActiveSkillMiddleware —— 解析用户消息中的 ``@skill:<name>`` 标记。
 
-用户输入 ``/skill_name 问题`` 时：
-1. 从请求体 ``input.content`` 的 text block 中解析出 ``skill_name`` 与剩余问题；
-2. 把 ``skill_name`` 存入 ContextVar（供 CustomPromptMiddleware 读取）；
-3. 把去掉 ``/skill_name`` 前缀后的消息写回请求体，LLM 只看到问题。
+标记协议（可同时指定多个技能）::
 
-技能不存在时：skill_name 仍会被设置，由 CustomPromptMiddleware 判断技能
-存在性——不存在则按普通消息处理（不注入）。
+    @skill:ob-sql-review 帮我看下这段 SQL
+    @skill:ob-sql-review @skill:excel分析 对比下两份数据
+
+- 标记形如 ``@skill:<技能名>``，``@skill:`` 关键字**大小写不敏感**；
+- 技能名到**空白**或 ``@`` 为止，且必须由**空白（或消息结尾）收尾**——
+  因此 ``@skill:a@skill:b`` 这种没有空白分隔的写法**整段不识别**；
+- 标记可出现在消息**任意位置**（正文中间也识别，前面不要求有空格）；
+- 识别到的技能名**去重**后按出现顺序汇总。
+
+命中标记时：
+1. 把技能名列表存入 ContextVar（:func:`get_active_skills`，供下游读取）；
+2. **消息正文一个字符都不改**——``@skill:<name>`` 标记随用户原文一起
+   落库（前端历史/刷新后看到的就是用户输入的原始字符串）；
+3. 模型侧如何得知"本次指定了哪些技能"由
+   :class:`CustomPromptMiddleware` 在 system prompt 中注入
+   （见 ``custom_prompt.py::_build_active_skill_note``）。
+
+边界与约定：
+- 本中间件对请求体**只读不写**：解析完标记后把原始 body 原样重放给下游；
+- system prompt 的技能注入保持框架默认的 **全量** ``<agent-skills>``
+  段，另加一段"本次请求指定技能"的强调；
+- 不校验技能是否存在；
+- 请求携带 ``custom_params.custom_prompt`` 时**不解析**（custom_prompt
+  整体覆盖 system prompt，优先于本中间件）；
+- **仅拦截 chat 入口**：``/chat/``、``/chat``
+  （deerflow 的 ``/runs/stream`` 不再拦截）。
+
+历史演进：旧协议为消息开头的 ``/skill_name`` 前缀；随后一度把消息改写为
+"请使用 xxx 技能完成以下任务：…"（该文案会落库并被前端展示）；再改为
+"摘掉标记、只保留问题"；**现为"标记原样保留、正文不动"**。
 """
 from __future__ import annotations
 
 import contextvars
 import json
-import re
 from typing import Any
 
-_active_skill: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "active_skill",
-    default="",
+#: 当前请求指定的技能名（按出现顺序去重）；无则空元组。
+_active_skills: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "active_skills",
+    default=(),
 )
+
+#: 标记前缀（匹配时大小写不敏感）。
+_MARKER_PREFIX = "@skill:"
+
+
+def get_active_skills() -> list[str]:
+    """返回当前请求指定的全部技能名（无则空列表）。"""
+    return list(_active_skills.get() or ())
 
 
 def get_active_skill() -> str:
-    """返回当前请求指定的技能名（无则空串）。"""
-    return _active_skill.get() or ""
+    """返回第一个指定技能名（兼容旧接口；无则空串）。"""
+    skills = _active_skills.get() or ()
+    return skills[0] if skills else ""
 
 
-_SKILL_PREFIX_RE = re.compile(r"^/(\S+)\s*(.*)$", re.S)
+def _dedup(names: list[str]) -> list[str]:
+    """按出现顺序去重（保留首现位置）。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
 
 
-def _rewrite_question(m: re.Match[str]) -> str:
-    """把 ``/skill_name 问题`` 重写为显式要求使用该技能的任务描述。"""
-    skill_name = m.group(1)
-    question = m.group(2).strip() or "请使用该技能完成工作"
-    return f"请使用 {skill_name} 技能完成以下任务：{question}"
+def _scan_skills(text: str) -> list[str]:
+    """扫描文本中所有合法的 ``@skill:<name>`` 标记，返回技能名。
 
+    纯读取，不改动传入文本。技能名按出现顺序返回、**未去重**。
 
-def _match_text_blocks(blocks: Any) -> tuple[str, bool]:
-    """在 block 数组（list[dict]）的 text block 里匹配 ``/skill_name`` 前缀。
-
-    命中时原地改写 ``block["text"]`` 为显式任务描述。
-
-    Returns:
-        ``(skill_name, modified)``：技能名与是否发生了改写。
+    识别规则：
+        - ``@skill:`` 大小写不敏感；
+        - 技能名到空白或 ``@`` 为止，且必须由**空白（或文本结尾）收尾**；
+        - 非法标记（如 ``@skill:a@skill:b`` 无空白分隔）整段跳过，不把其中
+          的第二个 ``@skill:`` 误判为有效技能。
     """
-    if not isinstance(blocks, list):
-        return "", False
-    for block in blocks:
+    if _MARKER_PREFIX not in text.lower():
+        return []
+
+    lowered = text.lower()
+    names: list[str] = []
+    index = 0
+    length = len(text)
+
+    while index < length:
+        hit = lowered.find(_MARKER_PREFIX, index)
+        if hit < 0:
+            break
+
+        start = hit + len(_MARKER_PREFIX)
+        cursor = start
+        while cursor < length and not text[cursor].isspace() and text[cursor] != "@":
+            cursor += 1
+
+        name = text[start:cursor]
+        if name and (cursor >= length or text[cursor].isspace()):
+            names.append(name)
+            index = cursor
+        else:
+            # 非法标记：跳过这一段连续非空白，避免误判其中的后续标记
+            cursor = start
+            while cursor < length and not text[cursor].isspace():
+                cursor += 1
+            index = cursor
+
+    return names
+
+
+def _collect_skill_names(data: dict) -> list[str]:
+    """从请求体中收集技能名（只读，不修改任何内容）。
+
+    支持原生 ``/chat/`` 的 ``input.content`` block 数组（遍历其中的
+    ``type == "text"`` 块）。
+    """
+    input_data = data.get("input")
+    if not isinstance(input_data, dict):
+        return []
+
+    content = input_data.get("content")
+    if not isinstance(content, list):
+        return []
+
+    names: list[str] = []
+    for block in content:
         if not isinstance(block, dict) or block.get("type") != "text":
             continue
-        text = block.get("text", "")
-        m = _SKILL_PREFIX_RE.match(text)
-        if m:
-            block["text"] = _rewrite_question(m)
-            return m.group(1), True
-    return "", False
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            names.extend(_scan_skills(text))
+    return _dedup(names)
 
 
 class ActiveSkillMiddleware:
-    """ASGI 中间件：解析 ``/skill_name`` 前缀，移除并存入 ContextVar。"""
+    """ASGI 中间件：解析 ``@skill:<name>`` 标记并存入 ContextVar（只读）。
+
+    请求体不做任何修改，解析后原样重放给下游。
+    """
 
     def __init__(self, app: Any) -> None:
         self.app = app
@@ -69,17 +153,13 @@ class ActiveSkillMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # 仅处理 chat 请求（fire-and-forget 入口 / deerflow run stream 入口）
+        # 仅处理 chat 入口（原生 fire-and-forget 与阻塞式 chat）
         path = scope.get("path", "")
-        if not (
-            path.endswith("/chat/")
-            or path.endswith("/chat")
-            or path.endswith("/runs/stream")
-        ):
+        if not (path.endswith("/chat/") or path.endswith("/chat")):
             await self.app(scope, receive, send)
             return
 
-        # 1. 读取 body
+        # 1. 读取 body（只为了解析标记，内容不会被修改）
         chunks: list[bytes] = []
         while True:
             message = await receive()
@@ -89,13 +169,13 @@ class ActiveSkillMiddleware:
                     break
 
         raw = b"".join(chunks)
-        new_raw, skill_name = self._parse_skill_prefix(raw)
-        if skill_name:
-            _active_skill.set(skill_name)
+        skill_names = self._parse_skill_names(raw)
+        if skill_names:
+            _active_skills.set(tuple(skill_names))
 
-        # 2. 重放（修改后的）body 给下游
+        # 2. 原样重放 body 给下游
         async def new_receive():
-            yield {"type": "http.request", "body": new_raw, "more_body": False}
+            yield {"type": "http.request", "body": raw, "more_body": False}
 
         recv_iter = new_receive()
 
@@ -104,68 +184,40 @@ class ActiveSkillMiddleware:
                 return await recv_iter.__anext__()
             except StopAsyncIteration:
                 # 重放完 body 后，继续转发原始 receive 的后续消息，而不是
-                # 返回 http.disconnect。否则对 /runs/stream 这类 SSE 流式
-                # 请求，Starlette 会把该消息误判为客户端断开，提前终止
-                # StreamingResponse（表现为只回显 human 帧后 SSE 直接结束）。
+                # 返回 http.disconnect。否则对 SSE 流式响应，Starlette 会把
+                # 该消息误判为客户端断开，提前终止 StreamingResponse。
                 return await receive()
 
         await self.app(scope, receive_wrapper, send)
 
     @staticmethod
-    def _parse_skill_prefix(raw: bytes) -> tuple[bytes, str]:
-        """解析 ``input.content`` 中 text block 的 ``/skill_name`` 前缀。
+    def _parse_skill_names(raw: bytes) -> list[str]:
+        """从请求体中解析 ``@skill:`` 标记，返回去重后的技能名列表。
+
+        **不修改** 请求体：仅解析 ``input.content`` 里的 text block。
 
         Returns:
-            ``(new_raw, skill_name)``：去掉前缀后的请求体，与技能名。
-            请求携带 ``custom_prompt`` 时：不重写消息、不设置技能名
-            （由 custom_prompt 整体覆盖 system prompt）。
+            ``list[str]``: 技能名（按出现顺序去重）；body 非法、无 ``input``、
+            携带 ``custom_prompt`` 或未命中标记时返回空列表。
         """
         try:
             data = json.loads(raw.decode("utf-8"))
-        except Exception:
-            return raw, ""
+        except Exception:  # noqa: BLE001 —— 非 JSON / 编码异常：视为无标记
+            return []
 
-        # 带 custom_prompt → 不重写用户消息（custom_prompt 优先）
-        custom_prompt = data.get("custom_params", {}).get("custom_prompt")
+        if not isinstance(data, dict):
+            return []
+
+        # 带 custom_prompt → 不解析（custom_prompt 优先，整体覆盖 system prompt）
+        custom_prompt = (data.get("custom_params") or {}).get("custom_prompt")
         if custom_prompt:
-            return raw, ""
+            return []
 
-        input_data = data.get("input")
-        if not isinstance(input_data, dict):
-            return raw, ""
+        return _collect_skill_names(data)
 
-        skill_name = ""
-        modified = False
 
-        # 原生 /chat/：input.content 为 block 数组
-        content = input_data.get("content")
-        if isinstance(content, list):
-            skill_name, modified = _match_text_blocks(content)
-
-        # deerflow /runs/stream：input.messages 为 LangGraph 消息数组，
-        # 每条 content 可能是字符串或 block 数组
-        if not modified:
-            messages = input_data.get("messages")
-            if isinstance(messages, list):
-                for message in messages:
-                    if not isinstance(message, dict):
-                        continue
-                    msg_content = message.get("content")
-                    if isinstance(msg_content, str):
-                        m = _SKILL_PREFIX_RE.match(msg_content)
-                        if m:
-                            message["content"] = _rewrite_question(m)
-                            skill_name = m.group(1)
-                            modified = True
-                            break
-                    elif isinstance(msg_content, list):
-                        skill_name, modified = _match_text_blocks(msg_content)
-                        if modified:
-                            break
-
-        if modified:
-            return (
-                json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                skill_name,
-            )
-        return raw, ""
+__all__ = [
+    "ActiveSkillMiddleware",
+    "get_active_skill",
+    "get_active_skills",
+]
