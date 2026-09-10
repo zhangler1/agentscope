@@ -6,7 +6,8 @@
 engine + 幂等建表 + 纯 ``text`` SQL，绕过框架表管理与 Alembic 迁移。
 
 本表是**独立的模型台账**，与 Redis ``bocomadp:model:think_tag``（ELLM
-运行时模型候选，由 ``/ellm-models`` 维护）**不同源、不做同步**——
+运行时模型候选，由 ELLM 运行时读写；HTTP 管理接口 ``/ellm-models``
+已移除）**不同源、不做同步**——
 两者用途不同：本表供资产/能力登记与查询，Redis 那一份只服务
 ``EllmChatModel.list_models()`` 的热路径。
 
