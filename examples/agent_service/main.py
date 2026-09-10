@@ -539,18 +539,12 @@ class _BuiltinAgentStorageProxy:
         Memory cleanup (best-effort, never blocks the delete result):
         - DB ``agent_memory_configs`` row: ``memory_store.memory_delete``;
         - Redis per-session state (``active_sessions`` member / ``turns`` /
-          extract lock): enumerated from the agent's sessions *before* the
-          delete (sessions vanish afterwards), then removed per sid.
+          extract lock): scanned from ``active_sessions`` by agent dimension
+          inside ``cleanup_agent_memory`` — no pre-delete session snapshot
+          needed (the compound key embeds user_id, so cleanup resolves it
+          from the active set instead).
           Platform-side delete remains a placeholder (local delete only).
         """
-        # ① 删除前快照该 agent 的会话 id（删除后取不到），供记忆 Redis 清理；
-        #    枚举与容错实现收口在 memory 包（list_agent_session_ids）。
-        session_ids = await memory_module.list_agent_session_ids(
-            user_id,
-            agent_id,
-            storage=self._inner,
-        )
-
         ok = await self._inner.delete_agent(user_id, agent_id)
         if ok:
             try:
@@ -569,12 +563,8 @@ class _BuiltinAgentStorageProxy:
                 )
             try:
                 # 记忆清理收口到 memory 包（DB 配置行 + Redis 会话态）；
-                # 平台侧删除仍为占位（仅本地清理）。session_ids 已在上方快照。
-                await memory_module.cleanup_agent_memory(
-                    user_id,
-                    agent_id,
-                    session_ids=session_ids,
-                )
+                # 平台侧删除仍为占位（仅本地清理）。
+                await memory_module.cleanup_agent_memory(agent_id)
             except Exception:  # 记忆清理失败不影响删除结果
                 logger.warning(
                     "failed to drop memory records for agent %s",
