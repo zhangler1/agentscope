@@ -1004,12 +1004,12 @@ app.include_router(credential_model_router)
 # 系统提示词管理（全局默认 + 按智能体自定义）
 from bocomadp.routers.system_prompt import system_prompt_router
 app.include_router(system_prompt_router)
-# ELLM 模型管理（Redis bocomadp:model:think_tag 增删改查）
-from bocomadp.routers.ellm_models import ellm_models_router
-app.include_router(ellm_models_router)
 # 运行时配置管理（PG runtime_configs 表，/config/{key} 通用 CRUD）
 from bocomadp.routers.runtime_config import runtime_config_router
 app.include_router(runtime_config_router)
+# 模型注册表（PG model_registry 表：模型台账 CRUD，与 Redis 模型候选不同源）
+from bocomadp.routers.model_registry import model_registry_router
+app.include_router(model_registry_router)
 
 
 # ---------------------------------------------------------------------------
