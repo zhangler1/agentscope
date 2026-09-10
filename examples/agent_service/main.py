@@ -1010,6 +1010,9 @@ app.include_router(runtime_config_router)
 # 模型注册表（PG model_registry 表：模型台账 CRUD，与 Redis 模型候选不同源）
 from bocomadp.routers.model_registry import model_registry_router
 app.include_router(model_registry_router)
+# 智能体凭证绑定（agent_credential 表：agent_id -> credential_id 的 CRUD）
+from bocomadp.routers.agent_credential import agent_credential_router
+app.include_router(agent_credential_router)
 
 
 # ---------------------------------------------------------------------------
