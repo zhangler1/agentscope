@@ -93,7 +93,7 @@ class ELLMCredential(CredentialBase):
             "单模型，候选模型由 list_models 返回全部。"
         ),
     )
-    """绑定的模型名（可空；候选见 ``bocomadp/providers/_models/*.yaml``）。"""
+    """绑定的模型名（可空；候选见 ``model_registry`` 模型库）。"""
 
     # @model_validator(mode="after")
     # def _validate_model(self) -> Self:
@@ -109,7 +109,7 @@ class ELLMCredential(CredentialBase):
 
     @classmethod
     def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """动态注入 model 字段的 enum（候选来自 Redis list_models），前端表单变下拉。"""
+        """动态注入 model 字段的 enum（候选来自模型库 list_models），前端表单变下拉。"""
         schema = super().model_json_schema(*args, **kwargs)
         candidates = [
             card.name for card in cls.get_chat_model_class().list_models()

@@ -306,18 +306,18 @@ curl -X PATCH http://192.168.0.106/api/model/credential/{credential_id} \
 > `deerflow-<user_id>-<provider_id>` 幂等写入 credential 存储（不同用户互不冲突），
 > 无需手动创建。
 
-## 5. 模型候选（`/ellm-models`）
+## 5. 模型库（`/model-registry`）
 
 ```bash
-# 模型候选管理（Redis 模型表 bocomadp:model:think_tag）
-curl http://192.168.0.106/api/ellm-models
-curl http://192.168.0.106/api/ellm-models/Qwen3-235B-A22B
-curl -X POST http://192.168.0.106/api/ellm-models \
+# 模型库管理（PG model_registry 表：注册表 CRUD + ELLM 运行时候选真源）
+curl http://192.168.0.106/api/model-registry
+curl http://192.168.0.106/api/model-registry/Qwen3-235B-A22B
+curl -X POST http://192.168.0.106/api/model-registry \
   -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen3-235B-A22B","think_tag":1,"context_size":1000000,"output_size":384000}'
-curl -X PUT http://192.168.0.106/api/ellm-models/Qwen3-235B-A22B \
-  -H 'Content-Type: application/json' -d '{"think_tag":0}'
-curl -X DELETE http://192.168.0.106/api/ellm-models/Qwen3-235B-A22B
+  -d '{"model_name":"Qwen3-235B-A22B","model_type":"LLM","context_size":1000000,"output_size":384000,"think_tag":true}'
+curl -X PUT http://192.168.0.106/api/model-registry/Qwen3-235B-A22B \
+  -H 'Content-Type: application/json' -d '{"think_tag":false}'
+curl -X DELETE http://192.168.0.106/api/model-registry/Qwen3-235B-A22B
 ```
 
 > 原 `/api/models` / `/api/models/active`（ProviderManager 列表与 active 切换）已随 ProviderManager 一并移除。

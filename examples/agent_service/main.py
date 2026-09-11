@@ -882,6 +882,12 @@ async def _lifespan_with_builtin_agents(app):
         # 内置模型条目作为 default 用户默认凭证幂等入库（deerflow
         # 模型名解析的默认参数单一来源；失败仅告警不阻断启动）
         await ensure_default_credentials(storage)
+        # 模型库（model_registry）进程内快照预热：同步接口
+        # （EllmChatModel.list_models / context_size / think_tag）据此读取；
+        # 内部已吞异常，DB 不可用时保留空快照、不阻断启动。
+        from bocomadp.routers.model_registry import load_snapshot
+
+        await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
         patch_get_toolkit()
@@ -1007,7 +1013,7 @@ app.include_router(system_prompt_router)
 # 运行时配置管理（PG runtime_configs 表，/config/{key} 通用 CRUD）
 from bocomadp.routers.runtime_config import runtime_config_router
 app.include_router(runtime_config_router)
-# 模型注册表（PG model_registry 表：模型台账 CRUD，与 Redis 模型候选不同源）
+# 模型库（PG model_registry 表：CRUD + ELLM 运行时模型候选唯一真源）
 from bocomadp.routers.model_registry import model_registry_router
 app.include_router(model_registry_router)
 
