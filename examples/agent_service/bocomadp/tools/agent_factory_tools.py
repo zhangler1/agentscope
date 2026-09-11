@@ -13,6 +13,7 @@ Tool list:
 - ``delete_agent``          — delete an agent
 - ``list_agents``           — list current user's agents
 - ``get_agent``             — get one agent's full config
+- ``get_agent_tools``       — list the tools enabled for one agent
 - ``list_tools_for_agent``  — list all available tools + MCPs
 """
 
@@ -21,12 +22,24 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import urllib.parse
 from typing import Any
 
 import httpx
 
-logger = logging.getLogger("bocomadp.agent_factory_tools")
+from ..tool_catalog import (
+    BUILTIN_TOOL_NAMES,
+    BUILTIN_TOOLS_META,
+    FRAMEWORK_TOOLS_META,
+    canonical_tool_name,
+)
+from .enterprise_catalog import enterprise_tools_meta
+
+# 用框架 logger "as"：``apply_logging_level`` 会把 "as" 一起调到
+# config.yaml 的 ``log_level``，因此 ``log_level: debug`` 时工厂工具的
+# 请求/响应明细会一并输出（与 bocomadp/memory/* 等模块一致）。
+logger = logging.getLogger("as")
 
 try:
     from agentscope.tool import FunctionTool
@@ -78,22 +91,33 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "agent_factory_session_id", default="",
 )
 
-# Framework agent API base (same process, localhost is safe).
-_AGENT_API = "http://localhost:8000/agent"
+# Internal API root (same process, localhost is safe).
+# 服务以 ``root_app`` 启动时所有路由挂在 ``/api`` 下
+# （main.py 末尾：``root_app.mount("/api", app)``，Dockerfile CMD 即
+# ``python main.py``），因此默认带 ``/api`` 前缀。
+# 若改用 ``uvicorn main:app``（内层 app、无前缀）启动，可设
+# ``BOCOMADP_INTERNAL_API_BASE=http://localhost:8000`` 覆盖。
+_INTERNAL_API_BASE = os.environ.get(
+    "BOCOMADP_INTERNAL_API_BASE",
+    "http://localhost:8000/api",
+).rstrip("/")
+
+# Framework agent API base.
+_AGENT_API = f"{_INTERNAL_API_BASE}/agent"
 
 # Tool-config API base — the per-agent tool whitelist endpoints.
-_TOOLS_API = "http://localhost:8000/agents"
+_TOOLS_API = f"{_INTERNAL_API_BASE}/agents"
 
 # Session API base — used to ensure a target agent has a session before
 # skill operations (skill endpoints resolve the workspace via session).
-_SESSIONS_API = "http://localhost:8000/sessions"
+_SESSIONS_API = f"{_INTERNAL_API_BASE}/sessions"
 
 # Skill API base — external skillhub catalog + download endpoints.
-_SKILLS_API = "http://localhost:8000/workspace"
+_SKILLS_API = f"{_INTERNAL_API_BASE}/workspace"
 
-# Workspace builtins are always available and not affected by
-# ``enabled_tools`` — skip them when aligning tool whitelists.
-_BUILTIN_NAMES = {"bash", "read", "write", "edit", "glob", "grep"}
+# 注：workspace builtins（``Bash``/``Read``/...）与普通工具**同等可配置**——
+# 它们参与白名单 diff，可被启用或停用。名称/元数据统一取自
+# ``bocomadp.tool_catalog``，避免与运行时大写名不一致（历史 bug）。
 
 #: Unicode 连字符/空白 → ASCII 映射（LLM 生成的名称中很常见）。
 _NAME_TRANS = str.maketrans(
@@ -142,6 +166,188 @@ def init_factory_tools(
     )
 
 
+def _known_tool_names() -> set[str]:
+    """Return the configurable tool set M.
+
+    Mirrors :func:`bocomadp.routers.agent_tools._all_tool_names` so the
+    factory tools validate names against the very universe the tool
+    config APIs accept (builtins + registry + MCP + framework +
+    enterprise).
+    """
+    names: set[str] = set(BUILTIN_TOOL_NAMES)
+    names.update(m["name"] for m in FRAMEWORK_TOOLS_META)
+    names.update(m["name"] for m in enterprise_tools_meta())
+    if _tool_registry is not None:
+        try:
+            names.update(_tool_registry.list_tool_names())
+        except Exception:  # noqa: BLE001
+            logger.debug("list_tool_names failed", exc_info=True)
+    if _mcp_registry is not None:
+        try:
+            for mcp in _mcp_registry.list_mcps():
+                name = getattr(mcp, "name", "") or ""
+                if name:
+                    names.add(name)
+        except Exception:  # noqa: BLE001
+            logger.debug("list_mcps failed", exc_info=True)
+    return names
+
+
+def _normalize_tool_names(names: list[str]) -> tuple[list[str], list[str]]:
+    """Normalize (case) and validate a requested tool-name list.
+
+    Returns:
+        tuple[list[str], list[str]]: ``(valid, unknown)`` — ``valid`` is
+        the de-duplicated canonical name list; ``unknown`` holds names
+        that are not part of the configurable set M.
+    """
+    canonical = [canonical_tool_name(n) for n in names or []]
+    canonical = [n for n in canonical if n]
+    known = _known_tool_names()
+    unknown = sorted({n for n in canonical if n not in known})
+    valid = sorted({n for n in canonical if n in known})
+    return valid, unknown
+
+
+def _tool_state(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """解析 ``GET /agents/{agent_id}/tools`` 的响应。
+
+    Returns:
+        tuple[set[str], set[str]]: ``(enabled, all_names)`` —— ``enabled``
+        是当前处于启用状态的可配置工具名；``all_names`` 是接口报告的全部
+        可配置工具名（即可配置集合 M）。展示用的工厂工具
+        （``toggleable=False``）两边都不计入，因为它们不在白名单里，
+        对它们发 PUT/DELETE 会 404。
+    """
+    enabled: set[str] = set()
+    all_names: set[str] = set()
+    for tool in payload.get("tools", []):
+        if not tool.get("toggleable", True):
+            continue
+        name = tool.get("name", "")
+        if not name:
+            continue
+        all_names.add(name)
+        if tool.get("enabled"):
+            enabled.add(name)
+    for mcp in payload.get("mcps", []):
+        name = mcp.get("name", "")
+        if not name:
+            continue
+        all_names.add(name)
+        if mcp.get("enabled"):
+            enabled.add(name)
+    return enabled, all_names
+
+
+#: list_tools_for_agent 里每个工具简介的最大字符数。
+_TOOL_BRIEF_LIMIT = 50
+
+
+def _brief(description: str, name: str = "", limit: int = _TOOL_BRIEF_LIMIT) -> str:
+    """把工具的长描述压成一句话（供 list_tools_for_agent 展示）。
+
+    规则：折叠空白 → 剥掉开头与工具名重复的部分（含"工具"/"tool"后缀）
+    → 取第一句 → 超长则在最近的标点处截断，不硬切词。
+
+    Args:
+        description (str): 原始描述，可能含多段换行长文。
+        name (str): 工具名，用于剥掉描述开头重复的名字。
+        limit (int): 单行最大字符数。
+
+    Returns:
+        str: 压好的一句话；原描述为空时返回空串。
+    """
+    text = " ".join((description or "").split())
+    if not text:
+        return ""
+    if name and text.startswith(name):
+        text = text[len(name):].lstrip()
+        for suffix in ("工具：", "工具:", "工具", "tool:", "tool：", "tool"):
+            if text.lower().startswith(suffix.lower()):
+                text = text[len(suffix):]
+                break
+        text = text.lstrip("：: ")
+    if not text:
+        return ""
+
+    head = text
+    for idx, ch in enumerate(text):
+        if ch in "。！？!?":
+            head = text[: idx + 1]
+            break
+    if len(head) <= limit:
+        return head
+
+    window = head[:limit]
+    cut = max(window.rfind(p) for p in "，,、；;")
+    if cut >= limit // 2:  # 断点太靠前（语义不完整），宁可硬截
+        return window[: cut + 1] + "…"
+    return window.rstrip() + "…"
+
+
+def _project_tools_meta() -> list[tuple[str, str]]:
+    """Return ``[(name, description), ...]`` for registry-provided tools.
+
+    Prefers :meth:`ToolRegistry.list_tools`（带 description）；注册表不提供
+    或调用失败时回退到 :meth:`ToolRegistry.list_tool_names`（只有名字）。
+
+    Returns:
+        list[tuple[str, str]]: ``(工具名, 描述)`` 列表，描述可能为空串。
+    """
+    if _tool_registry is None:
+        return []
+    try:
+        tools = list(_tool_registry.list_tools())
+    except Exception:  # noqa: BLE001 —— 注册表异常不影响其余目录
+        logger.debug("list_tools failed; falling back to names", exc_info=True)
+        tools = []
+    metas: list[tuple[str, str]] = []
+    for tool in tools:
+        name = getattr(tool, "name", "") or ""
+        if not name:
+            continue
+        metas.append((name, getattr(tool, "description", "") or ""))
+    if metas:
+        return metas
+    return [(n, "") for n in _tool_registry.list_tool_names()]
+
+
+async def _ensure_editable_agent(agent_id: str, action: str = "修改") -> str:
+    """校验 *agent_id* 对当前调用者存在且可编辑，通过返回空字符串。
+
+    通过 ``GET /agent``（列表接口按调用者归属过滤，内含 ``editable``
+    标记）确认目标可见性与编辑权。**不能**仅凭 id 直接改：
+    ``_BuiltinAgentStorageProxy.get_agent`` 对 ``default`` 名下智能体做了
+    无条件兜底，会让内置/他人智能体在编辑权解析中被误判为"自己的"。
+
+    Args:
+        agent_id (str): 目标智能体 ID。
+        action (str): 失败提示中使用的动作词（``"修改"`` / ``"删除"``）。
+
+    Returns:
+        str: 空字符串表示校验通过；否则为给模型看的错误说明。
+    """
+    # 系统内置智能体（_agent-creator 等）由服务端托管，禁止改。
+    if agent_id.startswith("_"):
+        return f"智能体 '{agent_id}' 是系统内置的，不可{action}。"
+
+    agents = await _list_agents()
+    if isinstance(agents, str):
+        return agents
+    for agent in agents:
+        # agent_id 取列表响应的**顶层 ``id``**（自动翻页后为全量）。
+        if agent.get("id") != agent_id:
+            continue
+        if agent.get("editable"):
+            return ""
+        return f"智能体 '{agent_id}' 对当前用户只读，无法{action}。"
+    return (
+        f"智能体 '{agent_id}' 不存在或无权访问。"
+        "调用 list_agents 查看当前用户可管理的智能体。"
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -168,6 +374,17 @@ async def _api(
         "X-User-ID": _current_user_id.get(),
         "guwpToken": _current_token.get(),
     }
+    # 完整请求日志（凭据打码，避免 token 落盘/进日志收集）。
+    logger.debug(
+        "[factory-api] --> %s %s\n  headers=%s\n  body=%s",
+        method,
+        url,
+        {
+            k: ("***redacted***" if k.lower() == "guwptoken" and v else v)
+            for k, v in headers.items()
+        },
+        json.dumps(body, ensure_ascii=False) if body is not None else None,
+    )
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.request(
@@ -177,7 +394,24 @@ async def _api(
                 headers=headers,
             )
     except httpx.HTTPError as exc:
+        logger.debug(
+            "[factory-api] !! %s %s raised %s: %s",
+            method,
+            url,
+            type(exc).__name__,
+            exc,
+        )
         return f"无法连接 Agent API: {exc}"
+
+    # 原始响应日志（含重定向后的最终 URL / 状态码 / 未解析响应体）。
+    logger.debug(
+        "[factory-api] <-- %s %s\n  final_url=%s status=%s\n  body=%s",
+        method,
+        url,
+        resp.request.url,
+        resp.status_code,
+        resp.text,
+    )
 
     if resp.status_code == 204:  # DELETE returns no content
         return {}
@@ -189,6 +423,57 @@ async def _api(
             detail = resp.text
         return f"请求失败 (HTTP {resp.status_code}): {detail}"
     return resp.json()
+
+
+#: 智能体列表接口的翻页大小。服务端（bocomadp 版 ``GET /agent``）每页默认
+#: 只返回 5 条（``pageSize`` 默认值，上限 100），工厂工具必须显式翻页，
+#: 否则只能看到前 5 个智能体，其余会"看起来不存在"。
+_AGENT_LIST_PAGE_SIZE = 100
+
+#: 翻页防御上限（100 页 × 100 条 = 1 万条），避免服务端异常时死循环。
+_AGENT_LIST_MAX_PAGES = 100
+
+
+async def _list_agents() -> list[dict[str, Any]] | str:
+    """拉取当前用户可见的**全部**智能体条目（自动翻页）。
+
+    ``GET /agent`` 默认每页 5 条，这里显式按 :data:`_AGENT_LIST_PAGE_SIZE`
+    翻页直到取完，返回值即 ``ListAgentsResponse.agents`` 的并集。
+
+    注意：条目里的智能体 id 在**顶层 ``id``** 字段（不是 ``agent_id``，
+    也不是 ``data.id`` —— 后者是 ``AgentData`` 自己的随机 id）。
+
+    Returns:
+        list[dict[str, Any]] | str: 条目列表；请求失败时返回错误字符串
+        （与 :func:`_api` 的约定一致，调用方用 ``isinstance(..., str)``
+        判断）。
+    """
+    agents: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        result = await _api(
+            "GET",
+            f"/?pageNum={page}&pageSize={_AGENT_LIST_PAGE_SIZE}",
+        )
+        if isinstance(result, str):
+            return result
+        batch = result.get("agents") or []
+        agents.extend(batch)
+        # 不足一页即已取完；不依赖 total，兼容不带 total 的实现。
+        if len(batch) < _AGENT_LIST_PAGE_SIZE:
+            break
+        total = result.get("total")
+        if isinstance(total, int) and len(agents) >= total:
+            break
+        page += 1
+        if page > _AGENT_LIST_MAX_PAGES:
+            logger.warning(
+                "agent list pagination stopped at %d pages (%d agents)",
+                _AGENT_LIST_MAX_PAGES,
+                len(agents),
+            )
+            break
+    return agents
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +498,21 @@ async def create_agent(
         system_prompt (str): 决定智能体行为的核心提示词
         max_iters (int): 最大推理轮次（默认20，复杂任务可设30~50）
         enabled_tools (list[str]): 要启用的工具名列表；空列表表示全部可用。
-            工具名从 list_tools_for_agent 的结果中选取。
+            工具名从 list_tools_for_agent 的结果中选取（大小写不敏感，
+            但必须是其中的名字，否则创建失败并返回非法名清单）。
     """
     name = _clean_name(name)
+
+    # Validate/normalize the requested tool names *before* creating, so an
+    # invalid or mis-cased name never lands in the whitelist (a whitelist
+    # entry that matches nothing would silently strip every other tool).
+    requested, unknown = _normalize_tool_names(enabled_tools)
+    if unknown:
+        return (
+            "以下工具名不存在，未创建智能体。请先调用 list_tools_for_agent "
+            "获取可用工具名（注意大小写）：\n- " + "\n- ".join(unknown)
+        )
+
     body: dict = {
         "name": name,
         "system_prompt": system_prompt,
@@ -233,19 +530,16 @@ async def create_agent(
     # so per-tool PUT calls are no-ops on a fresh agent; writing the
     # whitelist directly makes a non-empty ``enabled_tools`` actually
     # restrict the agent to exactly those tools at runtime.
-    errors: list[str] = []
-    if enabled_tools:
+    if requested:
         from bocomadp.routers.agent_tools import _set_enabled_tools
 
-        _set_enabled_tools(agent_id, list(enabled_tools))
+        _set_enabled_tools(agent_id, list(requested))
 
     lines = [f"智能体 '{name}' 创建成功，agent_id: {agent_id}"]
-    if enabled_tools:
-        lines.append(f"已启用工具: {', '.join(enabled_tools)}")
+    if requested:
+        lines.append(f"已启用工具: {', '.join(requested)}")
     else:
         lines.append("工具配置: 全部可用")
-    if errors:
-        lines.append("部分工具启用失败:\n" + "\n".join(errors))
     return "\n".join(lines)
 
 
@@ -258,7 +552,9 @@ async def update_agent(
 ) -> str:
     """修改已有智能体的配置。未传入的字段保持原值不变。
 
-    先调用 get_agent 查看当前配置，再决定修改哪些字段。
+    先调用 get_agent 查看当前配置，再决定修改哪些字段。本工具会先校验
+    目标智能体存在且对当前用户可编辑；系统内置智能体（``_`` 开头）不可
+    修改。
 
     Args:
         agent_id (str): 要修改的智能体 ID（系统生成的 UUID）
@@ -277,6 +573,10 @@ async def update_agent(
     if not body:
         return "未提供任何要修改的字段。"
 
+    error = await _ensure_editable_agent(agent_id)
+    if error:
+        return error
+
     result = await _api("PATCH", f"/{agent_id}", body)
     if isinstance(result, str):
         return result
@@ -287,11 +587,20 @@ async def update_agent(
 async def delete_agent(agent_id: str) -> str:
     """删除一个智能体配置。系统内置的智能体不可删除。
 
+    与 update_agent 一致：先校验目标智能体对当前用户存在且有编辑权，
+    校验不通过（内置智能体 / 只读 / 不存在或无权访问）时直接返回说明，
+    **不发起删除请求**。删除会级联清理该智能体的会话、工具白名单与记忆
+    记录，不可恢复。
+
     Args:
         agent_id (str): 要删除的智能体 ID（系统生成的 UUID）
     """
-    if agent_id.startswith("_"):
-        return f"智能体 '{agent_id}' 是系统内置的，不可删除。"
+    # 归属/编辑权预检（含内置智能体拦截）。不能只依赖服务端：
+    # _BuiltinAgentStorageProxy.get_agent 对 default 名下智能体做了无条件
+    # 兜底，会让 resolve_for_edit 误判为"自己的"，从而放行删除。
+    error = await _ensure_editable_agent(agent_id, action="删除")
+    if error:
+        return error
 
     result = await _api("DELETE", f"/{agent_id}")
     if isinstance(result, str):
@@ -301,48 +610,60 @@ async def delete_agent(agent_id: str) -> str:
 
 @tool
 async def list_agents() -> str:
-    """列出当前用户创建的所有智能体的摘要信息。"""
-    result = await _api("GET", "/")
-    if isinstance(result, str):
-        return result
+    """列出当前用户可见的智能体（自己的 + 被共享的），一行一个。
 
-    agents = result.get("agents", [])
+    每行格式：``agent_id | 名称 | 可编辑(✓/✗)``。修改/删除智能体前先用它
+    定位目标 agent_id；需要完整 system prompt 等信息再用 get_agent。
+    不含团队成员的 worker 智能体。
+    """
+    agents = await _list_agents()
+    if isinstance(agents, str):
+        return agents
     if not agents:
         return "当前还没有创建任何智能体。调用 create_agent 来创建第一个吧。"
 
-    lines = [f"共 {len(agents)} 个智能体:\n"]
+    lines = [f"共 {len(agents)} 个智能体（agent_id | 名称 | 可编辑）:"]
     for a in agents:
-        agent_id = a.get("agent_id", "")
-        data = a.get("data", {})
-        name = data.get("name", "")
-        sp = (data.get("system_prompt", "") or "")[:60]
-        max_iters = (
-            data.get("react_config", {}).get("max_iters", 20)
-        )
-        editable = "✓" if a.get("editable") else "✗"
+        # 智能体 id 是列表条目的顶层 ``id``（自动翻页后为全量）。
+        data = a.get("data") or {}
         lines.append(
-            f"- {agent_id}  {name}\n"
-            f"  可编辑={editable}  max_iters={max_iters}  "
-            f"prompt={sp}{'...' if len(sp) >= 60 else ''}",
+            f"{a.get('id', '')} | {data.get('name', '')} | "
+            f"{'✓' if a.get('editable') else '✗'}",
         )
     return "\n".join(lines)
 
 
 @tool
 async def get_agent(agent_id: str) -> str:
-    """查看指定智能体的完整配置，包括 system prompt、max_iters 等。
+    """查看指定智能体可配置项与完整 system prompt。
+
+    只返回工厂能改/需要看的字段：``agent_id`` / 名称 / ``max_iters`` /
+    是否可编辑 / 完整 ``system_prompt``。上下文压缩、邀请等不可改配置
+    不返回；工具配置用 get_agent_tools。
 
     Args:
         agent_id (str): 智能体 ID（系统生成的 UUID）
     """
-    # Framework has no single-agent GET — list all and filter.
-    result = await _api("GET", "/")
-    if isinstance(result, str):
-        return result
+    # 框架没有单查接口 —— 拉全量列表再本地过滤（_list_agents 已自动翻页）。
+    agents = await _list_agents()
+    if isinstance(agents, str):
+        return agents
 
-    for a in result.get("agents", []):
-        if a.get("agent_id") == agent_id:
-            return json.dumps(a, ensure_ascii=False, indent=2)
+    for a in agents:
+        if a.get("id") != agent_id:
+            continue
+        data = a.get("data") or {}
+        react = data.get("react_config") or {}
+        return "\n".join(
+            [
+                f"agent_id: {agent_id}",
+                f"名称: {data.get('name', '')}",
+                f"max_iters: {react.get('max_iters', 20)}",
+                f"可编辑: {'✓' if a.get('editable') else '✗'}",
+                "system_prompt:",
+                data.get("system_prompt", "") or "",
+            ],
+        )
 
     return (
         f"智能体 '{agent_id}' 不存在。"
@@ -351,55 +672,116 @@ async def get_agent(agent_id: str) -> str:
 
 
 @tool
+async def get_agent_tools(agent_id: str) -> str:
+    """查看指定智能体当前启用了哪些工具（可配置集合内的启用/停用清单）。
+
+    ``get_agent`` 只返回基础配置（名称/prompt/轮次），**不含工具**；要了解
+    某个智能体的工具现状，用本工具。修改工具前应先调用它确认现状，再用
+    ``set_agent_tools`` 做覆盖式调整。
+
+    Args:
+        agent_id (str): 目标智能体 ID
+    """
+    result = await _api("GET", f"/{agent_id}/tools", base=_TOOLS_API)
+    if isinstance(result, str):
+        return result
+
+    enabled: list[str] = []
+    disabled: list[str] = []
+    readonly: list[str] = []
+    for tool in result.get("tools", []):
+        name = tool.get("name", "")
+        if not name:
+            continue
+        if not tool.get("toggleable", True):
+            readonly.append(name)
+        elif tool.get("enabled"):
+            enabled.append(name)
+        else:
+            disabled.append(name)
+
+    def _join(names: list[str]) -> str:
+        return ", ".join(sorted(names)) or "（无）"
+
+    lines = [
+        f"智能体 '{agent_id}' 的工具配置：",
+        "",
+        f"已启用（{len(enabled)}）: {_join(enabled)}",
+        f"未启用（{len(disabled)}）: {_join(disabled)}",
+    ]
+    if readonly:
+        lines.append(f"仅展示不可配置（{len(readonly)}）: {_join(readonly)}")
+
+    mcps = result.get("mcps", [])
+    if mcps:
+        lines.append(
+            "MCP: "
+            + ", ".join(
+                f"{m.get('name', '')}"
+                f"[{'已启用' if m.get('enabled') else '未启用'}]"
+                for m in mcps
+            ),
+        )
+
+    if not disabled:
+        lines += ["", "说明：未启用为空 = 当前为「全部可用」。"]
+    return "\n".join(lines)
+
+
+@tool
 def list_tools_for_agent() -> str:
     """列出系统中所有可分配给智能体的工具和MCP服务器。
 
-    返回两部分：
-    - tools: 项目工具和框架内置工具的名称+描述
-    - mcps: MCP 服务器列表
+    输出的就是**可配置工具集合**（框架内置 / 项目工具 / 框架团队与规划 /
+    企业工具 / MCP 服务器），其中的工具名可直接用于 create_agent 的
+    ``enabled_tools`` 或 set_agent_tools，大小写需保持一致。
+
+    每项只给一句话简介（长描述会被压成一行）；工具的详细用法由目标智能体
+    在运行时自行探索。
     """
-    tools_info: list[str] = []
-    mcps_info: list[str] = []
+    lines: list[str] = ["# 可配置工具与 MCP", "", "## 框架内置工具（文件 / 命令）"]
 
-    # Builtin tools
-    _BUILTIN_TOOLS = [
-        {"name": "bash", "description": "在沙箱中执行Shell命令"},
-        {"name": "read", "description": "读取文件内容"},
-        {"name": "write", "description": "写入文件"},
-        {"name": "edit", "description": "精确编辑文件"},
-        {"name": "glob", "description": "按通配符模式查找文件"},
-        {"name": "grep", "description": "在文件中搜索文本"},
-    ]
+    # 1. workspace builtins（运行时真值：首字母大写）
+    for meta in BUILTIN_TOOLS_META:
+        name = meta["name"]
+        lines.append(f"- {name}: {_brief(meta['description'], name)}")
 
-    tools_info.append("\n## 框架内置工具")
-    for bt in _BUILTIN_TOOLS:
-        tools_info.append(f"- {bt['name']:20} {bt['description']}")
+    # 2. 项目工具
+    project_tools = _project_tools_meta()
+    if project_tools:
+        lines += ["", "## 项目工具"]
+        for name, desc in project_tools:
+            lines.append(f"- {name}: {_brief(desc, name)}" if desc else f"- {name}")
 
-    # Project tools
-    if _tool_registry is not None:
-        tools_info.append("\n## 项目工具")
-        for name in _tool_registry.list_tool_names():
-            tools_info.append(f"- {name}")
+    # 3. 框架团队/规划工具
+    lines += ["", "## 框架团队 / 规划工具（多智能体协作与任务规划）"]
+    for meta in FRAMEWORK_TOOLS_META:
+        name = meta["name"]
+        lines.append(f"- {name}: {_brief(meta['description'], name)}")
 
-    # MCP servers
+    # 4. 企业工具
+    enterprise_tools = enterprise_tools_meta()
+    if enterprise_tools:
+        lines += ["", "## 企业工具"]
+        for meta in enterprise_tools:
+            name = meta.get("name", "")
+            desc = meta.get("description", "")
+            lines.append(f"- {name}: {_brief(desc, name)}" if desc else f"- {name}")
+
+    # 5. MCP 服务器
     if _mcp_registry is not None:
         mcps = _mcp_registry.list_mcps()
         if mcps:
-            mcps_info.append("\n## MCP 服务器")
+            lines += ["", "## MCP 服务器"]
             for mcp in mcps:
                 mcp_name = getattr(mcp, "name", "") or ""
                 mcp_desc = getattr(mcp, "description", None) or ""
-                mcps_info.append(
-                    f"- {mcp_name}: {mcp_desc}"
-                    if mcp_desc
+                lines.append(
+                    f"- {mcp_name}: {_brief(mcp_desc)}" if mcp_desc
                     else f"- {mcp_name}",
                 )
 
-    parts = ["# 系统可用工具一览", "\n".join(tools_info)]
-    if mcps_info:
-        parts.append("\n".join(mcps_info))
-
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
 @tool
@@ -412,55 +794,82 @@ async def set_agent_tools(
     - enabled_tools 为空列表：全部工具可用
     - enabled_tools 非空：只启用列表中的工具（按名称精确匹配）
 
-    内置工具（bash/read/write/edit/glob/grep）始终可用，不受影响。
+    内置工具（Bash/Read/Write/Edit/Glob/Grep）与其它工具同等对待，
+    可以启用也可以停用。工具名从 list_tools_for_agent 选取，大小写
+    不敏感但需存在于可配置集合中；**传入不存在的名字会直接拒绝且
+    不做任何修改**。
+
+    与 update_agent 一样，本工具会先校验目标智能体存在且对当前用户可
+    编辑；系统内置智能体（``_`` 开头）不可修改。
 
     Args:
         agent_id (str): 目标智能体 ID
         enabled_tools (list[str]): 工具名列表（从 list_tools_for_agent 选取）
     """
+    error = await _ensure_editable_agent(agent_id)
+    if error:
+        return error
+
+    # 工具名前置校验（与 create_agent 一致）：非法名直接拒绝，避免
+    # "先删掉旧工具、再发现新名字不存在"这种带副作用的半成品失败。
+    target_list, unknown = _normalize_tool_names(enabled_tools)
+    if unknown:
+        return (
+            "以下工具名不存在，未做任何修改。请先调用 list_tools_for_agent "
+            "获取可用工具名（注意大小写）：\n- " + "\n- ".join(unknown)
+        )
+
     # 1. Read current enabled state
     result = await _api("GET", f"/{agent_id}/tools", base=_TOOLS_API)
     if isinstance(result, str):
         return result
+    current_enabled, all_names = _tool_state(result)
 
-    current_enabled: set[str] = set()
-    for t in result.get("tools", []):
-        if t.get("name") not in _BUILTIN_NAMES and t.get("enabled"):
-            current_enabled.add(t["name"])
-    for m in result.get("mcps", []):
-        if m.get("enabled"):
-            current_enabled.add(m["name"])
-
-    target = set(enabled_tools)
+    target = set(target_list)
     errors: list[str] = []
 
-    # 2. Diff-align. Empty target → all-enabled: every currently
-    # enabled name is disabled one by one (last removal lands on the
-    # all-enabled [] state).
+    # 2. Diff-align.
     if not target:
-        disabled = [
-            t["name"]
-            for t in result.get("tools", [])
-            if t.get("name") not in _BUILTIN_NAMES and not t.get("enabled")
-        ]
-        if not disabled:
+        # 空目标 = 全部可用：逐个停用当前已启用的工具，最后一次移除
+        # 落到空白名单，服务端语义即为「全部可用」。
+        if current_enabled == all_names:
             return f"智能体 '{agent_id}' 的工具已是全部可用。"
         for name in sorted(current_enabled):
             r = await _api("DELETE", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
             if isinstance(r, str):
                 errors.append(r)
     else:
-        for name in sorted(current_enabled - target):
-            r = await _api("DELETE", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
-            if isinstance(r, str):
-                errors.append(r)
+        # **先加后删**：先把目标工具写进白名单，删除阶段就不可能把它
+        # 们删空。若反过来（先删后加），一旦「当前已启用」与目标无交集，
+        # 最后一个 DELETE 会把白名单写成 []，被服务端理解为「全部可用」，
+        # 于是后续 PUT 全部变成空操作 —— 结果是静默放开所有工具，却仍
+        # 返回成功文案。
         for name in sorted(target - current_enabled):
             r = await _api("PUT", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
+            if isinstance(r, str):
+                errors.append(r)
+        for name in sorted(current_enabled - target):
+            r = await _api("DELETE", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
             if isinstance(r, str):
                 errors.append(r)
 
     if errors:
         return "工具配置部分失败:\n" + "\n".join(errors)
+
+    # 3. 回读校验：确认最终状态与目标一致。防止"报成功但实际不符"
+    # （如服务端与工具侧的工具集合不一致，导致某些 PUT/DELETE 未生效）。
+    check = await _api("GET", f"/{agent_id}/tools", base=_TOOLS_API)
+    if isinstance(check, str):
+        return check
+    final_enabled, final_all = _tool_state(check)
+    expected = target if target else final_all
+    if final_enabled != expected:
+        return (
+            f"工具配置未生效：期望 {', '.join(sorted(expected))}，"
+            f"实际 {', '.join(sorted(final_enabled))}。"
+            "请重试，或用工具面板核对。"
+        )
+
     if not target:
         return f"智能体 '{agent_id}' 的工具已设置为全部可用。"
     return (
@@ -576,6 +985,7 @@ __all__ = [
     "delete_agent",
     "list_agents",
     "get_agent",
+    "get_agent_tools",
     "list_tools_for_agent",
     "set_agent_tools",
     "list_available_skills",

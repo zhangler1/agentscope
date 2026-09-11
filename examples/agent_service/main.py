@@ -106,6 +106,7 @@ from bocomadp.projectors import WorkerFailureNotifier
 from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.toolkit_whitelist import patch_get_toolkit
+from bocomadp.tool_catalog import AGENT_CREATOR_ID
 from bocomadp.deerflow.model_patch import patch_get_model
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
@@ -244,10 +245,11 @@ if config.mcp.enabled:
         mcp_registry.load_custom()
 
 # ── 内置智能体：智能体工厂（agent-creator） ──
-# 专门用于对话式创建/修改智能体，不需要 K8s 沙箱，
-# 工具通过 AgentBuilder 在运行时按 agent_id 注入。
+# 专门用于对话式创建/修改智能体：除工厂工具（build_agent_tools
+# 按 agent_id 运行时注入）外，它也可以像普通智能体一样配置可配置集合
+# M 内的工具（含 workspace builtins）。
 # 注意：实际注册在下方 storage 创建之后进行。
-_AGENT_CREATOR_ID = "_agent-creator"
+_AGENT_CREATOR_ID = AGENT_CREATOR_ID
 _AGENT_CREATOR_SYSTEM_PROMPT = (
     "你是智能体工厂，通过对话帮助用户创建和修改智能体配置。\n"
     "\n## 工作流程\n"
@@ -354,13 +356,14 @@ async def build_agent_tools(
     )
 
     # Inject factory tools for the built-in agent-creator
-    if agent_id == "_agent-creator":
+    if agent_id == _AGENT_CREATOR_ID:
         from bocomadp.tools.agent_factory_tools import (
             create_agent,
             update_agent,
             delete_agent,
             list_agents,
             get_agent,
+            get_agent_tools,
             list_tools_for_agent,
             set_agent_tools,
             list_available_skills,
@@ -372,6 +375,7 @@ async def build_agent_tools(
             delete_agent,
             list_agents,
             get_agent,
+            get_agent_tools,
             list_tools_for_agent,
             set_agent_tools,
             list_available_skills,
@@ -382,9 +386,9 @@ async def build_agent_tools(
     # (PUT/DELETE /agents/{id}/tools/{name}):
     #   empty  -> every tool above stays available
     #   non-empty -> only the listed tool names survive
-    # This makes the tool config APIs effective at runtime (for agents
-    # created by the agent-creator) and enforces least privilege for
-    # the agent-creator itself (only its 9 factory tools remain).
+    # This makes the tool config APIs effective at runtime. For the
+    # agent-creator its whitelist covers M plus its factory tools
+    # (see _register_builtin_agents), so it keeps both.
     from bocomadp.routers.agent_tools import _tool_whitelists
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
@@ -798,6 +802,32 @@ app = create_app(
 )
 
 
+def _configurable_tool_names() -> list[str]:
+    """Return the configurable tool set M.
+
+    M = workspace builtins + ToolRegistry tools + MCP servers + framework
+    team/planning tools + enterprise tools. Mirrors
+    :func:`bocomadp.routers.agent_tools._all_tool_names` so the built-in
+    agent-creator's whitelist covers exactly what the tool config APIs
+    manage.
+    """
+    from bocomadp.tool_catalog import (
+        BUILTIN_TOOL_NAMES,
+        FRAMEWORK_TOOLS_META,
+    )
+    from bocomadp.tools.enterprise_catalog import enterprise_tool_names
+
+    names: set[str] = set(BUILTIN_TOOL_NAMES)
+    names.update(meta["name"] for meta in FRAMEWORK_TOOLS_META)
+    names.update(enterprise_tool_names())
+    names.update(tool_registry.list_tool_names())
+    for mcp in mcp_registry.list_mcps():
+        name = getattr(mcp, "name", "") or ""
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
 # ── 注册内置智能体：智能体工厂（agent-creator）到框架 StorageBase ──
 # 使用 user_id="default" 创建；对话上下文构建中对所有用户
 # fallback 查询 default 用户，确保每个用户都能与 agent-creator 对话。
@@ -834,20 +864,26 @@ async def _register_builtin_agents() -> None:
             _AGENT_CREATOR_ID,
         )
 
-    # Init tool whitelist — only factory tools for agent-creator.
+    # Init tool whitelist — the factory tools plus the configurable
+    # set M (builtins / project / framework / enterprise), so the factory
+    # agent can use any normal tool the tool config APIs manage.
     # Idempotent: re-applied on every startup (not just first
     # registration) because the in-memory store is lost on restart.
-    _tool_whitelists[_AGENT_CREATOR_ID] = [
+    factory_tools = [
         "create_agent",
         "update_agent",
         "delete_agent",
         "list_agents",
         "get_agent",
+        "get_agent_tools",
         "list_tools_for_agent",
         "set_agent_tools",
         "list_available_skills",
         "enable_skill_for_agent",
     ]
+    _tool_whitelists[_AGENT_CREATOR_ID] = sorted(
+        set(factory_tools) | set(_configurable_tool_names()),
+    )
 
 
 _original_lifespan = app.router.lifespan_context

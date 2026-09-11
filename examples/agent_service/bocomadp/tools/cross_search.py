@@ -31,6 +31,7 @@ except ImportError:
 
 from ..config.cross_search_config import CrossSearchConfig, get_cross_search_config
 from ..deerflow.custom_params import get_custom_params
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -455,11 +456,9 @@ async def _cross_search_tool_impl(
 if FunctionTool is not None and ToolMiddlewareBase is not None:
     cross_search_tool = FunctionTool(
         _cross_search_tool_impl,
-        # 工具函数名必须是 ^[a-zA-Z0-9_-]+$（DeepSeek 等 API 强校验），
-        # 不能用中文名「行内搜索」；中文语义放在 docstring 描述里，
-        # 模型通过描述识别该工具。与 deer-search-mcp 的 vector_search
-        # 命名风格保持一致。
-        name="cross_search",
+        # 工具名默认中文（行内网关）；行外 DeepSeek 等 API 强校验
+        # ^[a-zA-Z0-9_-]+$，设置 BOCOMADP_TOOL_ASCII_NAMES=1 切 ASCII。
+        name=tool_name("跨知识搜索", "cross_search"),
         is_read_only=True,
         middlewares=[_SpacecodeOverrideMiddleware()],
     )

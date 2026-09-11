@@ -7,25 +7,27 @@ Endpoints
 ``PUT    /agents/{agent_id}/tools/{name}``    — enable a tool
 ``DELETE /agents/{agent_id}/tools/{name}``    — disable a tool
 
-Tool sources (matching the full ``get_toolkit()`` assembly):
+Tool sources — the configurable set ``M``, single-sourced from
+:mod:`bocomadp.tool_catalog`:
 
-1. **Workspace builtins** — Bash/Read/Write/Edit/Glob/Grep;
-   always enabled, not affected by ``enabled_tools``.
-2. **Project tools** — from ``ToolRegistry`` (builtin_tools.py +
-   custom/ + enterprise); toggleable via ``enabled_tools``.
-3. **MCP tools** — MCP server names from ``McpRegistry``;
-   always enabled (individual MCP-tool discovery requires a live
-   connection).
+1. **Workspace builtins** — ``Bash/Read/Write/Edit/Glob/Grep``
+   (runtime names, capitalized; see ``agentscope.tool._builtin``).
+2. **Project tools** — from ``ToolRegistry`` (builtin_tools.py + custom/).
+3. **MCP servers** — names from ``McpRegistry``.
+4. **Framework team/planning tools** — ``Team*`` / ``Task*``.
+5. **Enterprise tools** — built by ``build_enterprise_tools``
+   (online search and the placeholder tools are excluded).
 
 Semantics
 ---------
-``enabled_tools == []`` means **all project tools are enabled**.
-The first *disable* operation expands ``[]`` to the full project-
-tool list minus the disabled tool.  Subsequent toggles are plain
-list add / remove.
+``enabled_tools == []`` means **every tool in M is enabled**.
+The first *disable* operation expands ``[]`` to the full M list minus
+the disabled tool.  Subsequent toggles are plain list add / remove.
 
-Only project tools (source=``"project"``) can be toggled; builtins
-and MCPs return 400 on PUT/DELETE.
+Every tool in M is toggleable — including the workspace builtins.
+The built-in agent-creator additionally *displays* its own factory
+tools on ``GET``; those are display-only (``toggleable=False``) and
+are intentionally not configurable.
 """
 
 from __future__ import annotations
@@ -39,6 +41,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from agentscope.app.deps import get_current_user_id
 
+from ..tool_catalog import (
+    AGENT_CREATOR_ID,
+    BUILTIN_TOOLS_META,
+    FRAMEWORK_TOOLS_META,
+    canonical_tool_name,
+)
+
 logger = logging.getLogger("bocomadp.agent_tools")
 
 agent_tools_router = APIRouter(
@@ -47,96 +56,30 @@ agent_tools_router = APIRouter(
 )
 
 # ------------------------------------------------------------------
-# workspace builtins — hardcoded to avoid requiring a live workspace
+# workspace builtins — 名称/描述统一取自 bocomadp.tool_catalog
 # ------------------------------------------------------------------
-
-_BUILTIN_TOOLS: list[dict] = [
-    {
-        "name": "bash",
-        "description": (
-            "在工作区沙箱中执行bash命令。"
-            "命令在工作区目录中运行，可以读写文件、安装包和执行脚本。"
-        ),
-    },
-    {
-        "name": "read",
-        "description": (
-            "读取工作区中文件的内容。"
-            "支持为大型文件选择行范围。"
-        ),
-    },
-    {
-        "name": "write",
-        "description": (
-            "向工作区中的文件写入内容。"
-            "会自动创建父目录。"
-        ),
-    },
-    {
-        "name": "edit",
-        "description": (
-            "在现有文件中执行精确的字符串替换。"
-            "适用于无需重写整个文件的有针对性修改。"
-        ),
-    },
-    {
-        "name": "glob",
-        "description": (
-            "查找匹配glob模式的文件（例如 ``**/*.py``）。"
-            "返回相对文件路径。"
-        ),
-    },
-    {
-        "name": "grep",
-        "description": (
-            "使用正则表达式搜索文件内容。"
-            "支持基于ripgrep的完整正则语法。"
-        ),
-    },
-]
+#: 注意名字是**运行时真值**（首字母大写）。历史上这里用的是小写名，
+#: 与运行时 ``Bash`` 等对不上，导致白名单对 builtins 失效。
+_BUILTIN_TOOLS: list[dict] = [dict(m) for m in BUILTIN_TOOLS_META]
 
 #: 团队/规划工具的静态元数据（name + 简短 description）。
 #: 单一数据源：``_all_tool_names()`` 据此推导可管理的工具名集合，
 #: ``GET /agents/{id}/tools`` 据此输出带 description 的展示条目。
-#: 风格与 ``_BUILTIN_TOOLS`` 一致，不另设名字集合。
-_FRAMEWORK_TOOLS_META: list[dict] = [
-    {
-        "name": "TeamCreate",
-        "description": "以当前会话为领导创建一个新团队，用于拆分子任务并行执行。",
-    },
-    {
-        "name": "AgentCreate",
-        "description": "为团队创建专业化的成员智能体，配置角色、提示词与权限。",
-    },
-    {
-        "name": "TeamSay",
-        "description": "向团队领导者或所有成员发送消息、广播与协调进度。",
-    },
-    {
-        "name": "TeamDelete",
-        "description": "解散当前团队并删除其所有成员智能体与会话（不可逆）。",
-    },
-    {
-        "name": "AgentInvite",
-        "description": "邀请其他可邀请的智能体加入当前团队。",
-    },
-    {
-        "name": "TaskCreate",
-        "description": "为当前会话创建结构化的任务列表以跟踪进度。",
-    },
-    {
-        "name": "TaskList",
-        "description": "列出任务列表中的所有任务。",
-    },
-    {
-        "name": "TaskGet",
-        "description": "按 ID 从任务列表中检索单个任务。",
-    },
-    {
-        "name": "TaskUpdate",
-        "description": "更新任务列表中的任务（状态、内容等）。",
-    },
-]
+_FRAMEWORK_TOOLS_META: list[dict] = [dict(m) for m in FRAMEWORK_TOOLS_META]
+
+#: 智能体工厂自带的工厂工具（仅供 ``_agent-creator`` 的 GET 展示，不可配置）。
+_FACTORY_TOOL_ATTRS: tuple[str, ...] = (
+    "create_agent",
+    "update_agent",
+    "delete_agent",
+    "list_agents",
+    "get_agent",
+    "get_agent_tools",
+    "list_tools_for_agent",
+    "set_agent_tools",
+    "list_available_skills",
+    "enable_skill_for_agent",
+)
 
 # ------------------------------------------------------------------
 # Tool whitelist store
@@ -194,10 +137,21 @@ def load_tool_whitelists() -> None:
             logger.warning("whitelist file %s is not a dict; ignoring", path)
             return
         _tool_whitelists.clear()
-        _tool_whitelists.update(data)
+        for aid, names in data.items():
+            if not isinstance(names, list):
+                logger.warning(
+                    "whitelist for %s is not a list; skipped",
+                    aid,
+                )
+                continue
+            # 归一化历史小写 builtin 名（bash → Bash 等），其余名字保留：
+            # 智能体工厂的白名单含工厂工具名，它们不在 M 内，需原样保留。
+            _tool_whitelists[aid] = [
+                canonical_tool_name(str(n)) for n in names
+            ]
         logger.info(
             "loaded %d agent tool whitelists from %s",
-            len(data),
+            len(_tool_whitelists),
             path,
         )
     except FileNotFoundError:
@@ -271,7 +225,7 @@ def _resolve_enabled(all_tool_names: list[str], whitelist: list[str]) -> set[str
 
 
 def _all_tool_names(request: Request) -> set[str]:
-    """Every known tool name across all sources."""
+    """Every known tool name across all sources (the configurable set M)."""
     names: set[str] = {bt["name"] for bt in _BUILTIN_TOOLS}
     names.update(_tool_registry(request).list_tool_names())
     mcp_reg = _mcp_registry(request)
@@ -282,7 +236,51 @@ def _all_tool_names(request: Request) -> set[str]:
                 names.add(name)
     # 团队/规划工具由框架 get_toolkit 挂载，纳入白名单接口管理。
     names.update(m["name"] for m in _FRAMEWORK_TOOLS_META)
+    # 企业工具由 build_enterprise_tools 主动构建，纳入白名单接口管理。
+    # 名字取自工具实例，自动跟随 BOCOMADP_TOOL_ASCII_NAMES 切换中/英文。
+    names.update(m["name"] for m in _enterprise_tools_meta())
     return names
+
+
+def _enterprise_tools_meta() -> list[dict]:
+    """企业工具元数据（延迟导入，避免请求层导入重量级工具模块）。
+
+    导入失败时降级为空列表，不影响其余工具目录。
+    """
+    try:
+        from ..tools.enterprise_catalog import enterprise_tools_meta
+    except Exception:  # noqa: BLE001 —— 企业工具不可用时降级
+        logger.warning("enterprise tools unavailable; skipped", exc_info=True)
+        return []
+    return enterprise_tools_meta()
+
+
+def _factory_tools_meta() -> list[dict]:
+    """智能体工厂自带工厂工具的元数据（仅用于 ``_agent-creator`` 展示）。
+
+    这些工具由 ``build_agent_tools`` 在运行时按 agent_id 注入，**不在**
+    可配置集合 M 内，因此不参与校验/启停；只在 ``GET`` 响应里展示，
+    让工具面板能完整反映智能体工厂的实际能力。
+    """
+    try:
+        from ..tools import agent_factory_tools as _aft
+    except Exception:  # noqa: BLE001 —— 工厂工具不可用时降级
+        logger.debug("factory tools unavailable; skipped", exc_info=True)
+        return []
+
+    metas: list[dict] = []
+    for attr in _FACTORY_TOOL_ATTRS:
+        tool = getattr(_aft, attr, None)
+        name = getattr(tool, "name", "") or ""
+        if not name:
+            continue
+        metas.append(
+            {
+                "name": name,
+                "description": getattr(tool, "description", "") or "",
+            },
+        )
+    return metas
 
 
 # ------------------------------------------------------------------
@@ -299,17 +297,19 @@ async def list_agent_tools(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Return every tool the agent sees, annotated with its enabled state.
+    """Return every tool in M, annotated with its enabled state.
 
-    Tools (builtins + project) are returned in a flat ``tools`` list;
-    MCP servers are in a separate ``mcps`` list.
+    All configurable tools (builtins + project + framework + enterprise)
+    are returned in a flat ``tools`` list; MCP servers are in a separate
+    ``mcps`` list.  For the built-in agent-creator, its own factory tools
+    are appended as display-only entries (``toggleable=False``).
 
     Response::
 
         {
           "agent_id": "...",
           "tools": [
-            {"name": "bash", "description": "...", "enabled": true, "toggleable": true},
+            {"name": "Bash", "description": "...", "enabled": true, "toggleable": true},
             {"name": "echo", "description": "...", "enabled": false, "toggleable": true}
           ],
           "mcps": [
@@ -354,6 +354,30 @@ async def list_agent_tools(
                 "toggleable": True,
             },
         )
+
+    # 1c. 企业工具（build_enterprise_tools 主动构建）→ 纳入可配置集合
+    for meta in _enterprise_tools_meta():
+        name = meta["name"]
+        tools.append(
+            {
+                "name": name,
+                "description": meta.get("description", ""),
+                "enabled": name in enabled_names,
+                "toggleable": True,
+            },
+        )
+
+    # 1d. 智能体工厂自带的工厂工具 → 仅展示，不可配置
+    if agent_id == AGENT_CREATOR_ID:
+        for meta in _factory_tools_meta():
+            tools.append(
+                {
+                    "name": meta["name"],
+                    "description": meta.get("description", ""),
+                    "enabled": True,
+                    "toggleable": False,
+                },
+            )
 
     # 2. MCP servers → separate `mcps` list
     mcp_reg = _mcp_registry(request)
