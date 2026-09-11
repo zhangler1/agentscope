@@ -49,10 +49,27 @@ CONFIGS: list[dict] = [
     #         "model_name": "deepseek-v4-flash"
     #     },
     # },
-    # {
-    #     "key": "personal_search",
-    #     "payload": {"top_k": 5},
-    # },
+    {
+        "key": "tool_result",
+        "payload": {
+            "enabled": True,
+            "ttl_seconds": 14400,
+            "per_tool_threshold_chars": 20000,
+            "message_budget_chars": 80000,
+            "preview_chars": 1000,
+            "read_result_max_output_chars": 2000,
+            "exempt_tools": []
+        }
+    },
+    {
+        "key": "memory",
+        "payload": {
+            "default_memory_prompt": "全局记忆配置",
+            "idle_minutes": 1,
+            "sweep_interval_seconds": 5,
+            "max_tokens": 90000
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------

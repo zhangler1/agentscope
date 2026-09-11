@@ -26,6 +26,7 @@ from bocomadp.memory.state import (
     try_acquire_lock,
     turns_key,
 )
+
 from bocomadp.memory.store import MemoryConfig
 from bocomadp.memory.sweeper import MemorySweeper
 
@@ -77,10 +78,10 @@ def test_extract_success_saves_and_cleans(fake_redis, monkeypatch):
 
     monkeypatch.setattr(pf, "save_memories", _save)
     msgs = _chat_messages()
-    _run(incr_turn(fake_redis, "s1"))
-    _run(incr_turn(fake_redis, "s1"))  # W = 2 → 取最近 4 条消息
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))  # W = 2 → 取最近 4 条消息
     storage = _FakeStorage(messages=msgs)
-    _run(try_acquire_lock(fake_redis, "s1"))
+    _run(try_acquire_lock(fake_redis, "u1", "a1", "s1"))
     ok = _run(
         run_extract(
             fake_redis,
@@ -102,8 +103,8 @@ def test_extract_success_saves_and_cleans(fake_redis, monkeypatch):
         m["role"] in ("user", "assistant") and m["content"] for m in saved["param"]["messages"]
     )
     # 状态清理：turns 清零 + 提取锁释放
-    assert _run(fake_redis.get(turns_key("s1"))) is None
-    assert lock_key("s1") not in fake_redis._strings
+    assert _run(fake_redis.get(turns_key("u1", "a1", "s1"))) is None
+    assert lock_key("u1", "a1", "s1") not in fake_redis._strings
 
 
 def test_extract_aborts_when_session_still_active(fake_redis, monkeypatch):
@@ -113,9 +114,9 @@ def test_extract_aborts_when_session_still_active(fake_redis, monkeypatch):
         called.append(param)
 
     monkeypatch.setattr(pf, "save_memories", _save)
-    _run(incr_turn(fake_redis, "s1"))
-    _run(mark_active(fake_redis, "s1", now=time.time()))  # 心跳最新 → 仍活跃
-    _run(try_acquire_lock(fake_redis, "s1"))
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))
+    _run(mark_active(fake_redis, "u1", "a1", "s1", now=time.time()))  # 心跳最新 → 仍活跃
+    _run(try_acquire_lock(fake_redis, "u1", "a1", "s1"))
     ok = _run(
         run_extract(
             fake_redis,
@@ -130,7 +131,7 @@ def test_extract_aborts_when_session_still_active(fake_redis, monkeypatch):
     assert ok is False
     assert called == []
     # 锁仍被释放（放弃提取也放锁，供下次轮数/扫描再触发）
-    assert lock_key("s1") not in fake_redis._strings
+    assert lock_key("u1", "a1", "s1") not in fake_redis._strings
 
 
 def test_extract_skips_when_no_turns(fake_redis, monkeypatch):
@@ -140,7 +141,7 @@ def test_extract_skips_when_no_turns(fake_redis, monkeypatch):
         called.append(param)
 
     monkeypatch.setattr(pf, "save_memories", _save)
-    _run(try_acquire_lock(fake_redis, "s1"))
+    _run(try_acquire_lock(fake_redis, "u1", "a1", "s1"))
     ok = _run(
         run_extract(
             fake_redis,
@@ -155,7 +156,7 @@ def test_extract_skips_when_no_turns(fake_redis, monkeypatch):
     )
     assert ok is False
     assert called == []
-    assert lock_key("s1") not in fake_redis._strings
+    assert lock_key("u1", "a1", "s1") not in fake_redis._strings
 
 
 def test_extract_save_retries_then_raises(fake_redis, monkeypatch):
@@ -166,8 +167,8 @@ def test_extract_save_retries_then_raises(fake_redis, monkeypatch):
         raise pf.PlatformError("boom")
 
     monkeypatch.setattr(pf, "save_memories", _fail)
-    _run(incr_turn(fake_redis, "s1"))
-    _run(try_acquire_lock(fake_redis, "s1"))
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))
+    _run(try_acquire_lock(fake_redis, "u1", "a1", "s1"))
     with pytest.raises(pf.PlatformError):
         _run(
             run_extract(
@@ -183,7 +184,7 @@ def test_extract_save_retries_then_raises(fake_redis, monkeypatch):
             ),
         )
     assert len(calls) == 4  # 1 次初次尝试 + 3 次退避重试（1s/3s/9s）
-    assert lock_key("s1") not in fake_redis._strings  # 失败也释放锁
+    assert lock_key("u1", "a1", "s1") not in fake_redis._strings  # 失败也释放锁
 
 
 def test_extract_truncates_to_max_tokens(fake_redis, monkeypatch):
@@ -195,8 +196,8 @@ def test_extract_truncates_to_max_tokens(fake_redis, monkeypatch):
     monkeypatch.setattr(pf, "save_memories", _save)
     # 每条 ~800 字节 ≈ 200 tokens；预算 500 → 从最旧丢弃直到 ≤500（保留最新 2 条）
     msgs = _chat_messages(n=8, text="x" * 800)
-    _run(incr_turn(fake_redis, "s1"))
-    _run(try_acquire_lock(fake_redis, "s1"))
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))
+    _run(try_acquire_lock(fake_redis, "u1", "a1", "s1"))
     ok = _run(
         run_extract(
             fake_redis,
@@ -227,15 +228,15 @@ def test_sweeper_picks_idle_session(fake_redis, monkeypatch):
         saved["param"] = param
 
     monkeypatch.setattr(pf, "save_memories", _save)
-    _run(mark_active(fake_redis, "s1", now=time.time() - 10000))  # 超静默窗口
-    _run(incr_turn(fake_redis, "s1"))
+    _run(mark_active(fake_redis, "u1", "a1", "s1", now=time.time() - 10000))  # 超静默窗口
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))
     storage = _FakeStorage(
         messages=_chat_messages(),
         sessions=[SimpleNamespace(id="s1")],
     )
 
     async def _fake_list_enabled():
-        return [("u1", "a1", MemoryConfig(memory_enabled=True))]
+        return [("a1", MemoryConfig(memory_enabled=True))]
 
     monkeypatch.setattr(memory_store, "memory_list_enabled", _fake_list_enabled)
     sweeper = MemorySweeper(fake_redis, storage)
@@ -251,15 +252,15 @@ def test_sweeper_skips_active_session(fake_redis, monkeypatch):
         called.append(param)
 
     monkeypatch.setattr(pf, "save_memories", _save)
-    _run(mark_active(fake_redis, "s1", now=time.time()))  # 仍活跃 → 跳过
-    _run(incr_turn(fake_redis, "s1"))
+    _run(mark_active(fake_redis, "u1", "a1", "s1", now=time.time()))  # 仍活跃 → 跳过
+    _run(incr_turn(fake_redis, "u1", "a1", "s1"))
     storage = _FakeStorage(
         messages=_chat_messages(),
         sessions=[SimpleNamespace(id="s1")],
     )
 
     async def _fake_list_enabled():
-        return [("u1", "a1", MemoryConfig(memory_enabled=True))]
+        return [("a1", MemoryConfig(memory_enabled=True))]
 
     monkeypatch.setattr(memory_store, "memory_list_enabled", _fake_list_enabled)
     sweeper = MemorySweeper(fake_redis, storage)

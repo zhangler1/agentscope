@@ -15,7 +15,10 @@ AgentScope 的 ``on_system_prompt`` transformer 钩子，并在其上叠加
 - 否则从 PostgreSQL ``system_prompts`` 表读取公共提示词（该智能体 →
   全局回退），把其中的 ``<技能注入>`` / ``<工作区>`` 占位符替换为框架拼好的
   ``<agent-skills>`` / ``<workspace>`` 段；没有占位符的段追加到末尾；
-  数据库无提示词时原样透传。
+  数据库无提示词时原样透传；
+- 最后追加「本次请求指定技能」提示段（用户在消息里写 ``@skill:<name>``
+  时，``ActiveSkillMiddleware`` 摘掉标记并把技能名放进 ContextVar，
+  这里负责告知模型；见 :func:`_build_active_skill_note`）。
 
 存储迁移说明：公共提示词已由 Redis 迁移到 PostgreSQL（持久化真源），
 写入端为管理 API ``routers/system_prompt.py``，读取端为本中间件。
@@ -163,6 +166,29 @@ async def _get_pg_prompt(agent_id: str) -> str:
         return ""
 
 
+def _build_active_skill_note() -> str:
+    """构造「本次请求指定技能」提示段（无指定则返回空串）。
+
+    ``ActiveSkillMiddleware`` 对用户消息**只读不写**：``@skill:<name>``
+    标记随用户原文一起落库（前端看到的就是用户输入的原始字符串），技能名
+    仅写入 ContextVar。因此"本次指定了哪些技能"必须在这里显式告知模型，
+    否则模型无从得知。
+
+    注入内容刻意保持简短：技能清单与 SKILL.md 的读取方式仍由框架默认的
+    ``<agent-skills>`` 段（全量）负责，这里只做优先级强调。
+    """
+    from bocomadp.middleware.active_skill import get_active_skills
+
+    skills = get_active_skills()
+    if not skills:
+        return ""
+    return (
+        "\n\n# 本次请求指定技能\n"
+        f"用户指定优先使用以下技能：{'、'.join(skills)}。"
+        "请先调用 Skill 工具读取其 SKILL.md，再按其中的指令执行。"
+    )
+
+
 class CustomPromptMiddleware(MiddlewareBase):
     """把 custom_params 的 custom_prompt 整体覆盖，否则注入 PG 公共提示词。
 
@@ -250,18 +276,19 @@ class CustomPromptMiddleware(MiddlewareBase):
                 )
             return prompt
 
-        # 1.5. 用户指定技能：消息改写由 active_skill.py 负责（把 /skill_name
-        #      前缀解析并重写为任务指令）。system prompt 这里**不再**只注入该
-        #      技能，而是保留框架默认注入的全部技能（全量 <agent-skills> 段）。
-        #      （原 _build_single_skill_section 的单技能过滤逻辑已停用）
+        # 1.5. 用户指定技能（@skill:<name>）：active_skill.py 只负责**摘掉
+        #      标记**（消息正文保持用户原话，落库/前端展示的都是原问题），
+        #      "本次指定了哪些技能"在这里追加到 system prompt 末尾告知模型。
+        #      技能清单仍保留框架默认注入的全量 <agent-skills> 段。
+        skill_note = _build_active_skill_note()
 
         # 2. 从 PostgreSQL 读取公共提示词（该智能体 → 全局回退）
         agent_id = getattr(agent, "name", "") or ""
         pg_prompt = await _get_pg_prompt(agent_id)
 
-        # 3. 无公共提示词 → 原样透传框架结果
+        # 3. 无公共提示词 → 原样透传框架结果（带上指定技能提示）
         if not pg_prompt:
-            return current_prompt
+            return current_prompt + skill_note
 
         # 4. 从 current_prompt 提取框架拼好的段
         base = _extract_base(current_prompt)   # PostgreSQL 用户输入提示词
@@ -293,6 +320,9 @@ class CustomPromptMiddleware(MiddlewareBase):
             missing.append(workspace)
         if missing:
             result = result + "\n\n" + "\n\n".join(missing)
+
+        # 7. 追加「本次指定技能」提示（无指定时 skill_note 为空串）
+        result = result + skill_note
 
         if result != current_prompt:
             logger.info(

@@ -29,14 +29,21 @@ if TYPE_CHECKING:
 #: 目录查询端点路径（命名空间走 query 参数）。
 CATALOG_PATH = "/api/web/skills"
 
-#: 下载端点前缀 —— 最终 URL 为 ``{base_url}{DOWNLOAD_PREFIX}/{card_id}/download``。
-DOWNLOAD_PREFIX = "/api/web/skills/global"
+#: 下载端点前缀 —— 最终 URL 为
+#: ``{base_url}{DOWNLOAD_PREFIX}/{namespace}/{card_id}/download``。
+DOWNLOAD_PREFIX = "/api/web/skills"
 
 #: 目录命名空间。
 CATALOG_NAMESPACE = "global"
 
 #: 当前用户已上传 skill 的端点路径。
 MY_SKILLS_PATH = "/api/web/me/skills"
+
+#: 当前用户收藏的 skill 端点路径。
+MY_STARS_PATH = "/api/web/me/stars"
+
+#: 全部分类标签端点路径（树形，两级：一级类目 + children）。
+LABELS_PATH = "/api/web/labels"
 
 #: 默认流式块大小（64 KiB）。
 DEFAULT_CHUNK_SIZE = 64 * 1024
@@ -135,6 +142,261 @@ class ExternalSkillHub(SkillHubBase):
             "User-Agent": "PostmanRuntime-ApipostRuntime/1.1.0",
         }
 
+    # ── 原样透传（不加工）────────────────────────────────────────
+
+    async def _get_json(self, url: str) -> dict:
+        """GET 一个 JSON 端点，**原样**返回响应体（不做任何字段映射/裁剪）。
+
+        异常统一转 :class:`HubError`（与 :meth:`list_skills` 一致）。
+        """
+        return await self._request_json("GET", url)
+
+    async def _request_json(self, method: str, url: str) -> dict:
+        """发一个 HTTP 请求（GET / PUT / DELETE）并**原样**返回响应体。
+
+        异常统一转 :class:`HubError`——注意这只覆盖 **HTTP 层**失败；
+        远端「HTTP 200 但 ``code != 0``」的业务失败由调用方（路由）
+        解析响应体后处理。
+
+        Args:
+            method (`str`): HTTP 方法，如 ``GET`` / ``PUT`` / ``DELETE``。
+            url (`str`): 完整 URL。
+        """
+        try:
+            resp = await self._http().request(
+                method,
+                url,
+                headers=self._headers(await self._cookie()),
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:  # noqa: BLE001
+            status_code = getattr(getattr(e, "response", None), "status_code", 0)
+            raise HubError(self.hub_id, status_code, str(e)) from e
+
+    async def _request_text(self, method: str, url: str) -> str:
+        """发一个 HTTP 请求并**原样返回文本**（远端返回纯文本，如 markdown）。
+
+        异常统一转 :class:`HubError`（与 :meth:`_request_json` 一致）。
+        """
+        try:
+            resp = await self._http().request(
+                method,
+                url,
+                headers=self._headers(await self._cookie()),
+            )
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:  # noqa: BLE001
+            status_code = getattr(getattr(e, "response", None), "status_code", 0)
+            raise HubError(self.hub_id, status_code, str(e)) from e
+
+    @staticmethod
+    def _normalize_version(version: str) -> str:
+        """去掉版本号的前导 ``v``：``v20260904.074311`` → ``20260904.074311``。
+
+        只去**第一个**字符（不能用 ``lstrip("v")``，会把连续 v 全吃掉）；
+        非 v 开头原样返回。
+        """
+        v = (version or "").strip()
+        return v[1:] if v[:1].lower() == "v" else v
+
+    def _skill_file_url(
+        self,
+        namespace: str,
+        slug: str,
+        version: str,
+        path: str,
+    ) -> str:
+        """技能文件内容 URL：``/api/web/skills/{ns}/{slug}/versions/{v}/file?path=``。"""
+        import urllib.parse
+
+        return (
+            f"{self.base_url}{CATALOG_PATH}/"
+            f"{urllib.parse.quote(namespace, safe='')}/"
+            f"{urllib.parse.quote(slug, safe='')}/versions/"
+            f"{urllib.parse.quote(version, safe='')}/file"
+            f"?path={urllib.parse.quote(path, safe='')}"
+        )
+
+    async def get_skill_file(
+        self,
+        user_id: str,
+        slug: str,
+        version: str,
+        namespace: str = CATALOG_NAMESPACE,
+        path: str = "SKILL.md",
+    ) -> str:
+        """读取技能内某个文件的内容（默认 ``SKILL.md``），**返回纯文本原样内容**。
+
+        远端：``GET {base}/api/web/skills/{ns}/{slug}/versions/{v}/file?path=SKILL.md``，
+        返回 **text/plain 的 markdown 原文**（不是 JSON 信封）。
+
+        Args:
+            user_id (`str`): 用户标识（透传给远端鉴权用）。
+            slug (`str`): 技能 slug（目录项 ``slug``）。
+            version (`str`): 版本号；远端形如 ``v20260904.074311``，
+                此处会**自动去掉前导 v** 再拼 URL。
+            namespace (`str`): 命名空间，默认 ``global``。
+            path (`str`): 技能内文件路径，默认 ``SKILL.md``。
+
+        Returns:
+            `str`: 远端返回的原始文本（markdown 原文）。
+        """
+        url = self._skill_file_url(
+            namespace,
+            slug,
+            self._normalize_version(version),
+            path,
+        )
+        return await self._request_text("GET", url)
+
+    def _star_url(self, skill_id: str) -> str:
+        """收藏/取消收藏端点 URL（远端用**数字 id**，非 slug）。"""
+        import urllib.parse
+
+        return (
+            f"{self.base_url}{CATALOG_PATH}/"
+            f"{urllib.parse.quote(str(skill_id), safe='')}/star"
+        )
+
+    async def star_skill(self, user_id: str, skill_id: str) -> dict:
+        """收藏一个 skill —— ``PUT /api/web/skills/{id}/star``。
+
+        **原样返回**远端响应：成功为 ``{"code": 0, "msg": "Updated "
+        "successfully", "data": null, ...}``；远端「HTTP 200 但
+        ``code != 0``」的业务失败也原样返回，由调用方判定。
+
+        Args:
+            user_id (`str`): 用户标识（透传给远端鉴权用）。
+            skill_id (`str`): 远端技能的**数字 id**（非 slug）。
+        """
+        return await self._request_json("PUT", self._star_url(skill_id))
+
+    async def unstar_skill(self, user_id: str, skill_id: str) -> dict:
+        """取消收藏一个 skill —— ``DELETE /api/web/skills/{id}/star``。
+
+        返回语义同 :meth:`star_skill`。
+        """
+        return await self._request_json("DELETE", self._star_url(skill_id))
+
+    def _catalog_url(
+        self,
+        q: str | None,
+        page: int,
+        limit: int,
+        label: str = "",
+        sort: str = "",
+    ) -> str:
+        """拼目录查询 URL（命名空间 / 标签 / 排序走 query 参数）。
+
+        Args:
+            q (`str | None`): 关键字搜索。
+            page (`int`): 页码（从 0 开始）。
+            limit (`int`): 每页数量。
+            label (`str`): 标签 slug（来自 ``/api/web/labels``），远端按
+                标签过滤；空串为不过滤。
+            sort (`str`): 排序（透传远端）；空串为远端默认。
+        """
+        import urllib.parse
+
+        return (
+            f"{self.base_url}{CATALOG_PATH}"
+            f"?page={page}&q={urllib.parse.quote(q or '', safe='')}"
+            f"&size={limit}&sort={urllib.parse.quote(sort, safe='')}"
+            f"&label={urllib.parse.quote(label, safe='')}"
+            f"&namespace={CATALOG_NAMESPACE}"
+        )
+
+    async def list_skills_raw(
+        self,
+        user_id: str,
+        q: str | None = None,
+        page: int = 0,
+        limit: int = 20,
+        label: str | None = None,
+        sort: str | None = None,
+    ) -> dict:
+        """目录查询 —— **原样返回远端响应**，不做任何加工。
+
+        远端结构示例（完整透传，含 ``code`` / ``msg`` / ``data`` /
+        ``timestamp`` / ``requestId``）::
+
+            {
+              "code": 0,
+              "msg": "Fetched successfully",
+              "data": {"items": [...], "total": 308, "page": 0, "size": 1},
+              "timestamp": "...",
+              "requestId": "..."
+            }
+
+        Args:
+            user_id (`str`): 用户标识（透传给远端鉴权用）。
+            q (`str | None`): 关键字搜索。
+            page (`int`): 页码（从 0 开始）。
+            limit (`int`): 每页数量。
+            label (`str | None`): 标签 slug（来自 :meth:`list_labels_raw`
+                返回项的 ``slug``），远端按标签过滤；``None`` 不过滤。
+            sort (`str | None`): 排序（透传远端）；``None`` 用远端默认。
+        """
+        return await self._get_json(
+            self._catalog_url(q, page, limit, label or "", sort or ""),
+        )
+
+    async def list_uploaded_skills_raw(
+        self,
+        user_id: str,
+        page: int = 0,
+        size: int = 5,
+    ) -> dict:
+        """我的上传查询 —— **原样返回远端响应**，不做任何加工。"""
+        url = f"{self.base_url}{MY_SKILLS_PATH}?page={page}&size={size}"
+        return await self._get_json(url)
+
+    async def list_labels_raw(self, user_id: str) -> dict:
+        """全部分类标签查询 —— **原样返回远端响应**，不做任何加工。
+
+        远端：``GET {base_url}/api/web/labels``，无分页，返回信封里
+        ``data`` 是**数组**（非 ``items/total`` 对象），两级树形：
+
+        ::
+
+            {"code": 0, "msg": "Fetched successfully",
+             "data": [{"id": 46, "slug": "intelligent-development",
+                       "level": 1, "parentId": 0, "type": "RECOMMENDED",
+                       "displayName": "智能研发",
+                       "children": [{"id": 2, "slug": "review",
+                                     "level": 2, "parentId": 46, ...}]}],
+             "timestamp": "...", "requestId": "..."}
+
+        带登录态（``guwpToken``）时远端可能额外返回 ``PRIVILEGED``
+        类目，故 token 由调用方按需透传，本方法不强制。
+
+        Args:
+            user_id (`str`): 用户标识（透传给远端鉴权用）。
+        """
+        return await self._get_json(f"{self.base_url}{LABELS_PATH}")
+
+    async def list_starred_skills_raw(
+        self,
+        user_id: str,
+        page: int = 0,
+        size: int = 5,
+    ) -> dict:
+        """我的收藏查询 —— **原样返回远端响应**，不做任何加工。
+
+        远端：``GET {base_url}/api/web/me/stars?page=&size=``，按用户
+        隔离（登录态 cookie 携带身份），返回结构与目录/我的上传一致
+        （``{code, msg, data:{items, total, page, size}, ...}``）。
+
+        Args:
+            user_id (`str`): 用户标识（透传给远端鉴权用）。
+            page (`int`): 页码（从 0 开始）。
+            size (`int`): 每页数量。
+        """
+        url = f"{self.base_url}{MY_STARS_PATH}?page={page}&size={size}"
+        return await self._get_json(url)
+
     # ── 认证 ────────────────────────────────────────────────────
 
     async def _cookie(self) -> str:
@@ -178,10 +440,13 @@ class ExternalSkillHub(SkillHubBase):
         q: str | None = None,
         cursor: str | None = None,
         limit: int = 20,
+        label: str | None = None,
+        sort: str | None = None,
     ) -> SkillHubPage:
-        """浏览目录。``cursor`` 以 ``page:N`` 编码上游页码。"""
-        import urllib.parse
+        """浏览目录。``cursor`` 以 ``page:N`` 编码上游页码。
 
+        ``label``（标签 slug）与 ``sort`` 透传远端；``None`` 用默认。
+        """
         page = 0
         if cursor and cursor.startswith("page:"):
             try:
@@ -189,21 +454,9 @@ class ExternalSkillHub(SkillHubBase):
             except ValueError:
                 page = 0
 
-        url = (
-            f"{self.base_url}{CATALOG_PATH}"
-            f"?page={page}&q={urllib.parse.quote(q or '', safe='')}"
-            f"&size={limit}&sort=&label=&namespace={CATALOG_NAMESPACE}"
+        data = await self._get_json(
+            self._catalog_url(q, page, limit, label or "", sort or ""),
         )
-        try:
-            resp = await self._http().get(
-                url,
-                headers=self._headers(await self._cookie()),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:  # noqa: BLE001
-            status_code = getattr(getattr(e, "response", None), "status_code", 0)
-            raise HubError(self.hub_id, status_code, str(e)) from e
 
         payload = data.get("data") or {}
         items = payload.get("items") or []
@@ -253,20 +506,7 @@ class ExternalSkillHub(SkillHubBase):
             page (`int`): 页码，默认 0。
             size (`int`): 每页数量，默认 5。
         """
-        url = (
-            f"{self.base_url}{MY_SKILLS_PATH}"
-            f"?page={page}&size={size}"
-        )
-        try:
-            resp = await self._http().get(
-                url,
-                headers=self._headers(await self._cookie()),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:  # noqa: BLE001
-            status_code = getattr(getattr(e, "response", None), "status_code", 0)
-            raise HubError(self.hub_id, status_code, str(e)) from e
+        data = await self.list_uploaded_skills_raw(user_id, page=page, size=size)
 
         payload = data.get("data") or {}
         items = payload.get("items") or []
@@ -300,16 +540,26 @@ class ExternalSkillHub(SkillHubBase):
         user_id: str,
         card_id: str,
         version: str | None = None,
+        namespace: str = CATALOG_NAMESPACE,
     ) -> SkillArchive:
-        """打开 skill 归档流（``{base}/api/web/skills/global/<id>/download``）。
+        """打开 skill 归档流
+        （``{base}/api/web/skills/{namespace}/{id}/download``）。
 
         响应头在此处等待——缺失的 skill（404）在调用方开始安装前抛出；
         body 保持惰性，归档可被直接管道送入 workspace 而无需整体驻留内存。
+
+        Args:
+            user_id (`str`): 用户标识（透传给远端鉴权用）。
+            card_id (`str`): 技能 slug。
+            version (`str | None`): 版本（远端暂未使用，保留扩展位）。
+            namespace (`str`): 命名空间（如 ``global``），由前端传入；
+                默认 ``global``。
         """
         import urllib.parse
 
         url = (
             f"{self.base_url}{DOWNLOAD_PREFIX}/"
+            f"{urllib.parse.quote(namespace, safe='')}/"
             f"{urllib.parse.quote(card_id, safe='')}/download"
         )
         client = self._http()

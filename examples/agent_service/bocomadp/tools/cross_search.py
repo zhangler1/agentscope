@@ -40,6 +40,8 @@ from ..agent_cross_search_config import (
     cross_search_config_get,
 )
 from ..config.cross_search_config import CrossSearchConfig, get_cross_search_config
+from ..deerflow.custom_params import get_custom_params
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -410,7 +412,9 @@ async def _cross_search_tool_impl(keyword: str) -> str:
 if FunctionTool is not None and ToolMiddlewareBase is not None:
     cross_search_tool = FunctionTool(
         _cross_search_tool_impl,
-        name="cross_search",
+        # 工具名默认中文（行内网关）；行外 DeepSeek 等 API 强校验
+        # ^[a-zA-Z0-9_-]+$，设置 BOCOMADP_TOOL_ASCII_NAMES=1 切 ASCII。
+        name=tool_name("跨知识搜索", "cross_search"),
         is_read_only=True,
     )
 else:

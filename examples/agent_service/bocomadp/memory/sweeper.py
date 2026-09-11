@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """静默会话记忆扫描器：定时扫描 → 抢锁 → run_extract。
 
-扫描维度：全部开启记忆的智能体（``store.memory_list_enabled``）→ 其会话
-（``storage.list_sessions``）→ 在 active_sessions 中且最后心跳超过
-``idle_minutes`` 的会话 → 轮数 turns>=1 → 抢提取锁 → ``run_extract``。
-
-运行参数每次 tick 从 runtime_configs（key=``memory``）热读，热更新即时生效。
+扫描维度（spec 5.2，枚举反转）：从 ``active_sessions`` 活跃集出发，反查每个
+会话的 (user_id, agent_id, session_id)；按 agent_id 读配置校验启用；静默且
+turns>=1 的会话抢锁后以**真实 owner** 执行 run_extract——不再依赖配置归属者 user。
 """
 from __future__ import annotations
 
@@ -20,6 +18,7 @@ from bocomadp.memory.extractor import run_extract
 from bocomadp.memory.state import (
     ACTIVE_ZSET,
     lock_key,
+    parse_member,
     try_acquire_lock,
     turns_key,
 )
@@ -60,52 +59,81 @@ class MemorySweeper:
             await asyncio.sleep(rt_cfg.sweep_interval_seconds)
 
     async def _sweep_once(self, rt_cfg) -> int:
-        """扫描一轮，返回本次提取尝试次数。"""
+        """扫描一轮，返回本次提取尝试次数。
+
+        候选来源是 ``active_sessions``（中间件心跳写入），而非
+        ``storage.list_sessions(配置归属者, agent)``——共享 agent 下后者会漏掉
+        非配置归属者的会话。
+        """
         idle_seconds = rt_cfg.idle_minutes * 60
         now = time.time()
         attempts = 0
-        for user_id, agent_id, cfg in await memory_store.memory_list_enabled():
-            for session_id in await self._list_session_ids_safe(user_id, agent_id):
-                last = await self._redis.zscore(ACTIVE_ZSET, session_id)
-                if last is None:
-                    continue  # 不在活跃集：无记忆中间件心跳，忽略
-                if (now - float(last)) < idle_seconds:
-                    continue  # 静默窗口内仍活跃
-                turns_raw = await self._redis.get(turns_key(session_id))
-                turns = int(turns_raw) if turns_raw else 0
-                if turns < 1:
-                    continue  # 无可提取的完整轮次
-                if not await try_acquire_lock(self._redis, session_id):
-                    continue  # 已有提取在进行（轮数触发/其它扫描实例）
-                attempts += 1
-                try:
-                    # run_extract 内部二次活跃确认 + 负责释放锁
-                    await run_extract(
-                        self._redis,
-                        self._storage,
-                        user_id,
-                        agent_id,
-                        session_id,
-                        cfg,
-                        rt_cfg,
-                    )
-                except Exception:  # noqa: BLE001 — 单会话失败不影响其它
-                    logger.exception(
-                        "memory: sweep extract failed for session=%s",
-                        session_id,
-                    )
-                    await self._redis.delete(lock_key(session_id))
+
+        # agent_id → 启用配置（供按 agent 校验；不携带归属者 user）
+        enabled: dict[str, Any] = {}
+        try:
+            for agent_id, cfg in await memory_store.memory_list_enabled():
+                enabled[agent_id] = cfg
+        except Exception:  # noqa: BLE001 — 配置读失败本轮跳过
+            logger.exception("memory: sweep list_enabled failed")
+            return 0
+
+        try:
+            members = await self._redis.zrangebyscore(
+                ACTIVE_ZSET,
+                "-inf",
+                "+inf",
+                withscores=True,
+            )
+        except Exception:  # noqa: BLE001 — 活跃集读失败本轮跳过
+            logger.exception("memory: sweep active_sessions read failed")
+            return 0
+
+        for member, last_score in members:
+            try:
+                user_id, agent_id, session_id = parse_member(member)
+            except ValueError:
+                continue  # 旧格式/异常成员，忽略
+            cfg = enabled.get(agent_id)
+            if cfg is None:
+                continue  # 该 agent 未开启记忆
+            if (now - float(last_score)) < idle_seconds:
+                continue  # 静默窗口内仍活跃
+            try:
+                turns_raw = await self._redis.get(
+                    turns_key(user_id, agent_id, session_id),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            turns = int(turns_raw) if turns_raw else 0
+            if turns < 1:
+                continue  # 无可提取的完整轮次
+            if not await try_acquire_lock(
+                self._redis,
+                user_id,
+                agent_id,
+                session_id,
+            ):
+                continue  # 已有提取在进行（轮数触发/其它扫描实例）
+            attempts += 1
+            try:
+                # 以会话真实 owner 提取：读消息 / userCode 均正确
+                await run_extract(
+                    self._redis,
+                    self._storage,
+                    user_id,
+                    agent_id,
+                    session_id,
+                    cfg,
+                    rt_cfg,
+                )
+            except Exception:  # noqa: BLE001 — 单会话失败不影响其它
+                logger.exception(
+                    "memory: sweep extract failed for session=%s",
+                    session_id,
+                )
+                await self._redis.delete(lock_key(user_id, agent_id, session_id))
         return attempts
-
-    async def _list_session_ids_safe(self, user_id: str, agent_id: str) -> list[str]:
-        """取某 agent 的会话 id（失败返回空）——收敛到 memory 包统一实现。"""
-        from bocomadp.memory import list_agent_session_ids
-
-        return await list_agent_session_ids(
-            user_id,
-            agent_id,
-            storage=self._storage,
-        )
 
 
 __all__ = ["MemorySweeper"]

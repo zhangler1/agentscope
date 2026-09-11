@@ -30,6 +30,7 @@ from ..config.physical_contact_search_config import (
     get_physical_contact_search_config,
 )
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,8 @@ async def _physical_contact_search_tool_impl(
 if FunctionTool is not None:
     physical_contact_search_tool = FunctionTool(
         _physical_contact_search_tool_impl,
-        name="physical_contact_search",
+        # 工具名默认中文；BOCOMADP_TOOL_ASCII_NAMES=1 切 ASCII。
+        name=tool_name("物理系统负责人查询", "physical_contact_search"),
         is_read_only=True,
     )
 else:

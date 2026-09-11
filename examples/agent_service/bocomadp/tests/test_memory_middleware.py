@@ -10,9 +10,13 @@ from agentscope.state import AgentState
 from bocomadp.memory.middleware import MemoryMiddleware
 from bocomadp.memory.state import (
     clear_extract_state,
+    encode_member,
     incr_turn,
+    lock_key,
     mark_active,
+    parse_member,
     try_acquire_lock,
+    turns_key,
 )
 from bocomadp.memory.store import MemoryConfig
 
@@ -27,17 +31,23 @@ def _run(coro):
 
 
 def test_incr_turn_auto_from_one(fake_redis):
-    assert _run(incr_turn(fake_redis, "s1")) == 1
-    assert _run(incr_turn(fake_redis, "s1")) == 2
+    assert _run(incr_turn(fake_redis, "u1", "a1", "s1")) == 1
+    assert _run(incr_turn(fake_redis, "u1", "a1", "s1")) == 2
+
+
+def test_state_member_roundtrip():
+    assert encode_member("u1", "a1", "s1") == "u1:a1:s1"
+    assert parse_member("u1:a1:s1") == ("u1", "a1", "s1")
 
 
 def test_state_primitives_roundtrip(fake_redis):
-    _run(mark_active(fake_redis, "s1", now=100.0))
-    assert fake_redis._zsets["memory:active_sessions"]["s1"] == 100.0
-    assert _run(try_acquire_lock(fake_redis, "s1")) is True
-    assert _run(try_acquire_lock(fake_redis, "s1")) is False  # 已被占用
-    _run(clear_extract_state(fake_redis, "s1"))
-    assert _run(incr_turn(fake_redis, "s1")) == 1  # turns 已清空，重新从 1 起
+    _run(mark_active(fake_redis, "u1", "a1", "s1", now=100.0))
+    assert fake_redis._zsets["memory:active_sessions"]["u1:a1:s1"] == 100.0
+    assert _run(try_acquire_lock(fake_redis, "u1", "a1", "s1")) is True
+    assert _run(try_acquire_lock(fake_redis, "u1", "a1", "s1")) is False  # 已被占用
+    _run(clear_extract_state(fake_redis, "u1", "a1", "s1"))
+    assert _run(fake_redis.get(turns_key("u1", "a1", "s1"))) is None
+    assert _run(fake_redis.zscore("memory:active_sessions", "u1:a1:s1")) is None
 
 
 # ---------------------------------------------------------------------------
@@ -93,8 +103,6 @@ def test_inject_empty_keeps_existing_memory():
 
 def test_trigger_once_until_lock_released(fake_redis):
     """达阈值触发一次；提取锁未释放前后续达阈值不再重复触发（防并发提取）。"""
-    from bocomadp.memory.state import lock_key
-
     hits = []
 
     async def _trigger(turns):
@@ -116,20 +124,18 @@ def test_trigger_once_until_lock_released(fake_redis):
         # 第 6 轮也达阈值但提取锁仍占用（extractor 尚未清理）→ 不重复触发
         _run(mw._record_turn(None))
     assert hits == [3]
-    assert lock_key("s1") in fake_redis._strings
+    assert lock_key("u", "a", "s1") in fake_redis._strings
 
 
 def test_trigger_next_batch_after_extract_cleanup(fake_redis):
     """模拟 extractor 完整行为（清 turns + 释放锁）→ 后续每满 N 轮再次触发。"""
-    from bocomadp.memory.state import lock_key
-
     hits = []
 
     async def _trigger(turns):
         hits.append(turns)
         # extractor 成功路径：clear_extract_state + 释放锁
-        await clear_extract_state(fake_redis, "s1")
-        await fake_redis.delete(lock_key("s1"))
+        await clear_extract_state(fake_redis, "u", "a", "s1")
+        await fake_redis.delete(lock_key("u", "a", "s1"))
 
     mw = MemoryMiddleware(
         "u",
