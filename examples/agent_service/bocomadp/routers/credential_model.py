@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
-"""按凭证查询可用模型（含"凭证绑定单模型"过滤）。
+"""按 (X-User-ID, credential_id) 查询凭证 payload；并提供 ELLM 凭证部分更新。
 
-类似官方 ``GET /model/?provider=...``，但额外传 ``credential_id``：
-
-- 凭证带 ``model`` 字段（B 方案：一凭证一模型）→ **只返回该模型**；
-- 凭证没有 ``model`` 字段 → 返回该类型全部候选（``_models/*.yaml``）。
+- ``GET    /model/credential?credential_id=<id>``   查凭证 payload（**严格归属**）
+- ``PATCH  /model/credential/{credential_id}``      部分更新（仅 ELLM）
 
 用法::
 
-    GET /model/credential?credential_id=<id>&user_id=zy
+    GET /model/credential?credential_id=<id>      # 身份取请求头 X-User-ID
+
+归属口径（两接口不同，均为刻意设计）：
+
+- ``GET``：**只认调用者自己的凭证**（``storage.get_credential``）——该接口
+  会返回含明文 ``api_key`` 的完整 payload，因此不能走带"全局兜底"补丁的
+  ``resolve_credential``；
+- ``PATCH``：沿用 ``resolve_credential``（own / 共享可见即可更新），保持
+  与原有行为一致。
 """
 from __future__ import annotations
 
@@ -17,7 +23,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agentscope.app._router._schema import ListModelsResponse
 from agentscope.app._service import ResourceAccessService
 from agentscope.app.deps import (
     get_current_user_id,
@@ -30,55 +35,58 @@ from agentscope.credential import CredentialFactory
 credential_model_router = APIRouter(prefix="/model", tags=["credential-model"])
 
 
+class CredentialPayloadResponse(BaseModel):
+    """凭证 payload 查询响应。"""
+
+    credential_id: str = Field(description="凭证 id。")
+    data: dict[str, Any] = Field(description="凭证的完整 payload data。")
+
+
 @credential_model_router.get(
     "/credential",
-    response_model=ListModelsResponse,
-    summary="List models for a credential",
+    response_model=CredentialPayloadResponse,
+    summary="Get a credential payload by id",
     description=(
-        "Resolve the credential by id, then return its candidate models: "
-        "the single bound model when the credential carries a ``model`` "
-        "field, otherwise every candidate from ``_models/*.yaml``."
+        "Look up the credential by ``(X-User-ID, credential_id)`` and "
+        "return its full payload ``data``. Strictly scoped to the "
+        "caller's own credentials — not found (or not owned) → 404."
     ),
 )
-async def list_credential_models(
+async def get_credential_payload(
     credential_id: str = Query(
         ...,
         description="The credential to inspect.",
     ),
     user_id: str = Depends(get_current_user_id),
-    access: ResourceAccessService = Depends(get_resource_access_service),
-) -> ListModelsResponse:
-    """按凭证返回可调用模型。
+    storage: StorageBase = Depends(get_storage),
+) -> CredentialPayloadResponse:
+    """按 (X-User-ID, credential_id) 查询凭证 payload。
 
-    ``resolve_credential`` 校验归属/共享（不可见 → 404），返回原始
-    记录（含完整 payload）。从 payload 反序列化凭证后：
+    **严格按调用者归属定位**（``storage.get_credential(user_id, id)``）：
+    别的用户的凭证、以及"被共享给自己"的凭证都返回 404。
 
-    - 凭证带 ``model`` → 从该类型候选里筛出对应模型（只返回一个）；
-    - 不带 → 返回该类型全部候选。
+    这里刻意**不使用** ``ResourceAccessService.resolve_credential``：本
+    仓库的 ``bocomadp/open_agent_access.py`` 给该方法打了"全局兜底"补丁
+    （own / 共享均 miss 时按 id 直接全局查库，供开放交互模式下跨用户使用
+    凭证），若走它则任意用户可用任意凭证 id 读到明文 payload。
+
+    返回值 ``data`` 为完整 payload（含 ``api_key`` 明文），仅供内部排查/
+    管理使用，注意不要在前端或日志中裸奔。
     """
-    record = await access.resolve_credential(user_id, credential_id)
-
+    record = await storage.get_credential(user_id, credential_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Credential {credential_id!r} not found for "
+                f"user {user_id!r}."
+            ),
+        )
     credential = CredentialFactory.from_dict(record.data)
-    model_cls = credential.get_chat_model_class()
-    cards = model_cls.list_models()
-
-    bound = getattr(credential, "model", None)
-    if bound:
-        cards = [
-            card
-            for card in cards
-            if card.name == bound
-        ]
-        if not cards:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Credential's model {bound!r} not found in "
-                    "candidates."
-                ),
-            )
-
-    return ListModelsResponse(models=cards, total=len(cards))
+    return CredentialPayloadResponse(
+        credential_id=credential.id,
+        data=_dump_credential_data(credential),
+    )
 
 
 class ELLMCredentialPatch(BaseModel):
@@ -92,11 +100,8 @@ class ELLMCredentialPatch(BaseModel):
     )
 
 
-class ELLMCredentialPatchResponse(BaseModel):
-    """部分更新后的凭证视图。"""
-
-    credential_id: str = Field(description="凭证 id。")
-    data: dict[str, Any] = Field(description="更新后的完整 payload data。")
+class ELLMCredentialPatchResponse(CredentialPayloadResponse):
+    """部分更新后的凭证视图（与查询响应同构）。"""
 
 
 @credential_model_router.patch(
