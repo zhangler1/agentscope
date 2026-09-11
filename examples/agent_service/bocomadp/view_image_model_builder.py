@@ -43,7 +43,7 @@ def build_image_parse_model(
         model=model_name,
         # 视觉解析必须用 OpenAI 兼容 formatter（DeepSeekChatFormatter
         # 不支持图片输入）；context_size 不传，由 EllmChatModel 按模型名
-        # 从 Redis 默认读取（图片解析无压缩触发阈值语义）。
+        # 从模型库（model_registry）默认读取（图片解析无压缩触发阈值语义）。
         formatter=OpenAIChatFormatter(),
     )
 

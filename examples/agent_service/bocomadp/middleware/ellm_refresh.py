@@ -6,7 +6,7 @@ apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落�
 再用 ``EllmChatModel.set_api_key`` 把新鲜 key 注入到当前模型实例的
 请求头（``Authorization: Bearer <key>``），并设置 ``inject_think_tag``
 开关——优先级：请求体 ``custom_params.add_think``（deerflow run/stream
-每轮携带）> Redis 模型表 ``bocomadp:model:think_tag``（按模型名）> 默认
+每轮携带）> 模型库 ``model_registry``（按模型名）> 默认
 False。不换类、不重建 client，模型调用链保持不变。
 
 挂载方式（bocomadp main.py）::
@@ -51,7 +51,7 @@ MiddlewareBase._is_agent_middleware = True  # type: ignore[attr-defined]
 from bocomadp.deerflow.custom_params import get_custom_params  # noqa: E402
 from bocomadp.providers.ellm_chat_model import (  # noqa: E402
     EllmChatModel,
-    _get_think_tag_from_redis,
+    _get_think_tag,
 )
 
 
@@ -83,7 +83,7 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
     - 非 :class:`EllmChatModel` 模型直接透传，不做任何处理；
     - :class:`EllmChatModel` 模型：``EllmKeyRefresher`` 惰性刷新 →
       ``set_api_key`` 注入 → 设置 ``inject_think_tag``（请求体
-      ``custom_params.add_think`` 优先，否则按模型名查 Redis 模型表）；
+      ``custom_params.add_think`` 优先，否则按模型名查模型库）；
       并注入 401 回调：强制刷新 key 并重试当前调用一次，刷新失败则
       标记凭证 key 过期。
     """
@@ -126,7 +126,7 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 # inject_think_tag 优先级：
                 #   1) 请求体 custom_params.add_think（deerflow run/stream
                 #      每轮携带，第一优先级）；
-                #   2) Redis 模型表 bocomadp:model:think_tag（按模型名）；
+                #   2) 模型库 model_registry（按模型名）；
                 #   3) 默认 False。
                 # 原生 /chat/ 或请求未携带 add_think 时，第 1 级返回
                 # None，自动回退到第 2/3 级，行为与之前一致。
@@ -136,8 +136,8 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 if req_think is not None:
                     current_model.inject_think_tag = req_think
                 else:
-                    current_model.inject_think_tag = (
-                        await _get_think_tag_from_redis(current_model.model)
+                    current_model.inject_think_tag = _get_think_tag(
+                        current_model.model,
                     )
                 # 401 时的行为：
                 #   1) 强制刷新 key（force_refresh_key，锁保护）并用新 key

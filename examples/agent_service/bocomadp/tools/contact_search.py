@@ -27,6 +27,7 @@ except ImportError:
 
 from ..config.contact_search_config import get_contact_search_config
 from ..deerflow.auth_context import attach_muwp_user, build_auth_headers
+from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -242,8 +243,9 @@ async def _contact_search_tool_impl(
 if FunctionTool is not None:
     contact_search_tool = FunctionTool(
         _contact_search_tool_impl,
-        # 工具名（按用户要求中文化，对齐"个人知识库搜索"命名）
-        name="contact_search",
+        # 工具名默认中文（行内网关）；行外 DeepSeek 等 API 强校验
+        # ^[a-zA-Z0-9_-]+$，设置 BOCOMADP_TOOL_ASCII_NAMES=1 切 ASCII。
+        name=tool_name("通讯录查询", "contact_search"),
         is_read_only=True,
     )
 else:
