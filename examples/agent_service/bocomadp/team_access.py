@@ -11,10 +11,9 @@ demand by passing ``parent_agent_id``.
 Without touching framework code we wrap ``list_resource`` here:
 
 - when ``parent_agent_id`` is provided (AGENT kind only), we read the
-  leader's ``team_config.member_ids`` so invited-by-reference members
-  (present in ``member_ids`` but without a ``parent_agent_id`` backlink)
-  also surface, and each returned view gets its ``is_self_built`` flag set
-  (``True`` for backlinked members, ``False`` for invited-by-reference).
+  leader's roster (``expert_team_relations.members``) and surface its
+  members; under scheme B every member is self-built (``parent_agent_id``
+  backlink present, ``is_self_built=True``).
 - top-level listings pass straight through to the original implementation.
 
 The patch is class-level and idempotent, so any instance handed out by
@@ -52,8 +51,8 @@ async def _team_list_resource(
 
     if parent_agent_id is None:
         # Top-level listing: hide self-built members (they exist only
-        # under their team), keep leaders / plain / invited-by-reference
-        # agents, and re-derive the ``is_team`` flag from the team table.
+        # under their team), keep leaders / plain agents, and re-derive
+        # the ``is_team`` flag from the team table.
         teams = await team_store.list_teams(self._storage, viewer_id)
         hidden = {
             mid
@@ -77,8 +76,8 @@ async def _team_list_resource(
         return enriched
 
     # Team-member listing for a specific leader. The roster lives in the
-    # ``expert_team_relations`` table; ``relation`` tells self-built from
-    # invited-by-reference members.
+    # ``expert_team_relations`` table; members are all self-built under
+    # scheme B (``is_self_built`` is therefore always True here).
     rel = await team_store.get_team(
         self._storage,
         viewer_id,
@@ -113,24 +112,6 @@ async def _team_list_resource(
             continue
         views.append(_to_member_view(record, True))
         seen.add((record.user_id, record.id))
-
-    # Cross-owner shared members (policy refs) stay visible too.
-    from agentscope.app.access import ResourcePermission
-
-    for ref in await self._list_refs(viewer_id, kind):
-        key = (ref.owner_id, ref.resource_id)
-        if key in seen:
-            continue
-        record = await self._get_owned(kind, ref.owner_id, ref.resource_id)
-        if record is None or not _is_member(record):
-            continue
-        views.append(
-            _to_member_view(
-                record,
-                ref.permission == ResourcePermission.EDIT,
-            ),
-        )
-        seen.add(key)
 
     return views
 

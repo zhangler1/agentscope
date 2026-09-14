@@ -3,7 +3,7 @@
 
 覆盖（全部是从 src 迁到 bocomadp 的专家团功能）：
 - team_store             团队档案模型 + 异步访问层（SQLite 临时库替换 engine）
-- session_team_cascade   删除 agent 时的团队级联策略（自建级联删 / 外邀只摘链）
+- session_team_cascade   删除 agent 时的团队级联策略（自建级联删 / 自建成员直删时从团长名册摘链）
 - team_toolkit           _allowed_handoff_targets：workflow 严格交接白名单解析
 - team_briefing          leader 系统提示词简报拼接
 - agent_list_sort        资源列表按 updated_at 倒序
@@ -41,23 +41,22 @@ def test_relation_member_ids_and_relation_of():
         leader_agent_id="leader-1",
         members=[
             ExpertTeamMember(agent_id="child-1", relation="self_built"),
-            ExpertTeamMember(agent_id="guest-1", relation="invited"),
+            ExpertTeamMember(agent_id="child-2", relation="self_built"),
         ],
     )
-    assert rel.member_ids == ["child-1", "guest-1"]
+    assert rel.member_ids == ["child-1", "child-2"]
     assert rel.relation_of("child-1") == "self_built"
-    assert rel.relation_of("guest-1") == "invited"
     assert rel.relation_of("nobody") is None
     assert rel.is_self_built("child-1") is True
-    assert rel.is_self_built("guest-1") is False
+    assert rel.is_self_built("child-2") is True
 
 
 def test_add_member_idempotent():
     rel = ExpertTeamRelation(user_id="u1", leader_agent_id="l1")
     rel.add_member("a", "self_built")
-    rel.add_member("a", "invited")  # 同 id 更新标记，不重复
+    rel.add_member("a", "self_built")  # 同 id 幂等，不重复
     assert len(rel.members) == 1
-    assert rel.relation_of("a") == "invited"
+    assert rel.relation_of("a") == "self_built"
 
 
 def test_remove_member():
@@ -187,7 +186,7 @@ def test_cascade_deletes_self_built_members_then_team(monkeypatch):
         leader_agent_id="leader-1",
         members=[
             ExpertTeamMember(agent_id="child-1", relation="self_built"),
-            ExpertTeamMember(agent_id="guest-1", relation="invited"),
+            ExpertTeamMember(agent_id="guest-1", relation="self_built"),
         ],
     )
 
@@ -224,29 +223,29 @@ def test_cascade_deletes_self_built_members_then_team(monkeypatch):
     svc = _FakeService()
     result = _run(session_team_cascade._delete_agent_with_cascade(svc, "u1", "leader-1"))
     assert result is True
-    # 自建成员被级联删、外邀成员不删、团队行被解散
-    assert deleted == ["child-1", "leader-1"]
+    # 所有自建成员被级联删、团队行被解散
+    assert deleted == ["child-1", "guest-1", "leader-1"]
     assert removed_teams == ["leader-1"]
 
 
-def test_cascade_detaches_invited_member_from_other_team(monkeypatch):
+def test_cascade_detaches_self_built_member_from_other_team(monkeypatch):
     leader_rel = ExpertTeamRelation(
         user_id="u1",
         leader_agent_id="leader-1",
         members=[
-            ExpertTeamMember(agent_id="guest-1", relation="invited"),
+            ExpertTeamMember(agent_id="child-1", relation="self_built"),
         ],
         handoff_relations=[
             HandoffRelation(
                 from_agent_id="leader-1",
-                to_agent_id="guest-1",
+                to_agent_id="child-1",
                 description="翻译",
             ),
         ],
     )
 
     async def fake_get_team(storage, user_id, agent_id):
-        return None  # guest-1 不是任何 leader
+        return None  # child-1 不是任何 leader，走"成员直删"分支
 
     async def fake_list_teams(storage, user_id):
         return [leader_rel]
@@ -276,9 +275,9 @@ def test_cascade_detaches_invited_member_from_other_team(monkeypatch):
     monkeypatch.setattr(session_team_cascade, "_original_delete_agent", fake_original)
 
     svc = _FakeService()
-    _run(session_team_cascade._delete_agent_with_cascade(svc, "u1", "guest-1"))
-    # 外邀成员本身照删，leader 名册里只剩"摘链"动作
-    assert deleted == ["guest-1"]
+    _run(session_team_cascade._delete_agent_with_cascade(svc, "u1", "child-1"))
+    # 自建成员本身被删，其团长名册里先"摘链"（成员 + 交接边清空）
+    assert deleted == ["child-1"]
     assert leader_rel.member_ids == []
     assert leader_rel.handoff_relations == []
     assert len(upserted) == 1
