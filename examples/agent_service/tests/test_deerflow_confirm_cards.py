@@ -143,7 +143,7 @@ def test_state_endpoint_appends_rebuilt_card() -> None:
     storage = FakeStorage(_messages("user", "assistant"), _asking_state())
     with TestClient(_make_app(storage)) as client:
         response = client.get(
-            "/api/deerflow/threads/t1/state",
+            "/api/bocomadp/v1/threads/t1/state",
             headers={"X-User-ID": "default"},
         )
 
@@ -161,7 +161,7 @@ def test_history_endpoint_appends_rebuilt_card() -> None:
     storage = FakeStorage(_messages("user"), _asking_state())
     with TestClient(_make_app(storage)) as client:
         response = client.post(
-            "/api/deerflow/threads/t1/history",
+            "/api/bocomadp/v1/threads/t1/history",
             json={},
             headers={"X-User-ID": "default"},
         )
@@ -179,7 +179,7 @@ def test_messages_page_appends_card_on_latest_page() -> None:
     storage = FakeStorage(_messages("user"), _asking_state())
     with TestClient(_make_app(storage)) as client:
         response = client.get(
-            "/api/deerflow/threads/t1/messages/page",
+            "/api/bocomadp/v1/threads/t1/messages/page",
             headers={"X-User-ID": "default"},
         )
 
@@ -197,7 +197,7 @@ def test_messages_page_skips_card_when_paging_backward() -> None:
     storage = FakeStorage(_messages("user", "assistant"), _asking_state())
     with TestClient(_make_app(storage)) as client:
         response = client.get(
-            "/api/deerflow/threads/t1/messages/page?before_seq=1",
+            "/api/bocomadp/v1/threads/t1/messages/page?before_seq=1",
             headers={"X-User-ID": "default"},
         )
 
@@ -210,11 +210,11 @@ def test_no_card_when_no_pending_confirmation() -> None:
     storage = FakeStorage(_messages("user"), AgentState(context=[]))
     with TestClient(_make_app(storage)) as client:
         state_resp = client.get(
-            "/api/deerflow/threads/t1/state",
+            "/api/bocomadp/v1/threads/t1/state",
             headers={"X-User-ID": "default"},
         )
         page_resp = client.get(
-            "/api/deerflow/threads/t1/messages/page",
+            "/api/bocomadp/v1/threads/t1/messages/page",
             headers={"X-User-ID": "default"},
         )
 
@@ -243,7 +243,7 @@ def test_card_options_include_confirm_always_with_rules() -> None:
     storage = FakeStorage(_messages("user"), state)
     with TestClient(_make_app(storage)) as client:
         response = client.get(
-            "/api/deerflow/threads/t1/state",
+            "/api/bocomadp/v1/threads/t1/state",
             headers={"X-User-ID": "default"},
         )
 

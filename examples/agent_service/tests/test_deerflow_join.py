@@ -99,7 +99,7 @@ def test_join_finished_record_ends_immediately() -> None:
 
     with TestClient(app) as client:
         response = client.get(
-            f"/api/deerflow/threads/t1/runs/{rec.run_id}/stream",
+            f"/api/bocomadp/v1/threads/t1/runs/{rec.run_id}/stream",
             headers={"X-User-ID": "default"},
         )
 
@@ -115,7 +115,7 @@ def test_join_unknown_run_without_active_task_ends() -> None:
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/deerflow/threads/t1/runs/ghost-run/stream",
+            "/api/bocomadp/v1/threads/t1/runs/ghost-run/stream",
             headers={"X-User-ID": "default"},
         )
 
@@ -150,7 +150,7 @@ def test_join_unknown_run_with_active_task_still_waits() -> None:
                 transport=transport, base_url="http://test") as client:
                 resp_task = asyncio.create_task(
                     client.get(
-                        "/api/deerflow/threads/t1/runs/ghost-run/stream",
+                        "/api/bocomadp/v1/threads/t1/runs/ghost-run/stream",
                         headers={"X-User-ID": "default"},
                     )
                 )

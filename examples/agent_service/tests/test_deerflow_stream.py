@@ -215,7 +215,7 @@ def test_create_run_stream_echoes_human_message_first() -> None:
                     },
                 }
                 resp = await client.post(
-                    f"/api/deerflow/threads/{THREAD_ID}/runs/stream",
+                    f"/api/bocomadp/v1/threads/{THREAD_ID}/runs/stream",
                     json=payload,
                     headers={"X-User-ID": USER_ID},
                 )
@@ -266,7 +266,7 @@ def test_join_run_stream_echoes_human_messages() -> None:
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test") as client:
                 resp = await client.get(
-                    f"/api/deerflow/threads/{THREAD_ID}/runs/ghost-run/stream",
+                    f"/api/bocomadp/v1/threads/{THREAD_ID}/runs/ghost-run/stream",
                     headers={"X-User-ID": USER_ID},
                 )
                 return _parse_sse(resp.text) if resp.status_code == 200 else []

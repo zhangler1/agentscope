@@ -15,7 +15,7 @@
 
 ## 核心特性
 
-- **DeerFlow 风格 SSE**（`deerflow/`）：`/api/threads/{tid}/runs/*` 四端点（stream / wait / join / cancel），事件/数据/id 帧 + 心跳 + Last-Event-ID 断线续传，执行引擎复用原生 `ChatService`
+- **threads/runs 对话接口（SSE）**（`deerflow/`）：`/api/bocomadp/v1/threads/{tid}/runs/*` 四端点（stream / wait / join / cancel），事件/数据/id 帧 + 心跳 + Last-Event-ID 断线续传，执行引擎复用原生 `ChatService`
 - **SSE 协议与翻译**（`deerflow/protocol.py` + `formatter.py`）：AgentScope 事件 → deer-flow 事件（metadata/messages/custom/error/end）
 - **请求级运行时配置**（`custom_params`）：空间码强制覆盖 / custom_prompt 整体替换 / 检索开关 / 认证方案（guwp/jrt/okic/muwp），随 run 请求注入并落盘回退，详见 [custom_params.md](./custom_params.md)
 - **会话与凭证自动供给**：`_prepare_session_for_run` 懒建会话；模型凭证按 `deerflow-<user_id>-<provider_id>` 幂等写入 credential 存储（id 带 user_id 维度，避免 SQL 存储全局主键跨用户冲突）；模型解析链无 ProviderManager / active 切换，解析失败直接返回 None 由原生 404 兜底（详见模型层.md）
@@ -43,7 +43,7 @@ examples/agent_service/
 │   │   ├── logging_config.py            # TraceContextFilter + JsonTraceFormatter
 │   │   └── trace_middleware.py          # ASGI TraceMiddleware (X-Trace-Id)
 │   │
-│   ├── deerflow/                        # DeerFlow 风格 SSE
+│   ├── deerflow/                        # threads/runs 对话接口（SSE）
 │   │   ├── protocol.py                   # 帧序列化（event/data/id + 心跳 + end 哨兵）
 │   │   ├── formatter.py                  # AgentScope 事件 → deer-flow 事件翻译
 │   │   ├── bridge.py                     # MessageBus 回放 + 订阅（断线续传）
@@ -365,10 +365,10 @@ app.include_router(orders_router)
 8. **挂载自定义路由** — health / stats / deerflow / ellm_models / platform_health / agent_tools / session_usage / uploads 等
 9. **企业扩展接入** — `extra_agent_middlewares`（审计）、`extra_agent_tools`（企业工具）
 
-### DeerFlow 风格 SSE 链路
+### threads/runs 对话链路
 
 ```
-POST /api/threads/{tid}/runs/stream
+POST /api/bocomadp/v1/threads/{tid}/runs/stream
   → _prepare_session_for_run（懒建会话 + 模型凭证自动供给：deerflow-<user_id>-<provider_id>）
   → custom_params 解析（带值落盘 workspace / 不带值回退加载）
   → RunManager 记账（409 并发拒绝）→ 原生 ChatService.run(run_id=...) 后台任务

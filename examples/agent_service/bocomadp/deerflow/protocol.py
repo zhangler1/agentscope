@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DeerFlow 风格 SSE 协议原语（唯一接触"帧格式"的文件）。
+"""threads/runs 对话接口的 SSE 协议原语（唯一接触"帧格式"的文件）。
 
 对齐 deer-flow 2.0 源码协议事实：
 

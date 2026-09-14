@@ -95,7 +95,7 @@ def test_delete_thread_removes_session() -> None:
     run_manager = FakeRunManager()
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
         response = client.delete(
-            "/api/deerflow/threads/t1",
+            "/api/bocomadp/v1/threads/t1",
             headers={"X-User-ID": "default"},
         )
 
@@ -115,7 +115,7 @@ def test_delete_thread_interrupts_active_run() -> None:
     run_manager = FakeRunManager(active_record=record)
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
         response = client.delete(
-            "/api/deerflow/threads/t1",
+            "/api/bocomadp/v1/threads/t1",
             headers={"X-User-ID": "default"},
         )
 
@@ -133,7 +133,7 @@ def test_delete_thread_skips_interrupt_without_active_run() -> None:
     run_manager = FakeRunManager(active_record=None)
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
         response = client.delete(
-            "/api/deerflow/threads/t1",
+            "/api/bocomadp/v1/threads/t1",
             headers={"X-User-ID": "default"},
         )
 
@@ -150,7 +150,7 @@ def test_delete_thread_idempotent_when_missing() -> None:
     run_manager = FakeRunManager()
     with TestClient(_make_app(storage, chat_service, run_manager)) as client:
         response = client.delete(
-            "/api/deerflow/threads/ghost",
+            "/api/bocomadp/v1/threads/ghost",
             headers={"X-User-ID": "default"},
         )
 

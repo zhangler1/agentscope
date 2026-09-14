@@ -86,7 +86,7 @@ def _make_app(storage: FakeStorage) -> FastAPI:
 
 def _search(client: TestClient, body: dict[str, Any]) -> list[dict[str, Any]]:
     response = client.post(
-        "/api/deerflow/threads/search",
+        "/api/bocomadp/v1/threads/search",
         json=body,
         headers={"X-User-ID": "user-1"},
     )
