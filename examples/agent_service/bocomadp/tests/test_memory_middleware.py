@@ -9,6 +9,7 @@ from agentscope.state import AgentState
 
 from bocomadp.memory.middleware import MemoryMiddleware
 from bocomadp.memory.state import (
+    ACTIVE_ZSET,
     clear_extract_state,
     encode_member,
     incr_turn,
@@ -118,11 +119,11 @@ def test_trigger_once_until_lock_released(fake_redis):
         trigger=_trigger,
     )
     for _ in range(3):
-        _run(mw._record_turn(None))
+        _run(mw._record_turn(None, "问题"))
     assert hits == [3]
     for _ in range(3):
         # 第 6 轮也达阈值但提取锁仍占用（extractor 尚未清理）→ 不重复触发
-        _run(mw._record_turn(None))
+        _run(mw._record_turn(None, "问题"))
     assert hits == [3]
     assert lock_key("u", "a", "s1") in fake_redis._strings
 
@@ -147,6 +148,36 @@ def test_trigger_next_batch_after_extract_cleanup(fake_redis):
         trigger=_trigger,
     )
     for _ in range(6):
-        _run(mw._record_turn(None))
+        _run(mw._record_turn(None, "问题"))
     # 每满 3 轮触发一次；turns 清零后重新计数，故两次触发值均为 update_rounds
     assert hits == [3, 3]
+
+
+def test_record_turn_ignores_non_user_continuation(fake_redis):
+    """需求 4：工具确认 / resume 续轮不计轮，只有用户输入轮推进计数。"""
+    hits = []
+
+    async def _trigger(turns):
+        hits.append(turns)
+
+    mw = MemoryMiddleware(
+        "u",
+        "a",
+        "s1",
+        MemoryConfig(update_rounds=2),
+        None,
+        redis=fake_redis,
+        trigger=_trigger,
+    )
+
+    # 3 次“非用户输入”的续轮：心跳刷新，但不计数、不触发
+    for _ in range(3):
+        _run(mw._record_turn(None, ""))
+    assert hits == []
+    assert _run(fake_redis.get(turns_key("u", "a", "s1"))) is None
+    assert _run(fake_redis.zscore(ACTIVE_ZSET, "u:a:s1")) is not None  # 心跳仍刷新
+
+    # 用户输入轮才计数：第 2 轮触发
+    _run(mw._record_turn(None, "问题1"))
+    _run(mw._record_turn(None, "问题2"))
+    assert hits == [2]

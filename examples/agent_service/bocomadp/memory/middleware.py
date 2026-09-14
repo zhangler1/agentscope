@@ -117,7 +117,7 @@ class MemoryMiddleware(MiddlewareBase):
             completed = True
         finally:
             if completed:
-                await self._record_turn(agent)
+                await self._record_turn(agent, query)
 
     def _can_retrieve(self) -> bool:
         """记忆开关开启 且（已有 caller 走平台 或 注入检索回调）。"""
@@ -202,8 +202,13 @@ class MemoryMiddleware(MiddlewareBase):
         state = getattr(agent, "state", None)
         return getattr(state, "reply_id", "-") or "-"
 
-    async def _record_turn(self, agent: Any) -> None:
-        """回复正常完成：心跳 + 轮数 +1，达阈值抢锁触发提取。"""
+    async def _record_turn(self, agent: Any, user_query: str) -> None:
+        """回复正常完成：心跳 +（仅用户输入轮）轮数 +1，达阈值抢锁触发提取。
+
+        ``user_query`` 为空表示本轮**不是用户消息发起的**（工具确认、外部
+        执行结果、resume 续轮等），只刷新心跳、不计轮也不触发——``update_rounds``
+        统计的是“用户交互轮数”，续轮计入会让轮次虚高并撑大后续取数窗口。
+        """
         reply_id = self._reply_id(agent)
         if self._redis is None:
             return
@@ -214,6 +219,8 @@ class MemoryMiddleware(MiddlewareBase):
                 self.agent_id,
                 self.session_id,
             )
+            if not user_query:
+                return
             turns = await incr_turn(
                 self._redis,
                 self.user_id,

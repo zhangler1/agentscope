@@ -67,7 +67,12 @@ CONFIGS: list[dict] = [
             "default_memory_prompt": "全局记忆配置",
             "idle_minutes": 1,
             "sweep_interval_seconds": 5,
-            "max_tokens": 90000
+            "max_tokens": 90000,
+            # 记忆运行时状态保留天数：静默扫描器据此修剪超龄会话——
+            # 最后活跃距今达到该天数的会话，其 active_sessions 成员 /
+            # 轮数计数 / 提取游标一并清除（视为遗忘，下次对话从 1 重新计数）。
+            # 这几个 key 本身不设 Redis TTL，清理完全依赖扫描器。
+            "state_ttl_days": 7
         },
     },
 ]

@@ -40,6 +40,21 @@ class MemoryRuntimeConfig(BaseModel):
         ge=1,
         description="单会话单次提取送入模型的 token 预算（超长按字节/4 截断）。",
     )
+    state_ttl_days: int = Field(
+        default=7,
+        ge=1,
+        description=(
+            "记忆运行时状态保留天数：静默扫描器据此修剪超龄会话——最后活跃"
+            "距今达到该天数的会话，其 active_sessions 成员 / 轮数计数 / 提取"
+            "游标一并清除（视为遗忘，下次对话从 1 重新计数、重建游标）。"
+            "这些 key 本身不设 Redis TTL。"
+        ),
+    )
+
+    @property
+    def state_ttl_secs(self) -> int:
+        """超龄修剪窗口（秒）——由 :attr:`state_ttl_days` 换算，供扫描器使用。"""
+        return self.state_ttl_days * 86400
 
 
 async def get_memory_runtime_config() -> MemoryRuntimeConfig:

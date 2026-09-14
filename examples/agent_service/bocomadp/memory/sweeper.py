@@ -19,6 +19,7 @@ from bocomadp.memory.state import (
     ACTIVE_ZSET,
     lock_key,
     parse_member,
+    purge_session_state,
     try_acquire_lock,
     turns_key,
 )
@@ -66,8 +67,11 @@ class MemorySweeper:
         非配置归属者的会话。
         """
         idle_seconds = rt_cfg.idle_minutes * 60
+        # 超龄保留窗口：与 turns/cursor 的 Redis TTL 同一口径（state_ttl_days）
+        retention_secs = rt_cfg.state_ttl_secs
         now = time.time()
         attempts = 0
+        purged = 0
 
         # agent_id → 启用配置（供按 agent 校验；不携带归属者 user）
         enabled: dict[str, Any] = {}
@@ -79,10 +83,12 @@ class MemorySweeper:
             return 0
 
         try:
+            # 只取「已静默」的成员：范围下推到 Redis（score = 最后活跃时间），
+            # 正在对话的成员根本不传输、不遍历。
             members = await self._redis.zrangebyscore(
                 ACTIVE_ZSET,
                 "-inf",
-                "+inf",
+                now - idle_seconds,
                 withscores=True,
             )
         except Exception:  # noqa: BLE001 — 活跃集读失败本轮跳过
@@ -94,11 +100,28 @@ class MemorySweeper:
                 user_id, agent_id, session_id = parse_member(member)
             except ValueError:
                 continue  # 旧格式/异常成员，忽略
+            # 超龄（最后活跃距今超过保留窗口）→ 逐会话清空运行时状态并跳过：
+            # 该会话按「遗忘」处理，下次对话从 1 重新计数、重建游标。
+            # 只清 Redis 运行时状态，不动 DB 消息与平台已保存的记忆内容。
+            if (now - float(last_score)) >= retention_secs:
+                try:
+                    await purge_session_state(
+                        self._redis,
+                        user_id,
+                        agent_id,
+                        session_id,
+                    )
+                    purged += 1
+                except Exception:  # noqa: BLE001 — 单会话清理失败不影响本轮
+                    logger.exception(
+                        "memory: purge stale session=%s failed",
+                        session_id,
+                    )
+                continue
             cfg = enabled.get(agent_id)
             if cfg is None:
                 continue  # 该 agent 未开启记忆
-            if (now - float(last_score)) < idle_seconds:
-                continue  # 静默窗口内仍活跃
+            # （静默判断已下推到上面的 zrangebyscore 范围，此处无需再判）
             try:
                 turns_raw = await self._redis.get(
                     turns_key(user_id, agent_id, session_id),
@@ -133,6 +156,8 @@ class MemorySweeper:
                     session_id,
                 )
                 await self._redis.delete(lock_key(user_id, agent_id, session_id))
+        if purged:
+            logger.info("memory: purged %d stale session states", purged)
         return attempts
 
 
