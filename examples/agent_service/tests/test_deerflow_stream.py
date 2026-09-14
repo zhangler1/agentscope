@@ -90,6 +90,14 @@ class FakeWorkspaceManager:
         return "ws-test"
 
 
+class FakeAccess:
+    """resource_access_service 依赖最小实现（绑定凭证兑底解析）。"""
+
+    async def resolve_credential(self, user_id: str, credential_id: str):
+        del user_id, credential_id
+        return None
+
+
 class FakeChatService:
     """spawn 后以真实 run_id 发布 REPLY_START + REPLY_END。
 
@@ -167,6 +175,7 @@ def _make_app(
     api.state.chat_run_registry = registry
     api.state.storage = storage
     api.state.workspace_manager = FakeWorkspaceManager()
+    api.state.resource_access_service = FakeAccess()
     api.include_router(deerflow_router)
     app = FastAPI()
     app.mount("/api", api)
@@ -185,7 +194,7 @@ def _parse_sse(text: str) -> list[tuple[str, str]]:
     return events
 
 
-def test_create_run_stream_echoes_human_message_first() -> None:
+def test_create_run_stream_echoes_human_message_first(monkeypatch) -> None:
     """SSE 首帧为 human messages 事件（id 非空），先于 metadata/end。
 
     后台任务（FakeChatService.run）以端点生成的真实 run_id 发布
@@ -195,6 +204,16 @@ def test_create_run_stream_echoes_human_message_first() -> None:
     的 receive 等 response_complete，中途 break 会造成死锁（真实 uvicorn
     无此限制）。
     """
+    # agent_credential 无绑定 → 回退旧链路（避免测试真查数据库）
+    async def _no_binding(agent_id: str):
+        del agent_id
+        return None
+
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_agent_credential_id",
+        _no_binding,
+    )
+
     mgr = RunManager()
 
     async def scenario() -> list[tuple[str, str]]:
