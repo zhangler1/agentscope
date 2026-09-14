@@ -122,57 +122,6 @@ class TestListTopLevel:
         # 团队成员被藏起来——顶层是"个人工作台"，不是"团队名册"
         assert member_id not in ids
 
-    def test_top_level_keeps_invited_members(self, client):
-        """邀请成员（invited）不是自建成员，顶层列表必须可见。
-
-        区分两种成员身份：
-        - parent_agent_id 创建 → self_built → 顶层隐藏
-        - 普通 agent 被邀请进团队 → invited → 顶层可见
-        曾踩过坑：agent.py 顶层过滤用 team.members 把 invited 也藏了，
-        违反"子智能体不展示只对自建成员成立"（回归）。本用例锁死。
-        """
-        leader_id = _create_leader(client)
-        invited_id = _create_member(client, leader_id, name="invited-plain")
-        # 不挂 parent：这个普通 agent 本身在顶层可见；
-        # 邀请硬校验要求 invitable=true 且描述非空，否则邀请返回 422。
-        plain = client.post(
-            "/agent/",
-            json={
-                "name": "plain-invitee",
-                "invite_config": {
-                    "invitable": True,
-                    "invite_description": "可被邀请的普通成员",
-                },
-            },
-            headers=HEADERS,
-        )
-        assert plain.status_code == 201
-        plain_id = plain.json()["agent_id"]
-
-        # 把普通 agent 邀请进团队（变成 invited 成员）
-        resp = client.post(
-            f"/agent/{leader_id}/team/members",
-            json={"agent_id": plain_id},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 200
-        cfg = resp.json()
-        member_ids = {m["agent_id"] for m in cfg["members"]}
-        assert member_ids == {invited_id, plain_id}
-        # 身份区分：parent 创建的是 self_built，邀请进来的是 invited
-        by_id = {m["agent_id"]: m["is_self_built"] for m in cfg["members"]}
-        assert by_id[invited_id] is True
-        assert by_id[plain_id] is False
-
-        top = client.get("/agent/", headers=HEADERS)
-        assert top.status_code == 200
-        ids = {a["id"] for a in top.json()["agents"]}
-        # leader + 邀请成员（invited）都在顶层
-        assert leader_id in ids
-        assert plain_id in ids
-        # 只有自建成员被藏
-        assert invited_id not in ids
-
     def test_top_level_empty_without_agents(self, client):
         resp = client.get("/agent/", headers=HEADERS)
         assert resp.status_code == 200
@@ -316,121 +265,13 @@ class TestPagination:
         )
 
 
-class TestInvitableGate:
-    """invitable 邀请门禁 + 列表过滤（对应 e2e_invitable_gate.ps1 六步验证）。
+class TestSelfBuiltMemberInvitable:
+    """自建成员的 invitable 开关（运行时团长 AgentInvite 借调的前置条件）。
 
-    与 `e2e_invitable_gate.ps1` 覆盖同一组行为，但用 TestClient + 真 SQLite，
-    在 CI 可重复执行：
-    - GET /agent/?invitable=true|false 过滤
-    - 邀请 / 批量保存时的硬校验（不可邀请 → 422 且不写入花名册）
-    - 自建成员自动 invitable=true 且描述非空（团长运行时才能借调）
+    邀请功能已移除（专家团成员只能由 parent_agent_id 自建、独属于本团），
+    但自建成员创建时仍自动 invitable=true 且描述非空，否则团长运行时
+    无法用 AgentInvite 拉起该成员。这里锁死该自动行为。
     """
-
-    def _create_invitable(self, client, name: str) -> str:
-        resp = client.post(
-            "/agent/",
-            json={
-                "name": name,
-                "invite_config": {
-                    "invitable": True,
-                    "invite_description": f"{name} 的能力介绍",
-                },
-            },
-            headers=HEADERS,
-        )
-        assert resp.status_code == 201
-        return resp.json()["agent_id"]
-
-    def test_filter_invitable_true_only(self, client):
-        inv_a = self._create_invitable(client, "inv-a")
-        inv_b = self._create_invitable(client, "inv-b")
-        # 不传 invite_config → 默认 invitable=false
-        plain_a = _create_leader(client)
-        plain_b = _create_leader(client)
-
-        resp = client.get("/agent/?invitable=true", headers=HEADERS)
-        assert resp.status_code == 200
-        ids = {a["id"] for a in resp.json()["agents"]}
-        assert inv_a in ids and inv_b in ids
-        assert plain_a not in ids and plain_b not in ids
-
-    def test_filter_invitable_false_only(self, client):
-        inv_a = self._create_invitable(client, "inv-a")
-        plain_a = _create_leader(client)
-        plain_b = _create_leader(client)
-
-        resp = client.get("/agent/?invitable=false", headers=HEADERS)
-        assert resp.status_code == 200
-        ids = {a["id"] for a in resp.json()["agents"]}
-        assert plain_a in ids and plain_b in ids
-        assert inv_a not in ids
-
-    def test_no_filter_returns_all(self, client):
-        inv_a = self._create_invitable(client, "inv-a")
-        plain_a = _create_leader(client)
-
-        resp = client.get("/agent/", headers=HEADERS)
-        assert resp.status_code == 200
-        ids = {a["id"] for a in resp.json()["agents"]}
-        assert inv_a in ids and plain_a in ids
-
-    def test_invite_rejects_non_invitable(self, client):
-        leader_id = _create_leader(client)
-        plain_id = _create_leader(client)  # 默认不可邀请
-
-        resp = client.post(
-            f"/agent/{leader_id}/team/members",
-            json={"agent_id": plain_id},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-        # 拒绝时不得写入花名册
-        cfg = client.get(f"/agent/{leader_id}/team/config", headers=HEADERS)
-        assert cfg.status_code == 200
-        assert {m["agent_id"] for m in cfg.json()["members"]} == set()
-
-    def test_invite_ok_when_invitable(self, client):
-        leader_id = _create_leader(client)
-        inv_id = self._create_invitable(client, "inv-guest")
-
-        resp = client.post(
-            f"/agent/{leader_id}/team/members",
-            json={"agent_id": inv_id},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 200
-        member_ids = {m["agent_id"] for m in resp.json()["members"]}
-        assert inv_id in member_ids
-
-    def test_team_config_rejects_non_invitable(self, client):
-        leader_id = _create_leader(client)
-        inv_id = self._create_invitable(client, "inv-guest")
-        plain_id = _create_leader(client)
-
-        resp = client.put(
-            f"/agent/{leader_id}/team/config",
-            json={"member_ids": [inv_id, plain_id]},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 422
-        # 整批拦截：只要有一个不可邀请，一个都不写入
-        cfg = client.get(f"/agent/{leader_id}/team/config", headers=HEADERS)
-        assert cfg.status_code == 200
-        assert cfg.json()["members"] == []
-
-    def test_team_config_ok_all_invitable(self, client):
-        leader_id = _create_leader(client)
-        inv_a = self._create_invitable(client, "inv-a")
-        inv_b = self._create_invitable(client, "inv-b")
-
-        resp = client.put(
-            f"/agent/{leader_id}/team/config",
-            json={"member_ids": [inv_a, inv_b]},
-            headers=HEADERS,
-        )
-        assert resp.status_code == 200
-        member_ids = {m["agent_id"] for m in resp.json()["members"]}
-        assert member_ids == {inv_a, inv_b}
 
     def test_self_built_member_auto_invitable(self, client):
         """自建成员创建后自动 invitable=true 且描述非空（团长可借调）。"""

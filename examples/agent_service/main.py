@@ -116,7 +116,7 @@ from agentscope.app._router._agent import (
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
 # 统一注册，本文件无需 import 或 include；框架 chat_router(POST /chat/) 与
-# deerflow_router(POST /deerflow/threads/...) 路径不同，互不冲突。
+# deerflow_router(POST /bocomadp/v1/threads/...) 路径不同，互不冲突。
 from bocomadp.mcp import McpRegistry
 from bocomadp.skills import ExternalSkillHub
 from bocomadp.skills.bocom_skill_hub import BocomSkillHub
@@ -1067,7 +1067,8 @@ app.include_router(agent_credential_router)
 # /api 前缀，nginx / vite 代理均不剥前缀直接透传）：
 #   内置 /chat、/agent...        → /api/chat、/api/agent...
 #   bocomadp /agents、/files...  → /api/agents、/api/files...
-#   deerflow /deerflow/threads、/deerflow/v1/auth → /api/deerflow/threads...
+#   threads 协议 /bocomadp/v1/threads → /api/bocomadp/v1/threads；deer-flow 前端桩
+#   /deerflow/v1/auth → /api/deerflow/v1/auth（兼容保留）
 
 
 @asynccontextmanager

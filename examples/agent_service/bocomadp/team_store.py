@@ -9,9 +9,9 @@
 表语义（一行 = 一个 leader 的团队档案）:
 
 - ``user_id`` + ``leader_agent_id`` 联合主键（谁的档案室、哪张团长名片）
-- ``members``: 成员名册，每条带 ``relation`` 标记
-  - ``self_built`` 自建（团长创建的子 agent，leader 删除时级联删）
-  - ``invited``   外邀（引用别人的 agent，只摘链接不删人）
+- ``members``: 成员名册，每条带 ``relation`` 标记（方案 B 下恒为
+  ``self_built``，不再有外邀 / 引用类型）—— ``self_built`` 自建（团长创建的
+  子 agent，独属于本团，leader 删除时级联删）。
 - ``handoff_relations``: 交接序（workflow 模式的严格交接链）
 - ``collaboration_mode``: ``free_handoff``（自由交接）| ``workflow``（固定流程）
 
@@ -44,11 +44,16 @@ class HandoffRelation(BaseModel):
     description: str = ""
 
 
-MemberRelation = Literal["self_built", "invited"]
+# 方案 B：专家团成员只能由 ``parent_agent_id`` 自建，``relation`` 恒为
+# ``self_built``；外邀 / 引用类型（历史上的 ``invited``）已彻底移除。
+MemberRelation = Literal["self_built"]
 
 
 class ExpertTeamMember(BaseModel):
-    """名册条目；``relation`` 说明这个成员是怎么进来的。"""
+    """名册条目；``relation`` 标记成员的来源。
+
+    方案 B 下只会是 ``self_built``（自建、独属于本团），外邀类型已移除。
+    """
 
     agent_id: str
     relation: MemberRelation = "self_built"
@@ -70,11 +75,11 @@ class ExpertTeamRelation(BaseModel):
 
     @property
     def member_ids(self) -> list[str]:
-        """所有成员 id（自建 + 外邀）。"""
+        """所有成员 id（方案 B 下均为自建）。"""
         return [m.agent_id for m in self.members]
 
     def relation_of(self, agent_id: str) -> MemberRelation | None:
-        """某个成员的自建/外邀标记；不是成员返回 None。"""
+        """某个成员的来源标记；不是成员返回 None。"""
         for m in self.members:
             if m.agent_id == agent_id:
                 return m.relation

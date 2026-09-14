@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""DeerFlow 风格 SSE 路由（threads/runs 资源模型）。
+"""threads/runs 对话接口的 SSE 路由（threads/runs 资源模型）。
 
 对齐 deer-flow 2.0 ``backend/app/gateway/routers/thread_runs.py`` 的 4 个
 端点，但执行引擎复用原生 ``ChatService``（配置与原生 ``/chat/`` 完全
 一致——agent 构建、模型、工具、审计中间件、HITL 全部同源）：
 
-- ``POST /api/deerflow/threads/{tid}/runs/stream``  创建 run + SSE 流式
-- ``POST /api/deerflow/threads/{tid}/runs/wait``    创建 run + 阻塞至完成
-- ``GET  /api/deerflow/threads/{tid}/runs/{rid}/stream``  join 已有 run（回放 + live）
-- ``POST /api/deerflow/threads/{tid}/runs/{rid}/cancel``  取消（映射原生 session 级 interrupt）
+- ``POST /api/bocomadp/v1/threads/{tid}/runs/stream``  创建 run + SSE 流式
+- ``POST /api/bocomadp/v1/threads/{tid}/runs/wait``    创建 run + 阻塞至完成
+- ``GET  /api/bocomadp/v1/threads/{tid}/runs/{rid}/stream``  join 已有 run（回放 + live）
+- ``POST /api/bocomadp/v1/threads/{tid}/runs/{rid}/cancel``  取消（映射原生 session 级 interrupt）
 
 设计要点（方案决策①④⑤）：
 
@@ -35,11 +35,12 @@ from pydantic import BaseModel, Field
 from agentscope.app.deps import (
     get_chat_run_registry,
     get_chat_service,
+    get_resource_access_service,
     get_storage,
     get_workspace_manager,
 )
 from agentscope.app._manager import ChatRunRegistry
-from agentscope.app._service import ChatService
+from agentscope.app._service import ChatService, ResourceAccessService
 from agentscope.app.storage import (
     ChatModelConfig,
     CredentialRecord,
@@ -64,6 +65,7 @@ from bocomadp.credential.ellm import ELLMCredential
 from bocomadp.logging.trace_context import run_id_context
 from bocomadp.open_agent_access import get_agent_global
 from bocomadp.workspace._shared_pvc import NON_ADP_WORKSPACE_PREFIX
+from bocomadp.routers.agent_credential import get_agent_credential_id
 from bocomadp.routers.uploads import download_urls_to_session
 
 from ..bridge import BusBridge
@@ -112,6 +114,10 @@ logger = logging.getLogger(__name__)
 
 # LangGraph 消息 type → 原生 Msg.role（前端 SDK 固定发 human）。
 _ROLE_MAP = {"human": "user", "ai": "assistant", "system": "system"}
+
+#: 绑定凭证允许的凭证 type（与 session_usage.ELLM_CREDENTIAL_TYPE 同值，
+#: 此处独立定义避免 deerflow 路由 import 会话路由）。
+_ELLM_CREDENTIAL_TYPE = "bocom_ellm_credential"
 
 
 class _HumanInputResponseMarker:
@@ -288,10 +294,10 @@ async def _load_human_chunks(
         return []
     return [_msg_to_human_chunk(m) for m in messages if m.role == "user"]
 
-deerflow_router = APIRouter(prefix="/deerflow/threads", tags=["deerflow"])
+deerflow_router = APIRouter(prefix="/bocomadp/v1/threads", tags=["threads"])
 
 # 注意：本路由挂载在 main.py 的 /api 子应用下，对外路径为
-# /api/deerflow/threads/...；deer-flow 前端旧路径 /api/threads/... 由
+# /api/bocomadp/v1/threads/...；deer-flow 前端旧路径 /api/threads/... 由
 # nginx 网关 rewrite 兼容。
 
 
@@ -588,20 +594,133 @@ def _pick_fallback_entry() -> ModelEntry | None:
     )
 
 
-async def _resolve_chat_model_config(
+async def _resolve_bound_credential(
     storage: StorageBase,
+    access: ResourceAccessService,
     user_id: str,
+    credential_id: str,
+) -> CredentialRecord | None:
+    """解析绑定凭证的原始记录；找不到返回 ``None``。
+
+    与 ``session_usage._resolve_bound_credential`` 语义一致：先按严格
+    归属查（``storage.get_credential``），miss 再退到
+    ``access.resolve_credential``（own / 共享；本仓给该方法打了
+    「全局兜底」补丁，因此绑定在智能体上的、属于别人的凭证也能解析到）。
+    """
+    record = await storage.get_credential(user_id, credential_id)
+    if record is not None:
+        return record
+    try:
+        return await access.resolve_credential(user_id, credential_id)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+    return None
+
+
+async def _resolve_bound_chat_model_config(
+    storage: StorageBase,
+    access: ResourceAccessService,
+    user_id: str,
+    agent_id: str,
+    credential_id: str,
     model_name: str = "",
 ) -> ChatModelConfig | None:
-    """把请求解析为原生 ChatModelConfig（凭证来自用户凭证表）。
+    """按 ``agent_credential`` 绑定的凭证解析模型配置（绑定优先契约）。
 
-    凭证选择（新契约，一凭证多模型，不考虑 B 方案）：
+    对齐 ``session_usage._build_bound_chat_model_config`` 的新契约，差异
+    只在 model / parameters 的来源（deerflow 的模型名来自请求
+    ``llm_model_name``，parameters 来自内置条目）：
 
-    - ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
+    1. 解析绑定凭证（严格归属 → 共享 / 全局兜底），不可解析 → 404；
+    2. 校验其 ``data["type"]`` 必须是 ``bocom_ellm_credential``（否则 400）；
+    3. model：``model_name`` 非空一律透传 → 回退凭证 model → 内置条目
+       model_name（与旧链路回退顺序一致）；
+    4. parameters：内置条目中与凭证 type 匹配条目的 parameters（无匹配
+       则空）。
+    """
+    record = await _resolve_bound_credential(
+        storage,
+        access,
+        user_id,
+        credential_id,
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Credential {credential_id!r} bound to agent "
+                f"{agent_id!r} is not found or not resolvable."
+            ),
+        )
+    bound_type = (record.data or {}).get("type")
+    if bound_type != _ELLM_CREDENTIAL_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Credential {credential_id!r} is type {bound_type!r}, "
+                f"not {_ELLM_CREDENTIAL_TYPE!r}."
+            ),
+        )
+    try:
+        credential = CredentialFactory.from_dict(dict(record.data or {}))
+    except Exception:  # noqa: BLE001 —— 损坏凭证不可解析
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Credential {credential_id!r} bound to agent "
+                f"{agent_id!r} failed to deserialize."
+            ),
+        ) from None
+
+    credential_type = getattr(credential, "type", None) or bound_type
+    # ── 模型名：model_name 一律透传；缺失回退凭证 model → 条目 ──
+    entry = _entry_for_credential_type(credential_type)
+    model = model_name
+    if not model:
+        bound = getattr(credential, "model", None)
+        if bound:
+            model = str(bound)
+    if not model and entry is not None:
+        model = entry.model_name or entry.provider_id
+    if not model:
+        logger.warning(
+            "deerflow: bound credential %s has no model name resolved "
+            "(model_name=%r); config unresolved.",
+            credential_id,
+            model_name,
+        )
+        return None
+
+    parameters = dict(entry.parameters or {}) if entry is not None else {}
+    return ChatModelConfig(
+        type=credential_type,
+        credential_id=credential_id,
+        model=model,
+        parameters=parameters,
+    )
+
+
+async def _resolve_chat_model_config(
+    storage: StorageBase,
+    access: ResourceAccessService,
+    user_id: str,
+    agent_id: str,
+    model_name: str = "",
+) -> ChatModelConfig | None:
+    """把请求解析为原生 ChatModelConfig（凭证来自 agent 绑定或用户凭证表）。
+
+    凭证选择（新契约：绑定优先，无绑定回退旧链路）：
+
+    - ``agent_credential`` 表有该 agent 的绑定 → 严格走绑定凭证
+      （:func:`_resolve_bound_chat_model_config`：不可解析 404、
+      非 ELLM 400）；
+    - 无绑定 → 旧链路三级兜底：
+      ``list_credentials(user_id)`` 挑选：type 可反序列化过滤、ELLM
       优先、id 稳定排序取第一个；
-    - 用户凭证为空 → default 用户凭证同规则挑选，复制参数入库为
+      用户凭证为空 → default 用户凭证同规则挑选，复制参数入库为
       用户维度凭证后引用（复制保留 api_key / scene_code 等元数据）；
-    - 再空 → 回退内置条目参数创建（第一条可反序列化条目；api_key
+      再空 → 回退内置条目参数创建（第一条可反序列化条目；api_key
       空且非 ELLM 视为不可用）。
 
     模型名：``model_name`` 非空一律直接透传（凭证不绑定模型，
@@ -610,6 +729,18 @@ async def _resolve_chat_model_config(
     parameters 取内置条目中与凭证 type 匹配条目的 parameters（无匹配
     则空）。
     """
+    # ── 绑定优先：agent_credential 有绑定 → 严格走绑定凭证 ──
+    bound_credential_id = await get_agent_credential_id(agent_id)
+    if bound_credential_id:
+        return await _resolve_bound_chat_model_config(
+            storage,
+            access,
+            user_id,
+            agent_id,
+            bound_credential_id,
+            model_name,
+        )
+    # ── 无绑定 → 回退旧链路（用户凭证挑选 → default 复制 → 内置条目）──
     # ── 凭证选择 ──
     record: CredentialRecord | None = None
     # 用户凭证表挑选：ELLM 优先、id 稳定排序取第一个
@@ -755,6 +886,7 @@ async def _resolve_chat_model_config(
 async def _prepare_session_for_run(
     storage: StorageBase,
     workspace_manager,
+    access: ResourceAccessService,
     user_id: str,
     agent_id: str,
     session_id: str,
@@ -766,8 +898,9 @@ async def _prepare_session_for_run(
     本函数保证这一前置条件：
 
     - 会话不存在 → 创建：分配 workspace_id（与原生 /session/ 创建路径
-      一致）+ 按凭证表解析模型配置（_resolve_chat_model_config：凭证表
-      挑选 → default 复制 → 内置条目创建；解析失败返回 None）；
+      一致）+ 按凭证解析模型配置（_resolve_chat_model_config：
+      agent_credential 绑定优先，无绑定回退凭证表挑选 → default 复制 →
+      内置条目创建；解析失败返回 None）；
     - 会话存在但缺配置 → 回填解析出的配置；
     - 会话存在、本次显式携带模型名（``model_name`` 非空）且解析出的
       (type, credential_id, model) 与现状不一致 → 更新（per-run 模型
@@ -787,7 +920,9 @@ async def _prepare_session_for_run(
         return
     model_config = await _resolve_chat_model_config(
         storage,
+        access,
         user_id,
+        agent_id,
         model_name,
     )
     if existing is not None:
@@ -1294,7 +1429,7 @@ def _streaming_response(
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             # LangGraph SDK 用正则从该头提取 run id（对齐 deer-flow）。
-            "Content-Location": f"/api/deerflow/threads/{thread_id}/runs/{run_id}",
+            "Content-Location": f"/api/bocomadp/v1/threads/{thread_id}/runs/{run_id}",
         },
     )
 
@@ -1354,6 +1489,7 @@ async def create_run_stream(
     chat_run_registry: ChatRunRegistry = Depends(get_chat_run_registry),
     storage: StorageBase = Depends(get_storage),
     workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
+    access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> StreamingResponse:
     """创建 run（后台任务 = 原生 ChatService.run）并立即 SSE 流式。
 
@@ -1380,6 +1516,7 @@ async def create_run_stream(
     await _prepare_session_for_run(
         storage,
         workspace_manager,
+        access,
         user_id,
         agent_id,
         session_id,
@@ -1523,6 +1660,7 @@ async def create_run_wait(
     chat_run_registry: ChatRunRegistry = Depends(get_chat_run_registry),
     storage: StorageBase = Depends(get_storage),
     workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
+    access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> dict[str, Any]:
     """创建 run 并阻塞至后台任务完成，返回 run 终态。"""
     session_id = _resolve_session_id(thread_id, body)
@@ -1541,6 +1679,7 @@ async def create_run_wait(
     await _prepare_session_for_run(
         storage,
         workspace_manager,
+        access,
         user_id,
         agent_id,
         session_id,
