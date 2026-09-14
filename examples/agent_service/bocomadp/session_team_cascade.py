@@ -6,11 +6,7 @@ A leader agent may carry a persistent expert-team config
 ``parent_agent_id``). When the leader is deleted we must:
 
 - self-built members (``parent_agent_id == agent_id``) -> cascade-delete
-  them (they exist only under this team);
-- invited/referenced members (present in some leader's ``member_ids`` but
-  not owned by this leader) -> only detach them from that leader's
-  ``member_ids`` / ``handoff_relations`` (the underlying agent record is
-  preserved, matching the permission-isolation rule).
+  them (they exist only under this team, exclusive to it under scheme B).
 
 This is expert-team policy, so instead of living inside the framework's
 :class:`SessionService` we wrap ``delete_agent`` from the plugin layer.
@@ -54,8 +50,11 @@ async def _delete_agent_with_cascade(
                 await self.delete_agent(user_id, mid)
         await team_store.delete_team(self._storage, user_id, agent_id)
 
-    # Detach this agent from any leader that references it (invited
-    # member case). Team rosters live in ``expert_team_relations`` now.
+    # Unbind this agent from any team roster that references it. Under
+    # scheme B a member is always self-built and belongs to exactly one
+    # leader; this fires when the member is deleted *directly* (not via
+    # its leader's cascade) so its leader's roster + handoffs are cleaned
+    # up. Team rosters live in ``expert_team_relations`` now.
     for other_team in await team_store.list_teams(self._storage, user_id):
         if other_team.leader_agent_id == agent_id:
             continue
