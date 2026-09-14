@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""DeerFlow 风格 SSE 适配包（bocomadp/deerflow）。
+"""threads/runs 对话接口的 SSE 适配包（bocomadp/deerflow）。
 
 基于原生 chat 链路（``ChatService`` + ``MessageBus``）新增的 deer-flow 2.0
-（LangGraph Platform）风格 SSE 路由适配层：
+（LangGraph Platform）协议对齐 SSE 路由适配层：
 
 - :mod:`~bocomadp.deerflow.protocol`   协议数据类与帧序列化（唯一接触帧格式的文件）
 - :mod:`~bocomadp.deerflow.formatter`  AgentEvent dict → StreamEvent 翻译

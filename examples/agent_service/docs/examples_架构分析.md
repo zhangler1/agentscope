@@ -88,7 +88,7 @@ from agentscope.rag import QdrantStore
 bocomadp/
 ├── config/      配置：base(公共加载层) / app_config(唯一 schema) / audit_config
 ├── logging/     trace_context(ContextVar) + trace_middleware(ASGI) + formatter
-├── deerflow/    ★ DeerFlow 风格 SSE：protocol / formatter / bridge / runs /
+├── deerflow/    ★ threads/runs 对话接口（SSE）：protocol / formatter / bridge / runs /
 │                custom_params / auth_context / deps / routers(threads + chat + auth_stub)
 ├── providers/   ELLM 协议适配与 key 生命周期（ellm_chat_model / ellm_key / _models）
 ├── credential/  自定义凭证类型（ELLMCredential 等）
