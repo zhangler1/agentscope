@@ -89,6 +89,7 @@ from ..custom_params import (
     set_custom_params,
 )
 from ..run_context import (
+    RUN_CONTEXT_KEYS,
     extract_run_context,
     load_run_context,
     reset_run_context,
@@ -221,12 +222,12 @@ def _convert_input(raw: Any) -> Any:
 
 
 def _attach_files_metadata(input_msg: Any, files: list | None) -> None:
-    """把 ``custom_params.files`` 附加到 human 消息的 metadata。
+    """把 ``context.files`` 附加到 human 消息的 metadata。
 
     UploadsMiddleware 从 human 消息的 ``metadata.files``（或旧版
     ``additional_kwargs.files``）提取文件引用并渲染 ``<context name="files">``；
     而 deerflow 兼容路径的消息转换（:func:`_langgraph_message_to_msg`）会丢弃
-    ``additional_kwargs``，故文件引用改经 ``custom_params.files`` 透传，在此统一
+    ``additional_kwargs``，故文件引用改经 ``context.files`` 透传，在此统一
     挂载到 ``Msg.metadata``，与原生 ``/chat/`` 路径的注入通道对齐。事件类输入
     （确认卡片 / 外部结果续跑，Case B）无新文件，跳过。
     """
@@ -320,6 +321,11 @@ class CreateRunRequest(BaseModel):
     - ``session_id`` 必填且必须等于 thread_id；deer-flow 扩展参数
       （``stream_mode`` / ``multitask_strategy``）接受但忽略——本方案
       固定流模式与 reject 并发策略（裁剪项 1/2）。
+    - ``context`` 为请求级参数容器（对齐 deer-flow context overrides，
+      原顶层 ``custom_params`` 与根路径 5 键并入此字段）：原生白名单
+      key（model_name / mode / thinking_enabled / reasoning_effort /
+      is_plan_mode / subagent_enabled）与项目扩展 key（llm_model_name /
+      files / additional_urls 等）统一在 context 下传递。
     """
 
     agent_id: str = Field(
@@ -361,37 +367,16 @@ class CreateRunRequest(BaseModel):
         description="客户端断线后行为：cancel 立即中断 run（默认，对齐 "
         "deer-flow）；continue 仅断开订阅、run 继续执行。",
     )
-    custom_params: dict[str, Any] | None = Field(
-        default=None,
-        description="请求级自定义参数（空间码等），注入后台 run 任务，"
-        "由工具中间件强制覆盖模型传参。",
-    )
-    reasoning_effort: str | None = Field(
-        default=None,
-        description="请求级 run 配置（根路径）：推理强度，如 low/medium/high。",
-    )
-    thinking_enabled: bool | None = Field(
-        default=None,
-        description="请求级 run 配置（根路径）：是否启用模型思考模式。",
-    )
-    is_plan_mode: bool | None = Field(
-        default=None,
-        description="请求级 run 配置（根路径）：是否规划模式（静默接受，不使用）。",
-    )
-    subagent_enabled: bool | None = Field(
-        default=None,
-        description="请求级 run 配置（根路径）：是否启用子智能体（静默接受，不使用）。",
-    )
-    mode: str | None = Field(
-        default=None,
-        description="请求级 run 配置（根路径）：运行模式（静默接受，不使用）。",
-    )
     context: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "LangGraph SDK 固定携带的 context（前端 overrides）。"
-            "接受但忽略：原生 ChatRequest 无请求级配置通道，模型名"
-            "改由 custom_params.llm_model_name 传递。"
+            "请求级参数容器（对齐 deer-flow context overrides）。"
+            "原生白名单 key：model_name / mode / thinking_enabled / "
+            "reasoning_effort / is_plan_mode / subagent_enabled（其中 "
+            "thinking_enabled / reasoning_effort 由模型构建层消费，其余 "
+            "静默接受）；本项目扩展 key（原顶层 custom_params 内容）："
+            "llm_model_name（模型名，优先于 model_name）、files、"
+            "additional_urls、tools_param 等。"
         ),
     )
     config: dict[str, Any] | None = Field(
@@ -425,19 +410,22 @@ def _resolve_session_id(thread_id: str, body: CreateRunRequest) -> str:
 
 
 def _resolve_requested_model_name(
-    custom_params: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> str:
-    """解析请求级模型名（单一通道：custom_params.llm_model_name）。
+    """解析请求级模型名（context 通道：llm_model_name 优先，model_name 回退）。
 
-    对齐 deer-flow lead_agent 的 runtime_model_name。调用方保证传入
-    ELLM 需要的模型名，本函数不做校验/映射，直接信任。原生
-    ChatRequest 无请求级模型名通道，context / config 等 LangGraph
-    SDK 字段不再作为模型名来源（接受但忽略）。
+    ``context.llm_model_name`` 为本项目扩展 key（原 custom_params），
+    优先；``context.model_name`` 对齐 deer-flow 原生白名单 key，作为
+    回退通道。调用方保证传入 ELLM 需要的模型名，本函数不做校验/映射，
+    直接信任。原生 ChatRequest 无请求级模型名通道，``config`` 等
+    LangGraph SDK 字段不再作为模型名来源（接受但忽略）。
 
-    缺失返回空串（调用方回退全局 active provider / config.yaml
-    条目解析）。
+    缺失返回空串（调用方回退绑定凭证 model / config.yaml 条目解析）。
     """
-    value = (custom_params or {}).get("llm_model_name")
+    params = context or {}
+    value = params.get("llm_model_name")
+    if not value:
+        value = params.get("model_name")
     return str(value).strip() if value else ""
 
 
@@ -1006,16 +994,45 @@ async def _prepare_session_for_run(
     )
 
 
+def _split_request_context(
+    context: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """把合并后的 ``context`` 拆回两个内部通道。
+
+    ``context`` 为请求级参数容器（对齐 deer-flow context overrides）：
+    原生白名单 key（model_name / mode / thinking_enabled /
+    reasoning_effort / is_plan_mode / subagent_enabled）与项目扩展 key
+    （llm_model_name / files / additional_urls / tools_param 等）统一在
+    context 下传递。返回 ``(custom_params_part, run_context_part)``：
+
+    - ``run_context_part`` = 根路径 5 键（mode / reasoning_effort /
+      thinking_enabled / is_plan_mode / subagent_enabled），经
+      :mod:`..run_context` ContextVar 注入；
+    - ``custom_params_part`` = context 去除根路径 5 键后的剩余内容
+      （含 model_name / llm_model_name / files / additional_urls 等），
+      经 :mod:`..custom_params` ContextVar 注入；为空返回 None（触发
+      Redis 回退加载语义）。
+    """
+    run_context = extract_run_context(context)
+    params = {
+        k: v
+        for k, v in (context or {}).items()
+        if k not in RUN_CONTEXT_KEYS
+    }
+    return params or None, run_context
+
+
 async def _resolve_custom_params(
     session_id: str,
     requested: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """解析本次 run 的 custom_params（Redis 存储版）。
 
-    请求携带 custom_params → 写入 Redis（按 session_id，TTL 4h 原生过期）
-    并直接采用；未携带 → 从 Redis 回退加载（HITL 确认续跑等场景空间码
-    约束持续生效）。Redis 不可用 fail-open（返回空 dict 不阻断 run）；
-    多 worker 实例共享同一 Redis，回退加载不 miss。
+    请求携带 context（拆分后的 custom_params 部分）→ 写入 Redis（按
+    session_id，TTL 4h 原生过期）并直接采用；未携带 → 从 Redis 回退加载
+    （HITL 确认续跑等场景空间码约束持续生效）。Redis 不可用 fail-open
+    （返回空 dict 不阻断 run）；多 worker 实例共享同一 Redis，回退加载
+    不 miss。
     """
     if requested is not None:
         await save_custom_params(session_id, requested)
@@ -1050,22 +1067,22 @@ async def _download_additional_urls(
     storage: StorageBase,
     workspace_manager: WorkspaceManagerBase,
 ) -> None:
-    """下载 custom_params.additional_urls 到会话 uploads 目录（仅副作用）。
+    """下载 context.additional_urls 到会话 uploads 目录（仅副作用）。
 
-    ``custom_params: {additional_urls: ["http://.../a.png", ...]}`` 中的
+    ``context: {additional_urls: ["http://.../a.png", ...]}`` 中的
     地址是 OSS / HTTP(S) 直链，需在 run 启动前下载并保存到会话 uploads
     目录（与 ``POST /files/upload`` 同链路：落盘 + 图片 base64 / 文档
     .md + uploads DB 记录，下游工具与 ``<context name="files">`` 立即可见）。
 
-    本函数不改变任何参数：custom_params（含 additional_urls）由调用方
-    原样交给 ``_resolve_custom_params`` **整体落盘** ``custom_params.json``，
-    便于事后查看历史传参。下载仅在请求显式携带 additional_urls 时触发
-    一次；回退加载路径（请求未携带时从落盘文件恢复）不会再次触发下载，
-    故持久化不会导致重复下载。
+    本函数不改变任何参数：context（含 additional_urls）由调用方按通道
+    拆分后交给 ``_resolve_custom_params`` 整体落盘，便于事后查看历史
+    传参。下载仅在请求显式携带 additional_urls 时触发一次；回退加载
+    路径（请求未携带时从落盘文件恢复）不会再次触发下载，故持久化
+    不会导致重复下载。
     """
-    if not body.custom_params or not body.custom_params.get("additional_urls"):
+    if not body.context or not body.context.get("additional_urls"):
         return
-    raw = body.custom_params.get("additional_urls")
+    raw = body.context.get("additional_urls")
     urls = (
         [u.strip() for u in raw if isinstance(u, str) and u.strip()]
         if isinstance(raw, list)
@@ -1505,14 +1522,14 @@ async def create_run_stream(
         _resolve_agent_id(body),
     )
     converted = _convert_input(body.input)
-    # 文件引用经 custom_params.files 透传：附加到 human 消息 metadata，
+    # 文件引用经 context.files 透传：附加到 human 消息 metadata，
     # 供 UploadsMiddleware 注入 <context name="files">（_langgraph_message_to_msg
     # 丢弃 additional_kwargs，无法走消息内通道）。
-    _attach_files_metadata(converted, (body.custom_params or {}).get("files"))
-    # 请求级模型名（custom_params.llm_model_name，唯一通道），在
-    # custom_params 落盘/回退之前解析——首次建会话时 workspace 尚不存在，
-    # 直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
-    model_name = _resolve_requested_model_name(body.custom_params)
+    _attach_files_metadata(converted, (body.context or {}).get("files"))
+    # 请求级模型名（context.llm_model_name 优先，context.model_name
+    # 回退），在 context 落盘/回退之前解析——首次建会话时 workspace
+    # 尚不存在，直接用请求携带值即可（对齐 deer-flow 每轮携带语义）。
+    model_name = _resolve_requested_model_name(body.context)
     await _prepare_session_for_run(
         storage,
         workspace_manager,
@@ -1573,10 +1590,10 @@ async def create_run_stream(
     else:
         input_msg = converted
         human_chunks = _collect_human_chunks(input_msg)
-    # spawn 前处理 custom_params：请求携带 additional_urls 时先下载到
-    # 会话 uploads 目录；随后 custom_params（含 additional_urls）整体
-    # 落盘到 custom_params.json（便于查看历史传参），未携带则从会话
-    # workspace 回退加载，reset 不影响已创建的后台 run 任务。
+    # spawn 前处理 context：请求携带 additional_urls 时先下载到会话
+    # uploads 目录；随后 context 按通道拆分（根路径 5 键 → run_context，
+    # 其余 → custom_params）分别落盘/回退加载，reset 不影响已创建的
+    # 后台 run 任务。
     await _download_additional_urls(
         body,
         user_id,
@@ -1585,15 +1602,15 @@ async def create_run_stream(
         storage,
         workspace_manager,
     )
+    custom_params_part, run_context = _split_request_context(body.context)
     resolved_params = await _resolve_custom_params(
         session_id,
-        body.custom_params,
+        custom_params_part,
     )
     ctx_token = set_custom_params(resolved_params)
-    # 请求级 run 配置（请求体根路径 5 键）：与 custom_params 并列的独立
-    # 通道，经 ContextVar 注入后台 run 任务；spawn 后 reset（create_task
-    # 已复制上下文快照，reset 不影响后台任务）。
-    run_context = extract_run_context(body.model_dump())
+    # 请求级 run 配置（context 内根路径 5 键）：经 ContextVar 注入后台
+    # run 任务；spawn 后 reset（create_task 已复制上下文快照，reset
+    # 不影响后台任务）。
     if "mode" in run_context:
         logger.debug(
             "deerflow: request.mode=%r accepted but ignored",
@@ -1670,12 +1687,11 @@ async def create_run_wait(
         _resolve_agent_id(body),
     )
     input_msg = _convert_input(body.input)
-    # 同 create_run_stream：custom_params.files 附加到 human 消息 metadata，
+    # 同 create_run_stream：context.files 附加到 human 消息 metadata，
     # 供 UploadsMiddleware 注入 <context name="files">。
-    _attach_files_metadata(input_msg, (body.custom_params or {}).get("files"))
-    # 同 create_run_stream：先解析请求级模型名（custom_params 唯一通道）
-    # 再懒建会话。
-    model_name = _resolve_requested_model_name(body.custom_params)
+    _attach_files_metadata(input_msg, (body.context or {}).get("files"))
+    # 同 create_run_stream：先解析请求级模型名（context 通道）再懒建会话。
+    model_name = _resolve_requested_model_name(body.context)
     await _prepare_session_for_run(
         storage,
         workspace_manager,
@@ -1686,10 +1702,9 @@ async def create_run_wait(
         model_name,
     )
     # 同 create_run_stream：请求携带 additional_urls 时先下载到会话
-    # uploads 目录；随后 custom_params（含 additional_urls）整体落盘
-    # 到 custom_params.json（便于查看历史传参），未携带则从会话
-    # workspace 回退加载，reset 不影响已创建的后台 run 任务
-    # （create_task 复制 ContextVar 上下文）。
+    # uploads 目录；随后 context 按通道拆分（根路径 5 键 → run_context，
+    # 其余 → custom_params）分别落盘/回退加载，reset 不影响已创建的
+    # 后台 run 任务（create_task 复制 ContextVar 上下文）。
     await _download_additional_urls(
         body,
         user_id,
@@ -1698,11 +1713,22 @@ async def create_run_wait(
         storage,
         workspace_manager,
     )
+    custom_params_part, run_context = _split_request_context(body.context)
     resolved_params = await _resolve_custom_params(
         session_id,
-        body.custom_params,
+        custom_params_part,
     )
     ctx_token = set_custom_params(resolved_params)
+    if "mode" in run_context:
+        logger.debug(
+            "deerflow: request.mode=%r accepted but ignored",
+            run_context["mode"],
+        )
+    resolved_run_context = await _resolve_run_context(
+        session_id,
+        run_context or None,
+    )
+    rc_token = set_run_context(resolved_run_context)
     auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
         record, task = _spawn_run(
@@ -1717,6 +1743,7 @@ async def create_run_wait(
     finally:
         _reset_run_auth_contexts(auth_tokens)
         reset_custom_params(ctx_token)
+        reset_run_context(rc_token)
     try:
         await task
     except asyncio.CancelledError:

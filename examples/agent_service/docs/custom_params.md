@@ -6,7 +6,7 @@
 
 ## 1. 一句话概述
 
-`custom_params` 是一条**请求级运行时配置通道**：前端在 `POST /threads/{thread_id}/runs/stream`（或 `/runs/wait`）请求体里携带一个 JSON 对象，框架把它注入到该次 run 的后台任务上下文中，供**工具中间件、Agent 中间件、工具构建工厂**在 run 任务内读取，从而在**不重启服务、不改配置、不侵入 Agent 代码**的前提下，按请求动态控制：
+`custom_params` 是一条**请求级运行时配置通道**：前端在 `POST /api/bocomadp/v1/threads/{thread_id}/runs/stream`（或 `/runs/wait`）请求体的 `context` 容器里携带一个 JSON 对象，框架把它注入到该次 run 的后台任务上下文中，供**工具中间件、Agent 中间件、工具构建工厂**在 run 任务内读取，从而在**不重启服务、不改配置、不侵入 Agent 代码**的前提下，按请求动态控制：
 
 - 空间码检索参数（强制覆盖模型传参）
 - 自定义提示词（custom_prompt）
@@ -17,7 +17,12 @@
 
 ## 2. 背景：为什么需要 custom_params
 
-deer-flow 的 `run/stream` 接口原生支持 `custom_params` 请求体字段，前端可以随每次请求动态下发运行时配置。bocomadp 沿用了这一接口形态（`deerflow/` 目录本身就是 deer-flow 风格的兼容层），但早期实现中这些参数"传了没人消费"。
+deer-flow 的 `run/stream` 接口通过请求体 `context` 字段支持请求级覆盖
+（context overrides，白名单 key：`model_name` / `thinking_enabled` /
+`reasoning_effort` / `mode` / `is_plan_mode` / `subagent_enabled`）。
+bocomadp 沿用了这一接口形态（`deerflow/` 目录本身就是 deer-flow 风格的
+兼容层），并把项目扩展参数（空间码等，原顶层 `custom_params` 内容）也
+并入 `context` 传递，但早期实现中这些参数"传了没人消费"。
 
 核心矛盾在于 **AgentScope 的 Agent 是请求处理开始后才在框架内部组装的**，业务侧拿不到 deer-flow 那种"agent 构建时注入"的钩子：
 
@@ -32,17 +37,18 @@ bocomadp 的解法是**把"构建时参数"转化为"运行时参数"**：用 Co
 ## 3. 整体架构：数据流全景
 
 ```
-前端 POST /threads/{id}/runs/stream
-  body.custom_params = {"space_code_list": ["S1"], "custom_prompt": "...",
-                        "vector_search_switch": true, "guwp_token": "..."}
+前端 POST /api/bocomadp/v1/threads/{id}/runs/stream
+  body.context = {"space_code_list": ["S1"], "custom_prompt": "...",
+                  "vector_search_switch": true, "guwp_token": "..."}
         │
         ▼
 deerflow_chat.py  路由层（FastAPI 端点）
-  1) _resolve_custom_params()   ← 带值：写入 Redis；不带：从 Redis 回退
-  2) set_custom_params()        ← ContextVar.set(resolved)
-  3) _set_run_auth_contexts()   ← ResolvedAuth + save_auth(Redis) + _current_token 联动
-  4) _spawn_run()               ← asyncio.create_task 复制当前 ContextVar 快照
-  5) reset（不影响已创建的后台任务）
+  1) _split_request_context()  ← 根路径 5 键 → run_context，其余 → custom_params
+  2) _resolve_custom_params()  ← 带值：写入 Redis；不带：从 Redis 回退
+  3) set_custom_params()        ← ContextVar.set(resolved)
+  4) _set_run_auth_contexts()   ← ResolvedAuth + save_auth(Redis) + _current_token 联动
+  5) _spawn_run()               ← asyncio.create_task 复制当前 ContextVar 快照
+  6) reset（不影响已创建的后台任务）
         │
         ▼  run 任务内（ContextVar 已复制进来）
   ┌─────────────────────────────────────────────────────────────┐
@@ -398,23 +404,23 @@ curl -s http://localhost:8000/healthz
 
 **接口约定**（写 curl 前先了解）：
 
-- 路径：`POST /api/threads/{thread_id}/runs/stream`（SSE 流式）；`POST /api/threads/{thread_id}/runs/wait`（阻塞至完成）。
+- 路径：`POST /api/bocomadp/v1/threads/{thread_id}/runs/stream`（SSE 流式）；`POST /api/bocomadp/v1/threads/{thread_id}/runs/wait`（阻塞至完成）。
 - **thread_id == session_id**（同一资源），首次请求自动建会话（`_prepare_session_for_run`），无需预先创建。
 - 鉴权：`X-User-ID` 请求头**可选**，缺省 `"default"`（单租户本地部署）。
 - `input` 兼容 LangGraph SDK 形态：`{"type": "human", "content": "..."}` 或 `{"messages": [...]}`。
-- `custom_params` 放在请求体顶层，为任意 JSON 对象。
+- 项目扩展参数放在请求体 `context` 容器里（根路径 5 键 `mode` / `reasoning_effort` / `thinking_enabled` / `is_plan_mode` / `subagent_enabled` 与其余 key 按通道拆分），为任意 JSON 对象。
 - **观察方式**：SSE 输出看 curl 终端；注入/覆盖日志看 **uvicorn 服务端终端**。
 
-### 12.1 首次带 custom_params 请求（Redis 写入 + 提示词注入）
+### 12.1 首次带 context 请求（Redis 写入 + 提示词注入）
 
 ```bash
-curl -N -X POST http://localhost:8000/api/threads/t-verify-1/runs/stream \
+curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-1/runs/stream \
   -H 'Content-Type: application/json' \
   -H 'X-User-ID: tester' \
   -d '{
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "你好，介绍一下你自己"},
-    "custom_params": {
+    "context": {
       "space_code_list": ["SP0000001"],
       "team_space_code_list": ["TEAM01"],
       "user_code": "U001",
@@ -434,10 +440,10 @@ CustomPromptMiddleware: custom_prompt overrides system prompt (was N chars, now 
 
 > `SpacecodeOverride:` 覆盖日志**仅在模型实际调用 cross_search（行内搜索）工具时出现**——先随便聊一轮确认服务连通，再用 12.3 的提问触发检索工具。
 
-### 12.2 同一 thread 不带 custom_params（回退加载）
+### 12.2 同一 thread 不带 context（回退加载）
 
 ```bash
-curl -N -X POST http://localhost:8000/api/threads/t-verify-1/runs/stream \
+curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-1/runs/stream \
   -H 'Content-Type: application/json' \
   -H 'X-User-ID: tester' \
   -d '{
@@ -446,20 +452,20 @@ curl -N -X POST http://localhost:8000/api/threads/t-verify-1/runs/stream \
   }'
 ```
 
-**预期**：请求体没有 custom_params，但 `CustomPromptMiddleware: custom_prompt overrides system prompt` 仍出现——证明参数从 Redis（按 session_id）回退加载成功。
+**预期**：请求体没有 context，但 `CustomPromptMiddleware: custom_prompt overrides system prompt` 仍出现——证明参数从 Redis（按 session_id）回退加载成功。
 
 ### 12.3 触发检索工具验证空间码覆盖
 
 提问方向明确指向知识检索（引导模型调用 cross_search 工具）：
 
 ```bash
-curl -N -X POST http://localhost:8000/api/threads/t-verify-2/runs/stream \
+curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-2/runs/stream \
   -H 'Content-Type: application/json' \
   -H 'X-User-ID: tester' \
   -d '{
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "请用 cross_search 工具检索“新员工入职流程”，并告诉我结果"},
-    "custom_params": {
+    "context": {
       "space_code_list": ["SP0000001"],
       "user_code": "U001"
     }
@@ -480,28 +486,28 @@ SpacecodeOverride: user_code ... -> 'U001'
 对**同一个 thread**（t-verify-2）换 `user_code` 再请求，然后回到 12.2 观察回退值：
 
 ```bash
-curl -s -X POST http://localhost:8000/api/threads/t-verify-2/runs/wait \
+curl -s -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-2/runs/wait \
   -H 'Content-Type: application/json' \
   -H 'X-User-ID: tester' \
   -d '{
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "你好"},
-    "custom_params": {"user_code": "U002", "space_code_list": ["SP0000002"]}
+    "context": {"user_code": "U002", "space_code_list": ["SP0000002"]}
   }'
 ```
 
-**预期**：Redis 记录被整体覆盖（HSET 更新，非合并）；此后不带 custom_params 的请求回退到的就是 `U002 / SP0000002`。
+**预期**：Redis 记录被整体覆盖（HSET 更新，非合并）；此后不带 context 的请求回退到的就是 `U002 / SP0000002`。
 
 ### 12.5 检索开关：vector_search_switch=false
 
 ```bash
-curl -N -X POST http://localhost:8000/api/threads/t-verify-3/runs/stream \
+curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-3/runs/stream \
   -H 'Content-Type: application/json' \
   -H 'X-User-ID: tester' \
   -d '{
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "请用 cross_search 工具检索“差旅报销流程”"},
-    "custom_params": {"vector_search_switch": false}
+    "context": {"vector_search_switch": false}
   }'
 ```
 
@@ -516,13 +522,13 @@ enterprise tools: vector_search disabled by vector_search_switch=false (session=
 ### 12.6 检索开关：personal_search_switch=true + 空间参数齐备
 
 ```bash
-curl -N -X POST http://localhost:8000/api/threads/t-verify-4/runs/stream \
+curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-4/runs/stream \
   -H 'Content-Type: application/json' \
   -H 'X-User-ID: tester' \
   -d '{
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "请在个人知识库中检索“组织架构”"},
-    "custom_params": {
+    "context": {
       "personal_search_switch": true,
       "tools_param": {
         "personalKnowledgeSearch": {
@@ -552,8 +558,9 @@ redis-cli hgetall 'bocomadp:session:t-verify-2:custom_params'
 redis-cli ttl 'bocomadp:session:t-verify-2:custom_params'   # 剩余 TTL（<4h）
 ```
 
-> key 语义：`bocomadp:session:{session_id}:custom_params`，hash 字段 `params`（custom_params）
-> 与 `auth`（ResolvedAuth）同 key 同 TTL（4h 原生过期）。Redis 不可用时 save/load 均
+> key 语义：`bocomadp:session:{session_id}:custom_params`，hash 字段 `params`（custom_params
+> 部分，即 context 去除根路径 5 键后的剩余内容）与 `run_context`（根路径 5 键）以及
+> `auth`（ResolvedAuth）同 key 同 TTL（4h 原生过期）。Redis 不可用时 save/load 均
 > fail-open 降级，不阻断 run。
 
 ### 12.8 验证 checklist

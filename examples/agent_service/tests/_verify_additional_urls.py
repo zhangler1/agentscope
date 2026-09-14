@@ -257,7 +257,7 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
         body = CreateRunRequest(
             agent_id="a1",
             session_id="s1",
-            custom_params={
+            context={
                 "additional_urls": [
                     " http://oss/a.png ",
                     123,
@@ -273,7 +273,7 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
                     body, "u1", "a1", "s1", FakeStorage(), FakeWorkspaceManager(),
                 )
             )
-        # URL 清洗 + 仅副作用：返回 None（custom_params 含 additional_urls
+        # URL 清洗 + 仅副作用：返回 None（context 含 additional_urls
         # 整体由 _resolve_custom_params 落盘，便于查看历史传参）
         self.assertEqual(
             seen["urls"], ["http://oss/a.png", "http://oss/b.txt"]
@@ -288,7 +288,7 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
 
         params = {"lang": "zh"}
         body = CreateRunRequest(
-            agent_id="a1", session_id="s1", custom_params=params,
+            agent_id="a1", session_id="s1", context=params,
         )
         with patch.object(chat_mod, "download_urls_to_session", new=fake_download):
             result = run(
@@ -297,7 +297,7 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
                 )
             )
         # 未携带 additional_urls：不触发下载（落盘由 _resolve_custom_params
-        # 对 body.custom_params 整体完成）
+        # 对拆分后的 context 整体完成）
         self.assertIsNone(result)
 
 
