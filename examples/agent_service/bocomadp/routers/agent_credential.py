@@ -121,6 +121,16 @@ async def _fetch_one(agent_id: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+async def get_agent_credential_id(agent_id: str) -> str | None:
+    """按 ``agent_id`` 读取绑定的 ``credential_id``（无绑定返回 ``None``）。
+
+    供其他路由复用（例如创建会话时按智能体自动注入凭证），避免在别处
+    重复这张表的表名/列名。
+    """
+    row = await _fetch_one(agent_id)
+    return row["credential_id"] if row is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -333,4 +343,4 @@ async def delete_agent_credential(
     return {"deleted": True, "agent_id": agent_id}
 
 
-__all__ = ["agent_credential_router"]
+__all__ = ["agent_credential_router", "get_agent_credential_id"]
