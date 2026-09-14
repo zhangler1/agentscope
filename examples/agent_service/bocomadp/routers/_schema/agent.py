@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Request / response schemas for the BocomADP agent router (expert team)."""
 import warnings
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
@@ -111,6 +112,37 @@ class ListAgentsResponse(BaseModel):
 
     agents: list[TeamAgentView] = Field(description="Agent records.")
     total: int = Field(description="Total number of agents.")
+
+
+class OwnedAgentView(BaseModel):
+    """一条"我名下拥有"的智能体视图（``GET /agent/owned``）。
+
+    与 ``GET /agent/``（可见性视图：自己的 + 别人共享给我的 + 隐藏
+    自建成员）不同，本视图是**纯归属清单**：只含 ``user_id=调用者``
+    且 ``source='user'`` 的记录——共享进来的别人的智能体不出现，
+    ``source='team'`` 的派生 worker 也不出现。
+    """
+
+    id: str = Field(description="智能体 id。")
+    name: str = Field(description="智能体名称。")
+    is_team: bool = Field(default=False, description="是否专家团团长。")
+    parent_agent_id: str | None = Field(
+        default=None,
+        description="作为自建成员挂在其名下的团长 id；非团队成员为 null。",
+    )
+    is_self_built: bool | None = Field(
+        default=None,
+        description="是否某团长的自建成员；非成员场景为 null。",
+    )
+    created_at: datetime | None = Field(default=None, description="创建时间。")
+    updated_at: datetime | None = Field(default=None, description="最后更新时间。")
+
+
+class ListOwnedAgentsResponse(BaseModel):
+    """Response body for ``GET /agent/owned``."""
+
+    agents: list[OwnedAgentView] = Field(description="本人名下智能体列表。")
+    total: int = Field(description="总数（分页前）。")
 
 
 class AgentSchemaResponse(BaseModel):

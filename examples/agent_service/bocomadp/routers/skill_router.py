@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
@@ -27,8 +28,17 @@ from agentscope.app.storage import StorageBase
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 
 from ..skills._schema import AgentSkillsListResponse, SkillActionResponse, SkillInfo
+from ..skills._skillhub_auth import (
+    OA_SEPARATOR,
+    build_auth_token,
+    skillhub_platform,
+)
 
 skill_router = APIRouter(prefix="/workspace", tags=["skill-external"])
+
+#: AES 凭证的有效期（秒）。上游登录接口按 5 分钟判定，且凭证明文含时间戳，
+#: 因此必须「用前现造」，不可缓存（见 ``skills/_skillhub_auth`` 模块说明）。
+AES_TOKEN_TTL_SECONDS = 300
 
 
 def _raise_remote_error(payload: dict) -> None:
@@ -140,6 +150,71 @@ async def _session_used_names(
             e,
         )
         return set()
+
+
+@skill_router.get(
+    "/skillhub/aes-token",
+    summary="Get SkillHub AES credential",
+    description=(
+        "Locally generate the SkillHub third-party login credential "
+        "(identical algorithm to the frontend ``lib/skillhub/token.ts``):\n"
+        "``key = <Beijing date YYYYMMDD>(8) + <SKILLHUB_CHANNEL_RAND>(8)``,"
+        " ``token = hex(AES-128-ECB/PKCS7(\"{oa}#{13-digit ms timestamp}\"))``.\n"
+        "``oa`` defaults to the ``X-User-ID`` header. The credential is "
+        "only valid for ~5 minutes, so it is built on **every** call — "
+        "never cache it."
+    ),
+)
+async def get_skillhub_aes_token(
+    oa: str | None = Query(
+        default=None,
+        description="OA 账号；省略时取 X-User-ID 请求头",
+    ),
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    """本地生成 SkillHub 登录用的 AES 凭证（明文只含 OA 与毫秒时间戳）。
+
+    - ``oa`` 省略时取 ``X-User-ID``；为空 → 400，含分隔符 ``#`` → 422
+    - 密钥后 8 字节取 ``SKILLHUB_CHANNEL_RAND``（必须 8 个 ASCII 字符）；
+      长度不为 16 字节 → 500（配置错误，非调用方问题）
+    - 返回 ``{oa, token, platform, timestamp, expires_in}``：
+      ``token`` 直接作为登录请求体的 ``token``，``platform`` 即登录请求体的
+      ``platform`` 取值（``SKILLHUB_PLATFORM``），``timestamp`` 为明文里用到
+      的毫秒时间戳，``expires_in`` 为有效期秒数（仅供调用方判断是否过期）
+
+    ``token`` 含登录态语义、有效期约 5 分钟：**每次调用现造**，调用方拿到后
+    应立即使用，不要落库/缓存。
+    """
+    account = (oa or user_id).strip()
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An OA account is required: pass ?oa= or X-User-ID.",
+        )
+    if OA_SEPARATOR in account:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"OA account must not contain {OA_SEPARATOR!r}.",
+        )
+
+    # 密钥里的日期与明文里的时间戳共用同一个 ms 时间戳，避免跨零点不一致。
+    timestamp_ms = int(time.time() * 1000)
+    try:
+        token = build_auth_token(account, timestamp_ms=timestamp_ms)
+    except ValueError as e:
+        # OA 已在上面校验，此处只可能是密钥长度问题（channel rand 配置错）
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"SkillHub AES credential misconfigured: {e}",
+        ) from e
+
+    return {
+        "oa": account,
+        "token": token,
+        "platform": skillhub_platform(),
+        "timestamp": timestamp_ms,
+        "expires_in": AES_TOKEN_TTL_SECONDS,
+    }
 
 
 @skill_router.get(

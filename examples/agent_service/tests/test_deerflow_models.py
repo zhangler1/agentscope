@@ -15,6 +15,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+from fastapi import HTTPException, status
+
 from agentscope.app.storage import ChatModelConfig, SessionConfig
 from agentscope.app.storage._utils import _dump_with_secrets
 from agentscope.permission import PermissionMode
@@ -157,6 +160,36 @@ class FakeWorkspaceManager:
         return "ws-test"
 
 
+class FakeAccess:
+    """ResourceAccessService 的最小替身：resolve_credential 兑底。"""
+
+    def __init__(self, records: dict[tuple[str, str], Any] | None = None) -> None:
+        self.records = records or {}
+
+    async def resolve_credential(self, user_id: str, credential_id: str):
+        record = self.records.get((user_id, credential_id))
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="not resolvable",
+            )
+        return record
+
+
+async def _no_binding(agent_id: str):
+    """monkeypatch 目标：agent_credential 无绑定（回退旧链路）。"""
+    del agent_id
+    return None
+
+
+def _patch_no_binding(monkeypatch) -> None:
+    """旧链路测试统一用：patch get_agent_credential_id 返回 None。"""
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_agent_credential_id",
+        _no_binding,
+    )
+
+
 # ── _resolve_requested_model_name ─────────────────────────────────────
 
 
@@ -275,12 +308,15 @@ def test_resolve_chat_model_config_by_model_name(monkeypatch) -> None:
     条目创建用户凭证。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
 
     config = _run(
         _resolve_chat_model_config(
             storage,
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
             model_name="r1",
         ),
     )
@@ -295,12 +331,15 @@ def test_resolve_chat_model_config_by_provider_id(monkeypatch) -> None:
     """``model_name`` 非约定凭证 id（provider_id）：原样透传为模型名。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
 
     config = _run(
         _resolve_chat_model_config(
             storage,
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
             model_name="ds-r1",
         ),
     )
@@ -317,12 +356,15 @@ def test_resolve_chat_model_config_unmatched_falls_back_to_first_entry(
     可用内置条目创建（无 active provider 兜底）。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
 
     config = _run(
         _resolve_chat_model_config(
             storage,
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
             model_name="nope",
         ),
     )
@@ -338,6 +380,7 @@ def test_resolve_chat_model_config_reuses_user_credential(
     """用户维度凭证已存在：直接引用，不重新 upsert。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
     own_id = user_credential_id(USER_ID, "ds")
     storage.seed_credential(USER_ID, own_id, api_key="sk-custom")
@@ -345,7 +388,9 @@ def test_resolve_chat_model_config_reuses_user_credential(
     config = _run(
         _resolve_chat_model_config(
             storage,
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
         ),
     )
 
@@ -360,6 +405,7 @@ def test_resolve_chat_model_config_copies_from_default_credential(
     """用户凭证缺失：从 default 凭证复制参数入库后引用。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
     storage.seed_credential(
         DEFAULT_CREDENTIAL_OWNER,
@@ -370,7 +416,9 @@ def test_resolve_chat_model_config_copies_from_default_credential(
     config = _run(
         _resolve_chat_model_config(
             storage,
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
         ),
     )
 
@@ -388,12 +436,15 @@ def test_resolve_chat_model_config_falls_back_to_entry_without_default(
     """default 凭证亦缺失：回退内置条目参数创建用户凭证。"""
     entries = [_make_model_entry("ds", api_key="sk-entry")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
 
     config = _run(
         _resolve_chat_model_config(
             storage,
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
         ),
     )
 
@@ -409,13 +460,146 @@ def test_resolve_chat_model_config_unknown_entry_returns_none(
 ) -> None:
     """无凭证无条目：返回 None 不阻断（原生 404 兜底）。"""
     _patch_config_loader(monkeypatch, [])
+    _patch_no_binding(monkeypatch)
     config = _run(
         _resolve_chat_model_config(
             FakeStorage(),
+            FakeAccess(),
             USER_ID,
+            AGENT_ID,
         ),
     )
     assert config is None
+
+
+# ── _resolve_chat_model_config：绑定优先（agent_credential）──────────
+
+
+def _bound_ellm_data(
+    credential_id: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """ELLM 凭证 dump（type 判别字段 + 必填 api_key；model 可空）。"""
+    data: dict[str, Any] = {
+        "type": "bocom_ellm_credential",
+        "id": credential_id,
+        "name": "",
+        "api_key": "sk-ellm",
+    }
+    if model:
+        data["model"] = model
+    return data
+
+
+def _patch_binding(monkeypatch, credential_id: str | None) -> None:
+    """patch get_agent_credential_id 返回指定绑定。"""
+
+    async def _get(agent_id: str) -> str | None:
+        del agent_id
+        return credential_id
+
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_agent_credential_id",
+        _get,
+    )
+
+
+def test_resolve_chat_model_config_uses_bound_credential(monkeypatch) -> None:
+    """有绑定：严格走绑定凭证，model_name 透传、credential_id 取绑定值。"""
+    _patch_config_loader(monkeypatch, [_make_model_entry("ds")])
+    _patch_binding(monkeypatch, "cred-bound")
+    storage = FakeStorage()
+    storage.credentials[(USER_ID, "cred-bound")] = FakeCredential(
+        "cred-bound",
+        USER_ID,
+        _bound_ellm_data("cred-bound"),
+    )
+
+    config = _run(
+        _resolve_chat_model_config(
+            storage,
+            FakeAccess(),
+            USER_ID,
+            AGENT_ID,
+            model_name="deepseek-v4-flash",
+        ),
+    )
+
+    assert config is not None
+    assert config.type == "bocom_ellm_credential"
+    assert config.credential_id == "cred-bound"
+    assert config.model == "deepseek-v4-flash"
+    assert config.parameters == {}
+    assert (USER_ID, "cred-bound") not in storage.upsert_counts
+
+
+def test_resolve_chat_model_config_bound_falls_back_to_credential_model(
+    monkeypatch,
+) -> None:
+    """有绑定 + 请求未带模型名：model 回退凭证 model 字段。"""
+    _patch_config_loader(monkeypatch, [_make_model_entry("ds")])
+    _patch_binding(monkeypatch, "cred-bound")
+    storage = FakeStorage()
+    storage.credentials[(USER_ID, "cred-bound")] = FakeCredential(
+        "cred-bound",
+        USER_ID,
+        _bound_ellm_data("cred-bound", model="deepseek-v4-flash"),
+    )
+
+    config = _run(
+        _resolve_chat_model_config(
+            storage,
+            FakeAccess(),
+            USER_ID,
+            AGENT_ID,
+        ),
+    )
+
+    assert config is not None
+    assert config.model == "deepseek-v4-flash"
+
+
+def test_resolve_chat_model_config_bound_credential_missing_raises_404(
+    monkeypatch,
+) -> None:
+    """有绑定但凭证不可解析（严格归属 miss + access 404）→ 404。"""
+    _patch_config_loader(monkeypatch, [_make_model_entry("ds")])
+    _patch_binding(monkeypatch, "cred-gone")
+    storage = FakeStorage()
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run(
+            _resolve_chat_model_config(
+                storage,
+                FakeAccess(),
+                USER_ID,
+                AGENT_ID,
+                model_name="deepseek-v4-flash",
+            ),
+        )
+    assert exc_info.value.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_resolve_chat_model_config_bound_non_ellm_raises_400(
+    monkeypatch,
+) -> None:
+    """有绑定但凭证 type 非 ELLM（deepseek）→ 400。"""
+    _patch_config_loader(monkeypatch, [_make_model_entry("ds")])
+    _patch_binding(monkeypatch, "cred-deepseek")
+    storage = FakeStorage()
+    storage.seed_credential(USER_ID, "cred-deepseek")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run(
+            _resolve_chat_model_config(
+                storage,
+                FakeAccess(),
+                USER_ID,
+                AGENT_ID,
+                model_name="deepseek-chat",
+            ),
+        )
+    assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
 
 
 # ── _prepare_session_for_run ─────────────────────────────────────────
@@ -429,6 +613,7 @@ def _run_prepare_session(
         _prepare_session_for_run(
             storage,
             FakeWorkspaceManager(),
+            FakeAccess(),
             USER_ID,
             AGENT_ID,
             "s1",
@@ -447,6 +632,7 @@ def test_prepare_session_creates_with_backfilled_model_config(
     """首次创建：session 自动补齐 chat_model_config。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
 
     _run_prepare_session(storage)
@@ -463,6 +649,7 @@ def test_prepare_session_creates_with_default_permission_mode(
     """首次创建：permission_context.mode 取配置项 default_permission_mode。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     monkeypatch.setattr(
         "bocomadp.deerflow.routers.deerflow_chat.get_app_config",
         lambda: SimpleNamespace(
@@ -483,6 +670,7 @@ def test_prepare_session_preserves_state_when_race_created(
     """竞态防护：upsert 前会话已被并发请求建好时不再覆盖。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     monkeypatch.setattr(
         "bocomadp.deerflow.routers.deerflow_chat.get_app_config",
         lambda: SimpleNamespace(
@@ -520,6 +708,7 @@ def test_prepare_session_updates_config_on_model_switch(
     """模型切换（三元组不一致）：已有 session 的 config 被更新。"""
     entries = [_make_model_entry("ds"), _make_model_entry("ds-r1", "r1")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
     storage.sessions[_session_key()] = SimpleNamespace(
         config=SessionConfig(
@@ -547,6 +736,7 @@ def test_prepare_session_no_update_when_config_matches(monkeypatch) -> None:
     """一致三元组（HITL 续跑同 thread 模型名）：不触发更新。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
     storage.sessions[_session_key()] = SimpleNamespace(
         config=SessionConfig(
@@ -573,6 +763,7 @@ def test_prepare_session_backfills_missing_model_config(
     """已有 session 但 chat_model_config 为空：backfill。"""
     entries = [_make_model_entry("ds")]
     _patch_config_loader(monkeypatch, entries)
+    _patch_no_binding(monkeypatch)
     storage = FakeStorage()
     storage.sessions[_session_key()] = SimpleNamespace(
         config=SessionConfig(workspace_id="ws1"),
