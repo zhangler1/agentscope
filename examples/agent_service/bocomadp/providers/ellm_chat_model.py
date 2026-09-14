@@ -16,14 +16,13 @@ The key-refresh logic (api-key header rotation) lives in the
 which injects the fresh key per call via :meth:`set_api_key`; this class
 only carries the protocol differences.
 
-Model candidates (``list_models``) are read from the Redis hash
-``bocomadp:model:think_tag`` — each field name is a model id and its
-value (``"1"`` / ``"0"``) toggles ``<think>`` injection — instead of the
-static ``_models/*.yaml`` files; the YAML directory remains as a
-fallback when Redis is unreachable.
+Model candidates (``list_models``), ``context_size`` and ``inject_think_tag``
+are read from the DB-backed model library (``model_registry`` table) through
+its in-process read snapshot (see :mod:`bocomadp.routers.model_registry`),
+replacing the former Redis hash ``bocomadp:model:think_tag`` and the static
+``_models/*.yaml`` fallback.
 """
 import copy
-import json
 import logging
 from collections import OrderedDict
 from datetime import datetime
@@ -40,12 +39,7 @@ from typing import (
 
 logger = logging.getLogger(__name__)
 
-import redis
-import redis.asyncio as aioredis
-
 from pydantic import BaseModel, Field
-
-from bocomadp.config import get_app_config
 
 from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from agentscope.model._model_card import ModelCard
@@ -65,114 +59,48 @@ else:
     AsyncStream = Any
 
 
-# ── 模型候选（Redis 真源，替代 _models/*.yaml） ────────────────
-# ``list_models`` 从 Redis Hash ``bocomadp:model:think_tag`` 读取模型
-# 列表：field 即模型名，value 为 JSON（见 :func:`_parse_model_meta`，兼容
-# 旧格式 ``"0"`` / ``"1"``）。Redis 连接失败时降级读取本地
-# _models/*.yaml（原逻辑），保证模型列表查询不因 Redis 抖动而不可用。
-_MODEL_THINK_TAG_KEY = "bocomadp:model:think_tag"
-# Redis 列表查询短超时（秒）：失败即降级 yaml，不阻塞凭证/表单渲染。
-_REDIS_TIMEOUT = 1.0
-# yaml 兜底默认值（与 providers/_models/*.yaml 一致）。
-_DEFAULT_CONTEXT_SIZE = 1000000
-_DEFAULT_OUTPUT_SIZE = 384000
-# 构造回退值：Redis 无该模型记录/不可用时，context_size 保持原默认。
+# ── 模型候选（model_registry 表为唯一真源） ────────────────
+# ``list_models`` / context_size / think_tag 统一从 ``model_registry`` 表的
+# 进程内只读快照读取（见 :mod:`bocomadp.routers.model_registry`）；快照由
+# 启动 lifespan 预热、模型库写接口成功后刷新。
+# 构造回退值：库中无该模型时，context_size 保持原默认。
 _FALLBACK_CONTEXT_SIZE = 65536
 
 
 def _get_model_context_size(model: str) -> int:
-    """按模型名从 Redis 读取 context_size；无记录/不可用回退默认值。
+    """按模型名从模型库（``model_registry``）快照读取 context_size。
 
     Args:
-        model (`str`): 模型名（Redis Hash ``bocomadp:model:think_tag`` 的 field）。
+        model (`str`): 模型名（``model_registry.model_name``）。
 
     Returns:
-        `int`: 该模型的 context_size；Redis 无记录/查询失败时回退
+        `int`: 该模型的 context_size；模型不在库中时回退
         ``_FALLBACK_CONTEXT_SIZE``（65536，保持原构造默认）。
     """
-    try:
-        cfg = get_app_config().redis
-        client = redis.Redis(
-            host=cfg.host,
-            port=cfg.port,
-            socket_connect_timeout=_REDIS_TIMEOUT,
-            socket_timeout=_REDIS_TIMEOUT,
-        )
-        raw = client.hget(_MODEL_THINK_TAG_KEY, model)
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel: Redis read failed for context_size of "
-            "model %r; fallback to %d: %s",
-            model,
-            _FALLBACK_CONTEXT_SIZE,
-            e,
-        )
+    from bocomadp.routers.model_registry import get_model_meta
+
+    row = get_model_meta(model)
+    if row is None:
         return _FALLBACK_CONTEXT_SIZE
-    if raw is None:
-        return _FALLBACK_CONTEXT_SIZE
-    _, context_size, _ = _parse_model_meta(raw)
-    return context_size
+    return int(row["context_size"])
 
 
-async def _get_think_tag_from_redis(model: str) -> bool:
-    """按模型名从 Redis 读取 ``inject_think_tag``（供中间件异步调用）。
+def _get_think_tag(model: str) -> bool:
+    """按模型名从模型库快照读取 ``inject_think_tag``（供中间件调用）。
 
     Args:
-        model (`str`): 模型名（Redis Hash ``bocomadp:model:think_tag`` 的 field）。
+        model (`str`): 模型名（``model_registry.model_name``）。
 
     Returns:
-        `bool`: 该模型的 think_tag；Redis 无该模型记录/连接失败时返回
-        ``False``（安全默认，不误加 ``<think>`` 前缀）。
+        `bool`: 该模型的 think_tag；模型不在库中时返回 ``False``
+        （安全默认，不误加 ``<think>`` 前缀）。
     """
-    try:
-        cfg = get_app_config().redis
-        client = aioredis.Redis(
-            host=cfg.host,
-            port=cfg.port,
-            socket_connect_timeout=_REDIS_TIMEOUT,
-            socket_timeout=_REDIS_TIMEOUT,
-        )
-        try:
-            raw = await client.hget(_MODEL_THINK_TAG_KEY, model)
-        finally:
-            await client.aclose()
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel: Redis read failed for inject_think_tag of "
-            "model %r; fallback to False: %s",
-            model,
-            e,
-        )
+    from bocomadp.routers.model_registry import get_model_meta
+
+    row = get_model_meta(model)
+    if row is None:
         return False
-    if raw is None:
-        return False
-    think, _, _ = _parse_model_meta(raw)
-    return think
-
-
-def _parse_model_meta(value: Any) -> tuple[bool, int, int]:
-    """解析 Redis value 为 ``(think_tag, context_size, output_size)``。
-
-    仅接受 JSON 格式：``{"think_tag": 1, "context_size": 1000000, \
-"output_size": 384000}``；非 JSON 或字段缺失时回退默认值
-    （think_tag=False，context_size / output_size 取默认值）。
-    """
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", "replace")
-    try:
-        data = json.loads(value)
-        if isinstance(data, dict):
-            think = data.get("think_tag") in (1, True)
-            context_size = int(
-                data.get("context_size") or _DEFAULT_CONTEXT_SIZE
-            )
-            output_size = int(
-                data.get("output_size") or _DEFAULT_OUTPUT_SIZE
-            )
-            return think, context_size, output_size
-    except (ValueError, TypeError):
-        pass
-    return False, _DEFAULT_CONTEXT_SIZE, _DEFAULT_OUTPUT_SIZE
+    return bool(row["think_tag"])
 
 
 def _build_parameter_schema(
@@ -198,58 +126,31 @@ def _build_parameter_schema(
     }
 
 
-def _list_models_from_redis() -> list[ModelCard] | None:
-    """从 Redis 读取模型候选列表。
+def _row_to_card(row: dict[str, Any]) -> ModelCard:
+    """``model_registry`` 行 → :class:`ModelCard`。
 
-    Returns:
-        `list[ModelCard] | None`: 读取成功返回卡片列表（可为空列表）；
-        Redis 连接失败返回 ``None``，由调用方降级读取 yaml。
+    ``think_tag`` 为真时 output_types 含 ``application/x-thinking``
+    （与原 Redis 语义一致）。
     """
-    try:
-        cfg = get_app_config().redis
-        client = redis.Redis(
-            host=cfg.host,
-            port=cfg.port,
-            socket_connect_timeout=_REDIS_TIMEOUT,
-            socket_timeout=_REDIS_TIMEOUT,
-        )
-        mapping = client.hgetall(_MODEL_THINK_TAG_KEY)
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel.list_models: Redis read failed, "
-            "fallback to _models yaml: %s",
-            e,
-        )
-        return None
-
-    cards: list[ModelCard] = []
-    for raw_name, raw_tag in (mapping or {}).items():
-        name = (
-            raw_name.decode("utf-8", "replace")
-            if isinstance(raw_name, bytes)
-            else str(raw_name)
-        )
-        think, context_size, output_size = _parse_model_meta(raw_tag)
-        output_types = ["text/plain"]
-        if think:
-            output_types.append("application/x-thinking")
-        cards.append(
-            ModelCard(
-                name=name,
-                label=name,
-                status="active",
-                input_types=["text/plain"],
-                output_types=output_types,
-                context_size=context_size,
-                output_size=output_size,
-                parameter_schema=_build_parameter_schema(
-                    output_types,
-                    output_size,
-                ),
-                parameters_overrides={},
-            ),
-        )
-    return cards
+    name = str(row["model_name"])
+    output_size = int(row["output_size"])
+    output_types = ["text/plain"]
+    if bool(row["think_tag"]):
+        output_types.append("application/x-thinking")
+    return ModelCard(
+        name=name,
+        label=name,
+        status="active",
+        input_types=["text/plain"],
+        output_types=output_types,
+        context_size=int(row["context_size"]),
+        output_size=output_size,
+        parameter_schema=_build_parameter_schema(
+            output_types,
+            output_size,
+        ),
+        parameters_overrides={},
+    )
 
 
 class EllmChatModel(ChatModelBase):
@@ -340,8 +241,8 @@ class EllmChatModel(ChatModelBase):
                 Seconds to sleep between retry attempts.
             context_size (`int | None`, defaults to `None`):
                 The model context size used for context compression.
-                ``None`` 时按 ``model`` 从 Redis（``bocomadp:model:think_tag``）
-                读取；Redis 无该模型记录或不可用时回退 65536。
+                ``None`` 时按 ``model`` 从模型库（``model_registry``）读取；
+                库中无该模型时回退 65536。
             formatter (`FormatterBase | None`, defaults to `None`):
                 The formatter that converts ``Msg`` objects to the format
                 required by the ELLM API. When ``None``, a
@@ -350,7 +251,7 @@ class EllmChatModel(ChatModelBase):
                 Extra keyword arguments forwarded to ``openai.AsyncClient``
                 (e.g. ``timeout``, ``default_headers``, ``http_client``).
         """
-        # context_size 未显式指定时按模型名从 Redis 读取（覆盖默认值）
+        # context_size 未显式指定时按模型名从模型库读取（覆盖默认值）
         if context_size is None:
             context_size = _get_model_context_size(model)
         super().__init__(
@@ -518,22 +419,21 @@ class EllmChatModel(ChatModelBase):
         cls,
         custom_yaml_dir: str | None = None,
     ) -> list[ModelCard]:
-        """候选模型：优先 Redis（``bocomadp:model:think_tag``），失败降级 yaml。
+        """候选模型：读取模型库（``model_registry`` 表）进程内快照。
 
-        覆盖基类 :meth:`ChatModelBase.list_models`。Redis Hash 的 field 即
-        模型名，值 ``"1"`` 启用 <think> 注入（output_types 含
-        ``application/x-thinking``），``"0"`` 不启用。
+        覆盖基类 :meth:`ChatModelBase.list_models`。每行的 ``model_name``
+        即模型名，``think_tag`` 为真时 output_types 含
+        ``application/x-thinking``。
 
         Args:
-            custom_yaml_dir (`str | None`): 降级 yaml 时使用的目录。
+            custom_yaml_dir (`str | None`): 保留参数（兼容基类签名，不再使用）。
 
         Returns:
             `list[ModelCard]`: 模型候选卡片列表。
         """
-        cards = _list_models_from_redis()
-        if cards is not None:
-            return cards
-        return super().list_models(custom_yaml_dir)
+        from bocomadp.routers.model_registry import list_model_metas
+
+        return [_row_to_card(row) for row in list_model_metas()]
 
     async def _call_api(
         self,
