@@ -5,11 +5,12 @@
 ``system_prompt.py`` / ``runtime_config_store.py`` 一致：懒加载独立 async
 engine + 幂等建表 + 纯 ``text`` SQL，绕过框架表管理与 Alembic 迁移。
 
-本表是**独立的模型台账**，与 Redis ``bocomadp:model:think_tag``（ELLM
-运行时模型候选，由 ELLM 运行时读写；HTTP 管理接口 ``/ellm-models``
-已移除）**不同源、不做同步**——
-两者用途不同：本表供资产/能力登记与查询，Redis 那一份只服务
-``EllmChatModel.list_models()`` 的热路径。
+本表是 ELLM 运行时模型候选的**唯一真源**（原 Redis Hash
+``bocomadp:model:think_tag`` 与 ``/ellm-models`` 接口均已废弃）：
+``EllmChatModel.list_models()`` / context_size / think_tag 三条热路径
+统一从这里读取。由于这些读取点是**同步**接口（框架契约），本模块额外
+维护一份进程内只读快照（:func:`load_snapshot` 预热、写接口成功后刷新），
+同步调用方通过 :func:`get_model_meta` / :func:`list_model_metas` 读取。
 
 存储方言：
     连接串取 ``get_app_config().db.url``，**PG / MySQL / OceanBase(MySQL
@@ -192,6 +193,52 @@ async def _fetch_one(model_name: str) -> dict[str, Any] | None:
         )
         row = result.mappings().first()
     return dict(row) if row is not None else None
+
+
+# ---------------------------------------------------------------------------
+# 进程内只读快照（供同步调用方读取）
+# ---------------------------------------------------------------------------
+# ``EllmChatModel.list_models()`` / ``_get_model_context_size`` 是**同步**
+# 接口（框架契约），无法 await 本模块的 async engine，因此这里维护一份
+# 进程内只读快照：启动 lifespan 调用 :func:`load_snapshot` 预热，本模块写
+# 接口（增/改/删）成功后刷新。模型库属低频管理数据，快照延迟可接受。
+_snapshot: dict[str, dict[str, Any]] = {}
+
+
+async def load_snapshot() -> None:
+    """从 ``model_registry`` 表读全量，刷新进程内只读快照。
+
+    幂等、可重复调用；DB 不可用时**保留旧快照**（不清空），避免瞬时故障
+    导致模型候选整体消失。
+    """
+    global _snapshot
+    from sqlalchemy import text
+
+    try:
+        engine = await _get_engine()
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        f"SELECT {_COLUMNS} FROM {_TABLE} "
+                        "ORDER BY model_name",
+                    ),
+                )
+            ).mappings().all()
+    except Exception as e:  # pragma: no cover - DB 不可用
+        logger.warning("model_registry: load_snapshot failed: %s", e)
+        return
+    _snapshot = {str(r["model_name"]): dict(r) for r in rows}
+
+
+def get_model_meta(model_name: str) -> dict[str, Any] | None:
+    """同步读快照中的单个模型行；不存在返回 ``None``。"""
+    return _snapshot.get(model_name)
+
+
+def list_model_metas() -> list[dict[str, Any]]:
+    """同步读出快照中的全部模型行（按 ``model_name`` 有序）。"""
+    return list(_snapshot.values())
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +541,7 @@ async def create_model(
     )
     row = await _fetch_one(body.model_name)
     assert row is not None
+    await load_snapshot()
     return _row_to_item(row)
 
 
@@ -593,6 +641,7 @@ async def update_model(
     )
     updated = await _fetch_one(target)
     assert updated is not None
+    await load_snapshot()
     return _row_to_item(updated)
 
 
@@ -624,7 +673,13 @@ async def delete_model(
         model_name,
         user_id,
     )
+    await load_snapshot()
     return {"deleted": True, "model_name": model_name}
 
 
-__all__ = ["model_registry_router"]
+__all__ = [
+    "model_registry_router",
+    "load_snapshot",
+    "get_model_meta",
+    "list_model_metas",
+]

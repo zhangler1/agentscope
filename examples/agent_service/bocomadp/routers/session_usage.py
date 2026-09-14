@@ -237,7 +237,15 @@ async def list_session_ids_paginated(
     # ``ValueError: dictionary update sequence element #0 has length 1``。
     sessions: list[dict] = []
     for row in rows:
-        obj: dict = dict(_as_payload_dict(row.payload))
+        # text() 原生 SQL 不经过 ORM 的 JSON 类型处理：PG 原生 JSON 列
+        # 返回 dict，但 MySQL（本项目实际为 TEXT 存储）返回 JSON 字符串，
+        # 需与 memory/store.py 保持一致，两种形态都要兼容。
+        raw_payload = row.payload
+        obj: dict = (
+            json.loads(raw_payload)
+            if isinstance(raw_payload, str) and raw_payload
+            else dict(raw_payload or {})
+        )
         obj["id"] = row.id
         obj["created_at"] = row.created_at
         obj["updated_at"] = row.updated_at
