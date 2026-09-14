@@ -25,6 +25,8 @@ from bocomadp.routers._schema.agent import (
     AgentSchemaResponse,
     AgentSchemaV2Response,
     ListAgentsResponse,
+    ListOwnedAgentsResponse,
+    OwnedAgentView,
     CreateAgentRequest,
     CreateAgentResponse,
     UpdateAgentRequest,
@@ -188,14 +190,6 @@ async def list_agents(
             "leaders, `false` only plain agents. Omit to list all."
         ),
     ),
-    invitable: bool | None = Query(
-        default=None,
-        description=(
-            "Optional filter: `true` returns only agents whose "
-            "invite_config.invitable is enabled, `false` only disabled "
-            "ones. Omit to list all."
-        ),
-    ),
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> ListAgentsResponse:
     """Return all agent records visible to the authenticated user.
@@ -247,11 +241,12 @@ async def list_agents(
             member_ids = set(team.member_ids) if team is not None else set()
             entries = [e for e in entries if e.id in member_ids]
         else:
-            # Top-level list stays clean: only *self-built* team members are
-            # hidden here and reachable via parent_agent_id=<leader> (matches
-            # the docstring above, docs/api.md, and the access-layer patch in
-            # team_access.py). Invited-by-reference members are ordinary agents
-            # owned by the user and stay visible at the top level.
+            # Top-level list stays clean: *self-built* team members are hidden
+            # here and reachable only via parent_agent_id=<leader> (matches
+            # the docstring above, docs/expert-team-api.md, and the
+            # access-layer patch in team_access.py). Under scheme B there are
+            # no invited-by-reference members, so this set is exactly the
+            # self-built membership.
             teams = await list_teams(storage, user_id)
             member_ids = {
                 m.agent_id
@@ -262,19 +257,10 @@ async def list_agents(
             if member_ids:
                 entries = [e for e in entries if e.id not in member_ids]
     # is_team 筛选：生产环境顶层分支已在 TeamAgentView 上标记 is_team
-    # （True=团长，False=普通/被邀成员）。未 patch 的环境没有该字段，
+    # （True=团长，False=普通成员）。未 patch 的环境没有该字段，
     # getattr 兜底为 None，此时两种过滤都筛空（语义合理：无团队概念）。
     if is_team is not None:
         entries = [e for e in entries if getattr(e, "is_team", None) is is_team]
-    # invitable 筛选：按 invite_config.invitable 过滤（缺失视为 False），
-    # 供"邀请成员"的可选列表只展示可被邀请的智能体（invitable=true）。
-    if invitable is not None:
-        entries = [
-            e
-            for e in entries
-            if bool((e.data.invite_config or InviteConfig()).invitable)
-            is invitable
-        ]
     # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
     # 直接切片即可，total 用切片前的完整数量，前端可据此算总页数。
     total = len(entries)
@@ -285,6 +271,80 @@ async def list_agents(
     # 显式转换以通过 Pydantic 校验。
     views = [TeamAgentView(**e.model_dump()) for e in page_entries]
     return ListAgentsResponse(agents=views, total=total)
+
+
+@agent_router.get(
+    "/owned",
+    response_model=ListOwnedAgentsResponse,
+    summary="List agents strictly owned by the caller (user isolation)",
+)
+async def list_owned_agents(
+    page_num: int = Query(
+        default=1,
+        ge=1,
+        alias="pageNum",
+        description="Page number, 1-based.",
+    ),
+    page_size: int = Query(
+        default=20,
+        ge=1,
+        le=100,
+        alias="pageSize",
+        description="Page size (items per page), 1-100.",
+    ),
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+) -> ListOwnedAgentsResponse:
+    """返回**本人名下拥有**的智能体清单（严格用户隔离）。
+
+    与 ``GET /agent/``（可见性视图）的三点差异：
+
+    - 只含 ``user_id=调用者 AND source='user'`` 的记录——别人**共享
+      给我**的智能体不出现在这里（那是可见性，不是所有权）；
+    - 自建团队成员**不隐藏**，直接列出并带 ``parent_agent_id`` 标记；
+    - ``source='team'`` 的派生 worker 永不出现（不是用户创建的资产）。
+
+    每条记录通过 ``expert_team_relations`` 补充团队标记：
+    ``is_team``（团长）/ ``parent_agent_id`` + ``is_self_built``
+    （自建成员）。外邀成员（别人的智能体）天然不在结果里。
+
+    Args:
+        page_num (`int`): 页码，1-based。
+        page_size (`int`): 每页条数，1-100。
+        user_id (`str`): 注入的登录用户 ID（X-User-ID 头）。
+        storage (`StorageBase`): 注入的存储后端。
+
+    Returns:
+        `ListOwnedAgentsResponse`: 按 ``updated_at`` 倒序的归属清单。
+    """
+    records = await storage.list_agents(user_id)
+    teams = await list_teams(storage, user_id)
+    # updated_at 倒序（与 GET /agent/ 的展示习惯一致）；团队标记一次
+    # list_teams 全量算好，避免每条记录各查一遍关系表。
+    items: list[OwnedAgentView] = []
+    for record in sorted(records, key=lambda r: r.updated_at, reverse=True):
+        is_team = any(t.leader_agent_id == record.id for t in teams)
+        parent = next(
+            (t.leader_agent_id for t in teams if t.is_self_built(record.id)),
+            None,
+        )
+        items.append(
+            OwnedAgentView(
+                id=record.id,
+                name=record.data.name,
+                is_team=is_team,
+                parent_agent_id=parent,
+                is_self_built=True if parent is not None else None,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+            ),
+        )
+    total = len(items)
+    start = (page_num - 1) * page_size
+    return ListOwnedAgentsResponse(
+        agents=items[start : start + page_size],
+        total=total,
+    )
 
 
 @agent_router.post(
@@ -517,7 +577,6 @@ async def delete_agent(
         access (`ResourceAccessService`): Injected access service — used
             to resolve the owning user and enforce the edit permission
             when a shared editor deletes the agent.
-
     Raises:
         `HTTPException`: 404 if the agent is not visible to the caller;
             403 if visible but only readable.
@@ -533,6 +592,7 @@ async def delete_agent(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent '{agent_id}' not found.",
         )
+
 
 
 # ======================================================================
@@ -556,9 +616,10 @@ class TeamMemberView(BaseModel):
     description: str | None = None
     is_self_built: bool = Field(
         description=(
-            "True when the member was created under this leader "
-            "(parent_agent_id == leader). False when invited by reference "
-            "from another owner (frozen config, not deletable here)."
+            "Always True under scheme B: every team member is created under "
+            "this leader (parent_agent_id == leader) and belongs exclusively "
+            "to this team. The historical 'invited by reference' member type "
+            "is no longer supported, so this flag is now constant."
         ),
     )
 
@@ -578,24 +639,19 @@ class TeamConfigResponse(BaseModel):
 class SetTeamConfigRequest(BaseModel):
     """Replace the leader's team configuration.
 
-    member_ids may reference existing agents (self-built or invited). The
-    leader's ``parent_agent_id`` backlinks of referenced self-built members
-    are reconciled automatically; invited-by-reference members are never
-    re-stamped.
+    Only ``collaboration_mode``, ``handoff_relations`` and ``max_members``
+    are replaced. Team membership is **not** mutated by this endpoint:
+    members are created exclusively through ``POST /agent/`` with
+    ``parent_agent_id`` (self-built agents that belong only to this team)
+    and removed via
+    ``DELETE /agent/{agent_id}/team/members/{member_id}``. External /
+    invited agents are no longer supported, so there is no ``member_ids``
+    field here.
     """
 
     collaboration_mode: Literal["free_handoff", "workflow"] = "free_handoff"
-    member_ids: list[str] = Field(default_factory=list)
     handoff_relations: list[HandoffRelation] = Field(default_factory=list)
     max_members: int = 10
-
-
-class AddMemberRequest(BaseModel):
-    """Add a member to the team by reference (invite an existing agent)."""
-
-    agent_id: str = Field(
-        description="Existing agent ID to invite into this team.",
-    )
 
 
 class HandoffRelationResponse(BaseModel):
@@ -665,9 +721,10 @@ async def get_team_config(
 ) -> TeamConfigResponse:
     """Return the full expert-team config for ``agent_id``.
 
-    Lists each member (self-built or invited) with denormalized name and
-    description. Raises 404 if the agent is not visible to the caller.
-    The agent need not yet be a team (empty member_ids is reported).
+    Lists each member (all self-built, exclusive to this team) with
+    denormalized name and description. Raises 404 if the agent is not
+    visible to the caller. The agent need not yet be a team (empty
+    member_ids is reported).
     """
     owner_id, agent = await access.resolve_for_edit(
         user_id,
@@ -719,15 +776,15 @@ async def set_team_config(
     access: ResourceAccessService = Depends(get_resource_access_service),
     storage: StorageBase = Depends(get_storage),
 ) -> TeamConfigResponse:
-    """Replace the leader's team configuration wholesale.
+    """Replace the leader's team configuration.
 
-    Reconciles ``parent_agent_id`` backlinks for self-built members only:
-    removing a self-built member from the list clears its backlink.
-    Invited-by-reference members (``parent_agent_id`` is None or points at
-    another leader) are never re-stamped — re-stamping would silently
-    "promote" an invited member into a self-built one, flipping
-    ``is_self_built`` to true and making a later removal cascade-delete a
-    foreign-owned agent. Honors ``max_members``.
+    Only ``collaboration_mode``, ``handoff_relations`` and ``max_members``
+    are replaced. Membership is **not** mutated here: team members are
+    created exclusively through ``POST /agent/`` with ``parent_agent_id``
+    (self-built agents that belong only to this team) and removed via
+    ``DELETE /agent/{agent_id}/team/members/{member_id}``. External /
+    invited agents are no longer supported, so this endpoint no longer
+    accepts a ``member_ids`` field.
     """
     owner_id, agent = await access.resolve_for_edit(
         user_id,
@@ -735,34 +792,12 @@ async def set_team_config(
         agent_id,
     )
     _require_leader(agent)
-    if len(body.member_ids) > body.max_members:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"member_ids exceeds max_members={body.max_members}.",
-        )
-    # Reconcile the roster by relation flag. Members already self-built
-    # for this leader keep their ``self_built`` flag; everyone else (or a
-    # newcomer) is recorded as invited-by-reference and never promoted —
-    # flipping ``is_self_built`` to true would arm the cascade delete on
-    # removal for a foreign-owned agent.
     rel = await get_team(storage, owner_id, agent_id)
     if rel is None:
         rel = ExpertTeamRelation(user_id=owner_id, leader_agent_id=agent_id)
     rel.collaboration_mode = body.collaboration_mode
     rel.max_members = body.max_members
     rel.handoff_relations = list(body.handoff_relations)
-    old_relations = {
-        m.agent_id: m.relation
-        for m in rel.members
-        if m.relation == "self_built"
-    }
-    rel.members = []
-    for mid in body.member_ids:
-        # Hard-check the ``AgentInvite`` switch: only invitable agents may
-        # be in the roster, otherwise the runtime workflow could never
-        # borrow them and the invitation would be a no-op.
-        await _require_invitable(storage, owner_id, mid)
-        rel.add_member(mid, old_relations.get(mid, "invited"))
     await upsert_team(storage, rel)
     return await get_team_config(agent_id, user_id, access, storage)
 
@@ -826,87 +861,6 @@ async def set_collaboration_mode(
     return CollaborationModeResponse(collaboration_mode=rel.collaboration_mode)
 
 
-async def _require_invitable(
-    storage: StorageBase,
-    owner_id: str,
-    member_agent_id: str,
-) -> None:
-    """Reject inviting an agent whose ``AgentInvite`` switch is off.
-
-    Only agents with ``invite_config.invitable=true`` (plus a non-empty
-    ``invite_description``) may be invited into a team: otherwise the
-    invitation is only a config-layer roster record and the member can
-    never be ``AgentInvite``-borrowed into a runtime workflow — the
-    invitation would silently be a no-op. Hard-checking at both invite
-    entry points keeps the roster consistent with what the frontend's
-    ``invitable=true`` picker offers. Agents invisible to the current
-    user are also rejected (nothing to verify).
-    """
-    invited = await storage.get_agent(owner_id, member_agent_id)
-    if invited is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Agent '{member_agent_id}' not found or not owned by the "
-                "current user; cannot verify invitable before inviting."
-            ),
-        )
-    inv = invited.data.invite_config or InviteConfig()
-    if inv.invitable and (inv.invite_description or "").strip():
-        return
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail=(
-            f"Agent '{member_agent_id}' is not invitable: set "
-            "invite_config.invitable=true (with a non-empty "
-            "invite_description) before inviting it into a team."
-        ),
-    )
-
-
-@agent_router.post(
-    "/{agent_id}/team/members",
-    response_model=TeamConfigResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Add a member to the team by reference",
-)
-async def add_team_member(
-    agent_id: str,
-    body: AddMemberRequest,
-    user_id: str = Depends(get_current_user_id),
-    access: ResourceAccessService = Depends(get_resource_access_service),
-    storage: StorageBase = Depends(get_storage),
-) -> TeamConfigResponse:
-    """Invite an existing agent (``body.agent_id``) into the team.
-
-    Appends to ``member_ids`` if not already present and within
-    ``max_members``. The invited agent must be ``invitable`` (with a
-    non-empty ``invite_description``) — otherwise the invitation is
-    rejected with 422 so the roster never holds members that the runtime
-    workflow could not ``AgentInvite``-borrow.
-    """
-    owner_id, agent = await access.resolve_for_edit(
-        user_id,
-        ResourceKind.AGENT,
-        agent_id,
-    )
-    _require_leader(agent)
-    rel = await get_team(storage, owner_id, agent_id)
-    if rel is None:
-        rel = ExpertTeamRelation(user_id=owner_id, leader_agent_id=agent_id)
-    if body.agent_id in rel.member_ids:
-        return await get_team_config(agent_id, user_id, access, storage)
-    if len(rel.members) >= rel.max_members:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Team already at max_members={rel.max_members}.",
-        )
-    await _require_invitable(storage, owner_id, body.agent_id)
-    rel.add_member(body.agent_id, "invited")
-    await upsert_team(storage, rel)
-    return await get_team_config(agent_id, user_id, access, storage)
-
-
 @agent_router.delete(
     "/{agent_id}/team/members/{member_id}",
     response_model=TeamConfigResponse,
@@ -920,19 +874,21 @@ async def remove_team_member(
     storage: StorageBase = Depends(get_storage),
     session_service: SessionService = Depends(get_session_service),
 ) -> TeamConfigResponse:
-    """Unlink ``member_id`` from the team.
+    """Remove ``member_id`` from the team.
 
-    If the member was self-built (``parent_agent_id == leader``) it is
-    cascade-deleted; if it was invited by reference, only the link is
-    removed (the underlying agent is preserved, per the permission
-    isolation rule). The removed member is also detached from any
+    Under scheme B every team member is self-built (``parent_agent_id ==
+    leader``) and belongs exclusively to this team, so removing it
+    cascade-deletes the underlying agent (sessions + agent index
+    included). The removed member is also detached from any
     handoff_relations on this team.
 
     Borrowed-session cleanup
-        An invited member's team conversation lives in a
-        ``team:<leader_team_id>/invited:<handle>``-named session
-        whose ``team_id`` references this team's roster. If we
-        leave that session behind, two things break later:
+        A self-built member's team conversation lives in a
+        ``team:<leader_team_id>/invited:<handle>``-named borrowed
+        session (the runtime ``AgentInvite`` pool, unrelated to the
+        removed config-layer invite) whose ``team_id`` references this
+        team's roster. If we leave that session behind, two things
+        break later:
 
         1. The member's primary (user-owned) session is fine, but
            the ghost team session keeps a live inbox queue and the
@@ -988,7 +944,6 @@ async def remove_team_member(
                 s.id,
             )
 
-    was_self_built = rel.is_self_built(member_id)
     rel.remove_member(member_id)
     rel.handoff_relations = [
         r
@@ -996,14 +951,11 @@ async def remove_team_member(
         if r.from_agent_id != member_id and r.to_agent_id != member_id
     ]
 
-    # 3. If the member was self-built, drop its underlying agent
-    #    (which also cascades its remaining sessions and the
-    #    agent index entry). If the member was invited by
-    #    reference, leave the agent in place — the user owns it
-    #    independently of this team.
-    member = await storage.get_agent(owner_id, member_id)
-    if member is not None and was_self_built:
-        await session_service.delete_agent(owner_id, member_id)
+    # A team member is always self-built and belongs exclusively to this
+    # team, so removing it drops the underlying agent (cascading its
+    # sessions and agent index entry). There is no "invited" member type
+    # to merely unlink under scheme B.
+    await session_service.delete_agent(owner_id, member_id)
     await upsert_team(storage, rel)
     return await get_team_config(agent_id, user_id, access, storage)
 
