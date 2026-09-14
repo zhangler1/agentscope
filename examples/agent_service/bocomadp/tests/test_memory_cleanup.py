@@ -14,9 +14,11 @@ from bocomadp.memory import _pending_cleanup, cleanup_agent_memory
 from bocomadp.memory import store as memory_store
 from bocomadp.memory.state import (
     ACTIVE_ZSET,
+    get_cursor,
     incr_turn,
     lock_key,
     mark_active,
+    set_cursor,
     try_acquire_lock,
     turns_key,
 )
@@ -48,20 +50,22 @@ def sqlite_db(tmp_path, monkeypatch):
 
 
 def test_cleanup_deletes_config_row_and_redis_state(sqlite_db, fake_redis):
-    """DB 配置行已删 + 后台任务清 Redis（active/turns/锁）。"""
+    """DB 配置行已删 + 后台任务清 Redis（active/turns/锁/游标）。"""
     _run(memory_store.memory_upsert("u1", "a1", MemoryConfig(memory_enabled=True)))
     _run(mark_active(fake_redis, "u1", "a1", "s1", now=100.0))
     _run(incr_turn(fake_redis, "u1", "a1", "s1"))
     _run(try_acquire_lock(fake_redis, "u1", "a1", "s1"))
+    _run(set_cursor(fake_redis, "u1", "a1", "s1", "2026-09-14T10:00:00", "m1"))
 
     _run(_cleanup_and_drain("a1", fake_redis))
 
     # DB 配置行已删
     assert _run(memory_store.memory_get("a1")) is None
-    # Redis：active 成员 / turns / 锁全部清除
+    # Redis：active 成员 / turns / 锁 / 游标全部清除
     assert _run(fake_redis.zscore(ACTIVE_ZSET, "u1:a1:s1")) is None
     assert _run(fake_redis.get(turns_key("u1", "a1", "s1"))) is None
     assert lock_key("u1", "a1", "s1") not in fake_redis._strings
+    assert _run(get_cursor(fake_redis, "u1", "a1", "s1")) is None
 
 
 def test_cleanup_clears_all_owners_of_shared_agent(sqlite_db, fake_redis):

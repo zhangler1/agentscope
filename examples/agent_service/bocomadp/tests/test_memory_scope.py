@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
 from agentscope.message import AssistantMsg, UserMsg
 
+from bocomadp.memory import extractor as extractor_mod
 from bocomadp.memory import store as memory_store
 from bocomadp.memory.config import MemoryRuntimeConfig
 from bocomadp.memory.state import incr_turn, lock_key, mark_active
@@ -21,6 +23,12 @@ from bocomadp.memory.sweeper import MemorySweeper
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _fast_dangling_wait(monkeypatch):
+    """默认把「读前宽限」置 0：run_extract 的等待不应拖慢单测。"""
+    monkeypatch.setattr(extractor_mod, "_DANGLING_WAIT_SECS", 0.0)
 
 
 def _chat_messages(n: int = 6) -> list:

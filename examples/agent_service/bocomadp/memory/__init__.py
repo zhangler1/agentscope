@@ -206,7 +206,7 @@ async def _load_config(agent_id: str) -> MemoryConfig | None:
 
 
 async def _cleanup_agent_redis(agent_id: str, redis: Any) -> None:
-    """按 agent 清扫 Redis 会话态（active / turns / extract_lock）。
+    """按 agent 清扫 Redis 会话态（active / turns / extract_lock / cursor）。
 
     复合标识下键名内含 ``user_id``，仅凭 ``agent_id`` 无法直接定位 turns/lock
     键，故从 ``active_sessions`` 反解三元组后按 agent 过滤（共享 agent 可清
@@ -229,6 +229,7 @@ async def _cleanup_agent_redis(agent_id: str, redis: Any) -> None:
         await redis.delete(
             memory_state.turns_key(m_user, m_agent, m_session),
             memory_state.lock_key(m_user, m_agent, m_session),
+            memory_state.cursor_key(m_user, m_agent, m_session),
         )
 
 
