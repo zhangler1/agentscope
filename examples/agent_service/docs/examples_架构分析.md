@@ -76,7 +76,7 @@ from agentscope.rag import QdrantStore
 | 4 | 基础设施：storage + Qdrant + workspace manager（K8s 沙箱或本地模式二选一）+ message bus（Redis 或 InMemory） |
 | 5 | `create_app()`：注入全部依赖，自动挂载内置路由 |
 | 6 | `app.state` 挂载：把注册表暴露给路由层 |
-| 7 | 自定义路由：deerflow / health / ellm_models / stats / agent_tools / session_usage / uploads 等叠加在内置路由之上 |
+| 7 | 自定义路由：deerflow / health / model_registry / stats / agent_tools / session_usage / uploads 等叠加在内置路由之上 |
 
 ```
 配置加载 → 注册表 → 运行记账 → 基础设施 → create_app → app.state → 自定义路由
@@ -88,7 +88,7 @@ from agentscope.rag import QdrantStore
 bocomadp/
 ├── config/      配置：base(公共加载层) / app_config(唯一 schema) / audit_config
 ├── logging/     trace_context(ContextVar) + trace_middleware(ASGI) + formatter
-├── deerflow/    ★ DeerFlow 风格 SSE：protocol / formatter / bridge / runs /
+├── deerflow/    ★ threads/runs 对话接口（SSE）：protocol / formatter / bridge / runs /
 │                custom_params / auth_context / deps / routers(threads + chat + auth_stub)
 ├── providers/   ELLM 协议适配与 key 生命周期（ellm_chat_model / ellm_key / _models）
 ├── credential/  自定义凭证类型（ELLMCredential 等）
@@ -97,7 +97,7 @@ bocomadp/
 ├── middleware/  registry + agent_middleware + audit + custom_prompt + factory
 │                + error_handler / request_log (2 个 ASGI 中间件)
 ├── mcp/         registry(duck-type 扫描) + builtin_mcps + custom/
-├── routers/     ellm_models / health / platform_health / stats / agent_tools /
+├── routers/     model_registry / health / platform_health / stats / agent_tools /
 │                session_usage / channels / credential_model / skill_router
 │                / uploads / workspace_files / custom
 ├── skills/      BocomSkillHub 企业技能
@@ -383,7 +383,7 @@ examples/
 │       ├── middleware/  (registry / agent_middleware / audit / custom_prompt
 │       │                 / factory / error_handler / request_log / custom)
 │       ├── mcp/         (registry / builtin_mcps / custom)
-│       ├── routers/     (ellm_models / health / platform_health / stats / agent_tools
+│       ├── routers/     (model_registry / health / platform_health / stats / agent_tools
 │       │                 / session_usage / channels / credential_model
 │       │                 / skill_router / uploads / workspace_files / custom)
 │       ├── skills/ uploads/ workspace/ docker/ toolkit_whitelist.py

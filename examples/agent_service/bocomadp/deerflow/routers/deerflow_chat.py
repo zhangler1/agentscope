@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""DeerFlow 风格 SSE 路由（threads/runs 资源模型）。
+"""threads/runs 对话接口的 SSE 路由（threads/runs 资源模型）。
 
 对齐 deer-flow 2.0 ``backend/app/gateway/routers/thread_runs.py`` 的 4 个
 端点，但执行引擎复用原生 ``ChatService``（配置与原生 ``/chat/`` 完全
 一致——agent 构建、模型、工具、审计中间件、HITL 全部同源）：
 
-- ``POST /api/deerflow/threads/{tid}/runs/stream``  创建 run + SSE 流式
-- ``POST /api/deerflow/threads/{tid}/runs/wait``    创建 run + 阻塞至完成
-- ``GET  /api/deerflow/threads/{tid}/runs/{rid}/stream``  join 已有 run（回放 + live）
-- ``POST /api/deerflow/threads/{tid}/runs/{rid}/cancel``  取消（映射原生 session 级 interrupt）
+- ``POST /api/bocomadp/v1/threads/{tid}/runs/stream``  创建 run + SSE 流式
+- ``POST /api/bocomadp/v1/threads/{tid}/runs/wait``    创建 run + 阻塞至完成
+- ``GET  /api/bocomadp/v1/threads/{tid}/runs/{rid}/stream``  join 已有 run（回放 + live）
+- ``POST /api/bocomadp/v1/threads/{tid}/runs/{rid}/cancel``  取消（映射原生 session 级 interrupt）
 
 设计要点（方案决策①④⑤）：
 
@@ -288,10 +288,10 @@ async def _load_human_chunks(
         return []
     return [_msg_to_human_chunk(m) for m in messages if m.role == "user"]
 
-deerflow_router = APIRouter(prefix="/deerflow/threads", tags=["deerflow"])
+deerflow_router = APIRouter(prefix="/bocomadp/v1/threads", tags=["threads"])
 
 # 注意：本路由挂载在 main.py 的 /api 子应用下，对外路径为
-# /api/deerflow/threads/...；deer-flow 前端旧路径 /api/threads/... 由
+# /api/bocomadp/v1/threads/...；deer-flow 前端旧路径 /api/threads/... 由
 # nginx 网关 rewrite 兼容。
 
 
@@ -1294,7 +1294,7 @@ def _streaming_response(
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             # LangGraph SDK 用正则从该头提取 run id（对齐 deer-flow）。
-            "Content-Location": f"/api/deerflow/threads/{thread_id}/runs/{run_id}",
+            "Content-Location": f"/api/bocomadp/v1/threads/{thread_id}/runs/{run_id}",
         },
     )
 

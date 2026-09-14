@@ -8,7 +8,8 @@
 - muwp-user 模式 body 注入
 - 舆情 yq_info 附加情感代码
 - 无效 intent / 无效报文 / 超时 / HTTP 错误 / 无效响应 JSON → 友好错误
-- 挂载在 enterprise.py 中且名称 = raw_request_tool
+- 挂载在 enterprise.py 中，名称按 BOCOMADP_TOOL_ASCII_NAMES 在
+  中文（外数查）/ ASCII（raw_request_tool）间切换
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from bocomadp.deerflow.custom_params import (
     set_custom_params,
 )
 from bocomadp.tools.enterprise import build_enterprise_tools
+from bocomadp.tools._naming import tool_name
 from bocomadp.tools.raw_request import DEFAULT_API_PATHS, _raw_request_tool_impl
 
 
@@ -243,8 +245,9 @@ def test_raw_request_mounted_in_enterprise(monkeypatch):
     try:
         tools = asyncio.run(build_enterprise_tools("u1", "a1", "s1"))
         names = [t.name for t in tools]
-        assert "外数查" in names
-        assert "cross_search" in names
-        assert "online_search" not in names  # 默认不挂联网搜索
+        # 工具名默认中文，BOCOMADP_TOOL_ASCII_NAMES=1 时切 ASCII。
+        assert tool_name("外数查", "raw_request_tool") in names
+        assert tool_name("跨知识搜索", "cross_search") in names
+        assert tool_name("联网搜索", "online_search") not in names  # 默认不挂
     finally:
         reset_custom_params(token_params)

@@ -53,9 +53,9 @@ def build_persisted_message(
     key: str,
     original_size: int,
     content: str,
-    preview_chars: int = 2000,
+    preview_chars: int = 1000,
     tool_call_id: str = "",
-    max_output_chars: int = 100_000,
+    max_output_chars: int = 2000,
 ) -> str:
     """构建给模型看的 <persisted-output> 预览消息(复刻 Claude Code 格式)。
 

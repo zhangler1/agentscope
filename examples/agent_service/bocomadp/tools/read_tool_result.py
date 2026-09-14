@@ -55,8 +55,8 @@ class ReadToolResultTool(ToolBase):  # pylint: disable=abstract-method
             },
             "limit": {
                 "type": "integer",
-                "description": "最多返回字符数,默认 100000;超过单次输出上限会报错并提示分页。",
-                "default": 100000,
+                "description": "最多返回字符数,默认不超过单次输出上限(默认 2000);超过会报错并提示分页。",
+                "default": 2000,
             },
         },
         "required": ["tool_call_id"],

@@ -35,7 +35,7 @@ from bocomadp.deerflow.custom_params import (
 )
 from bocomadp.middleware.ellm_refresh import (
     EllmKeyRefreshMiddleware,
-    _get_think_tag_from_redis,
+    _get_think_tag,
     _parse_add_think,
 )
 from bocomadp.providers.ellm_chat_model import EllmChatModel
@@ -152,8 +152,8 @@ class TestInjection:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key-abc", 1_500_000),
         ), mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
-            new=mock.AsyncMock(return_value=True),
+            "bocomadp.middleware.ellm_refresh._get_think_tag",
+            new=mock.Mock(return_value=True),
         ):
             result = asyncio.run(
                 mw.on_model_call(
@@ -172,7 +172,7 @@ class TestInjection:
 
     def test_request_add_think_overrides_redis(self) -> None:
         """Request-level custom_params.add_think takes top priority,
-        even when the Redis model table would say otherwise."""
+        even when the model registry would say otherwise."""
         storage = _FakeStorage(_record("k", time.time() - 1800))
         mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
         base = _base_model()
@@ -184,8 +184,8 @@ class TestInjection:
                 "bocomadp.providers.ellm_key.fetch_ellm_key",
                 return_value=("new-key", 1_500_000),
             ), mock.patch(
-                "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
-                new=mock.AsyncMock(return_value=True),  # Redis says True
+                "bocomadp.middleware.ellm_refresh._get_think_tag",
+                new=mock.Mock(return_value=True),  # registry says True
             ):
                 asyncio.run(
                     mw.on_model_call(
@@ -197,7 +197,7 @@ class TestInjection:
         finally:
             reset_custom_params(token)
 
-        # Request-level False beats Redis True.
+        # Request-level False beats registry True.
         assert base.inject_think_tag is False
 
     def test_request_missing_add_think_falls_back_to_redis(self) -> None:
@@ -214,8 +214,8 @@ class TestInjection:
                 "bocomadp.providers.ellm_key.fetch_ellm_key",
                 return_value=("new-key", 1_500_000),
             ), mock.patch(
-                "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
-                new=mock.AsyncMock(return_value=True),
+                "bocomadp.middleware.ellm_refresh._get_think_tag",
+                new=mock.Mock(return_value=True),
             ):
                 asyncio.run(
                     mw.on_model_call(
@@ -227,7 +227,7 @@ class TestInjection:
         finally:
             reset_custom_params(token)
 
-        # No inject_think in request → Redis model table value wins.
+        # No inject_think in request → model registry value wins.
         assert base.inject_think_tag is True
 
     def test_non_ellm_model_passes_through(self) -> None:
@@ -287,8 +287,8 @@ class TestEndToEnd:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key-abc", 1_500_000),
         ) as fetch, mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag_from_redis",
-            new=mock.AsyncMock(return_value=True),
+            "bocomadp.middleware.ellm_refresh._get_think_tag",
+            new=mock.Mock(return_value=True),
         ):
             final = asyncio.run(
                 agent.reply(UserMsg(name="user", content="hi")),

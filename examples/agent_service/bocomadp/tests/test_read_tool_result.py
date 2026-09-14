@@ -138,5 +138,6 @@ class TestReadToolResult(IsolatedAsyncioTestCase):
 
     async def test_config_has_read_result_max_output_chars_default(self):
         cfg = ToolResultConfig()
-        assert cfg.read_result_max_output_chars == 100_000
-        assert cfg.read_result_max_output_chars > cfg.per_tool_threshold_chars
+        assert cfg.read_result_max_output_chars == 2000
+        # 读回单次上限默认 ≤ 持久化阈值:实际取 min(两者),输出恒 ≤ 阈值,防读回二次持久化
+        assert cfg.read_result_max_output_chars <= cfg.per_tool_threshold_chars

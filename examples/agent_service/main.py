@@ -53,6 +53,7 @@ from agentscope.mcp import MCPClient, StdioMCPConfig
 from agentscope.rag import QdrantStore
 
 from bocomadp.agents.templates import load_subagent_templates
+import bocomadp.memory as memory_module
 from bocomadp.credential import ELLMCredential  # noqa: F401 — import 即注册自定义供应商
 from bocomadp.config import (
     get_app_config,
@@ -104,8 +105,8 @@ from bocomadp.team_briefing import patch_team_briefing
 from bocomadp.projectors import WorkerFailureNotifier
 from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
-from bocomadp.routers.agent_api import install_agent_memory_router
 from bocomadp.toolkit_whitelist import patch_get_toolkit
+from bocomadp.tool_catalog import AGENT_CREATOR_ID
 from bocomadp.deerflow.model_patch import patch_get_model
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
@@ -114,7 +115,7 @@ from agentscope.app._router._agent import (
 # 框架内置路由（credential / knowledge_bases / agent / session / schedule /
 # skill / mcp / hub / workspace / tts_model / model / chat）全部由 create_app()
 # 统一注册，本文件无需 import 或 include；框架 chat_router(POST /chat/) 与
-# deerflow_router(POST /deerflow/threads/...) 路径不同，互不冲突。
+# deerflow_router(POST /bocomadp/v1/threads/...) 路径不同，互不冲突。
 from bocomadp.mcp import McpRegistry
 from bocomadp.skills import ExternalSkillHub
 from bocomadp.skills.bocom_skill_hub import BocomSkillHub
@@ -244,10 +245,11 @@ if config.mcp.enabled:
         mcp_registry.load_custom()
 
 # ── 内置智能体：智能体工厂（agent-creator） ──
-# 专门用于对话式创建/修改智能体，不需要 K8s 沙箱，
-# 工具通过 AgentBuilder 在运行时按 agent_id 注入。
+# 专门用于对话式创建/修改智能体：除工厂工具（build_agent_tools
+# 按 agent_id 运行时注入）外，它也可以像普通智能体一样配置可配置集合
+# M 内的工具（含 workspace builtins）。
 # 注意：实际注册在下方 storage 创建之后进行。
-_AGENT_CREATOR_ID = "_agent-creator"
+_AGENT_CREATOR_ID = AGENT_CREATOR_ID
 _AGENT_CREATOR_SYSTEM_PROMPT = (
     "你是智能体工厂，通过对话帮助用户创建和修改智能体配置。\n"
     "\n## 工作流程\n"
@@ -354,13 +356,14 @@ async def build_agent_tools(
     )
 
     # Inject factory tools for the built-in agent-creator
-    if agent_id == "_agent-creator":
+    if agent_id == _AGENT_CREATOR_ID:
         from bocomadp.tools.agent_factory_tools import (
             create_agent,
             update_agent,
             delete_agent,
             list_agents,
             get_agent,
+            get_agent_tools,
             list_tools_for_agent,
             set_agent_tools,
             list_available_skills,
@@ -372,6 +375,7 @@ async def build_agent_tools(
             delete_agent,
             list_agents,
             get_agent,
+            get_agent_tools,
             list_tools_for_agent,
             set_agent_tools,
             list_available_skills,
@@ -382,9 +386,9 @@ async def build_agent_tools(
     # (PUT/DELETE /agents/{id}/tools/{name}):
     #   empty  -> every tool above stays available
     #   non-empty -> only the listed tool names survive
-    # This makes the tool config APIs effective at runtime (for agents
-    # created by the agent-creator) and enforces least privilege for
-    # the agent-creator itself (only its 9 factory tools remain).
+    # This makes the tool config APIs effective at runtime. For the
+    # agent-creator its whitelist covers M plus its factory tools
+    # (see _register_builtin_agents), so it keeps both.
     from bocomadp.routers.agent_tools import _tool_whitelists
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
@@ -529,12 +533,21 @@ class _BuiltinAgentStorageProxy:
         return await self._inner.delete_session("default", agent_id, session_id)
 
     async def delete_agent(self, user_id: str, agent_id: str) -> bool:
-        """Delete via framework storage, then drop the per-agent tool
-        whitelist so the persisted whitelist file keeps no orphans.
+        """Delete via framework storage, then clean up side records:
+        per-agent tool whitelist + session memory config / Redis state.
 
         The framework's ``DELETE /agent/{id}`` (and team cascades)
         all funnel through this storage call; the bocomadp-only
         ``/agents`` router is unused by the product.
+
+        Memory cleanup (best-effort, never blocks the delete result):
+        - DB ``agent_memory_configs`` row: ``memory_store.memory_delete``;
+        - Redis per-session state (``active_sessions`` member / ``turns`` /
+          extract lock): scanned from ``active_sessions`` by agent dimension
+          inside ``cleanup_agent_memory`` — no pre-delete session snapshot
+          needed (the compound key embeds user_id, so cleanup resolves it
+          from the active set instead).
+          Platform-side delete remains a placeholder (local delete only).
         """
         ok = await self._inner.delete_agent(user_id, agent_id)
         if ok:
@@ -549,6 +562,16 @@ class _BuiltinAgentStorageProxy:
             except Exception:  # 白名单清理失败不影响删除结果
                 logger.warning(
                     "failed to drop tool whitelist for %s",
+                    agent_id,
+                    exc_info=True,
+                )
+            try:
+                # 记忆清理收口到 memory 包（DB 配置行 + Redis 会话态）；
+                # 平台侧删除仍为占位（仅本地清理）。
+                await memory_module.cleanup_agent_memory(agent_id)
+            except Exception:  # 记忆清理失败不影响删除结果
+                logger.warning(
+                    "failed to drop memory records for agent %s",
                     agent_id,
                     exc_info=True,
                 )
@@ -726,6 +749,14 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
+# 会话记忆运行时依赖：redis client（供心跳/计数/锁）与 storage（取消息）。
+# InMemory 本地模式 _get_redis_client() 返回 None → 记忆中间件仅检索注入，
+# 计数/提取降级关闭；Redis 模式全量生效。
+memory_module.configure_memory_runtime(
+    redis_client_fn=_get_redis_client,
+    storage=storage,
+)
+
 
 async def _build_agent_middlewares_with_ellm(
     user_id: str,
@@ -735,6 +766,14 @@ async def _build_agent_middlewares_with_ellm(
     mws = await build_agent_middlewares(user_id, agent_id, session_id)
     mws.extend(await _ellm_refresh_mw_factory(user_id, agent_id, session_id))
     mws.append(_summarization_mw)
+    # 会话记忆中间件：memory_enabled 才装配（检索注入 + 轮数/静默触发）
+    mws.extend(
+        await memory_module.build_memory_middlewares(
+            user_id,
+            agent_id,
+            session_id,
+        ),
+    )
     return mws
 
 
@@ -761,6 +800,32 @@ app = create_app(
     title="BocomADP",
     extra_middlewares=build_asgi_middlewares(trace_enabled),
 )
+
+
+def _configurable_tool_names() -> list[str]:
+    """Return the configurable tool set M.
+
+    M = workspace builtins + ToolRegistry tools + MCP servers + framework
+    team/planning tools + enterprise tools. Mirrors
+    :func:`bocomadp.routers.agent_tools._all_tool_names` so the built-in
+    agent-creator's whitelist covers exactly what the tool config APIs
+    manage.
+    """
+    from bocomadp.tool_catalog import (
+        BUILTIN_TOOL_NAMES,
+        FRAMEWORK_TOOLS_META,
+    )
+    from bocomadp.tools.enterprise_catalog import enterprise_tool_names
+
+    names: set[str] = set(BUILTIN_TOOL_NAMES)
+    names.update(meta["name"] for meta in FRAMEWORK_TOOLS_META)
+    names.update(enterprise_tool_names())
+    names.update(tool_registry.list_tool_names())
+    for mcp in mcp_registry.list_mcps():
+        name = getattr(mcp, "name", "") or ""
+        if name:
+            names.add(name)
+    return sorted(names)
 
 
 # ── 注册内置智能体：智能体工厂（agent-creator）到框架 StorageBase ──
@@ -799,20 +864,26 @@ async def _register_builtin_agents() -> None:
             _AGENT_CREATOR_ID,
         )
 
-    # Init tool whitelist — only factory tools for agent-creator.
+    # Init tool whitelist — the factory tools plus the configurable
+    # set M (builtins / project / framework / enterprise), so the factory
+    # agent can use any normal tool the tool config APIs manage.
     # Idempotent: re-applied on every startup (not just first
     # registration) because the in-memory store is lost on restart.
-    _tool_whitelists[_AGENT_CREATOR_ID] = [
+    factory_tools = [
         "create_agent",
         "update_agent",
         "delete_agent",
         "list_agents",
         "get_agent",
+        "get_agent_tools",
         "list_tools_for_agent",
         "set_agent_tools",
         "list_available_skills",
         "enable_skill_for_agent",
     ]
+    _tool_whitelists[_AGENT_CREATOR_ID] = sorted(
+        set(factory_tools) | set(_configurable_tool_names()),
+    )
 
 
 _original_lifespan = app.router.lifespan_context
@@ -847,6 +918,12 @@ async def _lifespan_with_builtin_agents(app):
         # 内置模型条目作为 default 用户默认凭证幂等入库（deerflow
         # 模型名解析的默认参数单一来源；失败仅告警不阻断启动）
         await ensure_default_credentials(storage)
+        # 模型库（model_registry）进程内快照预热：同步接口
+        # （EllmChatModel.list_models / context_size / think_tag）据此读取；
+        # 内部已吞异常，DB 不可用时保留空快照、不阻断启动。
+        from bocomadp.routers.model_registry import load_snapshot
+
+        await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
         patch_get_toolkit()
@@ -939,7 +1016,10 @@ app.include_router(agent_router)
 # （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
 # 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
 # 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
-install_agent_memory_router(app)
+# 会话记忆能力装配：/memory/config 路由 + lifespan 启动静默扫描器
+# （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
+# _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
+memory_module.install_memory(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
@@ -966,12 +1046,15 @@ app.include_router(credential_model_router)
 # 系统提示词管理（全局默认 + 按智能体自定义）
 from bocomadp.routers.system_prompt import system_prompt_router
 app.include_router(system_prompt_router)
-# ELLM 模型管理（Redis bocomadp:model:think_tag 增删改查）
-from bocomadp.routers.ellm_models import ellm_models_router
-app.include_router(ellm_models_router)
 # 运行时配置管理（PG runtime_configs 表，/config/{key} 通用 CRUD）
 from bocomadp.routers.runtime_config import runtime_config_router
 app.include_router(runtime_config_router)
+# 模型库（PG model_registry 表：CRUD + ELLM 运行时模型候选唯一真源）
+from bocomadp.routers.model_registry import model_registry_router
+app.include_router(model_registry_router)
+# 智能体凭证绑定（agent_credential 表：agent_id -> credential_id 的 CRUD）
+from bocomadp.routers.agent_credential import agent_credential_router
+app.include_router(agent_credential_router)
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1064,8 @@ app.include_router(runtime_config_router)
 # /api 前缀，nginx / vite 代理均不剥前缀直接透传）：
 #   内置 /chat、/agent...        → /api/chat、/api/agent...
 #   bocomadp /agents、/files...  → /api/agents、/api/files...
-#   deerflow /deerflow/threads、/deerflow/v1/auth → /api/deerflow/threads...
+#   threads 协议 /bocomadp/v1/threads → /api/bocomadp/v1/threads；deer-flow 前端桩
+#   /deerflow/v1/auth → /api/deerflow/v1/auth（兼容保留）
 
 
 @asynccontextmanager
@@ -1007,9 +1091,22 @@ if __name__ == "__main__":
         config.logging.enhance.format,
         config.service.reload,
     )
-    uvicorn.run(
-        "main:root_app",
-        host=config.service.host,
-        port=config.service.port,
-        reload=config.service.reload,
-    )
+    # 传 app 对象而非 "main:root_app" 字符串：python main.py 时本模块先以
+    # __main__ 执行一遍，若再让 uvicorn 按字符串 import "main"，顶层代码会
+    # 被完整重跑第二遍（重复建 engine/装 lifespan、install_memory 等模块级
+    # 日志全部打两遍）。传对象则不二次 import。
+    # reload 热更需要 import 字符串，dev 可接受双跑；生产 reload=false 传对象。
+    if config.service.reload:
+        uvicorn.run(
+            "main:root_app",
+            host=config.service.host,
+            port=config.service.port,
+            reload=True,
+        )
+    else:
+        uvicorn.run(
+            root_app,
+            host=config.service.host,
+            port=config.service.port,
+            reload=False,
+        )
