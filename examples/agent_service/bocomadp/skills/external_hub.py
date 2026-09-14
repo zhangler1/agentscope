@@ -5,15 +5,23 @@
 :class:`~agentscope.app.hub._skill._base.SkillHubBase` 接口暴露目录与
 下载能力，使 Web UI 与 workspace 流程将其视为普通 skill hub。
 
-认证为 cookie 式、token 驱动：调用方通过 :meth:`set_token` 每次请求
-传入 ``guwpToken``；每次调用都会向登录端点换取新的 ``SESSION``
-cookie（无缓存）。
+认证为 cookie 式、**本地 AES 凭证驱动**：以请求方身份 ``user_id``（即
+``X-User-ID`` 头）作为 OA 账号，本地生成 AES 凭证（见
+:mod:`._skillhub_auth`）后向登录端点换取 ``SESSION`` cookie。cookie
+**按 OA 分键缓存**（TTL 内复用），同一 OA 的并发登录自动合流
+（single-flight），因此不再需要、也不支持逐请求设置 token。
 
-服务地址从环境变量 ``BOCOMADP_EXTERNAL_SKILLHUB_URL`` 读取（或 ``.env``）。
+服务地址从环境变量 ``BOCOMADP_EXTERNAL_SKILLHUB_URL`` 读取（或 ``.env``）；
+AES 凭证相关配置见 :mod:`._skillhub_auth`（``SKILLHUB_CHANNEL_RAND`` /
+``SKILLHUB_PLATFORM``）。
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import re
+import time
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
@@ -22,6 +30,7 @@ from agentscope.app.hub._error import HubError
 from agentscope.app.hub._skill._base import SkillArchive, SkillHubBase
 
 from ._card import SkillCard, SkillHubPage
+from ._skillhub_auth import build_auth_token, skillhub_platform
 
 if TYPE_CHECKING:
     import httpx
@@ -48,6 +57,16 @@ LABELS_PATH = "/api/web/labels"
 #: 默认流式块大小（64 KiB）。
 DEFAULT_CHUNK_SIZE = 64 * 1024
 
+#: 登录端点路径（拼在 ``base_url`` 之后）。
+LOGIN_PATH = "/api/v1/auth/third-party/login"
+
+#: 会话 cookie 缓存时长（秒）。取 240s（小于 AES 凭证 5 分钟有效期）以保守
+#: 复用；真正的失效信号是业务请求返回 401 —— 届时丢弃缓存并重登一次。
+SESSION_TTL_SECONDS = 240.0
+
+#: 登录失败后的冷却时长（秒）：窗口内不再打上游，避免重试风暴撞限流。
+LOGIN_FAILURE_COOLDOWN_SECONDS = 5.0
+
 #: 默认服务地址（未配置 ``BOCOMADP_EXTERNAL_SKILLHUB_URL`` 时使用）。
 DEFAULT_BASE_URL = "http://53.12.9.18/skillhub-server"
 
@@ -60,13 +79,29 @@ def _default_skillhub_url() -> str:
     )
 
 
+def _session_id_from_set_cookie(raw: str) -> str:
+    """从 ``Set-Cookie`` 头里解析 ``SESSION=<id>``（``x-session-id`` 的兜底）。
+
+    部分网关不返回 ``x-session-id``，而是把会话放在 ``Set-Cookie`` 里；此
+    处只取会话值，不含 ``SESSION=`` 前缀。
+    """
+    match = re.search(
+        r"(?:^|;\s*)SESSION=([^;]+)",
+        raw or "",
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
 class ExternalSkillHub(SkillHubBase):
     """基于部署方自有 skillhub 服务器的 skill hub。
+
+    认证：以 ``user_id``（``X-User-ID``）为 OA 账号本地生成 AES 凭证换取
+    会话 cookie；cookie 按 OA 分键缓存，并发请求之间互不影响。
 
     .. code-block:: python
 
         hub = ExternalSkillHub()                 # base_url 取环境变量
-        hub.set_token("guwp_...")                # 可选，按请求设置
         page = await hub.list_skills(user_id="alice", q="write")
         archive = await hub.download("alice", "write")
     """
@@ -79,7 +114,6 @@ class ExternalSkillHub(SkillHubBase):
         icon_url: str | None = None,
         *,
         base_url: str | None = None,
-        api_token: str | None = None,
         timeout: float = 30.0,
     ) -> None:
         """初始化外部 skillhub 提供者。
@@ -91,22 +125,18 @@ class ExternalSkillHub(SkillHubBase):
             icon_url (`str | None`): hub 图标。
             base_url (`str | None`): skillhub 服务地址；``None`` 时
                 取 ``BOCOMADP_EXTERNAL_SKILLHUB_URL``（或默认值）。
-            api_token (`str | None`): 初始 ``guwpToken``，可后续通过
-                :meth:`set_token` 更新。
             timeout (`float`): 单请求超时（秒）。
         """
         super().__init__(hub_id, display_name, description, icon_url)
         self.base_url = (base_url or _default_skillhub_url()).rstrip("/")
         self.timeout = timeout
-        self._guwp_token = api_token
+        #: OA → (``SESSION=...`` cookie, 过期时刻；``time.monotonic()``)
+        self._sessions: dict[str, tuple[str, float]] = {}
+        #: OA → 进行中的登录任务（并发调用共享同一任务）
+        self._login_tasks: dict[str, "asyncio.Task[str]"] = {}
+        #: OA → 登录失败冷却截止时刻（``time.monotonic()``）
+        self._cooldowns: dict[str, float] = {}
         self._client: "httpx.AsyncClient | None" = None
-
-    def set_token(self, token: str | None) -> None:
-        """更新用于 cookie 刷新的 ``guwpToken``。
-
-        可逐请求调用——下一次调用会用新 token 重新认证。
-        """
-        self._guwp_token = token
 
     # ── 生命周期 ────────────────────────────────────────────────
 
@@ -132,26 +162,32 @@ class ExternalSkillHub(SkillHubBase):
         return self._client
 
     def _headers(self, cookie: str) -> dict[str, str]:
-        """构造请求头（含会话 cookie）。"""
-        return {
+        """构造请求头（会话 cookie 非空时才带 ``Cookie``）。"""
+        headers = {
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Content-Type": "application/json",
-            "Cookie": cookie,
             "User-Agent": "PostmanRuntime-ApipostRuntime/1.1.0",
         }
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
 
     # ── 原样透传（不加工）────────────────────────────────────────
 
-    async def _get_json(self, url: str) -> dict:
+    async def _get_json(self, url: str, oa: str = "") -> dict:
         """GET 一个 JSON 端点，**原样**返回响应体（不做任何字段映射/裁剪）。
 
         异常统一转 :class:`HubError`（与 :meth:`list_skills` 一致）。
-        """
-        return await self._request_json("GET", url)
 
-    async def _request_json(self, method: str, url: str) -> dict:
+        Args:
+            url (`str`): 完整 URL。
+            oa (`str`): OA 账号（即请求的 ``user_id``），用于取会话 cookie。
+        """
+        return await self._request_json("GET", url, oa)
+
+    async def _request_json(self, method: str, url: str, oa: str = "") -> dict:
         """发一个 HTTP 请求（GET / PUT / DELETE）并**原样**返回响应体。
 
         异常统一转 :class:`HubError`——注意这只覆盖 **HTTP 层**失败；
@@ -161,32 +197,64 @@ class ExternalSkillHub(SkillHubBase):
         Args:
             method (`str`): HTTP 方法，如 ``GET`` / ``PUT`` / ``DELETE``。
             url (`str`): 完整 URL。
+            oa (`str`): OA 账号（即请求的 ``user_id``），用于取会话 cookie。
         """
-        try:
-            resp = await self._http().request(
-                method,
-                url,
-                headers=self._headers(await self._cookie()),
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:  # noqa: BLE001
-            status_code = getattr(getattr(e, "response", None), "status_code", 0)
-            raise HubError(self.hub_id, status_code, str(e)) from e
+        resp = await self._send(method, url, oa)
+        return resp.json()
 
-    async def _request_text(self, method: str, url: str) -> str:
+    async def _request_text(self, method: str, url: str, oa: str = "") -> str:
         """发一个 HTTP 请求并**原样返回文本**（远端返回纯文本，如 markdown）。
 
         异常统一转 :class:`HubError`（与 :meth:`_request_json` 一致）。
+
+        Args:
+            method (`str`): HTTP 方法。
+            url (`str`): 完整 URL。
+            oa (`str`): OA 账号（即请求的 ``user_id``），用于取会话 cookie。
         """
+        resp = await self._send(method, url, oa)
+        return resp.text
+
+    async def _send(self, method: str, url: str, oa: str = "") -> Any:
+        """发请求：先取该 OA 的会话 cookie，401 时重登一次并重试。
+
+        Args:
+            method (`str`): HTTP 方法。
+            url (`str`): 完整 URL。
+            oa (`str`): OA 账号（即请求的 ``user_id``）。
+
+        Returns:
+            `Any`: ``httpx.Response``（已 ``raise_for_status``）。
+
+        Raises:
+            HubError: 登录失败，或远端返回 4xx/5xx / 网络异常。
+        """
+        cookie = await self._session_cookie(oa)
         try:
             resp = await self._http().request(
                 method,
                 url,
-                headers=self._headers(await self._cookie()),
+                headers=self._headers(cookie),
             )
+            if resp.status_code == 401 and cookie:
+                # 会话已被远端失效：丢弃缓存 → 重登一次 → 重试一次
+                logger.warning(
+                    "External skillhub session rejected (401): oa=%s "
+                    "cookie=%s -> relogin and retry once",
+                    oa,
+                    cookie,
+                )
+                self._invalidate_session(oa)
+                cookie = await self._session_cookie(oa)
+                resp = await self._http().request(
+                    method,
+                    url,
+                    headers=self._headers(cookie),
+                )
             resp.raise_for_status()
-            return resp.text
+            return resp
+        except HubError:
+            raise
         except Exception as e:  # noqa: BLE001
             status_code = getattr(getattr(e, "response", None), "status_code", 0)
             raise HubError(self.hub_id, status_code, str(e)) from e
@@ -249,7 +317,7 @@ class ExternalSkillHub(SkillHubBase):
             self._normalize_version(version),
             path,
         )
-        return await self._request_text("GET", url)
+        return await self._request_text("GET", url, user_id)
 
     def _star_url(self, skill_id: str) -> str:
         """收藏/取消收藏端点 URL（远端用**数字 id**，非 slug）。"""
@@ -271,14 +339,18 @@ class ExternalSkillHub(SkillHubBase):
             user_id (`str`): 用户标识（透传给远端鉴权用）。
             skill_id (`str`): 远端技能的**数字 id**（非 slug）。
         """
-        return await self._request_json("PUT", self._star_url(skill_id))
+        return await self._request_json("PUT", self._star_url(skill_id), user_id)
 
     async def unstar_skill(self, user_id: str, skill_id: str) -> dict:
         """取消收藏一个 skill —— ``DELETE /api/web/skills/{id}/star``。
 
         返回语义同 :meth:`star_skill`。
         """
-        return await self._request_json("DELETE", self._star_url(skill_id))
+        return await self._request_json(
+            "DELETE",
+            self._star_url(skill_id),
+            user_id,
+        )
 
     def _catalog_url(
         self,
@@ -341,6 +413,7 @@ class ExternalSkillHub(SkillHubBase):
         """
         return await self._get_json(
             self._catalog_url(q, page, limit, label or "", sort or ""),
+            user_id,
         )
 
     async def list_uploaded_skills_raw(
@@ -351,7 +424,7 @@ class ExternalSkillHub(SkillHubBase):
     ) -> dict:
         """我的上传查询 —— **原样返回远端响应**，不做任何加工。"""
         url = f"{self.base_url}{MY_SKILLS_PATH}?page={page}&size={size}"
-        return await self._get_json(url)
+        return await self._get_json(url, user_id)
 
     async def list_labels_raw(self, user_id: str) -> dict:
         """全部分类标签查询 —— **原样返回远端响应**，不做任何加工。
@@ -375,7 +448,7 @@ class ExternalSkillHub(SkillHubBase):
         Args:
             user_id (`str`): 用户标识（透传给远端鉴权用）。
         """
-        return await self._get_json(f"{self.base_url}{LABELS_PATH}")
+        return await self._get_json(f"{self.base_url}{LABELS_PATH}", user_id)
 
     async def list_starred_skills_raw(
         self,
@@ -395,26 +468,91 @@ class ExternalSkillHub(SkillHubBase):
             size (`int`): 每页数量。
         """
         url = f"{self.base_url}{MY_STARS_PATH}?page={page}&size={size}"
-        return await self._get_json(url)
+        return await self._get_json(url, user_id)
 
-    # ── 认证 ────────────────────────────────────────────────────
+    # ── 认证：本地 AES 凭证 → 登录换 cookie ──────────────────────
 
-    async def _cookie(self) -> str:
-        """为当前 token 返回一个新的 ``SESSION=...`` cookie。
+    async def _session_cookie(self, oa: str) -> str:
+        """取该 OA 的 ``SESSION=...`` cookie（缓存 / 单飞 / 失败冷却）。
 
-        无缓存：每次调用都会用当前 ``guwpToken``（:meth:`set_token`
-        设置）向登录端点重新认证。无 token 时返回空（匿名会话）。
+        cookie 按 **OA 分键缓存**（OA 即请求的 ``user_id``），不依赖任何
+        实例级可变状态，因此并发请求之间不会互相覆盖或串号：
+
+        - 命中缓存（TTL 内）→ 直接返回，不再登录
+        - 未命中 → 同一 OA 的并发调用共享同一个登录任务（single-flight）
+        - 登录失败 → 进入冷却窗口并抛 :class:`HubError`（不静默降级）
+
+        Args:
+            oa (`str`): OA 账号。空值（如无身份的框架调用）返回空串，
+                表示匿名会话。
+
+        Returns:
+            `str`: ``"SESSION=<id>"``；匿名时为空串。
+
+        Raises:
+            HubError: 登录失败，或该 OA 正处于失败冷却窗口内。
         """
-        token = self._guwp_token
-        if not token:
+        account = (oa or "").strip()
+        if not account:
             return ""
 
-        import json
+        cached = self._sessions.get(account)
+        if cached is not None:
+            cookie, expires_at = cached
+            if expires_at > time.monotonic():
+                logger.debug(
+                    "External skillhub session cache hit: oa=%s cookie=%s "
+                    "remaining=%.0fs",
+                    account,
+                    cookie,
+                    expires_at - time.monotonic(),
+                )
+                return cookie
+            self._sessions.pop(account, None)
 
-        login_url = f"{self.base_url}/api/v1/auth/third-party/login"
+        cooldown_until = self._cooldowns.get(account, 0.0)
+        if cooldown_until > time.monotonic():
+            raise HubError(
+                self.hub_id,
+                0,
+                f"login for {account!r} is in cooldown after a failure",
+            )
+
+        task = self._login_tasks.get(account)
+        if task is None:
+            task = asyncio.create_task(self._login(account))
+            self._login_tasks[account] = task
+            # 完成后立刻移出，避免失败的 future 永久毒化后续调用
+            task.add_done_callback(
+                lambda _task, key=account: self._login_tasks.pop(key, None),
+            )
+        # shield：等待方被取消时不牵连其他等待者共享的登录任务
+        return await asyncio.shield(task)
+
+    async def _login(self, oa: str) -> str:
+        """用本地生成的 AES 凭证登录，返回 ``"SESSION=<id>"`` cookie。
+
+        失败时记录冷却并抛 :class:`HubError`——**不**静默降级为匿名，
+        否则鉴权故障会伪装成「目录里技能变少」，难以排查。
+
+        Args:
+            oa (`str`): OA 账号（非空，由 :meth:`_session_cookie` 保证）。
+
+        Returns:
+            `str`: ``"SESSION=<id>"``。
+
+        Raises:
+            HubError: 登录请求失败，或响应里没有会话标识。
+        """
         body = json.dumps(
-            {"loginMethod": "TOKEN", "platform": "GUWP", "token": token},
+            {
+                "loginMethod": "AUTH",
+                "token": build_auth_token(oa),
+                "platform": skillhub_platform(),
+                "platForm": skillhub_platform(),
+            },
         )
+        login_url = f"{self.base_url}{LOGIN_PATH}"
         try:
             resp = await self._http().post(
                 login_url,
@@ -422,15 +560,62 @@ class ExternalSkillHub(SkillHubBase):
                 headers=self._headers(""),
             )
             resp.raise_for_status()
-            new_session_id = resp.headers.get("x-session-id", "")
-            if new_session_id:
-                return f"SESSION={new_session_id}"
         except Exception as e:  # noqa: BLE001
+            self._cooldowns[oa] = (
+                time.monotonic() + LOGIN_FAILURE_COOLDOWN_SECONDS
+            )
             logger.error(
-                "Failed to refresh external skillhub cookie: %s",
+                "External skillhub login failed (oa=%s): %s",
+                oa,
                 e,
             )
-        return ""
+            raise HubError(
+                self.hub_id,
+                getattr(getattr(e, "response", None), "status_code", 0),
+                f"login failed for oa={oa!r}: {e}",
+            ) from e
+
+        session_id = (resp.headers.get("x-session-id") or "").strip()
+        if not session_id:
+            # 兜底：部分网关把会话放在 ``Set-Cookie: SESSION=...``
+            session_id = _session_id_from_set_cookie(
+                resp.headers.get("set-cookie") or "",
+            )
+        if not session_id:
+            self._cooldowns[oa] = (
+                time.monotonic() + LOGIN_FAILURE_COOLDOWN_SECONDS
+            )
+            logger.error(
+                "External skillhub login response has no session id (oa=%s)",
+                oa,
+            )
+            raise HubError(
+                self.hub_id,
+                0,
+                f"login response has no session id (oa={oa!r})",
+            )
+
+        cookie = f"SESSION={session_id}"
+        self._sessions[oa] = (
+            cookie,
+            time.monotonic() + SESSION_TTL_SECONDS,
+        )
+        self._cooldowns.pop(oa, None)
+        # 每次「新获取」的 cookie 都打印（含会话值，属敏感信息；如需脱敏，
+        # 把 cookie 换成 f"{session_id[:8]}…" 即可）。
+        logger.info(
+            "External skillhub login ok: oa=%s session_id=%s cookie=%s "
+            "ttl=%.0fs",
+            oa,
+            session_id,
+            cookie,
+            SESSION_TTL_SECONDS,
+        )
+        return cookie
+
+    def _invalidate_session(self, oa: str) -> None:
+        """丢弃某 OA 的缓存 cookie（远端返回 401 时调用）。"""
+        self._sessions.pop((oa or "").strip(), None)
 
     # ── SkillHubBase ─────────────────────────────────────────────
 
@@ -456,6 +641,7 @@ class ExternalSkillHub(SkillHubBase):
 
         data = await self._get_json(
             self._catalog_url(q, page, limit, label or "", sort or ""),
+            user_id,
         )
 
         payload = data.get("data") or {}
@@ -497,8 +683,8 @@ class ExternalSkillHub(SkillHubBase):
     ) -> SkillHubPage:
         """浏览当前用户上传到 skillhub 的 skill。
 
-        需先通过 :meth:`set_token` 设置 ``guwpToken``——端点按用户
-        隔离，会话 cookie 携带身份。``page`` / ``size`` 以查询参数
+        端点按用户隔离：以 ``user_id``（OA）本地生成 AES 凭证换取会话
+        cookie，cookie 按 OA 缓存复用。``page`` / ``size`` 以查询参数
         拼接到远程 URL（``?page=..&size=..``）。
 
         Args:
@@ -569,7 +755,9 @@ class ExternalSkillHub(SkillHubBase):
                 client.stream(
                     "GET",
                     url,
-                    headers=self._headers(await self._cookie()),
+                    headers=self._headers(
+                        await self._session_cookie(user_id),
+                    ),
                 ),
             )
             if response.status_code == 404:
