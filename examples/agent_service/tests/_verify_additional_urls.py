@@ -258,13 +258,15 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
             agent_id="a1",
             session_id="s1",
             context={
-                "additional_urls": [
-                    " http://oss/a.png ",
-                    123,
-                    "",
-                    "http://oss/b.txt",
-                ],
-                "lang": "zh",
+                "custom_params": {
+                    "additional_urls": [
+                        " http://oss/a.png ",
+                        123,
+                        "",
+                        "http://oss/b.txt",
+                    ],
+                    "lang": "zh",
+                },
             },
         )
         with patch.object(chat_mod, "download_urls_to_session", new=fake_download):
@@ -273,8 +275,8 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
                     body, "u1", "a1", "s1", FakeStorage(), FakeWorkspaceManager(),
                 )
             )
-        # URL 清洗 + 仅副作用：返回 None（context 含 additional_urls
-        # 整体由 _resolve_custom_params 落盘，便于查看历史传参）
+        # URL 清洗 + 仅副作用：返回 None（context.custom_params 含
+        # additional_urls 整体由 _resolve_custom_params 落盘，便于查看历史传参）
         self.assertEqual(
             seen["urls"], ["http://oss/a.png", "http://oss/b.txt"]
         )
@@ -288,7 +290,7 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
 
         params = {"lang": "zh"}
         body = CreateRunRequest(
-            agent_id="a1", session_id="s1", context=params,
+            agent_id="a1", session_id="s1", context={"custom_params": params},
         )
         with patch.object(chat_mod, "download_urls_to_session", new=fake_download):
             result = run(

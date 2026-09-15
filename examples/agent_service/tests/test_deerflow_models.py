@@ -195,18 +195,24 @@ def _patch_no_binding(monkeypatch) -> None:
 
 
 def test_resolve_requested_model_name_from_context() -> None:
-    """context 通道：llm_model_name 优先于原生 model_name；config 忽略。"""
+    """llm_model_name（嵌套 custom_params）优先于原生 model_name；config 忽略。"""
     body = CreateRunRequest(
-        context={"model_name": "from-context", "llm_model_name": "from-llm"},
+        context={
+            "model_name": "from-context",
+            "custom_params": {"llm_model_name": "from-llm"},
+        },
         config={"configurable": {"model_name": "from-config"}},
     )
     assert _resolve_requested_model_name(body.context) == "from-llm"
 
 
 def test_resolve_requested_model_name_model_name_fallback() -> None:
-    """llm_model_name 缺失时回退 context.model_name（原生白名单 key）。"""
+    """custom_params 缺失 llm_model_name 时回退 context.model_name（原生白名单 key）。"""
     body = CreateRunRequest(
-        context={"model_name": "from-native"},
+        context={
+            "model_name": "from-native",
+            "custom_params": {"lang": "zh"},
+        },
         config={"configurable": {"model_name": "from-config"}},
     )
     assert _resolve_requested_model_name(body.context) == "from-native"
@@ -216,7 +222,10 @@ def test_resolve_requested_model_name_empty_fallback() -> None:
     """缺失返回空串；空白值视为缺失；其他 SDK 字段不参与解析。"""
     assert _resolve_requested_model_name(None) == ""
     body = CreateRunRequest(
-        context={"model_name": "  "},
+        context={
+            "model_name": "  ",
+            "custom_params": {"llm_model_name": "  "},
+        },
         config={"configurable": {"model_name": "from-config"}},
     )
     assert _resolve_requested_model_name(body.context) == ""
