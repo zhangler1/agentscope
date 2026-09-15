@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""deerflow context.additional_urls 下载保存功能测试。
+"""deerflow context.custom_params.additional_urls 下载保存功能测试。
 
 覆盖 ``bocomadp.routers.uploads.download_urls_to_session`` /
 ``_filename_from_url`` 与 ``bocomadp.deerflow.routers.deerflow_chat.
@@ -306,8 +306,10 @@ def test_download_additional_urls_downloads_cleaned_urls(
         agent_id="a1",
         session_id="s1",
         context={
-            "additional_urls": [" http://oss/a.png ", 123, "", "http://oss/b.txt"],
-            "lang": "zh",
+            "custom_params": {
+                "additional_urls": [" http://oss/a.png ", 123, "", "http://oss/b.txt"],
+                "lang": "zh",
+            },
         },
     )
 
@@ -320,7 +322,7 @@ def test_download_additional_urls_downloads_cleaned_urls(
     )
 
     # URL 清洗：去空白、过滤非字符串；仅执行下载副作用，返回 None
-    # （context 含 additional_urls 整体由 _resolve_custom_params 落盘）
+    # （context.custom_params 含 additional_urls 整体由 _resolve_custom_params 落盘）
     assert seen["urls"] == ["http://oss/a.png", "http://oss/b.txt"]
     assert result is None
 
@@ -336,7 +338,9 @@ def test_download_additional_urls_skips_without_key(
 
     monkeypatch.setattr(chat_mod, "download_urls_to_session", fake_download)
     params = {"lang": "zh"}
-    body = CreateRunRequest(agent_id="a1", session_id="s1", context=params)
+    body = CreateRunRequest(
+        agent_id="a1", session_id="s1", context={"custom_params": params},
+    )
 
     result = asyncio.run(
         _download_additional_urls(
