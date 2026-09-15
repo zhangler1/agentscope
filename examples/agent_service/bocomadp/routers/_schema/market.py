@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class MarketAgentView(BaseModel):
-    """一条平台市场智能体视图（agents 行 + market 档案 + 实时热度）。"""
+    """一条市场智能体视图（agents 行 + market 档案 + 实时热度）。"""
 
     id: str = Field(description="智能体 id（agents.id）。")
     name: str = Field(description="智能体名称（payload 里的 AgentData.name）。")
@@ -14,8 +14,9 @@ class MarketAgentView(BaseModel):
         description="来源：user（自建）/ team（团长对话中派生的 worker）。",
     )
     tag: str = Field(
-        description="标签（自由字符串）。平台智能体创建时自动写入默认标签"
-        "（未分类），清标/下架重置回默认——恒有值，不会是 null。",
+        description="标签（自由字符串）。平台智能体创建时、个人智能体"
+        "发布/打标时自动写入默认标签（未分类），清标重置回默认——"
+        "恒有值，不会是 null。",
     )
     heat: int = Field(
         default=0,
@@ -36,10 +37,18 @@ class MarketListResponse(BaseModel):
 
 
 class MarketEntryView(BaseModel):
-    """一条市场档案（PUT / DELETE /agent/market/{agent_id} 的返回体）。"""
+    """一条市场档案（发布/撤回/打标接口的返回体）。"""
 
     agent_id: str = Field(description="智能体 id。")
-    tag: str = Field(description="标签（清标/下架后为默认标签“未分类”）。")
+    tag: str = Field(description="标签（清标后为默认标签“未分类”）。")
+    published: bool = Field(
+        description="是否已发布到市场。平台智能体恒为 true；"
+        "个人智能体由 publish/unpublish 接口控制。",
+    )
+    published_at: datetime | None = Field(
+        default=None,
+        description="最近一次发布时间；未发布或已撤回为 null。",
+    )
     created_at: datetime | None = Field(default=None, description="建档时间。")
     updated_at: datetime | None = Field(default=None, description="最后修改时间。")
 

@@ -11,13 +11,20 @@
   打标内容原样存储，无预设清单、无权限体系（初版内部使用）；
 - 热度不落库（实时聚合 sessions，见 ``routers/market.py``）。
 
-表语义（一行 = 一个平台智能体的市场档案，1:1 关联 ``agents.id``）：
+表语义（一行 = 一个智能体的市场档案，1:1 关联 ``agents.id``）：
 
-- ``agent_id``  主键，即 ``agents.id``；
-- ``tag``       自由标签；平台智能体创建时自动写入默认标签
+- ``agent_id``     主键，即 ``agents.id``；
+- ``tag``          自由标签；平台智能体创建时自动写入默认标签
   （config ``agent_market.default_tag``，当前"未分类"），
-  清标/下架亦重置回默认值；
+  清标重置回默认值；
+- ``published``    是否发布到市场：平台智能体建档即 ``1``（天然在市场）；
+  用户智能体默认 ``0``，由 ``POST /agent/market/{id}/publish`` 置 1、
+  ``/unpublish`` 撤回置 0（标签保留不动）；
+- ``published_at`` 最近一次发布时间（撤回时清空）；
 - ``created_at`` / ``updated_at`` 档案时间戳。
+
+用户智能体的档案行**懒式创建**：发布或打标时才建档——未发布、
+未打标的个人智能体在表里没有行；启动兜底只补平台智能体。
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import DateTime, Index, String, select, text
+from sqlalchemy import Boolean, DateTime, Index, String, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 logger = logging.getLogger("bocomadp.market_store")
@@ -46,6 +53,12 @@ class AgentMarketRow(_MarketBase):
 
     agent_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     tag: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    published: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+    )
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
@@ -62,6 +75,8 @@ class AgentMarketEntry(BaseModel):
 
     agent_id: str
     tag: str = ""
+    published: bool = False
+    published_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -111,8 +126,42 @@ async def _migrate_domain_to_tag(conn: Any) -> None:
         logger.info("migrated agent_market: dropped legacy domain column")
 
 
+async def _migrate_publish_columns(conn: Any) -> None:
+    """旧表结构迁移：补 ``published`` / ``published_at`` 两列（幂等）。
+
+    ``create_all`` 不会给已存在的表加列，缺列就 ``ALTER ADD``。
+    TINYINT(1) / DATETIME 在 MySQL 与 SQLite 上通用（BOOLEAN 是
+    MySQL 里 TINYINT(1) 的别名，SQLite 只看类型亲和性）。
+    存量平台档案的 ``published=1`` 回填由 ``ensure_market_tables``
+    里的 ``_backfill_platform_published`` 负责（需要跨表查询）。
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    def _cols(sync_conn: Any) -> set[str]:
+        insp = sa_inspect(sync_conn)
+        return {c["name"] for c in insp.get_columns("agent_market")}
+
+    cols = await conn.run_sync(_cols)
+    if "published" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE agent_market "
+                "ADD COLUMN published TINYINT(1) NOT NULL DEFAULT 0",
+            ),
+        )
+        logger.info("migrated agent_market: added published column")
+    if "published_at" not in cols:
+        await conn.execute(
+            text(
+                "ALTER TABLE agent_market "
+                "ADD COLUMN published_at DATETIME NULL",
+            ),
+        )
+        logger.info("migrated agent_market: added published_at column")
+
+
 async def ensure_market_tables(storage: Any) -> None:
-    """启动时建表（幂等，已存在则跳过）+ 孤儿清理 + 默认标签补齐。"""
+    """启动时建表（幂等，已存在则跳过）+ 迁移 + 孤儿清理 + 平台档案补齐。"""
     engine = getattr(storage, "_engine", None)
     if engine is None:
         logger.warning(
@@ -122,6 +171,7 @@ async def ensure_market_tables(storage: Any) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(_MarketBase.metadata.create_all)
         await _migrate_domain_to_tag(conn)
+        await _migrate_publish_columns(conn)
     logger.info("ensured table agent_market")
 
     # 孤儿档案兜底清理（智能体已被删但市场档案残留的死数据）
@@ -129,10 +179,57 @@ async def ensure_market_tables(storage: Any) -> None:
     if pruned:
         logger.info("pruned %d orphan agent_market entries", pruned)
 
+    # 存量回填：平台名下档案刷 published=1（发布机制上线前的老行）
+    backfilled = await _backfill_platform_published(storage)
+    if backfilled:
+        logger.info("backfilled published=1 for %d platform entries", backfilled)
+
     # 默认标签补齐：平台名下还没有档案的智能体自动挂"未分类"
     tagged = await ensure_default_tags(storage)
     if tagged:
         logger.info("seeded default tag for %d platform agents", tagged)
+
+
+async def _backfill_platform_published(storage: Any) -> int:
+    """把平台名下智能体的市场档案刷成 ``published=1``（存量迁移兜底）。
+
+    ``published`` 列上线前建的老档案该列默认 0，但平台智能体天然
+    在市场，必须刷成 1；用户智能体不在这里动（它们本来就该是 0，
+    由发布接口按需置 1）。系统内置智能体（``_`` 开头）没有档案行，
+    天然被跳过。
+    """
+    from bocomadp.config.market_config import get_platform_user_id
+    from agentscope.app.storage._sql._tables import AgentRow
+
+    factory = _session_factory(storage)
+    if factory is None:
+        return 0
+    platform = get_platform_user_id()
+    async with factory() as session:
+        platform_ids = {
+            aid
+            for (aid,) in (
+                await session.execute(
+                    select(AgentRow.id).where(AgentRow.user_id == platform),
+                )
+            ).all()
+        }
+        if not platform_ids:
+            return 0
+        rows = (
+            await session.execute(
+                select(AgentMarketRow).where(
+                    AgentMarketRow.published.is_(False),
+                    AgentMarketRow.agent_id.in_(platform_ids),
+                ),
+            )
+        ).scalars().all()
+        for row in rows:
+            row.published = True
+            row.updated_at = _now()
+        if rows:
+            await session.commit()
+        return len(rows)
 
 
 async def ensure_default_tags(storage: Any) -> int:
@@ -172,6 +269,7 @@ async def ensure_default_tags(storage: Any) -> int:
                 AgentMarketRow(
                     agent_id=aid,
                     tag=default_tag,
+                    published=True,
                     created_at=now,
                     updated_at=now,
                 ),
@@ -183,9 +281,11 @@ async def ensure_default_tags(storage: Any) -> int:
 
 
 async def ensure_default_tag_for(storage: Any, agent_id: str) -> None:
-    """单个智能体的默认标签补齐（创建接口钩子用）。
+    """单个智能体的默认标签补齐（平台创建接口钩子专用）。
 
     已有档案则不做任何改动（保护已配置的标签）；没有则写入默认标签。
+    只有平台创建钩子会调用本函数，故新建档案 ``published=1``
+    （平台智能体天然在市场）。
     """
     from bocomadp.config.market_config import get_default_tag
 
@@ -193,7 +293,11 @@ async def ensure_default_tag_for(storage: Any, agent_id: str) -> None:
         return
     await upsert_market_entry(
         storage,
-        AgentMarketEntry(agent_id=agent_id, tag=get_default_tag()),
+        AgentMarketEntry(
+            agent_id=agent_id,
+            tag=get_default_tag(),
+            published=True,
+        ),
     )
 
 
@@ -212,6 +316,8 @@ async def get_market_entry(
         return AgentMarketEntry(
             agent_id=row.agent_id,
             tag=row.tag,
+            published=row.published,
+            published_at=row.published_at,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -230,6 +336,8 @@ async def list_market_entries(storage: Any) -> list[AgentMarketEntry]:
             AgentMarketEntry(
                 agent_id=r.agent_id,
                 tag=r.tag,
+                published=r.published,
+                published_at=r.published_at,
                 created_at=r.created_at,
                 updated_at=r.updated_at,
             )
@@ -254,14 +362,59 @@ async def upsert_market_entry(storage: Any, entry: AgentMarketEntry) -> None:
                 AgentMarketRow(
                     agent_id=entry.agent_id,
                     tag=entry.tag,
+                    published=entry.published,
+                    published_at=entry.published_at,
                     created_at=entry.created_at or now,
                     updated_at=now,
                 ),
             )
         else:
+            # 只覆盖标签；发布状态归 set_market_published 管，不在这里动
             row.tag = entry.tag
             row.updated_at = now
         await session.commit()
+
+
+async def set_market_published(
+    storage: Any,
+    agent_id: str,
+    published: bool,
+) -> AgentMarketEntry:
+    """设置发布状态（``publish`` / ``unpublish`` 路由专用）。
+
+    - 档案不存在则先建档（tag 取默认"未分类"），再置状态；
+    - 发布：``published=1`` 且 ``published_at=now``（重复发布幂等，
+      published_at 刷成当前时间）；
+    - 撤回：``published=0`` 且 ``published_at`` 清空，**标签保留不动**。
+    """
+    from bocomadp.config.market_config import get_default_tag
+
+    factory = _session_factory(storage)
+    if factory is None:
+        raise RuntimeError("storage has no session factory; cannot set published")
+    now = _now()
+    async with factory() as session:
+        row = await session.get(AgentMarketRow, agent_id)
+        if row is None:
+            row = AgentMarketRow(
+                agent_id=agent_id,
+                tag=get_default_tag(),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+        row.published = published
+        row.published_at = now if published else None
+        row.updated_at = now
+        await session.commit()
+        return AgentMarketEntry(
+            agent_id=row.agent_id,
+            tag=row.tag,
+            published=row.published,
+            published_at=row.published_at,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
 
 
 async def delete_market_entry(storage: Any, agent_id: str) -> bool:
@@ -317,5 +470,6 @@ __all__ = [
     "get_market_entry",
     "list_market_entries",
     "prune_orphan_market_entries",
+    "set_market_published",
     "upsert_market_entry",
 ]
