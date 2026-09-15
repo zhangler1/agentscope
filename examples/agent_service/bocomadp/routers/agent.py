@@ -297,16 +297,16 @@ async def list_owned_agents(
 ) -> ListOwnedAgentsResponse:
     """返回**本人名下拥有**的智能体清单（严格用户隔离）。
 
-    与 ``GET /agent/``（可见性视图）的三点差异：
+    与 ``GET /agent/``（可见性视图）的差异：
 
     - 只含 ``user_id=调用者 AND source='user'`` 的记录——别人**共享
       给我**的智能体不出现在这里（那是可见性，不是所有权）；
-    - 自建团队成员**不隐藏**，直接列出并带 ``parent_agent_id`` 标记；
-    - ``source='team'`` 的派生 worker 永不出现（不是用户创建的资产）。
-
-    每条记录通过 ``expert_team_relations`` 补充团队标记：
-    ``is_team``（团长）/ ``parent_agent_id`` + ``is_self_built``
-    （自建成员）。外邀成员（别人的智能体）天然不在结果里。
+    - ``source='team'`` 的派生 worker 永不出现（不是用户创建的资产）；
+    - **自建成员不返回**：成员独属其团（``expert_team_relations``），
+      不与团长/独立智能体并列；成员明细走
+      ``GET /agent/?parent_agent_id={团长id}`` 名册接口。
+      ``parent_agent_id`` / ``is_self_built`` 字段保留但恒为 ``null``
+      （响应结构不变，前端按 ``is_team`` 渲染团卡片即可）。
 
     Args:
         page_num (`int`): 页码，1-based。
@@ -321,20 +321,22 @@ async def list_owned_agents(
     teams = await list_teams(storage, user_id)
     # updated_at 倒序（与 GET /agent/ 的展示习惯一致）；团队标记一次
     # list_teams 全量算好，避免每条记录各查一遍关系表。
+    # 自建成员独属其团，不在归属清单里与团长/独立智能体并列——
+    # 前端要成员明细走 GET /agent/?parent_agent_id={团长id}。
+    member_ids: set[str] = {
+        m for t in teams for m in t.member_ids  # noqa: C416
+    }
     items: list[OwnedAgentView] = []
     for record in sorted(records, key=lambda r: r.updated_at, reverse=True):
-        is_team = any(t.leader_agent_id == record.id for t in teams)
-        parent = next(
-            (t.leader_agent_id for t in teams if t.is_self_built(record.id)),
-            None,
-        )
+        if record.id in member_ids:
+            continue
         items.append(
             OwnedAgentView(
                 id=record.id,
                 name=record.data.name,
-                is_team=is_team,
-                parent_agent_id=parent,
-                is_self_built=True if parent is not None else None,
+                is_team=any(t.leader_agent_id == record.id for t in teams),
+                parent_agent_id=None,
+                is_self_built=None,
                 created_at=record.created_at,
                 updated_at=record.updated_at,
             ),
@@ -456,6 +458,15 @@ async def create_agent(
         parent_team.add_member(agent_id, "self_built")
         await upsert_team(storage, parent_team)
 
+    # 平台名下新建智能体 → 自动写入默认市场标签（"未分类"）。
+    # 平台智能体创建时自动建立市场档案，tag 恒不为空；
+    # 普通用户的智能体不进市场，不建档案。
+    from bocomadp.config.market_config import get_platform_user_id
+    from bocomadp.market_store import ensure_default_tag_for
+
+    if user_id == get_platform_user_id():
+        await ensure_default_tag_for(storage, agent_id)
+
     return CreateAgentResponse(agent_id=agent_id)
 
 
@@ -563,12 +574,17 @@ async def delete_agent(
     user_id: str = Depends(get_current_user_id),
     session_service: SessionService = Depends(get_session_service),
     access: ResourceAccessService = Depends(get_resource_access_service),
+    storage: StorageBase = Depends(get_storage),
 ) -> None:
     """Permanently delete an agent configuration.
 
     Cascades through every session owned by this agent (and, for team
     leaders, through every worker session) — cancelling any in-flight
     chat run, removing storage records, and purging bus state.
+
+    删除成功后**级联清理该智能体的市场档案**（``agent_market`` 行）。
+    不清理会留下孤儿档案（指向已删智能体的死数据）。团队成员级联删除
+    等绕过本接口的路径，由启动时 ``prune_orphan_market_entries`` 兜底。
 
     Args:
         agent_id (`str`): The agent to delete.
@@ -577,6 +593,9 @@ async def delete_agent(
         access (`ResourceAccessService`): Injected access service — used
             to resolve the owning user and enforce the edit permission
             when a shared editor deletes the agent.
+        storage (`StorageBase`): Injected storage — used to cascade the
+            agent-market entry.
+
     Raises:
         `HTTPException`: 404 if the agent is not visible to the caller;
             403 if visible but only readable.
@@ -592,7 +611,17 @@ async def delete_agent(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent '{agent_id}' not found.",
         )
+    # 市场档案级联清理 + 控制台留痕（失败不影响删除主流程）
+    from bocomadp.market_audit import log_audit
+    from bocomadp.market_store import delete_market_entry
 
+    if await delete_market_entry(storage, agent_id):
+        log_audit(
+            user_id,
+            "delete_agent_market",
+            target=agent_id,
+            detail="删除智能体级联清理市场档案",
+        )
 
 
 # ======================================================================
