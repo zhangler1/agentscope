@@ -61,7 +61,7 @@ curl -X POST http://53.192.28.254/api/bocomadp/v1/threads/t1/runs/{run_id}/cance
 | `session_id` | 是 | 必须等于路径 `thread_id`（thread_id == session_id 同一资源）；缺失或不一致 → 400 |
 | `input` | 否 | 输入消息：单条消息 dict `{"type":"human","content":"..."}` 或 `{"messages":[...]}` 列表；**不接受纯字符串**（→ 400）；HITL（人在回路确认）卡片应答为 `human_input_response` 事件形态（不拦截） |
 | `on_disconnect` | 否 | `cancel`（默认，断线即中断 run，停止消耗模型额度）/ `continue`（仅断开订阅，run 继续） |
-| `context` | 否 | 请求级参数容器（对齐 deer-flow context overrides），见 1.5：原生白名单 key（`model_name` / `thinking_enabled` / `reasoning_effort` / `mode` / `is_plan_mode` / `subagent_enabled`）与项目扩展 key（空间码 / `llm_model_name` / `files` / `additional_urls` / 认证字段等）统一在此传递 |
+| `context` | 否 | 请求级参数容器（对齐 deer-flow context overrides），见 1.5：原生白名单 key（`model_name` / `thinking_enabled` / `reasoning_effort` / `mode` / `is_plan_mode` / `subagent_enabled`）平铺在 context 下；项目扩展参数经嵌套 key `custom_params` 传递（原顶层 `custom_params` 字段整体搬移，内容原封不动） |
 | `stream_mode` / `multitask_strategy` / `config` | 否 | 接受但忽略（固定 messages+custom 流、reject 并发策略） |
 
 ### 1.3 SSE 帧格式与事件类型
@@ -148,20 +148,21 @@ curl -X DELETE http://53.192.28.254/api/bocomadp/v1/threads/t1 -H 'x-user-id: u1
 
 ### 1.5 context 请求级配置
 
-context 是请求级参数容器（对齐 deer-flow context overrides）：原生白名单 key 与
-项目扩展 key（原顶层 `custom_params`）统一在此传递，每次请求携带的 JSON 对象在该次
-run 内生效，供工具与中间件消费（空间码强制覆盖、自定义提示词、检索开关、认证等）。
+context 是请求级参数容器（对齐 deer-flow context overrides）：原生白名单 key 平铺在
+context 下，项目扩展参数经嵌套 key `custom_params` 传递（原顶层 `custom_params`
+字段整体搬移，内容原封不动）。每次请求携带的 JSON 对象在该次 run 内生效，供工具
+与中间件消费（空间码强制覆盖、自定义提示词、检索开关、认证等）。
 
-**原生白名单 key**（deer-flow context overrides）：
+**原生白名单 key**（deer-flow context overrides，平铺在 context 下）：
 
 | key | 类型 | 语义 |
 |---|---|---|
-| `model_name` | str | 请求级模型名（回退通道；`llm_model_name` 优先） |
+| `model_name` | str | 请求级模型名（回退通道；`custom_params.llm_model_name` 优先） |
 | `thinking_enabled` | bool | 是否启用模型思考模式（模型构建层消费） |
 | `reasoning_effort` | str | 推理强度（low/medium/high，模型构建层消费） |
 | `mode` / `is_plan_mode` / `subagent_enabled` | str / bool | 静默接受但不使用 |
 
-**项目扩展 key**（原顶层 custom_params 内容）：
+**项目扩展 key**（嵌套在 `context.custom_params` 下，原顶层 custom_params 内容）：
 
 | key | 类型 | 语义 |
 |---|---|---|
@@ -183,11 +184,13 @@ run 内生效，供工具与中间件消费（空间码强制覆盖、自定义�
 | `additional_urls` | list[str] | 直链列表，run 启动前下载到会话 uploads 目录 |
 | `guwp_token` / `jrt_auth_code` / `okic_token` / `okic_type` / `muwp_user` | str / dict | 认证方案字段（优先级 guwp > jrt > okic > muwp） |
 
-**存储与回退语义**：context 按通道拆分——根路径 5 键（`mode` / `reasoning_effort` /
-`thinking_enabled` / `is_plan_mode` / `subagent_enabled`）走 run_context 通道，
-其余 key 走 custom_params 通道；两者均按 session 持久化（TTL 4h），首次带值请求后，
-之后不带该通道值的请求自动回退加载上次的值（HITL 确认续跑等场景开关状态持续生效）；
-每次带值请求整体覆盖旧记录（非合并）；未列出的 key 会被保存但静默忽略。
+**存储与回退语义**：context 按通道拆分——平铺层根路径 5 键（`mode` /
+`reasoning_effort` / `thinking_enabled` / `is_plan_mode` / `subagent_enabled`）走
+run_context 通道，嵌套 `custom_params` 子对象走 custom_params 通道；两者均按 session
+持久化（TTL 4h），首次带值请求后，之后不带该通道值的请求自动回退加载上次的值
+（HITL 确认续跑等场景开关状态持续生效）；每次带值请求整体覆盖旧记录（非合并）；
+custom_params 内未列出的 key 会被保存但静默忽略；context 平铺层的其他 key（如
+`thread_id` / `agent_name` 等前端内部 key）不落盘。
 
 ```bash
 curl -N -X POST http://53.192.28.254/api/bocomadp/v1/threads/t1/runs/stream \
@@ -196,13 +199,15 @@ curl -N -X POST http://53.192.28.254/api/bocomadp/v1/threads/t1/runs/stream \
     "assistant_id": "lead_agent",
     "input": {"type": "human", "content": "你好，介绍一下你自己"},
     "context": {
-      "space_code_list": ["SP0000001"],
-      "team_space_code_list": ["TEAM01"],
-      "user_code": "U001",
-      "search_type": "0",
-      "custom_prompt": "你是内部知识助手，回答必须简洁、引用检索结果。",
-      "vector_search_switch": true,
-      "guwp_token": "demo-guWP-token"
+      "custom_params": {
+        "space_code_list": ["SP0000001"],
+        "team_space_code_list": ["TEAM01"],
+        "user_code": "U001",
+        "search_type": "0",
+        "custom_prompt": "你是内部知识助手，回答必须简洁、引用检索结果。",
+        "vector_search_switch": true,
+        "guwp_token": "demo-guWP-token"
+      }
     }
   }'
 ```

@@ -2,22 +2,23 @@
 """请求级自定义参数（custom_params）上下文与持久化模块。
 
 对齐 deer-flow 新分支的 ``custom_params`` 机制：run/stream 请求体
-``context`` 容器携带项目扩展参数（空间码、用户编码等），路由层按通道
-拆分（去除根路径 5 键后的剩余内容）后在 spawn 后台 run 任务前经
-ContextVar 注入（``asyncio.create_task`` 复制当前上下文，值随之传播
+``context`` 容器的嵌套 key ``context.custom_params`` 携带项目扩展参数
+（空间码、用户编码等，原顶层 ``custom_params`` 字段整体搬移、内容原封
+不动），路由层按通道拆分（提取该嵌套子对象）后在 spawn 后台 run 任务前
+经 ContextVar 注入（``asyncio.create_task`` 复制当前上下文，值随之传播
 到 run 任务内），工具侧中间件读取后强制覆盖模型传参，避免在每个
 tool call 中重复解析请求。
 
-持久化（2026-08-20 用户改选 Redis 存储）：请求携带 custom_params 部分时写入
-会话级 Redis 存储（``bocomadp/deerflow/_session_store.py``，key
+持久化（2026-08-20 用户改选 Redis 存储）：请求携带 context.custom_params
+部分时写入会话级 Redis 存储（``bocomadp/deerflow/_session_store.py``，key
 ``bocomadp:session:{session_id}:custom_params``，hash 字段 ``params``，
 TTL 4h 由 Redis 原生 ``EXPIRE`` 自动过期、无清扫任务）；后续请求
 （如 HITL 确认续跑）未携带时从 Redis 回退加载，保证空间码约束
 在会话生命周期内持续生效。Redis 不可用 fail-open（save 告警不抛、
 load 返回 None），不阻断 run 创建。
 
-原生 ``/chat/`` 路径不携带 custom_params 部分，ContextVar 保持默认空 dict，
-下游行为与现状一致。
+原生 ``/chat/`` 路径不携带 context.custom_params 部分，ContextVar 保持
+默认空 dict，下游行为与现状一致。
 """
 
 from __future__ import annotations
