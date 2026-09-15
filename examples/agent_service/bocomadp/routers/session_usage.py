@@ -5,6 +5,8 @@ Endpoint
 --------
 ``GET  /sessions/{session_id}/usage?agent_id=xxx&user_id=xxx``
 ``GET  /sessions/limit``
+``GET  /sessions/usage/agents?user_id=xxx``
+``GET  /sessions/usage/history?user_id=xxx&agent_id=xxx``
 ``POST /sessions/create``
 ``POST /sessions/update``
 
@@ -12,6 +14,13 @@ Endpoint
       （聚合会话内全部已落库消息）。
     - limit：分页返回某智能体的会话记录（直连 DB，COUNT + LIMIT）。
       会话名按下述规则改写后返回（不落库）。
+    - usage/agents：某用户**使用过的智能体清单**（sessions 按 agent_id
+      分组聚合，含自建与市场智能体，排除系统内置），附会话数、最近
+      使用时间、智能体名与平台/自建标记。
+    - usage/history：某用户**跨智能体的会话历史**（自建 + 平台都在
+      内，按 updated_at 倒序统一分页），每条附 agent_name；可选
+      agent_id 收窄到单个智能体。会话名改写规则与 limit 相同。
+      两个接口的 user_id 均可省略（回退 X-User-ID）。
     - create：创建会话并**自动注入该智能体绑定的 ELLM 凭证**——请求体与
       原生 ``POST /api/sessions`` 一致，唯独 ``chat_model_config`` 只传
       ``model`` / ``parameters``，``type`` 与 ``credential_id`` 由后端补齐
@@ -299,14 +308,39 @@ async def list_session_ids_paginated(
             )
         ).all()
 
-    # Reconstruct full SessionRecord objects the same way the SQL storage
-    # mapper does: merge the promoted columns back into ``payload`` and
-    # let ``model_validate`` fire the record's validators.
-    #
-    # 注意：``text()`` 裸 SQL 绕过 SQLAlchemy 的 JSON 结果处理器，``payload``
-    # （MySQL/OceanBase 的 JSON 列）会以**字符串**回到这里（Postgres/asyncpg
-    # 则由驱动自动解码）。必须先解码成 dict，否则 ``dict("...")`` 会抛
-    # ``ValueError: dictionary update sequence element #0 has length 1``。
+    # 行 → SessionRecord dict + 默认时间名改写（公共实现见下方两个
+    # helper，与 /sessions/usage/history 共用）。
+    sessions = _session_rows_to_records(rows)
+    await _rewrite_default_session_names(engine, sessions)
+
+    return {
+        "sessions": sessions,
+        "total": total,
+        "agent_id": agent_id,
+        "page": page,
+        "page_size": page_size,
+        "has_more": offset + len(sessions) < total,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 公共 helper：裸 SQL 行重建 / 会话名改写 / 智能体简报
+# （/sessions/limit 与 /sessions/usage/* 共用）
+# ---------------------------------------------------------------------------
+
+
+def _session_rows_to_records(rows: list[Any]) -> list[dict]:
+    """``text()`` 裸 SQL 查出的 sessions 行 → SessionRecord dict 列表。
+
+    与 SQL 存储 mapper 同样的重建方式：把提升列合并回 ``payload`` 后
+    ``model_validate``。注意：``text()`` 裸 SQL 绕过 SQLAlchemy 的 JSON
+    结果处理器，``payload``（MySQL/OceanBase 的 JSON 列）会以**字符串**
+    回到这里（Postgres/asyncpg 则由驱动自动解码）。必须先解码成 dict，
+    否则 ``dict("...")`` 会抛 ``ValueError: dictionary update sequence
+    element #0 has length 1``。
+    """
+    from agentscope.app.storage import SessionRecord
+
     sessions: list[dict] = []
     for row in rows:
         # text() 原生 SQL 不经过 ORM 的 JSON 类型处理：PG 原生 JSON 列
@@ -329,12 +363,20 @@ async def list_session_ids_paginated(
         sessions.append(
             SessionRecord.model_validate(obj).model_dump(mode="json")
         )
+    return sessions
 
-    # 会话名改写：仍为默认时间名的会话，用该会话用户第一条输入生成
-    # 显示名（只改响应，不落库；用户手动改过名的会话不受影响）。
+
+async def _rewrite_default_session_names(
+    engine: Any,
+    sessions: list[dict],
+) -> None:
+    """默认时间名的会话，用首条用户输入生成显示名（就地改写，不落库）。
+
+    只改响应不落库（写会话状态的风险大于显示收益）；用户手动改过名
+    的会话（不命中 ``_DEFAULT_NAME_RE``）一律不动。
+    """
     from sqlalchemy import text as _text
 
-    title_by_session: dict[str, str] = {}
     async with engine.connect() as conn:
         for sess in sessions:
             name = (sess.get("config") or {}).get("name") or ""
@@ -351,14 +393,223 @@ async def list_session_ids_paginated(
                 )
             ).scalars().all()
             # 有首条用户输入 → 用它当名字；否则退到"新对话"
-            title = _derive_session_title(payloads) or _FALLBACK_SESSION_NAME
-            title_by_session[sess["id"]] = title
-            sess["config"]["name"] = title
+            sess["config"]["name"] = (
+                _derive_session_title(payloads) or _FALLBACK_SESSION_NAME
+            )
+
+
+async def _agent_brief_map(
+    engine: Any,
+    agent_ids: list[str],
+) -> dict[str, dict[str, str | None]]:
+    """批量取智能体简报 ``{agent_id: {"name", "owner_user_id"}}``。
+
+    名称藏在 ``payload["data"]["name"]``（框架 mapper 的存储契约）；
+    智能体已被删的 id 不在返回映射里，由调用方兜底空值。
+    """
+    if not agent_ids:
+        return {}
+    from sqlalchemy import text
+
+    placeholders = ", ".join(f":a{i}" for i in range(len(agent_ids)))
+    params = {f"a{i}": aid for i, aid in enumerate(agent_ids)}
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT id, user_id, payload FROM agents "
+                    f"WHERE id IN ({placeholders})"
+                ),
+                params,
+            )
+        ).all()
+    briefs: dict[str, dict[str, str | None]] = {}
+    for row in rows:
+        raw = row.payload
+        obj: dict = (
+            json.loads(raw)
+            if isinstance(raw, str) and raw
+            else dict(raw or {})
+        )
+        data = obj.get("data")
+        name = str(data.get("name", "") or "") if isinstance(data, dict) else ""
+        briefs[row.id] = {"name": name, "owner_user_id": row.user_id}
+    return briefs
+
+
+def _resolve_target_user(
+    user_id: str | None,
+    viewer_id: str,
+) -> str:
+    """usage 接口的目标用户：显式传参优先，否则回退 X-User-ID。"""
+    return (user_id or viewer_id).strip() or viewer_id
+
+
+# ---------------------------------------------------------------------------
+# 用户使用视角：用过哪些智能体 + 跨智能体历史会话
+# （前端传 user_id 查任意用户的记录；内部系统暂不做查询权限限制，
+#  将来加权限只需在 _resolve_target_user 一处收口）
+# ---------------------------------------------------------------------------
+
+
+@session_usage_router.get(
+    "/usage/agents",
+    summary="List agents a user has chatted with (grouped from sessions)",
+)
+async def list_user_used_agents(
+    user_id: str | None = Query(
+        default=None,
+        description="目标用户；省略时回退 X-User-ID。",
+    ),
+    viewer_id: str = Depends(get_current_user_id),
+) -> dict:
+    """某用户**使用过的智能体清单**（含自建与市场智能体）。
+
+    - 数据源：``sessions`` 表按 ``agent_id`` 分组聚合（会话数 +
+      最近使用时间）——聊过就会留下会话，天然涵盖自建与平台智能体；
+    - 附带智能体名（agents 表 ``payload["data"]["name"]``）、归属者
+      ``owner_user_id`` 及 ``is_platform`` / ``is_self`` 标记，前端
+      可直接分组渲染；
+    - 排除系统内置智能体（``_`` 开头 id）——内部工具载体，不算
+      "用户使用的智能体"；
+    - 按最近使用时间倒序。
+    """
+    from sqlalchemy import text
+
+    from bocomadp.config.market_config import get_platform_user_id
+    from bocomadp.pool_config import _get_engine
+
+    target = _resolve_target_user(user_id, viewer_id)
+    engine = await _get_engine()
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT agent_id, COUNT(*) AS session_count, "
+                    "MAX(updated_at) AS last_used_at "
+                    "FROM sessions "
+                    "WHERE user_id = :user_id "
+                    "GROUP BY agent_id "
+                    "ORDER BY last_used_at DESC, agent_id",
+                ),
+                {"user_id": target},
+            )
+        ).all()
+
+    usage = [r for r in rows if not r.agent_id.startswith("_")]
+    briefs = await _agent_brief_map(engine, [r.agent_id for r in usage])
+    platform = get_platform_user_id()
+    agents = [
+        {
+            "agent_id": r.agent_id,
+            "name": (briefs.get(r.agent_id) or {}).get("name") or "",
+            "owner_user_id": (briefs.get(r.agent_id) or {}).get(
+                "owner_user_id",
+            ),
+            "is_platform": (
+                (briefs.get(r.agent_id) or {}).get("owner_user_id") == platform
+            ),
+            "is_self": (
+                (briefs.get(r.agent_id) or {}).get("owner_user_id") == target
+            ),
+            "session_count": int(r.session_count),
+            "last_used_at": r.last_used_at,
+        }
+        for r in usage
+    ]
+    return {"user_id": target, "agents": agents, "total": len(agents)}
+
+
+@session_usage_router.get(
+    "/usage/history",
+    summary="Paginated cross-agent session history for a user (direct DB query)",
+)
+async def list_user_session_history(
+    user_id: str | None = Query(
+        default=None,
+        description="目标用户；省略时回退 X-User-ID。",
+    ),
+    agent_id: str | None = Query(
+        default=None,
+        description="可选，收窄到单个智能体；省略 = 该用户的全部会话。",
+    ),
+    page: int = Query(default=1, ge=1, description="Page number, starts at 1"),
+    page_size: int = Query(
+        default=20,
+        ge=1,
+        le=200,
+        description="Number of items per page (1-200)",
+    ),
+    viewer_id: str = Depends(get_current_user_id),
+) -> dict:
+    """某用户**跨智能体的会话历史**（自建 + 市场/平台智能体都在内）。
+
+    - ``sessions.user_id`` 记的是使用者，所以 ``WHERE user_id = :user``
+      天然涵盖该用户与任何智能体（自建、平台、他人发布）的对话——
+      与框架 ``GET /sessions/?agent_id=`` 不同，本接口不做智能体
+      归属校验（框架那条对平台智能体会 404）；
+    - 按 ``updated_at`` 倒序统一分页（COUNT + LIMIT/OFFSET 推到 DB）；
+    - 每条附 ``agent_name``（批量查 agents 表，删掉的智能体为空串）；
+    - 会话名改写规则与 ``/sessions/limit`` 相同（默认时间名 → 首条
+      用户输入，只改响应不落库）；
+    - 可选 ``agent_id`` 收窄到单个智能体（等价于 /limit 但带名称与
+      统一分页形态）。
+    """
+    from sqlalchemy import text
+
+    from bocomadp.pool_config import _get_engine
+
+    target = _resolve_target_user(user_id, viewer_id)
+    engine = await _get_engine()
+
+    where = "WHERE user_id = :user_id"
+    params: dict[str, Any] = {"user_id": target}
+    if agent_id:
+        where += " AND agent_id = :agent_id"
+        params["agent_id"] = agent_id
+    else:
+        # 系统内置智能体（_ 开头）的会话不算"使用记录"（与
+        # /usage/agents 口径一致）；显式传 agent_id 则尊重调用方。
+        where += " AND substr(agent_id, 1, 1) <> '_'"
+
+    async with engine.connect() as conn:
+        total = (
+            await conn.execute(
+                text(f"SELECT COUNT(*) FROM sessions {where}"),
+                params,
+            )
+        ).scalar_one()
+
+    offset = (page - 1) * page_size
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT id, created_at, updated_at, user_id, agent_id, "
+                    "source, source_schedule_id, team_id, payload "
+                    f"FROM sessions {where} "
+                    "ORDER BY updated_at DESC, created_at DESC "
+                    "LIMIT :limit OFFSET :offset",
+                ),
+                {**params, "limit": page_size, "offset": offset},
+            )
+        ).all()
+
+    sessions = _session_rows_to_records(rows)
+    briefs = await _agent_brief_map(
+        engine,
+        sorted({s["agent_id"] for s in sessions}),
+    )
+    for sess in sessions:
+        sess["agent_name"] = (briefs.get(sess["agent_id"]) or {}).get(
+            "name",
+        ) or ""
+    await _rewrite_default_session_names(engine, sessions)
 
     return {
         "sessions": sessions,
         "total": total,
-        "agent_id": agent_id,
+        "user_id": target,
         "page": page,
         "page_size": page_size,
         "has_more": offset + len(sessions) < total,

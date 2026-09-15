@@ -7,14 +7,19 @@
 1. GET /agent/owned   —— 严格归属隔离：
    - 团长 / 普通智能体在，`is_team` 标记正确；自建成员独属其团不返回；
    - 别人的智能体、source='team' 的派生 worker 不出现；
-2. GET /agent/market  —— 平台市场：
-   - 范围只由 user_id='default' 决定，**无 source 筛选**（worker 也进市场）；
-   - 别的用户的智能体绝不出现；
+2. GET /agent/market  —— 市场列表：
+   - 范围 = user_id='default' 全部（无 source 筛选，worker 也进市场）
+     ∪ published=1 的个人智能体；
+   - 未发布的个人智能体、别的用户的智能体绝不出现；
    - tag 筛选 + 未打标 tag=null 语义；
 3. GET /agent/market/featured —— 精选推荐（方案 A：实时聚合 sessions）：
    - 按会话数倒序取前 N；0 热度是合法状态，不过滤；
-4. PUT/DELETE /agent/market/{agent_id} —— 标签管理（全开放无权限
-   门槛，tag 自由字符串无清单校验）。
+4. POST /agent/market/{agent_id}/publish|unpublish —— 发布管理：
+   - 仅智能体 owner（X-User-ID = agents.user_id）可发布/撤回；
+   - 平台智能体 / 系统内置（_ 开头）422 拒绝，不存在 404；
+   - 发布后进市场（懒式建档，默认标签），撤回后消失、标签保留；
+5. PUT/DELETE /agent/market/{agent_id} —— 标签管理（全开放无权限
+   门槛，智能体存在即可打标；DELETE 是纯重置标签，不动发布状态）。
 
 pytest-asyncio 未安装：异步逻辑用 asyncio.run() 包裹（与
 test_expert_team.py 一致）。
@@ -510,3 +515,153 @@ def test_delete_agent_cascades_market_entry(client, market_ids):
         ),
     )
     assert after is None
+
+
+# ---------------------------------------------------------------------------
+# 7) 发布管理：publish / unpublish（仅 owner）
+# ---------------------------------------------------------------------------
+
+
+def test_publish_unpublish_flow(client, market_ids):
+    """个人智能体全流程：发布 → 市场可见 → 打标 → 撤回 → 市场消失。
+
+    撤回是"下架"不是"删除"：档案行与标签保留，重新发布原标签生效。
+    """
+    _, _, other_id = market_ids
+    storage = client.app.state.storage
+
+    # 发布前：不在市场
+    resp = client.get("/agent/market")
+    assert other_id not in {a["id"] for a in resp.json()["agents"]}
+
+    # owner 发布 → 200，返回发布状态；懒式建档挂默认标签
+    resp = client.post(f"/agent/market/{other_id}/publish", headers=HDR_ALICE)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["published"] is True
+    assert body["published_at"] is not None
+    assert body["tag"] == "未分类"
+
+    # 市场出现：平台 2 个 + 发布的 1 个
+    resp = client.get("/agent/market")
+    data = resp.json()
+    assert other_id in {a["id"] for a in data["agents"]}
+    assert data["total"] == 3
+
+    # 打标跟着进市场
+    resp = client.put(
+        f"/agent/market/{other_id}", json={"tag": "数据分析"}, headers=HDR_USER,
+    )
+    assert resp.status_code == 200
+    resp = client.get("/agent/market", params={"tag": "数据分析"})
+    assert [a["id"] for a in resp.json()["agents"]] == [other_id]
+
+    # owner 撤回 → 市场消失、published_at 清空、标签保留
+    resp = client.post(f"/agent/market/{other_id}/unpublish", headers=HDR_ALICE)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["published"] is False
+    assert body["published_at"] is None
+    assert body["tag"] == "数据分析"
+
+    resp = client.get("/agent/market")
+    assert other_id not in {a["id"] for a in resp.json()["agents"]}
+    entry = _run(market_store.get_market_entry(storage, other_id))
+    assert entry is not None and entry.tag == "数据分析"
+
+    # 幂等：重复撤回仍 200
+    assert client.post(
+        f"/agent/market/{other_id}/unpublish", headers=HDR_ALICE,
+    ).status_code == 200
+
+
+def test_publish_owner_only(client, market_ids):
+    """发布/撤回都锁 owner：别人的 X-User-ID 一律 403。"""
+    _, _, other_id = market_ids
+
+    # 未发布时别人不能替 alice 发布
+    assert client.post(
+        f"/agent/market/{other_id}/publish", headers=HDR_USER,
+    ).status_code == 403
+
+    # alice 自己发布成功后，别人也不能撤回
+    assert client.post(
+        f"/agent/market/{other_id}/publish", headers=HDR_ALICE,
+    ).status_code == 200
+    assert client.post(
+        f"/agent/market/{other_id}/unpublish", headers=HDR_USER,
+    ).status_code == 403
+    # 市场里还在（撤回被拒）
+    assert other_id in {
+        a["id"] for a in client.get("/agent/market").json()["agents"]
+    }
+
+
+def test_publish_rejects_platform_system_missing(client, market_ids):
+    """平台智能体/系统内置 422，不存在的智能体 404。"""
+    platform_user, _, _ = market_ids
+
+    # 平台智能体：天然在市场，发布/撤回都 422
+    assert client.post(
+        f"/agent/market/{platform_user}/publish", headers=HDR_ADMIN,
+    ).status_code == 422
+    assert client.post(
+        f"/agent/market/{platform_user}/unpublish", headers=HDR_ADMIN,
+    ).status_code == 422
+
+    # 系统内置（_ 开头）：422
+    assert client.post(
+        "/agent/market/_agent-creator/publish", headers=HDR_ADMIN,
+    ).status_code == 422
+
+    # 不存在：404
+    assert client.post(
+        "/agent/market/no-such-agent/publish", headers=HDR_ALICE,
+    ).status_code == 404
+
+
+def test_tag_and_delete_on_unpublished_user_agent(client, market_ids):
+    """未发布的个人智能体：存在即可打标；DELETE 纯重置标签不动发布态。"""
+    _, _, other_id = market_ids
+
+    # 未发布也能打标（打标全开放、建档懒式）
+    resp = client.put(
+        f"/agent/market/{other_id}", json={"tag": "预打标"}, headers=HDR_USER,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["published"] is False
+
+    # 发布后原标签直接生效
+    assert client.post(
+        f"/agent/market/{other_id}/publish", headers=HDR_ALICE,
+    ).status_code == 200
+    resp = client.get("/agent/market", params={"tag": "预打标"})
+    assert [a["id"] for a in resp.json()["agents"]] == [other_id]
+
+    # DELETE = 重置标签，不影响发布状态
+    assert client.delete(
+        f"/agent/market/{other_id}", headers=HDR_ALICE,
+    ).status_code == 204
+    entry = _run(
+        market_store.get_market_entry(client.app.state.storage, other_id),
+    )
+    assert entry is not None
+    assert entry.tag == "未分类"
+    assert entry.published is True
+
+
+def test_published_agent_in_featured(client, market_ids):
+    """个人发布的智能体参与精选热度排序，与其他市场成员同台竞技。"""
+    _, _, other_id = market_ids
+    assert client.post(
+        f"/agent/market/{other_id}/publish", headers=HDR_ALICE,
+    ).status_code == 200
+    _add_sessions(client.app.state.storage, other_id, count=2)
+
+    resp = client.get("/agent/market/featured", params={"top": 3})
+    assert resp.status_code == 200
+    body = resp.json()
+    # 热度 2 > 平台智能体的 0 → 排第一
+    assert body["agents"][0]["id"] == other_id
+    assert body["agents"][0]["heat"] == 2
+    assert body["total"] == 3
