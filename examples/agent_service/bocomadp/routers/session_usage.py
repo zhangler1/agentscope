@@ -10,7 +10,8 @@ Endpoint
 
     - usage：返回 ``input_tokens`` / ``output_tokens`` / ``message_count``
       （聚合会话内全部已落库消息）。
-    - limit：分页返回某智能体的会话 id 列表（直连 DB，COUNT + LIMIT）。
+    - limit：分页返回某智能体的会话记录（直连 DB，COUNT + LIMIT）。
+      会话名按下述规则改写后返回（不落库）。
     - create：创建会话并**自动注入该智能体绑定的 ELLM 凭证**——请求体与
       原生 ``POST /api/sessions`` 一致，唯独 ``chat_model_config`` 只传
       ``model`` / ``parameters``，``type`` 与 ``credential_id`` 由后端补齐
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -66,6 +68,72 @@ session_usage_router = APIRouter(
 #: 本接口注入的凭证类型（与 ``bocomadp/credential/ellm.py`` 的
 #: ``ELLMCredential.type`` 保持一致）。
 ELLM_CREDENTIAL_TYPE = "bocom_ellm_credential"
+
+
+# ---------------------------------------------------------------------------
+# 会话名改写
+# ---------------------------------------------------------------------------
+# 建会话时用户还没说话，框架因此用创建时间兜底当会话名（见
+# ``SessionConfig.name`` 的 default_factory）。前端侧栏于是一片日期。
+# 这里在 ``GET /sessions/limit`` 返回前把这类"默认时间名"换成更有意义的
+# 显示名：有用户输入就用首句话，没有就显示"新对话"。用户改过名的一律不动。
+#
+# 说明两点：
+#   1. 只改响应不落库（写的收益小于覆盖会话状态的风险）；
+#   2. 判定"是否默认名"靠下面的正则，属启发式——用户若把会话名手动起成
+#      "2026-09-14 15:13:26" 也会被改写，概率极低，接受。
+
+#: 框架默认会话名形态（``"%Y-%m-%d %H:%M:%S"``），命中即视为未改名。
+_DEFAULT_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+#: 会话名最大长度，超出截断并加省略号。
+_TITLE_MAX_LEN = 30
+
+#: 无用户输入时的会话名。
+_FALLBACK_SESSION_NAME = "新对话"
+
+
+def _extract_message_text(content: Any) -> str:
+    """从 ``Msg.content`` 里提取纯文本。
+
+    ``content`` 既可能是字符串，也可能是多模态块列表（形如
+    ``[{"type": "text", "text": "..."}, ...]``）。其余形态（图片块等）
+    一律跳过，返回拼接后的文本（可能为空串）。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                parts.append(block["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _derive_session_title(payloads: list[Any]) -> str | None:
+    """从按时间升序的消息 payload 列表里取**首条用户输入**做会话名。
+
+    ``payload`` 是完整 ``Msg`` JSON（含 ``role`` / ``content``）。取不到
+    有效用户输入时返回 ``None``，由调用方退到 ``_FALLBACK_SESSION_NAME``。
+    """
+    for raw in payloads:
+        msg = raw if isinstance(raw, dict) else _as_payload_dict(raw)
+        if not msg or msg.get("role") != "user":
+            continue
+        text = _extract_message_text(msg.get("content")).strip()
+        if not text:
+            continue
+        # 折叠连续空白为单个空格，避免多行输入把侧栏名字撑爆
+        text = re.sub(r"\s+", " ", text)
+        if len(text) > _TITLE_MAX_LEN:
+            text = text[:_TITLE_MAX_LEN] + "…"
+        return text
+    return None
 
 
 def _as_payload_dict(raw: Any) -> dict[str, Any]:
@@ -184,6 +252,10 @@ async def list_session_ids_paginated(
     lazy-loaded engine to avoid opening an extra connection pool), so
     pagination is pushed down to the database (COUNT + LIMIT/OFFSET)
     instead of loading every session through ``storage.list_sessions``.
+
+    会话名改写（见模块顶部说明）：名字仍是默认时间名的会话，返回时
+    换成本会话首条用户输入；无用户输入的显示 ``"新对话"``。改过名的
+    会话不动，且只改响应不落库。
     """
     from sqlalchemy import text
 
@@ -257,6 +329,31 @@ async def list_session_ids_paginated(
         sessions.append(
             SessionRecord.model_validate(obj).model_dump(mode="json")
         )
+
+    # 会话名改写：仍为默认时间名的会话，用该会话用户第一条输入生成
+    # 显示名（只改响应，不落库；用户手动改过名的会话不受影响）。
+    from sqlalchemy import text as _text
+
+    title_by_session: dict[str, str] = {}
+    async with engine.connect() as conn:
+        for sess in sessions:
+            name = (sess.get("config") or {}).get("name") or ""
+            if not _DEFAULT_NAME_RE.match(name):
+                continue
+            payloads = (
+                await conn.execute(
+                    _text(
+                        "SELECT payload FROM messages "
+                        "WHERE session_id = :sid "
+                        "ORDER BY created_at ASC, msg_id ASC LIMIT 20",
+                    ),
+                    {"sid": sess["id"]},
+                )
+            ).scalars().all()
+            # 有首条用户输入 → 用它当名字；否则退到"新对话"
+            title = _derive_session_title(payloads) or _FALLBACK_SESSION_NAME
+            title_by_session[sess["id"]] = title
+            sess["config"]["name"] = title
 
     return {
         "sessions": sessions,
