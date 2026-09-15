@@ -128,7 +128,7 @@ async def _persist_uploaded_bytes(
 ) -> UploadedFile:
     """落盘原始文件 + 图片 base64 固化 / 文档转 .md + 写入 uploads DB。
 
-    ``POST /files/upload`` 端点与 ``custom_params.additional_urls`` 下载
+    ``POST /files/upload`` 端点与 ``context.additional_urls`` 下载
     共用本函数，保证两条路径的文件元数据与落盘格式完全一致（下游
     ``list_uploaded_files`` / ``view_image_tool`` / ``<context name="files">``
     均以 uploads DB 记录为感知通道）。
@@ -217,7 +217,7 @@ async def _persist_uploaded_bytes(
 
 
 # ---------------------------------------------------------------------------
-# URL 下载保存（deerflow custom_params.additional_urls）
+# URL 下载保存（deerflow context.additional_urls）
 # ---------------------------------------------------------------------------
 # 对齐 deer-flow uploads.py 的下载参数：整体 60s 超时（连接 10s）+ 跟随
 # 重定向；单文件大小沿用本服务 uploads 配置（max_file_size_mb）。
@@ -245,7 +245,7 @@ async def download_urls_to_session(
     storage: StorageBase,
     workspace_manager: WorkspaceManagerBase,
 ) -> list[UploadedFile]:
-    """下载 URL 文件并保存到会话 uploads 目录（``custom_params.additional_urls``）。
+    """下载 URL 文件并保存到会话 uploads 目录（``context.additional_urls``）。
 
     对齐 deer-flow ``download_urls_to_thread`` 语义：单个 URL 失败仅告警
     跳过（部分成功可接受），不阻断调用方流程；保存逻辑与
@@ -401,7 +401,7 @@ async def upload_file(
             f"session {session_id!r} exceeds {cfg.max_files_per_session} files",
         )
 
-    # 落盘 + 转换 + DB 记录（与 custom_params.additional_urls 下载共用
+    # 落盘 + 转换 + DB 记录（与 context.additional_urls 下载共用
     # _persist_uploaded_bytes，保证两条路径行为一致）
     try:
         return await _persist_uploaded_bytes(

@@ -700,10 +700,10 @@ def _builtin_model_entries() -> list[ModelEntry]:
         ),
         # 多模态模型（原 config.yaml qwen3-vl-30b 条目，工具专用）
         ModelEntry(
-            provider_id="qwen3-vl-30b",
-            display_name="Qwen3 VL 30B A3B Instruct (多模态)",
+            provider_id="deepseek-v4-flash",
+            display_name="DeepSeek V4 Flash (多模态)",
             provider_type="bocom_ellm",
-            model_name="Qwen3-VL-30B-A3B-Instruct",
+            model_name="DeepSeek-V4-Flash",
             api_key=os.environ.get("ELLM_API_KEY", ""),
             base_url=os.environ.get("ELLM_BASE_URL", ""),
             is_active=False,
