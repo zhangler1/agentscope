@@ -225,8 +225,14 @@ def _resolve_enabled(all_tool_names: list[str], whitelist: list[str]) -> set[str
 
 
 def _all_tool_names(request: Request) -> set[str]:
-    """Every known tool name across all sources (the configurable set M)."""
-    names: set[str] = {bt["name"] for bt in _BUILTIN_TOOLS}
+    """Every known tool name across all sources (the configurable set M).
+
+    Workspace builtins (Bash/Read/Write/Edit/Glob/Grep) and framework
+    team/planning tools (Team*/Task*) are always present at runtime and
+    are intentionally excluded from the configurable set — they cannot be
+    toggled via the whitelist API.
+    """
+    names: set[str] = set()
     names.update(_tool_registry(request).list_tool_names())
     mcp_reg = _mcp_registry(request)
     if mcp_reg is not None:
@@ -234,10 +240,6 @@ def _all_tool_names(request: Request) -> set[str]:
             name = getattr(mcp, "name", "") or ""
             if name:
                 names.add(name)
-    # 团队/规划工具由框架 get_toolkit 挂载，纳入白名单接口管理。
-    names.update(m["name"] for m in _FRAMEWORK_TOOLS_META)
-    # 企业工具由 build_enterprise_tools 主动构建，纳入白名单接口管理。
-    # 名字取自工具实例，自动跟随 BOCOMADP_TOOL_ASCII_NAMES 切换中/英文。
     names.update(m["name"] for m in _enterprise_tools_meta())
     return names
 
@@ -328,10 +330,7 @@ async def list_agent_tools(
     tools: list[dict] = []
     mcps: list[dict] = []
 
-    # 1. Workspace builtins + project tools → merged into `tools`
-    for bt in _BUILTIN_TOOLS:
-        tools.append({**bt, "enabled": bt["name"] in enabled_names, "toggleable": True})
-
+    # 1. 项目工具（ToolRegistry 注册）
     for tool in _tool_registry(request).list_tools():
         name = _tool_name(tool)
         tools.append(
@@ -343,19 +342,7 @@ async def list_agent_tools(
             },
         )
 
-    # 1b. 团队/规划工具（框架 get_toolkit 挂载）→ 追加进 `tools`，带简短 description
-    for meta in _FRAMEWORK_TOOLS_META:
-        name = meta["name"]
-        tools.append(
-            {
-                "name": name,
-                "description": meta.get("description", ""),
-                "enabled": name in enabled_names,
-                "toggleable": True,
-            },
-        )
-
-    # 1c. 企业工具（build_enterprise_tools 主动构建）→ 纳入可配置集合
+    # 2. 企业工具（build_enterprise_tools 主动构建）
     for meta in _enterprise_tools_meta():
         name = meta["name"]
         tools.append(
@@ -367,19 +354,7 @@ async def list_agent_tools(
             },
         )
 
-    # 1d. 智能体工厂自带的工厂工具 → 仅展示，不可配置
-    if agent_id == AGENT_CREATOR_ID:
-        for meta in _factory_tools_meta():
-            tools.append(
-                {
-                    "name": meta["name"],
-                    "description": meta.get("description", ""),
-                    "enabled": True,
-                    "toggleable": False,
-                },
-            )
-
-    # 2. MCP servers → separate `mcps` list
+    # 3. MCP servers → separate `mcps` list
     mcp_reg = _mcp_registry(request)
     if mcp_reg is not None:
         for mcp in mcp_reg.list_mcps():
