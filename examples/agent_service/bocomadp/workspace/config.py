@@ -18,9 +18,13 @@
     - ``ADP_K8S_MAX_ACTIVE_PODS``: 温池大小，默认 ``5``（0=不池化）
     - ``ADP_K8S_POOL_IDLE_TTL``: 全池闲置回收阈值（秒），默认 ``3600``
     - ``ADP_K8S_RESOURCES_CPU_REQUEST``: CPU 请求，默认 ``"500m"``
-    - ``ADP_K8S_RESOURCES_CPU_LIMIT``: CPU 限制
-    - ``ADP_K8S_RESOURCES_MEM_REQUEST``: 内存请求，默认 ``"512Mi"``
-    - ``ADP_K8S_RESOURCES_MEM_LIMIT``: 内存限制
+    - ``ADP_K8S_RESOURCES_CPU_LIMIT``: CPU 限制，默认 ``"500m"``（与 request 相等）
+    - ``ADP_K8S_RESOURCES_MEM_REQUEST``: 内存请求，默认 ``"1Gi"``
+    - ``ADP_K8S_RESOURCES_MEM_LIMIT``: 内存限制，默认 ``"1Gi"``（与 request 相等）
+
+    资源规格 request 与 limit 取相同值（Guaranteed QoS）：调度按请求值预留，
+    节点资源紧张时该 Pod 优先级最高、最不易被驱逐；代价是运行时可突发
+    空间为零（无 Burstable 弹性）。
 """
 from __future__ import annotations
 
@@ -115,13 +119,13 @@ class K8sWorkspaceConfig:
         default_factory=lambda: _env("RESOURCES_CPU_REQUEST", "500m"),
     )
     cpu_limit: str = field(
-        default_factory=lambda: _env("RESOURCES_CPU_LIMIT", "2"),
+        default_factory=lambda: _env("RESOURCES_CPU_LIMIT", "500m"),
     )
     memory_request: str = field(
-        default_factory=lambda: _env("RESOURCES_MEM_REQUEST", "512Mi"),
+        default_factory=lambda: _env("RESOURCES_MEM_REQUEST", "1Gi"),
     )
     memory_limit: str = field(
-        default_factory=lambda: _env("RESOURCES_MEM_LIMIT", "2Gi"),
+        default_factory=lambda: _env("RESOURCES_MEM_LIMIT", "1Gi"),
     )
 
     # ── 存储 ──
