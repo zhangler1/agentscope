@@ -215,3 +215,10 @@ uploads:
   max_pdf_pages: 1000            # PDF 页数上限（超出拒绝）
   max_filename_length: 255       # 文件名最大长度
 
+# 智能体市场（/agent/market）：
+# - platform_user_id：平台应用智能体统一归属的 user（市场查询范围）；
+# - default_tag：默认标签——平台智能体创建时自动写入，清标签/下架时重置回它。
+agent_market:
+  platform_user_id: "default"
+  default_tag: "未分类"
+

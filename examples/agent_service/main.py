@@ -900,6 +900,11 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import team_store
 
         await team_store.ensure_team_tables(storage)
+        # 智能体市场扩展表（agent_market）——平台智能体的领域分类档案，
+        # 与专家团关系表同一套 bocomadp 自建表模式（热度不落库，实时聚合）。
+        from bocomadp import market_store
+
+        await market_store.ensure_market_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -1055,6 +1060,9 @@ app.include_router(model_registry_router)
 # 智能体凭证绑定（agent_credential 表：agent_id -> credential_id 的 CRUD）
 from bocomadp.routers.agent_credential import agent_credential_router
 app.include_router(agent_credential_router)
+# 智能体市场（平台应用列表 / 精选推荐 / 默认标签打标，全开放）
+from bocomadp.routers.market import market_router
+app.include_router(market_router)
 
 
 # ---------------------------------------------------------------------------
