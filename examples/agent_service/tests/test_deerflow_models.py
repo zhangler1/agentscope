@@ -2,7 +2,8 @@
 
 覆盖计划测试矩阵：
 
-- ``_resolve_requested_model_name``：llm_model_name 单一通道与空回退；
+- ``_resolve_requested_model_name``：context 通道 llm_model_name 优先 /
+  model_name 回退与空回退；
 - ``ensure_default_credentials``：default 用户维度、幂等 upsert、失败不阻断；
 - ``_resolve_chat_model_config``：模型名透传、用户凭证表挑选
   （ELLM 优先）、默认凭证复制入库、default 凭证缺失回退内置
@@ -193,25 +194,32 @@ def _patch_no_binding(monkeypatch) -> None:
 # ── _resolve_requested_model_name ─────────────────────────────────────
 
 
-def test_resolve_requested_model_name_from_custom_params() -> None:
-    """唯一通道 custom_params.llm_model_name；SDK 字段 context / config 忽略。"""
+def test_resolve_requested_model_name_from_context() -> None:
+    """context 通道：llm_model_name 优先于原生 model_name；config 忽略。"""
     body = CreateRunRequest(
-        context={"model_name": "from-context"},
+        context={"model_name": "from-context", "llm_model_name": "from-llm"},
         config={"configurable": {"model_name": "from-config"}},
-        custom_params={"llm_model_name": "from-custom"},
     )
-    assert _resolve_requested_model_name(body.custom_params) == "from-custom"
+    assert _resolve_requested_model_name(body.context) == "from-llm"
+
+
+def test_resolve_requested_model_name_model_name_fallback() -> None:
+    """llm_model_name 缺失时回退 context.model_name（原生白名单 key）。"""
+    body = CreateRunRequest(
+        context={"model_name": "from-native"},
+        config={"configurable": {"model_name": "from-config"}},
+    )
+    assert _resolve_requested_model_name(body.context) == "from-native"
 
 
 def test_resolve_requested_model_name_empty_fallback() -> None:
     """缺失返回空串；空白值视为缺失；其他 SDK 字段不参与解析。"""
     assert _resolve_requested_model_name(None) == ""
     body = CreateRunRequest(
-        context={"model_name": "from-context"},
+        context={"model_name": "  "},
         config={"configurable": {"model_name": "from-config"}},
-        custom_params={"llm_model_name": "  "},
     )
-    assert _resolve_requested_model_name(body.custom_params) == ""
+    assert _resolve_requested_model_name(body.context) == ""
 
 
 # ── ensure_default_credentials ────────────────────────────────────────
