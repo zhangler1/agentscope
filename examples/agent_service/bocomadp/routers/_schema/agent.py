@@ -126,6 +126,13 @@ class OwnedAgentView(BaseModel):
 
     id: str = Field(description="智能体 id。")
     name: str = Field(description="智能体名称。")
+    system_prompt: str = Field(
+        default="",
+        description=(
+            "智能体提示词（AgentData.system_prompt，创建/编辑时填的"
+            "那份）；历史脏数据缺字段时兜底空串。"
+        ),
+    )
     is_team: bool = Field(default=False, description="是否专家团团长。")
     parent_agent_id: str | None = Field(
         default=None,

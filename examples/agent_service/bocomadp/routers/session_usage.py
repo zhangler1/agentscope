@@ -532,13 +532,23 @@ async def list_user_used_agents(
         default=None,
         description="目标用户；省略时回退 X-User-ID。",
     ),
+    page: int = Query(default=1, ge=1, description="Page number, starts at 1"),
+    size: int = Query(
+        default=20,
+        ge=1,
+        le=200,
+        description="Number of items per page (1-200)",
+    ),
     viewer_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
 ) -> dict:
-    """某用户**使用过的智能体清单**（含自建与市场智能体）。
+    """某用户**使用过的智能体清单**（含自建与市场智能体），分页返回。
 
     - 数据源：``sessions`` 表按 ``agent_id`` 分组聚合（会话数 +
       最近使用时间）——聊过就会留下会话，天然涵盖自建与市场智能体；
+    - 分页：``page`` / ``size``（url 参数）；``total`` 为**分页前**
+      的总条数，``has_more`` 标识是否还有下一页——聚合本身在 SQL
+      侧完成（量级 = 用过的智能体数），Python 侧只做切片；
     - 附带智能体名（agents 表 ``payload["data"]["name"]``）、归属者
       ``owner_user_id`` 及 ``is_platform`` / ``is_self`` 标记，前端
       可直接分组渲染。``is_platform`` = 该智能体在市场名单内
@@ -571,7 +581,11 @@ async def list_user_used_agents(
         ).all()
 
     usage = [r for r in rows if not r.agent_id.startswith("_")]
-    briefs = await _agent_brief_map(engine, [r.agent_id for r in usage])
+    total = len(usage)
+    start = (page - 1) * size
+    page_rows = usage[start : start + size]
+
+    briefs = await _agent_brief_map(engine, [r.agent_id for r in page_rows])
     market_ids = {e.agent_id for e in await list_market_entries(storage)}
     agents = [
         {
@@ -587,9 +601,16 @@ async def list_user_used_agents(
             "session_count": int(r.session_count),
             "last_used_at": r.last_used_at,
         }
-        for r in usage
+        for r in page_rows
     ]
-    return {"user_id": target, "agents": agents, "total": len(agents)}
+    return {
+        "user_id": target,
+        "agents": agents,
+        "total": total,
+        "page": page,
+        "size": size,
+        "has_more": start + len(agents) < total,
+    }
 
 
 @session_usage_router.get(

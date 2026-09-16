@@ -334,6 +334,7 @@ async def list_owned_agents(
             OwnedAgentView(
                 id=record.id,
                 name=record.data.name,
+                system_prompt=record.data.system_prompt,
                 is_team=any(t.leader_agent_id == record.id for t in teams),
                 parent_agent_id=None,
                 is_self_built=None,

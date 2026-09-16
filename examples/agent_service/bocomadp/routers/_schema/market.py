@@ -10,6 +10,13 @@ class MarketAgentView(BaseModel):
 
     id: str = Field(description="智能体 id（agents.id）。")
     name: str = Field(description="智能体名称（payload 里的 AgentData.name）。")
+    system_prompt: str = Field(
+        default="",
+        description=(
+            "智能体提示词（payload 里的 AgentData.system_prompt，创建/编辑"
+            "时填的那份）；历史脏数据缺字段时兜底空串。"
+        ),
+    )
     source: str = Field(
         description="来源：user（自建）/ team（团长对话中派生的 worker）。",
     )

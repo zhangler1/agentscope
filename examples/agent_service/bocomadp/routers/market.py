@@ -182,12 +182,14 @@ def _row_to_view(
     tag: str | None,
     heat: int,
 ) -> MarketAgentView:
-    # payload 存储契约见 _market_agent_rows docstring：名称嵌在
-    # payload["data"]["name"]；get("data", {}) 兜底防御历史脏数据。
+    # payload 存储契约见 _market_agent_rows docstring：名称/提示词嵌在
+    # payload["data"] 下（AgentData.name / AgentData.system_prompt）；
+    # get("data", {}) 兜底防御历史脏数据。
     data = row.payload.get("data", {}) if isinstance(row.payload, dict) else {}
     return MarketAgentView(
         id=row.id,
         name=str(data.get("name", "")),
+        system_prompt=str(data.get("system_prompt", "")),
         source=row.source,
         tag=tag or "",  # 名单内必有行，None 只是防御；空串 = 未打标
         heat=heat,
