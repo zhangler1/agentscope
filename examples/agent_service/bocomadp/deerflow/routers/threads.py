@@ -55,6 +55,9 @@ threads_router = APIRouter(prefix="/bocomadp/v1/threads", tags=["threads"])
 # 无框架级上限；500 一批避免极端大会话单次查询过重。
 _MESSAGE_PAGE_FETCH_BATCH = 500
 
+# values 快照帧的消息条数上限（与 state 端点同值，足够前端重建当前视图）。
+_VALUES_SNAPSHOT_MESSAGES = 50
+
 
 def _msg_to_langgraph(msg: Msg) -> dict[str, Any]:
     """原生 Msg → LangGraph 消息（type/content 块数组，仅保留 text 块）。
@@ -89,6 +92,64 @@ async def _load_messages(storage: StorageBase, user_id: str,
         )
         return []
     return messages
+
+
+def _title_from_messages(messages: list[dict[str, Any]]) -> str:
+    """最近一条 human 消息文本（截断 50 字符）作标题，无则 Untitled。
+
+    与 ``_thread_title`` 的取值语义一致（最近用户消息优先），但不需
+    二次查询 session record——values 快照已加载全量消息，直接派生。
+    """
+    for msg in reversed(messages):
+        if msg.get("type") != "human":
+            continue
+        content = msg.get("content") or ""
+        text = (
+            content
+            if isinstance(content, str)
+            else "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict)
+            )
+        )
+        if text.strip():
+            return text.strip()[:50]
+    return "Untitled"
+
+
+async def build_thread_values(
+    storage: StorageBase,
+    user_id: str,
+    thread_id: str,
+    usage: dict[str, int] | None = None,
+) -> dict[str, Any] | None:
+    """组装 values 帧快照（``{messages, title}``），无消息时返回 None。
+
+    对齐 deer-flow 原生 ``stream_mode=["values"]`` 主通道帧：全量
+    LangGraph 消息列表 + title；``usage`` 非空时附到最后一条 ai 消息的
+    ``usage_metadata``（token 下发通道）。供 SSE 生成器在 end 哨兵前
+    补发最终快照（见 deerflow_chat._sse_generator）。
+    """
+    messages = await _load_messages(
+        storage,
+        user_id,
+        thread_id,
+        limit=_VALUES_SNAPSHOT_MESSAGES,
+    )
+    if not messages:
+        return None
+    langgraph_messages = [_msg_to_langgraph(m) for m in messages]
+    data: dict[str, Any] = {
+        "messages": langgraph_messages,
+        "title": _title_from_messages(langgraph_messages),
+    }
+    if usage:
+        for msg in reversed(data["messages"]):
+            if msg.get("type") == "ai":
+                msg["usage_metadata"] = usage
+                break
+    return data
 
 
 async def _agent_ids(storage: StorageBase, user_id: str) -> list[str]:

@@ -33,6 +33,7 @@ class FakeStorage:
 
     def __init__(self) -> None:
         self._sessions: dict[tuple[str, str, str], object] = {}
+        self._messages: list[Msg] = []
 
     async def get_session(self, user_id: str, agent_id: str, session_id: str):
         return self._sessions.get((user_id, agent_id, session_id))
@@ -102,11 +103,17 @@ class FakeChatService:
     """spawn 后以真实 run_id 发布 REPLY_START + REPLY_END。
 
     延迟 0.3s 保证 SSE 的 live 订阅先建立（InMemory 广播无缓冲，先发布
-    则丢失——回放侧 run_id 随机生成无法预置对齐）。
+    则丢失——回放侧 run_id 随机生成无法预置对齐）。``usage`` 非 None 时
+    在 REPLY_END 前追加 MODEL_CALL_END（token 用量下发通道）。
     """
 
-    def __init__(self, bus: InMemoryMessageBus) -> None:
+    def __init__(
+        self,
+        bus: InMemoryMessageBus,
+        usage: tuple[int, int] | None = None,
+    ) -> None:
         self._bus = bus
+        self._usage = usage
 
     async def run(self, user_id, session_id, agent_id, input_msg, run_id=None):
         del user_id, agent_id, input_msg
@@ -123,6 +130,19 @@ class FakeChatService:
             },
             run_id=run_id,
         )
+        if self._usage is not None:
+            await publish_session_event(
+                self._bus,
+                session_id,
+                {
+                    "type": "MODEL_CALL_END",
+                    "session_id": session_id,
+                    "input_tokens": self._usage[0],
+                    "output_tokens": self._usage[1],
+                    "finished_reason": "stop",
+                },
+                run_id=run_id,
+            )
         await publish_session_event(
             self._bus,
             session_id,
@@ -165,13 +185,14 @@ def _make_app(
     bus: InMemoryMessageBus,
     registry: FakeChatRunRegistry,
     storage: FakeStorage,
+    chat_service: FakeChatService | None = None,
 ) -> FastAPI:
     # 与 main.py 一致：router 挂到子应用，再 mount 到 /api（对外路径不变）；
     # state 必须设在子应用上（挂载后 request.app 是子应用）。
     api = FastAPI()
     api.state.run_manager = run_manager
     api.state.bus_bridge = BusBridge(bus)
-    api.state.chat_service = FakeChatService(bus)
+    api.state.chat_service = chat_service or FakeChatService(bus)
     api.state.chat_run_registry = registry
     api.state.storage = storage
     api.state.workspace_manager = FakeWorkspaceManager()
@@ -264,6 +285,103 @@ def test_create_run_stream_echoes_human_message_first(monkeypatch) -> None:
     assert events[2] == ("end", "null")
 
 
+def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
+    """token 下发通道：MODEL_CALL_END 消化后不泄漏 custom 帧，
+    改为 REPLY_END 末尾 messages usage 增量帧 + end 前 values 快照
+    （最后一条 ai 消息带 usage_metadata，对齐原生形态）。
+    """
+    async def _no_binding(agent_id: str):
+        del agent_id
+        return None
+
+    monkeypatch.setattr(
+        "bocomadp.deerflow.routers.deerflow_chat.get_agent_credential_id",
+        _no_binding,
+    )
+
+    mgr = RunManager()
+
+    async def scenario() -> list[tuple[str, str]]:
+        bus = InMemoryMessageBus()
+        registry = FakeChatRunRegistry()
+        storage = FakeStorage()
+        # 会话已有一轮历史：human + ai（values 快照的全量数据源）
+        storage.seed(
+            Msg(
+                name="user",
+                role="user",  # type: ignore[arg-type]
+                content=[TextBlock(text="德国的历史是什么？")],
+                id="human-1",
+            ),
+            Msg(
+                name="agent_a",
+                role="assistant",  # type: ignore[arg-type]
+                content=[TextBlock(text="德国历史很长。")],
+                id="ai-1",
+            ),
+        )
+        chat_service = FakeChatService(bus, usage=(120, 45))
+        app = _make_app(mgr, bus, registry, storage, chat_service)
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test") as client:
+                payload = {
+                    "agent_id": AGENT_ID,
+                    "session_id": THREAD_ID,
+                    "input": {
+                        "messages": [
+                            {"type": "human", "content": "继续讲"},
+                        ],
+                    },
+                }
+                resp = await client.post(
+                    f"/api/bocomadp/v1/threads/{THREAD_ID}/runs/stream",
+                    json=payload,
+                    headers={"X-User-ID": USER_ID},
+                )
+                return _parse_sse(resp.text) if resp.status_code == 200 else []
+        finally:
+            registry.cancel()
+
+    events = asyncio.run(scenario())
+    events_by_name = [e[0] for e in events]
+    # MODEL_CALL_END 不再以 model_call_end custom 帧泄漏
+    assert not any(
+        name == "custom" and "model_call_end" in data
+        for name, data in events
+    )
+    # 帧序：human 回显 → metadata → messages usage 增量 → values → end
+    assert events_by_name == [
+        "messages",
+        "metadata",
+        "messages",
+        "values",
+        "end",
+    ]
+    expected_usage = {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "total_tokens": 165,
+    }
+    # messages usage 增量帧（对齐原生 messages-tuple 最后一块）
+    usage_chunk, usage_meta = json.loads(events[2][1])
+    assert usage_chunk["type"] == "AIMessageChunk"
+    assert usage_chunk["content"] == ""
+    assert usage_chunk["id"] == "r1"
+    assert usage_chunk["usage_metadata"] == expected_usage
+    assert usage_meta == {"langgraph_node": "model"}
+    # values 快照：全量消息 + title + 最后一条 ai 附 usage_metadata
+    # （title 取 storage 内最近一条 human；请求输入尚未落库）
+    values = json.loads(events[3][1])
+    assert values["title"] == "德国的历史是什么？"
+    assert [m["type"] for m in values["messages"]] == ["human", "ai"]
+    assert values["messages"][-1]["id"] == "ai-1"
+    assert values["messages"][-1]["usage_metadata"] == expected_usage
+    # end 哨兵收尾
+    assert events[4] == ("end", "null")
+
+
 def test_join_run_stream_echoes_human_messages() -> None:
     """join 已有 run：SSE 回显 storage 中的用户消息（断线重连清理乐观消息）。"""
     mgr = RunManager()
@@ -303,5 +421,18 @@ def test_join_run_stream_echoes_human_messages() -> None:
         "content": [{"type": "text", "text": "德国的历史是什么？"}],
     }
 
-    # 帧 2：run 已结束 → end 收尾
-    assert events[1] == ("end", "null")
+    # 帧 2：values 快照（end 哨兵前补发，对齐原生主通道帧）；
+    # 无模型调用 → 无 usage_metadata
+    assert events[1][0] == "values"
+    values = json.loads(events[1][1])
+    assert values["title"] == "德国的历史是什么？"
+    assert values["messages"] == [
+        {
+            "type": "human",
+            "id": "human-1",
+            "content": [{"type": "text", "text": "德国的历史是什么？"}],
+        },
+    ]
+
+    # 帧 3：run 已结束 → end 收尾
+    assert events[2] == ("end", "null")

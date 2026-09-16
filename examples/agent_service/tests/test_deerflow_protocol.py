@@ -14,6 +14,7 @@ from bocomadp.deerflow.protocol import (
     EVENT_END,
     EVENT_MESSAGES,
     EVENT_METADATA,
+    EVENT_VALUES,
     HEARTBEAT_SENTINEL,
     StreamEvent,
     format_sse,
@@ -65,6 +66,15 @@ def test_end_sentinel() -> None:
 def test_end_sentinel_constant() -> None:
     """END_SENTINEL 的协议事件名为 end（供路由层识别）。"""
     assert END_SENTINEL.event == "__end__"
+
+
+def test_event_values_constant() -> None:
+    """values 帧事件名对齐原生主通道（stream_mode=["values"]）。"""
+    assert EVENT_VALUES == "values"
+    evt = StreamEvent(id="", event=EVENT_VALUES, data={"messages": [], "title": "t"})
+    lines = format_sse(evt).split("\n")
+    assert lines[0] == "event: values"
+    assert lines[1].startswith("data: ")
 
 
 def test_with_event_id_fills_id() -> None:

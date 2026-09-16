@@ -9,7 +9,10 @@
 - 心跳（``: heartbeat\\n\\n``）：纯注释帧，防止代理/浏览器超时断连。
 - 结束（``event: end``）：流终止哨兵，data 为 ``null``。
 - 事件枚举（``backend/packages/harness/deerflow/runtime/stream_bridge/base.py``）：
-  ``metadata`` / ``updates`` / ``messages`` / ``custom`` / ``error`` / ``end``。
+  ``metadata`` / ``values`` / ``updates`` / ``messages`` / ``custom`` /
+  ``error`` / ``end``。其中 ``values`` 为原生默认 ``stream_mode=["values"]``
+  的主通道帧：每个图节点完成后下发全量 state 快照（``messages`` +
+  ``title``），AI 消息自带 ``usage_metadata``（token 下发通道）。
 
 本模块只定义数据类与序列化；事件翻译在 :mod:`formatter`，缓冲与游标在
 :mod:`bridge`，互不越界。
@@ -27,6 +30,13 @@ EVENT_METADATA = "metadata"
 
 EVENT_UPDATES = "updates"
 """状态更新帧，data 为 ``{node_name: {channel: value}}`` 快照。"""
+
+EVENT_VALUES = "values"
+"""全量状态快照帧，data 为 ``{"messages": [...], "title": ...}``。
+
+对齐 deer-flow 原生主通道（``stream_mode=["values"]``）：AI 消息可附
+``usage_metadata``（``input_tokens`` / ``output_tokens`` / ``total_tokens``），
+是 token 下发通道之一。"""
 
 EVENT_MESSAGES = "messages"
 """消息增量帧，data 为 ``[chunk, metadata]`` 元组。"""
@@ -103,6 +113,7 @@ def with_event_id(evt: StreamEvent, event_id: str) -> StreamEvent:
 __all__ = [
     "EVENT_METADATA",
     "EVENT_UPDATES",
+    "EVENT_VALUES",
     "EVENT_MESSAGES",
     "EVENT_CUSTOM",
     "EVENT_ERROR",

@@ -67,7 +67,7 @@ def test_text_delta_maps_to_messages() -> None:
     # chunk 对齐 LangGraph 消息 tuple 协议：type/id 必填（langgraph-sdk
     # MessageTupleManager 缺 type 崩溃、缺 id 忽略），id 用 reply_id 聚合
     assert evts[0].data == [
-        {"type": "ai", "content": "你好", "id": "r1"},
+        {"type": "AIMessageChunk", "content": "你好", "id": "r1"},
         {"langgraph_node": "agent"},
     ]
 
@@ -78,8 +78,8 @@ def test_text_block_start_end_map_to_messages() -> None:
     end = f.translate({"type": "TEXT_BLOCK_END", "reply_id": "r1", "block_id": "b1", "run_id": "run1"})
     assert start[0].event == EVENT_MESSAGES and start[0].data[0]["content"] == ""
     assert end[0].event == EVENT_MESSAGES and end[0].data[0]["content"] == ""
-    assert start[0].data[0]["type"] == "ai" and start[0].data[0]["id"] == "r1"
-    assert end[0].data[0]["type"] == "ai" and end[0].data[0]["id"] == "r1"
+    assert start[0].data[0]["type"] == "AIMessageChunk" and start[0].data[0]["id"] == "r1"
+    assert end[0].data[0]["type"] == "AIMessageChunk" and end[0].data[0]["id"] == "r1"
 
 
 def test_thinking_delta_carries_reasoning_flag() -> None:
@@ -91,7 +91,7 @@ def test_thinking_delta_carries_reasoning_flag() -> None:
     assert evts[0].data[1] == {"langgraph_node": "agent", "reasoning": True}
     # thinking 增量进 additional_kwargs.reasoning_content（对齐 deer-flow
     # 官方 patched deepseek/mimo 语义），content 留空避免与正文混淆
-    assert evts[0].data[0]["type"] == "ai"
+    assert evts[0].data[0]["type"] == "AIMessageChunk"
     assert evts[0].data[0]["content"] == ""
     assert evts[0].data[0]["id"] == "r1"
     assert evts[0].data[0]["additional_kwargs"] == {"reasoning_content": "推理中"}
@@ -101,32 +101,44 @@ def test_thinking_delta_carries_reasoning_flag() -> None:
 
 
 def test_tool_call_accumulates_arguments() -> None:
+    """工具调用：start 首片带 name/id/index，delta 只带 args 片段，
+    end 发 updates 快照（完整 tool_calls，jx_chat 前端消费）。"""
     f = DeerflowSSEFormatter()
     start = f.translate(
         {"type": "TOOL_CALL_START", "reply_id": "r1", "tool_call_id": "c1", "tool_call_name": "get_balance", "run_id": "run1"},
     )
-    assert start[0].event == EVENT_CUSTOM
-    assert start[0].data == {"type": "on_tool_call", "name": "get_balance", "arguments": ""}
+    assert start[0].event == EVENT_MESSAGES
+    chunk, metadata = start[0].data
+    assert chunk["type"] == "AIMessageChunk"
+    assert chunk["id"] == "r1"
+    assert chunk["tool_call_chunks"] == [
+        {"name": "get_balance", "args": "", "id": "c1", "index": 0, "type": "tool_call_chunk"},
+    ]
+    assert metadata == {"langgraph_node": "model"}
 
     delta = f.translate(
         {"type": "TOOL_CALL_DELTA", "reply_id": "r1", "tool_call_id": "c1", "delta": '{"ac', "run_id": "run1"},
     )
-    assert delta[0].data["arguments"] == '{"ac'
+    assert delta[0].data[0]["tool_call_chunks"] == [
+        {"name": None, "args": '{"ac', "id": None, "index": 0, "type": "tool_call_chunk"},
+    ]
 
     end = f.translate({"type": "TOOL_CALL_END", "reply_id": "r1", "tool_call_id": "c1", "run_id": "run1"})
-    assert end[0].data["arguments"] == '{"ac'
+    assert end[0].event == "updates"
+    ai_msg = end[0].data["model"]["messages"][0]
+    assert ai_msg["tool_calls"][0]["args"] == {}  # 非法 args 片段回退 {}
 
 
 # ── custom：工具结果（result 文本跨事件累积）─────────────────────────
 
 
 def test_tool_result_accumulates_text() -> None:
+    """工具结果：start/delta 只累积不产帧，end 发 tool 消息帧。"""
     f = DeerflowSSEFormatter()
     start = f.translate(
         {"type": "TOOL_RESULT_START", "reply_id": "r1", "tool_call_id": "c1", "tool_call_name": "get_balance", "run_id": "run1"},
     )
-    assert start[0].event == EVENT_CUSTOM
-    assert start[0].data == {"type": "on_tool_end", "name": "get_balance", "result": ""}
+    assert start == []
 
     d1 = f.translate(
         {"type": "TOOL_RESULT_TEXT_DELTA", "reply_id": "r1", "tool_call_id": "c1", "delta": "余额", "run_id": "run1"},
@@ -134,11 +146,17 @@ def test_tool_result_accumulates_text() -> None:
     d2 = f.translate(
         {"type": "TOOL_RESULT_TEXT_DELTA", "reply_id": "r1", "tool_call_id": "c1", "delta": "100 元", "run_id": "run1"},
     )
-    assert d1[0].data["result"] == "余额"
-    assert d2[0].data["result"] == "余额100 元"
+    assert d1 == [] and d2 == []
 
-    end = f.translate({"type": "TOOL_RESULT_END", "reply_id": "r1", "tool_call_id": "c1", "state": "SUCCESS", "run_id": "run1"})
-    assert end[0].data["result"] == "余额100 元"
+    end = f.translate({"type": "TOOL_RESULT_END", "reply_id": "r1", "tool_call_id": "c1", "state": "success", "run_id": "run1"})
+    assert end[0].event == EVENT_MESSAGES
+    chunk, metadata = end[0].data
+    assert chunk["type"] == "tool"
+    assert chunk["content"] == "余额100 元"
+    assert chunk["name"] == "get_balance"
+    assert chunk["tool_call_id"] == "c1"
+    assert chunk["status"] == "success"
+    assert metadata == {"langgraph_node": "agent"}
 
 
 # ── custom：HITL / 自定义事件 ────────────────────────────────────────
@@ -258,7 +276,6 @@ def test_reply_end_normal_emits_end_sentinel() -> None:
     f = DeerflowSSEFormatter()
     assert f.translate(_reply_end()) == [END_SENTINEL]
 
-
 def test_reply_end_error_emits_error_then_end() -> None:
     f = DeerflowSSEFormatter()
     evts = f.translate(
@@ -274,6 +291,75 @@ def test_reply_end_interrupted_emits_end_only() -> None:
     """cancel 后的 REPLY_END(INTERRUPTED) 只收敛为 end（不带 error）。"""
     f = DeerflowSSEFormatter()
     assert f.translate(_reply_end(finished_reason="INTERRUPTED")) == [END_SENTINEL]
+
+
+# ── token 用量（MODEL_CALL_END 内部消化，reply_end 下发）───────────────
+
+
+def _model_call_end(input_tokens: int, output_tokens: int) -> dict:
+    return {
+        "type": "MODEL_CALL_END",
+        "session_id": "t1",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "finished_reason": "stop",
+        "run_id": "run1",
+    }
+
+
+def test_model_call_end_consumed_without_frames() -> None:
+    """MODEL_CALL_END 不产帧（不再以 model_call_end custom 泄漏）。"""
+    f = DeerflowSSEFormatter()
+    assert f.translate(_model_call_end(120, 45)) == []
+    assert f.usage == {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "total_tokens": 165,
+    }
+
+
+def test_model_call_end_accumulates_across_calls() -> None:
+    """多轮模型调用按 reply 聚合（对齐原生单回复单 AI 消息语义）。"""
+    f = DeerflowSSEFormatter()
+    f.translate(_model_call_end(100, 10))
+    f.translate(_model_call_end(20, 35))
+    assert f.usage == {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "total_tokens": 165,
+    }
+
+
+def test_reply_end_emits_usage_frame_before_end() -> None:
+    """正常结束且有用量：usage 增量帧（usage_metadata）+ end 哨兵。"""
+    f = DeerflowSSEFormatter()
+    f.translate(_model_call_end(120, 45))
+    evts = f.translate(_reply_end())
+    assert len(evts) == 2
+    assert evts[0].event == EVENT_MESSAGES
+    chunk, metadata = evts[0].data
+    assert chunk["type"] == "AIMessageChunk"
+    assert chunk["content"] == ""
+    assert chunk["id"] == "r1"
+    assert chunk["usage_metadata"] == {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "total_tokens": 165,
+    }
+    assert metadata == {"langgraph_node": "model"}
+    assert evts[1] is END_SENTINEL
+
+
+def test_reply_end_error_skips_usage_frame() -> None:
+    """error 流不发 usage 帧（token 只随正常完结下发）。"""
+    f = DeerflowSSEFormatter()
+    f.translate(_model_call_end(120, 45))
+    evts = f.translate(
+        _reply_end(finished_reason="ERROR", error={"type": "MODEL_ERROR", "message": "boom"}),
+    )
+    assert len(evts) == 2
+    assert evts[0].event == EVENT_ERROR
+    assert evts[1] is END_SENTINEL
 
 
 # ── 未知事件兜底 ─────────────────────────────────────────────────────
