@@ -126,10 +126,10 @@ cross_search:
   vector_min_score: 0.54
   user_role: "0"
   space_code_list: ["SP00000011", "SP10000011", "SP0000156"]
-  team_space_code_list: []
+  # team_space_code_list: []
   user_code: "9501173"
-  psnl_space_code_id: "PER754964863350213"
-  psnl_category_id_list: []
+  # psnl_space_code_id: "PER754964863350213"
+  # psnl_category_id_list: []
   headers:
     Accept: "*/*"
     Accept-Encoding: "gzip, deflate, br"
