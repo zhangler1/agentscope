@@ -240,9 +240,17 @@ async def build_enterprise_tools(
         )
         return []
     allowed = usable_enterprise_tool_names(usable)
+    logger.info(
+        "build_enterprise_tools: usableTools=%s allowed(normalized)=%s "
+        "before_filter_names=%s (session=%s)",
+        usable,
+        sorted(allowed),
+        [getattr(t, "name", "") for t in tools],
+        session_id,
+    )
     tools = [t for t in tools if getattr(t, "name", "") in allowed]
     logger.info(
-        "enterprise tools: usableTools filter applied -> %s (session=%s)",
+        "build_enterprise_tools: RETURN names=%s (session=%s)",
         [getattr(t, "name", "") for t in tools],
         session_id,
     )
