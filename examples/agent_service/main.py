@@ -358,7 +358,16 @@ async def build_agent_tools(
         usable_tool_names,
     )
 
-    usable = get_custom_params().get("usableTools")
+    _cp = get_custom_params()
+    usable = _cp.get("usableTools")
+    logger.info(
+        "build_agent_tools: session=%s agent=%s custom_params keys=%s "
+        "usableTools=%r",
+        session_id,
+        agent_id,
+        list(_cp.keys()),
+        usable,
+    )
 
     tools = tool_registry.list_tools()
     # usableTools 扩管到项目工具（对齐 GET /tools 可见范围：项目工具 +

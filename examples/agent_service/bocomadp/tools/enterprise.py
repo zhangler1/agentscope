@@ -165,6 +165,14 @@ async def build_enterprise_tools(
     ContextVar 已随 ``asyncio.create_task`` 复制进来，可直接读取。
     """
     params = get_custom_params()
+    logger.info(
+        "build_enterprise_tools: session=%s agent=%s custom_params keys=%s "
+        "usableTools=%r",
+        session_id,
+        agent_id,
+        list(params.keys()),
+        params.get("usableTools"),
+    )
     tools: list[ToolBase] = [
         contact_search_tool,
         physical_contact_search_tool,
