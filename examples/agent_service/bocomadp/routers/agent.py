@@ -334,6 +334,7 @@ async def list_owned_agents(
             OwnedAgentView(
                 id=record.id,
                 name=record.data.name,
+                system_prompt=record.data.system_prompt,
                 is_team=any(t.leader_agent_id == record.id for t in teams),
                 parent_agent_id=None,
                 is_self_built=None,
@@ -458,14 +459,9 @@ async def create_agent(
         parent_team.add_member(agent_id, "self_built")
         await upsert_team(storage, parent_team)
 
-    # 平台名下新建智能体 → 自动写入默认市场标签（"未分类"）。
-    # 平台智能体创建时自动建立市场档案，tag 恒不为空；
-    # 普通用户的智能体不进市场，不建档案。
-    from bocomadp.config.market_config import get_platform_user_id
-    from bocomadp.market_store import ensure_default_tag_for
-
-    if user_id == get_platform_user_id():
-        await ensure_default_tag_for(storage, agent_id)
+    # 注意：创建接口不再自动写市场档案——市场名单完全由 agent_market
+    # 表的行决定（有行 = 在市场）。平台内置智能体由运营手动 INSERT
+    # 进名单；个人智能体由 owner 调 POST /agent/market/{id}/publish 上架。
 
     return CreateAgentResponse(agent_id=agent_id)
 

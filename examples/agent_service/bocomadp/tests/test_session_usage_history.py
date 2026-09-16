@@ -44,6 +44,7 @@ from agentscope.app.storage._sql._tables import MessageRow, SessionRow
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 
 import bocomadp.pool_config as pool_config
+from bocomadp import market_store
 from bocomadp.routers.session_usage import session_usage_router
 
 HDR_USER = {"X-User-ID": "test-user"}
@@ -98,6 +99,8 @@ def client(tmp_path):
             # /limit 家族的裸 SQL 端点经 pool_config._get_engine() 拿连接，
             # 默认会连 config.yaml 的真库——测试里替换成测试存储的引擎。
             pool_config._engine = storage._engine
+            # is_platform 按 agent_market 名单判定，建表备用
+            await market_store.ensure_market_tables(storage)
 
     _run(_provision())
 
@@ -135,6 +138,11 @@ def _seed_agents(client) -> None:
     for rec in records:
         _run(storage.upsert_agent(rec.user_id, rec))
 
+    # 平台智能体手动上架进市场名单（新口径：is_platform 按 agent_market
+    # 行判定，user_id 不再承载"平台"语义）；_factory 是内部工具不上架。
+    for aid in ("plat-a", "plat-b"):
+        _run(market_store.insert_market_entry(storage, aid))
+
 
 def _add_session(
     client,
@@ -145,13 +153,36 @@ def _add_session(
     *,
     name: str | None = None,
     first_user_msg: str | None = None,
+    with_state: bool = False,
 ) -> None:
-    """插一条会话；name=None 用框架默认时间名形态，first_user_msg 造首条输入。"""
+    """插一条会话；name=None 用框架默认时间名形态，first_user_msg 造首条输入。
+
+    ``with_state=True`` 时 payload 里带一份 ``state.context``（模拟真实
+    会话里塞满消息明细的形态），用于验证列表接口会把它裁掉。
+    """
     storage = client.app.state.storage
     config = {
         "workspace_id": "w-fixed",
         "name": name or updated_at.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    payload: dict = {"config": config}
+    if with_state:
+        payload["state"] = {
+            "session_id": sid,
+            "summary": "",
+            "context": [
+                {
+                    "name": "user",
+                    "role": "user",
+                    "content": [{"type": "text", "text": "历史消息明细"}],
+                    "id": "msg-1",
+                    "created_at": updated_at.isoformat(),
+                    "metadata": {},
+                    "usage": None,
+                    "error": None,
+                },
+            ],
+        }
 
     async def _go() -> None:
         async with storage._session_factory() as session:
@@ -161,7 +192,7 @@ def _add_session(
                     user_id=user_id,
                     agent_id=agent_id,
                     source="user",
-                    payload={"config": config},
+                    payload=payload,
                     created_at=updated_at,
                     updated_at=updated_at,
                 ),
@@ -244,6 +275,51 @@ def test_usage_agents_groups_and_flags(seeded):
     ]
 
 
+def test_usage_agents_pagination(seeded):
+    """usage/agents 分页：page/size 切片，total 为分页前总数，has_more 正确。"""
+    # 第 1 页（size=2）：最近使用的前 2 个 plat-a(T3/T2)、own-a(T1)
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user", "page": 1, "size": 2},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3            # 分页前总数
+    assert body["page"] == 1 and body["size"] == 2
+    assert [a["agent_id"] for a in body["agents"]] == ["plat-a", "own-a"]
+    assert body["has_more"] is True
+
+    # 第 2 页：只剩 plat-b(T0)
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user", "page": 2, "size": 2},
+        headers=HDR_USER,
+    )
+    body = resp.json()
+    assert [a["agent_id"] for a in body["agents"]] == ["plat-b"]
+    assert body["has_more"] is False
+
+    # 越界页：空列表，total 不变
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user", "page": 9, "size": 2},
+        headers=HDR_USER,
+    )
+    body = resp.json()
+    assert body["agents"] == []
+    assert body["total"] == 3
+
+    # 不传分页参数 = 默认 page=1/size=20，现有调用方式兼容（3 条全回）
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user"},
+        headers=HDR_USER,
+    )
+    body = resp.json()
+    assert body["total"] == 3 and len(body["agents"]) == 3
+
+
 def test_usage_agents_falls_back_to_header(seeded):
     """user_id 省略 → 回退 X-User-ID。"""
     resp = seeded.get("/sessions/usage/agents", headers=HDR_USER)
@@ -275,7 +351,14 @@ def test_usage_agents_empty_user(client):
         headers=HDR_USER,
     )
     assert resp.status_code == 200
-    assert resp.json() == {"user_id": "nobody", "agents": [], "total": 0}
+    assert resp.json() == {
+        "user_id": "nobody",
+        "agents": [],
+        "total": 0,
+        "page": 1,
+        "size": 20,
+        "has_more": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +450,42 @@ def test_usage_history_falls_back_to_header(seeded):
     body = resp.json()
     assert body["user_id"] == "test-user"
     assert body["total"] == 4
+
+
+def test_list_apis_omit_message_context(client):
+    """列表接口不下发会话里的消息明细（state.context）。
+
+    会话列表只负责"目录"（id/名字/时间），完整对话走
+    GET /sessions/{id}/messages 分页取——消息明细随对话轮数线性膨胀，
+    塞进列表响应会拖慢甚至超时。
+    """
+    _seed_agents(client)
+    _add_session(
+        client, "ctx-1", "test-user", "plat-a", _T0,
+        name="带明细的会话", with_state=True,
+    )
+
+    # /sessions/limit（老接口）
+    resp = client.get(
+        "/sessions/limit", params={"agent_id": "plat-a"}, headers=HDR_USER,
+    )
+    assert resp.status_code == 200, resp.text
+    sessions = resp.json()["sessions"]
+    assert [s["id"] for s in sessions] == ["ctx-1"]
+    assert "context" not in (sessions[0].get("state") or {})
+    # 名字照常改写/保留（裁 context 不影响目录信息）
+    assert sessions[0]["config"]["name"] == "带明细的会话"
+
+    # /sessions/usage/history（新接口）
+    resp = client.get(
+        "/sessions/usage/history",
+        params={"user_id": "test-user"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 200, resp.text
+    for sess in resp.json()["sessions"]:
+        assert "context" not in (sess.get("state") or {})
+        assert sess["agent_name"]  # agent_name 照常附带
 
 
 def test_usage_history_empty_user(client):

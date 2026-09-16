@@ -16,7 +16,8 @@ Endpoint
       会话名按下述规则改写后返回（不落库）。
     - usage/agents：某用户**使用过的智能体清单**（sessions 按 agent_id
       分组聚合，含自建与市场智能体，排除系统内置），附会话数、最近
-      使用时间、智能体名与平台/自建标记。
+      使用时间、智能体名与市场/自建标记（``is_platform`` = 在
+      ``agent_market`` 名单内）。
     - usage/history：某用户**跨智能体的会话历史**（自建 + 平台都在
       内，按 updated_at 倒序统一分页），每条附 agent_name；可选
       agent_id 收窄到单个智能体。会话名改写规则与 limit 相同。
@@ -287,26 +288,18 @@ async def list_session_ids_paginated(
 
     offset = (page - 1) * page_size
 
-    # Current page of session records, newest-first
-    async with engine.connect() as conn:
-        rows = (
-            await conn.execute(
-                text(
-                    "SELECT id, created_at, updated_at, user_id, agent_id, "
-                    "source, source_schedule_id, team_id, payload "
-                    "FROM sessions "
-                    "WHERE user_id = :user_id AND agent_id = :agent_id "
-                    "ORDER BY created_at DESC "
-                    "LIMIT :limit OFFSET :offset",
-                ),
-                {
-                    "user_id": user_id,
-                    "agent_id": agent_id,
-                    "limit": page_size,
-                    "offset": offset,
-                },
-            )
-        ).all()
+    # Current page of session records, newest-first.
+    # 两步查（先 id 排序分页，再按 id 回查完整行）：payload 是几十 KB 的
+    # 大 JSON，带着它排序会撑爆 MySQL sort buffer（错误 1038
+    # Out of sort memory，线上已触发），详见 _paged_session_rows。
+    rows = await _paged_session_rows(
+        engine,
+        where="WHERE user_id = :user_id AND agent_id = :agent_id",
+        params={"user_id": user_id, "agent_id": agent_id},
+        order_by="created_at DESC, id DESC",
+        limit=page_size,
+        offset=offset,
+    )
 
     # 行 → SessionRecord dict + 默认时间名改写（公共实现见下方两个
     # helper，与 /sessions/usage/history 共用）。
@@ -329,6 +322,79 @@ async def list_session_ids_paginated(
 # ---------------------------------------------------------------------------
 
 
+def _strip_session_context(session: dict) -> dict:
+    """列表接口**不下发会话里的消息明细**（``state.context``）。
+
+    ``sessions`` 与 ``messages`` 是两张表、两种职责：列表接口只给"目录"
+    （id / 名字 / 时间），完整对话走 ``GET /sessions/{session_id}/messages``
+    分页取。``state.context`` 里塞着全部消息、工具结果、token 用量，会随
+    对话轮数**线性膨胀**——数据一多就拖慢响应、甚至超时，所以在列表接口
+    统一裁掉。只删 ``context``，``state`` 其余字段（summary / reply_context
+    等）保留，兼容需要读会话状态的调用方。
+    """
+    state = session.get("state")
+    if isinstance(state, dict):
+        state.pop("context", None)
+    return session
+
+
+async def _paged_session_rows(
+    engine: Any,
+    where: str,
+    params: dict[str, Any],
+    order_by: str,
+    limit: int,
+    offset: int,
+) -> list[Any]:
+    """分页查会话：**先只查 id 排序分页，再按 id 回查完整行**。
+
+    直接 ``SELECT ..., payload ... ORDER BY ...`` 时，MySQL 要把含巨大
+    JSON（``state`` / 消息明细，单条可达几十 KB）的整行塞进 sort buffer
+    排序——会话一多就撑爆，报 **1038 Out of sort memory**
+    （线上已触发：user_id='admin' 的 /sessions/limit 请求）。
+    改成两步：
+
+    1. 只取 ``id``（行宽几十字节，排序几乎不占内存），LIMIT/OFFSET
+       仍由 DB 完成，分页语义不变；
+    2. 用这十来个 id 回查完整行——**不带 ORDER BY**（否则又要把
+       payload 装进排序堆），顺序在 Python 侧按第 1 步的 id 序列还原。
+
+    这样数据库全程不排序大字段，1038 再无触发点；``order_by`` 只作用于
+    第 1 步，最终顺序与原写法一致，调用方无感。
+    """
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        id_rows = (
+            await conn.execute(
+                text(
+                    "SELECT id FROM sessions "
+                    f"{where} ORDER BY {order_by} "
+                    "LIMIT :limit OFFSET :offset",
+                ),
+                {**params, "limit": limit, "offset": offset},
+            )
+        ).all()
+    if not id_rows:
+        return []
+    ids = [r.id for r in id_rows]
+    placeholders = ", ".join(f":i{i}" for i in range(len(ids)))
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT id, created_at, updated_at, user_id, agent_id, "
+                    "source, source_schedule_id, team_id, payload "
+                    f"FROM sessions WHERE id IN ({placeholders})",
+                ),
+                {f"i{i}": sid for i, sid in enumerate(ids)},
+            )
+        ).all()
+    # 按第 1 步的顺序还原（DB 侧不再排序，避免触碰 payload 排序堆）
+    by_id = {r.id: r for r in rows}
+    return [by_id[sid] for sid in ids if sid in by_id]
+
+
 def _session_rows_to_records(rows: list[Any]) -> list[dict]:
     """``text()`` 裸 SQL 查出的 sessions 行 → SessionRecord dict 列表。
 
@@ -338,6 +404,9 @@ def _session_rows_to_records(rows: list[Any]) -> list[dict]:
     回到这里（Postgres/asyncpg 则由驱动自动解码）。必须先解码成 dict，
     否则 ``dict("...")`` 会抛 ``ValueError: dictionary update sequence
     element #0 has length 1``。
+
+    重建后统一走 :func:`_strip_session_context` 裁掉消息明细（列表接口
+    不下发对话内容，见其文档）。
     """
     from agentscope.app.storage import SessionRecord
 
@@ -361,7 +430,9 @@ def _session_rows_to_records(rows: list[Any]) -> list[dict]:
         obj["source_schedule_id"] = row.source_schedule_id
         obj["team_id"] = row.team_id
         sessions.append(
-            SessionRecord.model_validate(obj).model_dump(mode="json")
+            _strip_session_context(
+                SessionRecord.model_validate(obj).model_dump(mode="json"),
+            ),
         )
     return sessions
 
@@ -461,22 +532,35 @@ async def list_user_used_agents(
         default=None,
         description="目标用户；省略时回退 X-User-ID。",
     ),
+    page: int = Query(default=1, ge=1, description="Page number, starts at 1"),
+    size: int = Query(
+        default=20,
+        ge=1,
+        le=200,
+        description="Number of items per page (1-200)",
+    ),
     viewer_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
 ) -> dict:
-    """某用户**使用过的智能体清单**（含自建与市场智能体）。
+    """某用户**使用过的智能体清单**（含自建与市场智能体），分页返回。
 
     - 数据源：``sessions`` 表按 ``agent_id`` 分组聚合（会话数 +
-      最近使用时间）——聊过就会留下会话，天然涵盖自建与平台智能体；
+      最近使用时间）——聊过就会留下会话，天然涵盖自建与市场智能体；
+    - 分页：``page`` / ``size``（url 参数）；``total`` 为**分页前**
+      的总条数，``has_more`` 标识是否还有下一页——聚合本身在 SQL
+      侧完成（量级 = 用过的智能体数），Python 侧只做切片；
     - 附带智能体名（agents 表 ``payload["data"]["name"]``）、归属者
       ``owner_user_id`` 及 ``is_platform`` / ``is_self`` 标记，前端
-      可直接分组渲染；
+      可直接分组渲染。``is_platform`` = 该智能体在市场名单内
+      （``agent_market`` 表有行，即市场智能体——``user_id`` 已不再
+      承载"平台"语义）；``is_self`` = 归属者就是查询目标用户本人；
     - 排除系统内置智能体（``_`` 开头 id）——内部工具载体，不算
       "用户使用的智能体"；
     - 按最近使用时间倒序。
     """
     from sqlalchemy import text
 
-    from bocomadp.config.market_config import get_platform_user_id
+    from bocomadp.market_store import list_market_entries
     from bocomadp.pool_config import _get_engine
 
     target = _resolve_target_user(user_id, viewer_id)
@@ -497,8 +581,12 @@ async def list_user_used_agents(
         ).all()
 
     usage = [r for r in rows if not r.agent_id.startswith("_")]
-    briefs = await _agent_brief_map(engine, [r.agent_id for r in usage])
-    platform = get_platform_user_id()
+    total = len(usage)
+    start = (page - 1) * size
+    page_rows = usage[start : start + size]
+
+    briefs = await _agent_brief_map(engine, [r.agent_id for r in page_rows])
+    market_ids = {e.agent_id for e in await list_market_entries(storage)}
     agents = [
         {
             "agent_id": r.agent_id,
@@ -506,18 +594,23 @@ async def list_user_used_agents(
             "owner_user_id": (briefs.get(r.agent_id) or {}).get(
                 "owner_user_id",
             ),
-            "is_platform": (
-                (briefs.get(r.agent_id) or {}).get("owner_user_id") == platform
-            ),
+            "is_platform": r.agent_id in market_ids,
             "is_self": (
                 (briefs.get(r.agent_id) or {}).get("owner_user_id") == target
             ),
             "session_count": int(r.session_count),
             "last_used_at": r.last_used_at,
         }
-        for r in usage
+        for r in page_rows
     ]
-    return {"user_id": target, "agents": agents, "total": len(agents)}
+    return {
+        "user_id": target,
+        "agents": agents,
+        "total": total,
+        "page": page,
+        "size": size,
+        "has_more": start + len(agents) < total,
+    }
 
 
 @session_usage_router.get(
@@ -581,19 +674,15 @@ async def list_user_session_history(
         ).scalar_one()
 
     offset = (page - 1) * page_size
-    async with engine.connect() as conn:
-        rows = (
-            await conn.execute(
-                text(
-                    "SELECT id, created_at, updated_at, user_id, agent_id, "
-                    "source, source_schedule_id, team_id, payload "
-                    f"FROM sessions {where} "
-                    "ORDER BY updated_at DESC, created_at DESC "
-                    "LIMIT :limit OFFSET :offset",
-                ),
-                {**params, "limit": page_size, "offset": offset},
-            )
-        ).all()
+    # 同 /limit：两步查，避免带着 payload 排序撑爆 sort buffer（错误 1038）
+    rows = await _paged_session_rows(
+        engine,
+        where=where,
+        params=params,
+        order_by="updated_at DESC, created_at DESC, id DESC",
+        limit=page_size,
+        offset=offset,
+    )
 
     sessions = _session_rows_to_records(rows)
     briefs = await _agent_brief_map(
