@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from agentscope.tool import FunctionTool, ToolBase
 
 from ..deerflow.custom_params import get_custom_params
+from ._naming import tool_name
 from .contact_search import contact_search_tool
 from .cross_search import cross_search_tool  # 已是 FunctionTool 实例（带注入中间件）
 from .exchange_rate import exchange_rate_tool
@@ -31,6 +33,60 @@ from .read_tool_result import read_tool_result_tool
 from .vector_search import vector_search_tool
 
 logger = logging.getLogger(__name__)
+
+#: 企业工具的中/英文名对（顺序：中文名、英文名）。
+#: 用于 ``custom_params.usableTools`` 名单归一：名单条目无论写中文名还是
+#: 英文名（``BOCOMADP_TOOL_ASCII_NAMES`` 任一形态）都能命中，并换算为
+#: 当前运行时形态的工具名；也把豁免范围钉死在企业工具名空间内（名单里
+#: 出现 Bash 等 builtins 名不会误豁免）。
+_ENTERPRISE_NAME_PAIRS: tuple[tuple[str, str], ...] = (
+    ("通讯录查询", "contact_search"),
+    ("物理系统负责人查询", "physical_contact_search"),
+    ("外数查", "raw_request_tool"),
+    ("read_tool_result", "read_tool_result"),
+    ("汇率查询", "exchange_rate"),
+    ("利率查询", "interest_rate"),
+    ("跨知识搜索", "cross_search"),
+    ("行内搜索", "vector_search"),
+    ("个人知识库搜索", "personal_search"),
+    ("联网搜索", "online_search"),
+    ("query_internal_doc", "query_internal_doc"),
+    ("submit_it_ticket", "submit_it_ticket"),
+)
+
+#: 任一形态名（中/英文）→ 基准英文名的归一映射。
+_NAME_TO_CANONICAL: dict[str, str] = {
+    name: en for cn, en in _ENTERPRISE_NAME_PAIRS for name in (cn, en)
+}
+
+#: 基准英文名 → 中文名的反向映射（换算运行时名用）。
+_CANONICAL_TO_CN: dict[str, str] = {
+    en: cn for cn, en in _ENTERPRISE_NAME_PAIRS
+}
+
+
+def usable_enterprise_tool_names(usable: Any) -> set[str]:
+    """把 ``custom_params.usableTools`` 名单换算为当前运行时形态的工具名。
+
+    只保留命中企业工具名空间（中/英文任一形态）的条目，其余（builtins
+    名、未知名等）静默忽略——保证"只作用于企业工具层"与白名单豁免
+    范围不越界。
+
+    Args:
+        usable: ``custom_params.usableTools`` 原始值（list / None / 其他）。
+
+    Returns:
+        当前运行时形态（跟随 ``BOCOMADP_TOOL_ASCII_NAMES``）的工具名
+        集合；非 list 或全无效条目 → 空集合。
+    """
+    if not isinstance(usable, list):
+        return set()
+    names: set[str] = set()
+    for item in usable:
+        canonical = _NAME_TO_CANONICAL.get(str(item).strip())
+        if canonical:
+            names.add(tool_name(_CANONICAL_TO_CN[canonical], canonical))
+    return names
 
 
 async def build_enterprise_tools(
@@ -55,6 +111,13 @@ async def build_enterprise_tools(
     - ``personal_search_switch`` 显式 ``True`` 且 ``tools_param`` 的
       ``personalKnowledgeSearch`` 空间参数（psnlSpaceCodeId /
       psnlCategoryIdList）齐备 → 挂载个人知识库搜索工具（personal_search）。
+
+    ``usableTools`` 请求级名单（只作用于企业工具层，优先级高于 per-agent
+    白名单）：
+
+    - 缺失 / ``None`` / 非数组 / 空数组 → 不挂载任何企业工具（全禁用）；
+    - 非空数组 → 只保留名单内的工具（中/英文名均可匹配）；名单只收缩、
+      不扩张——开关关闭的工具即使列入名单也不会挂载。
 
     本函数在 run 任务内由框架 AgentToolFactory 调用，custom_params
     ContextVar 已随 ``asyncio.create_task`` 复制进来，可直接读取。
@@ -110,5 +173,25 @@ async def build_enterprise_tools(
             "session=%s)",
             session_id,
         )
+
+    # usableTools 请求级名单过滤（只作用于企业工具层）：
+    # - 缺失 / None / 非数组 / 空数组 → 不挂载任何企业工具（全禁用）；
+    # - 非空数组 → 只保留名单内的工具（中/英文名均可匹配）。
+    # 名单只收缩、不扩张：上方开关关闭的工具即使列入名单也不会挂载。
+    usable = params.get("usableTools")
+    if not isinstance(usable, list) or not usable:
+        logger.info(
+            "enterprise tools: usableTools missing or empty -> "
+            "no enterprise tool mounted (session=%s)",
+            session_id,
+        )
+        return []
+    allowed = usable_enterprise_tool_names(usable)
+    tools = [t for t in tools if getattr(t, "name", "") in allowed]
+    logger.info(
+        "enterprise tools: usableTools filter applied -> %s (session=%s)",
+        [getattr(t, "name", "") for t in tools],
+        session_id,
+    )
 
     return tools

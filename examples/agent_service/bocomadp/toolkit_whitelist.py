@@ -32,6 +32,12 @@ whitelist:
 MCPs are already filtered by ``WhitelistWorkspaceManager``; skills are
 installed explicitly into the agent's workspace so they are left
 untouched.
+
+Request-level override: ``custom_params.usableTools`` lists enterprise
+tools (see :mod:`bocomadp.tools.enterprise`) that are **exempt** from
+this per-agent whitelist — the request can only narrow enterprise tools
+(by listing fewer names) but can also keep ones the agent whitelist
+would drop. Non-enterprise tools are never exempted.
 """
 
 from __future__ import annotations
@@ -63,6 +69,16 @@ async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
     if not whitelist:
         return toolkit
     allowed = set(whitelist)
+
+    # usableTools 名单内的企业工具豁免 per-agent 白名单（请求级优先，
+    # 只作用于企业工具层）。名单经 usable_enterprise_tool_names 换算为
+    # 当前运行时形态的名字，builtins / 团队工具等不豁免。
+    from bocomadp.deerflow.custom_params import get_custom_params
+    from bocomadp.tools.enterprise import usable_enterprise_tool_names
+
+    allowed |= usable_enterprise_tool_names(
+        get_custom_params().get("usableTools"),
+    )
 
     # The framework ``Toolkit`` has no top-level ``tools`` attribute:
     # tools live inside each ``ToolGroup`` (the "basic" group plus the

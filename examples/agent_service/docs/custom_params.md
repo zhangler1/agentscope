@@ -229,6 +229,7 @@ class CustomPromptMiddleware(MiddlewareBase):
 | `vector_search_switch` | True | 显式 `False` → 不挂 vector_search 工具（cross_search 始终挂载） | `build_enterprise_tools` |
 | `online_search_switch` | False | 显式 `True` → 挂 online_search 联网搜索（默认不挂） | `build_enterprise_tools` |
 | `personal_search_switch` | False | 显式 `True` 且空间参数齐备 → 挂 personal_search 工具 | `build_enterprise_tools` |
+| `usableTools` | — | 请求级企业工具名单（见下方说明）：缺失/None/空数组 → 全禁用；非空 → 只挂名单内 | `build_enterprise_tools` + 白名单豁免 |
 
 ```python
 # enterprise.py（工具挂载开关，2026-08-20 起 cross_search 不受 vector 开关控制）
@@ -259,6 +260,20 @@ personal_search 工具（行内搜索之外的"个人知识库搜索"维度）�
 ``tools_param.personalKnowledgeSearch``，由
 :class:`PersonalSpacecodeOverrideMiddleware` 强制覆盖模型传参；开关为 True
 且空间参数齐备才挂载该工具。
+
+**usableTools 请求级名单**（只作用于企业工具层，优先级高于 per-agent 白名单）：
+
+- 类型 `list[str]`，表示本次请求可用的**企业工具**名字（中/英文名均可匹配，
+  跟随 `BOCOMADP_TOOL_ASCII_NAMES` 的任一形态）；
+- **缺失 / `null` / 非数组 / 空数组 → 不挂载任何企业工具**（全禁用，
+  破坏性语义：请求方不传 usableTools 时企业检索能力全部失效）；
+- 非空数组 → 只保留名单内的企业工具；**名单只收缩、不扩张**——
+  `online_search_switch` 等开关关闭的工具即使列入名单也不会挂载；
+- 名单只作用于企业工具层：builtins（Bash/Read/Write 等）、项目工具、
+  团队/规划工具、skill 执行依赖的通用工具**不受影响**；
+- 名单内的企业工具**豁免** per-agent 白名单（`main.py build_agent_tools`
+  与 `toolkit_whitelist.py` 两处过滤同步豁免）——请求方可以在白名单之外
+  临时启用某个企业工具，但名单外的企业工具仍被白名单约束。
 
 ### 6.4 认证参数（auth_context.py + 路由联动）
 
@@ -296,6 +311,7 @@ def resolve_auth_params(custom_params) -> ResolvedAuth:
 | `vector_search_switch` | bool | build_enterprise_tools | 显式 False 卸载 vector_search（默认挂载；cross_search 不受控） |
 | `online_search_switch` | bool | build_enterprise_tools | 显式 True 挂 online_search（默认不挂） |
 | `personal_search_switch` | bool | build_enterprise_tools | 显式 True 且空间参数齐备 → 挂 personal_search |
+| `usableTools` | list[str] | build_enterprise_tools + 白名单豁免 | 请求级企业工具名单：只挂名单内（中/英文名均可）；缺失/None/空数组 → 全禁用；名单内工具豁免 per-agent 白名单 |
 | `tools_param.personalKnowledgeSearch` | dict | PersonalSpacecodeOverrideMiddleware | 个人空间参数（psnlSpaceCodeId / psnlCategoryIdList）强制覆盖 |
 | `tools_param.source_param` | dict | vector_search 后端 | sourceType / repository / aggRepositories / HNSSParam |
 | `guwp_token` / `jrt_auth_code` / `okic_token` / `okic_type` / `muwp_user` | str / dict | resolve_auth_params | 认证方案（优先级 guwp > jrt > okic > muwp） |
