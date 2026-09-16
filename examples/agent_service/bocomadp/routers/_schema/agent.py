@@ -120,7 +120,8 @@ class OwnedAgentView(BaseModel):
     与 ``GET /agent/``（可见性视图：自己的 + 别人共享给我的 + 隐藏
     自建成员）不同，本视图是**纯归属清单**：只含 ``user_id=调用者``
     且 ``source='user'`` 的记录——共享进来的别人的智能体不出现，
-    ``source='team'`` 的派生 worker 也不出现。
+    ``source='team'`` 的派生 worker 不出现，**专家团自建成员也不
+    返回**（成员独属其团，明细走 ``GET /agent/?parent_agent_id=``）。
     """
 
     id: str = Field(description="智能体 id。")

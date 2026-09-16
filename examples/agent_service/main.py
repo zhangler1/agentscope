@@ -390,10 +390,19 @@ async def build_agent_tools(
     # This makes the tool config APIs effective at runtime. For the
     # agent-creator its whitelist covers M plus its factory tools
     # (see _register_builtin_agents), so it keeps both.
+    #
+    # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
+    # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
+    # builtins / 工厂工具等非企业工具不豁免。
+    from bocomadp.deerflow.custom_params import get_custom_params
     from bocomadp.routers.agent_tools import _tool_whitelists
+    from bocomadp.tools.enterprise import usable_enterprise_tool_names
+
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
-        allowed = set(whitelist)
+        allowed = set(whitelist) | usable_enterprise_tool_names(
+            get_custom_params().get("usableTools"),
+        )
         tools = [
             t for t in tools if getattr(t, "name", "") in allowed
         ]
@@ -901,6 +910,11 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import team_store
 
         await team_store.ensure_team_tables(storage)
+        # 智能体市场扩展表（agent_market）——平台智能体的领域分类档案，
+        # 与专家团关系表同一套 bocomadp 自建表模式（热度不落库，实时聚合）。
+        from bocomadp import market_store
+
+        await market_store.ensure_market_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -1059,6 +1073,9 @@ app.include_router(model_registry_router)
 # 智能体凭证绑定（agent_credential 表：agent_id -> credential_id 的 CRUD）
 from bocomadp.routers.agent_credential import agent_credential_router
 app.include_router(agent_credential_router)
+# 智能体市场（平台应用列表 / 精选推荐 / 默认标签打标，全开放）
+from bocomadp.routers.market import market_router
+app.include_router(market_router)
 
 
 # ---------------------------------------------------------------------------

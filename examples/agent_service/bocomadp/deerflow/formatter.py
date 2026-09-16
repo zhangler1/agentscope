@@ -15,8 +15,9 @@
 | ``ToolCallStart/Delta/End``   | ``messages`` + ``updates`` | 流式 ``AIMessageChunk`` 增量帧（``tool_call_chunks`` 首片带 name/id/index、delta 片只带 args，官方前端 SDK 按同 id concat 出 tool_calls）+ end 时 ``{"model": {"messages": [...]}}`` 完整 ai 消息快照（updates 帧，jx_chat 前端消费） |
 | ``ToolResultStart/Text/End``  | ``messages``           | ``[{"type": "tool", "content", "name", "tool_call_id", "id", "status", "artifact"}, metadata]`` |
 | ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` |
+| ``ModelCallEndEvent``         | （内部消化）             | 累积 input/output tokens，不产帧；随 reply_end 以 usage_metadata 下发 |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
-| ``ReplyEndEvent(normal)``     | ``end``                | 哨兵（data=None）                          |
+| ``ReplyEndEvent(normal)``     | ``messages`` + ``end`` | 末尾 usage 增量帧（``usage_metadata``）+ 哨兵（data=None）  |
 | ``ReplyEndEvent(error)``      | ``error`` + ``end``    | ``{"message", "name"}`` 后接哨兵           |
 | 未知事件                      | ``custom``             | 原样透传而非丢弃 |
 
@@ -60,6 +61,7 @@ _T_TOOL_RESULT_TEXT_DELTA = "TOOL_RESULT_TEXT_DELTA"
 _T_TOOL_RESULT_END = "TOOL_RESULT_END"
 _T_REQUIRE_USER_CONFIRM = "REQUIRE_USER_CONFIRM"
 _T_CUSTOM = "CUSTOM"
+_T_MODEL_CALL_END = "MODEL_CALL_END"
 
 # 确认卡片协议常量（对齐 deer-flow 前端 human_input_request）。
 CONFIRM_SOURCE = "agent_scope_permission"
@@ -162,6 +164,9 @@ class DeerflowSSEFormatter:
         self._tool_call_index: dict[str, int] = {}
         # tool_call_id -> 累积 result 文本（tool_result_text_delta 拼接）
         self._tool_result_text: dict[str, str] = {}
+        # 本 run 累积 token 用量（MODEL_CALL_END 累加，reply 级聚合；
+        # reply 内多轮模型调用合并计数，对齐原生单回复单 AI 消息语义）
+        self._usage: dict[str, int] | None = None
 
     # ------------------------------------------------------------------
     # 入口
@@ -206,7 +211,13 @@ class DeerflowSSEFormatter:
         return [_evt(event, EVENT_METADATA, payload)]
 
     def _on_reply_end(self, event: dict) -> list[StreamEvent]:
-        """ReplyEndEvent → error 帧（失败时）+ end 哨兵。"""
+        """ReplyEndEvent → error 帧（失败时）+ end 哨兵。
+
+        正常结束时若本 run 有 token 用量（ModelCallEndEvent 已累积），
+        在哨兵前补发一条 messages usage 增量帧——对齐原生 messages-tuple
+        最后一块带 ``usage_metadata`` 的形态（SDK 按同 id concat 进 AI
+        消息，usage 随消息保留）。
+        """
         finished_reason = str(event.get("finished_reason", "")).upper()
         if finished_reason == "ERROR":
             error = event.get("error") or {}
@@ -219,7 +230,25 @@ class DeerflowSSEFormatter:
                 },
             )
             return [error_frame, END_SENTINEL]
-        return [END_SENTINEL]
+        frames: list[StreamEvent] = []
+        if self._usage is not None:
+            frames.append(self._usage_messages_frame(event))
+        frames.append(END_SENTINEL)
+        return frames
+
+    def _usage_messages_frame(self, event: dict) -> StreamEvent:
+        """构造末尾 usage 增量帧（chunk 带 ``usage_metadata`` 三字段）。"""
+        chunk: dict[str, Any] = {
+            "type": "AIMessageChunk",
+            "content": "",
+            "id": event.get("reply_id"),
+            "usage_metadata": {
+                "input_tokens": self._usage["input_tokens"],  # type: ignore[index]
+                "output_tokens": self._usage["output_tokens"],  # type: ignore[index]
+                "total_tokens": self._usage["total_tokens"],  # type: ignore[index]
+            },
+        }
+        return _evt(event, EVENT_MESSAGES, [chunk, {"langgraph_node": "model"}])
 
     def _messages_chunk(
         self,
@@ -445,6 +474,35 @@ class DeerflowSSEFormatter:
         ]
 
     # ── HITL / 自定义 / 兜底 ───────────────────────────────────────────
+
+    def _on_model_call_end(self, event: dict) -> list[StreamEvent]:
+        """ModelCallEndEvent → 累积 token 用量（内部消化，不产帧）。
+
+        原生 deer-flow 的 token 经 ``usage_metadata``（values 快照 / 末尾
+        messages 增量）下发，没有独立的 custom 通道；此前本事件落入
+        passthrough 以 ``model_call_end`` custom 帧泄漏，前端不认识。
+        改为内部累积，由 :meth:`_on_reply_end` 统一补发。
+        """
+        input_tokens = int(event.get("input_tokens") or 0)
+        output_tokens = int(event.get("output_tokens") or 0)
+        if self._usage is None:
+            self._usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            }
+        self._usage["input_tokens"] += input_tokens
+        self._usage["output_tokens"] += output_tokens
+        self._usage["total_tokens"] += input_tokens + output_tokens
+        return []
+
+    @property
+    def usage(self) -> dict[str, int] | None:
+        """本 run 已累积的 token 用量（input/output/total），无调用时 None。
+
+        供 SSE 生成器在 end 前组装 values 快照时附加 ``usage_metadata``。
+        """
+        return dict(self._usage) if self._usage is not None else None
 
     def _on_require_user_confirm(self, event: dict) -> list[StreamEvent]:
         """RequireUserConfirmEvent → tool 消息（human_input 卡片）+ custom。
