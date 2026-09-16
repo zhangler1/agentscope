@@ -93,24 +93,24 @@ def _build_req_message(
             if agent_config.space_code_list
             else config.space_code_list
         )
-        effective_team_space_code_list = (
-            agent_config.team_space_code_list
-            if agent_config.team_space_code_list
-            else config.team_space_code_list
-        )
-        effective_psnl_space_code_id = (
-            agent_config.psnl_space_code_id or config.psnl_space_code_id
-        )
+        # effective_team_space_code_list = (
+        #     agent_config.team_space_code_list
+        #     if agent_config.team_space_code_list
+        #     else config.team_space_code_list
+        # )
+        # effective_psnl_space_code_id = (
+        #     agent_config.psnl_space_code_id or config.psnl_space_code_id
+        # )
         effective_customized_tag_list = (
             agent_config.customized_tag_list
             if agent_config.customized_tag_list
             else config.customized_tag_list
         )
-        effective_psnl_category_id_list = (
-            agent_config.psnl_category_id_list
-            if agent_config.psnl_category_id_list
-            else config.psnl_category_id_list
-        )
+        # effective_psnl_category_id_list = (
+        #     agent_config.psnl_category_id_list
+        #     if agent_config.psnl_category_id_list
+        #     else config.psnl_category_id_list
+        # )
         effective_text_top_n = (
             agent_config.text_top_n
             if agent_config.text_top_n is not None
@@ -122,13 +122,13 @@ def _build_req_message(
             else config.vector_top_n
         )
     else:
-        effective_user_code = 9501173 # config.user_code
+        effective_user_code = config.user_code
         effective_search_type = config.search_type
         effective_space_code_list = config.space_code_list
-        effective_team_space_code_list = config.team_space_code_list
-        effective_psnl_space_code_id = config.psnl_space_code_id
+        # effective_team_space_code_list = config.team_space_code_list
+        # effective_psnl_space_code_id = config.psnl_space_code_id
         effective_customized_tag_list = config.customized_tag_list
-        effective_psnl_category_id_list = config.psnl_category_id_list
+        # effective_psnl_category_id_list = config.psnl_category_id_list
         effective_text_top_n = config.text_top_n
         effective_vector_top_n = config.vector_top_n
 
@@ -137,16 +137,16 @@ def _build_req_message(
             "userCode is required. 请通过智能体配置接口或在 config.yaml 的 cross_search.user_code 中配置。",
         )
 
-    has_space = bool(
-        effective_space_code_list
-        or effective_team_space_code_list
-        or effective_psnl_space_code_id
-    )
-    if not has_space:
-        raise ValueError(
-            "至少需要提供 spaceCodeList、teamSpaceCodeList 或 "
-            "psnlSpaceCodeId 中的一个。请通过智能体配置接口设置。",
-        )
+    # has_space = bool(
+    #     effective_space_code_list
+    #     or effective_team_space_code_list
+    #     or effective_psnl_space_code_id
+    # )
+    # if not has_space:
+    #     raise ValueError(
+    #         "至少需要提供 spaceCodeList、teamSpaceCodeList 或 "
+    #         "psnlSpaceCodeId 中的一个。请通过智能体配置接口设置。",
+    #     )
 
     param: dict[str, Any] = {
         "keyword": keyword,
@@ -171,13 +171,13 @@ def _build_req_message(
 
     if effective_space_code_list:
         param["spaceCodeList"] = effective_space_code_list
-    if effective_team_space_code_list:
-        param["teamSpaceCodeList"] = effective_team_space_code_list
-    if effective_psnl_space_code_id:
-        param["psnlSpaceCodeId"] = effective_psnl_space_code_id
-    if effective_psnl_category_id_list:
-        param["psnlCategoryIdList"] = effective_psnl_category_id_list
-    if effective_customized_tag_list:
+    # if effective_team_space_code_list:
+    #     param["teamSpaceCodeList"] = effective_team_space_code_list
+    # if effective_psnl_space_code_id:
+    #     param["psnlSpaceCodeId"] = effective_psnl_space_code_id
+    # if effective_psnl_category_id_list:
+    #     param["psnlCategoryIdList"] = effective_psnl_category_id_list
+    # if effective_customized_tag_list:
         param["customizedTagList"] = effective_customized_tag_list
     if config.source_org_id_list:
         param["sourceOrgIdList"] = config.source_org_id_list
@@ -192,7 +192,7 @@ def _build_req_message(
 
     req_message = {
         "REQ_HEAD": {
-            "TRANS_PROCESS": "searchKnowledgeCross",
+            "TRANS_PROCESS": "searchKnowledgeStandard",
             "TRAN_ID": "",
         },
         "REQ_BODY": {
