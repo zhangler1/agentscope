@@ -44,6 +44,7 @@ from agentscope.app.storage._sql._tables import MessageRow, SessionRow
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 
 import bocomadp.pool_config as pool_config
+from bocomadp import market_store
 from bocomadp.routers.session_usage import session_usage_router
 
 HDR_USER = {"X-User-ID": "test-user"}
@@ -98,6 +99,8 @@ def client(tmp_path):
             # /limit 家族的裸 SQL 端点经 pool_config._get_engine() 拿连接，
             # 默认会连 config.yaml 的真库——测试里替换成测试存储的引擎。
             pool_config._engine = storage._engine
+            # is_platform 按 agent_market 名单判定，建表备用
+            await market_store.ensure_market_tables(storage)
 
     _run(_provision())
 
@@ -134,6 +137,11 @@ def _seed_agents(client) -> None:
     ]
     for rec in records:
         _run(storage.upsert_agent(rec.user_id, rec))
+
+    # 平台智能体手动上架进市场名单（新口径：is_platform 按 agent_market
+    # 行判定，user_id 不再承载"平台"语义）；_factory 是内部工具不上架。
+    for aid in ("plat-a", "plat-b"):
+        _run(market_store.insert_market_entry(storage, aid))
 
 
 def _add_session(

@@ -55,7 +55,6 @@ _BUSINESS_KEYS: frozenset[str] = frozenset(
         "uploads",
         "agents",
         "memory",
-        "agent_market", 
     },
 )
 
