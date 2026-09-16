@@ -13,31 +13,15 @@ caller-supplied ``extra_factory``:
 - middleware-provided tools
 
 The per-agent whitelist maintained by ``agent_tools_router``
-(PUT/DELETE ``/agents/{id}/tools/{name}``) previously only filtered
-the ``extra_factory`` source and ``list_mcps`` — so an agent created
-with ``enabled_tools=["get_current_time"]`` still saw every other tool
-at runtime (and could call them), which defeats least privilege.
+(PUT/DELETE ``/agents/{id}/tools/{name}``) stores **only** enterprise
+tools and MCP names. Default tools (builtins / framework / project)
+are always allowed. Enterprise tools and MCPs must be explicitly added
+to the whitelist to be available at runtime.
 
-Fix without touching framework code: patch the ``get_toolkit`` binding
-inside ``agentscope.app._service._chat`` — the only call site, looked
-up at call time through the module global, so there is no import-order
-race. The wrapper filters the assembled ``Toolkit`` by the per-agent
-whitelist:
+Filter logic:
 
-- empty whitelist -> everything stays available (same semantics as the
-  tool config APIs);
-- non-empty whitelist -> only listed tool names survive, across every
-  tool source above.
-
-MCPs are already filtered by ``WhitelistWorkspaceManager``; skills are
-installed explicitly into the agent's workspace so they are left
-untouched.
-
-Request-level override: ``custom_params.usableTools`` lists enterprise
-tools (see :mod:`bocomadp.tools.enterprise`) that are **exempt** from
-this per-agent whitelist — the request can only narrow enterprise tools
-(by listing fewer names) but can also keep ones the agent whitelist
-would drop. Non-enterprise tools are never exempted.
+- whitelist empty → only default tools survive (enterprise/MCP stripped)
+- whitelist non-empty → default tools + whitelisted enterprise/MCP survive
 """
 
 from __future__ import annotations
@@ -49,10 +33,35 @@ logger = logging.getLogger("bocomadp.toolkit_whitelist")
 
 _original_get_toolkit: Any = None
 
+_project_tool_names: set[str] = set()
 
-def _keep(tool: Any, allowed: set[str]) -> bool:
-    """Return whether *tool*'s name is in the allowed set."""
-    return getattr(tool, "name", "") in allowed
+
+def set_project_tool_names(names: set[str]) -> None:
+    """Set the project tool names (called once at startup from main.py)."""
+    global _project_tool_names
+    _project_tool_names = names
+
+
+_DEFAULT_TOOL_NAMES: set[str] = {
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+    "TeamCreate", "AgentCreate", "TeamSay", "TeamDelete", "AgentInvite",
+    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+    "ToolStop",
+    "ScheduleCreate", "ScheduleDelete", "ScheduleList", "ScheduleUpdate",
+}
+
+
+def _always_allowed_names() -> set[str]:
+    """Default tools + project tools — always allowed, never filtered."""
+    return _DEFAULT_TOOL_NAMES | _project_tool_names
+
+
+def _keep_default_or_whitelisted(tool: Any, always: set[str], allowed: set[str]) -> bool:
+    """Return whether *tool* is always-allowed or in the whitelist."""
+    name = getattr(tool, "name", "")
+    if name in always:
+        return True
+    return name in allowed
 
 
 async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
@@ -62,34 +71,15 @@ async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
     agent_record = kwargs.get("agent_record")
     agent_id = getattr(agent_record, "id", "") or ""
 
-    # Lazy import: this module may be imported early during startup.
     from bocomadp.routers.agent_tools import _tool_whitelists
 
     whitelist = _tool_whitelists.get(agent_id, [])
-    if not whitelist:
-        return toolkit
     allowed = set(whitelist)
+    always = _always_allowed_names()
 
-    # usableTools 名单内的企业工具豁免 per-agent 白名单（请求级优先，
-    # 只作用于企业工具层）。名单经 usable_enterprise_tool_names 换算为
-    # 当前运行时形态的名字，builtins / 团队工具等不豁免。
-    from bocomadp.deerflow.custom_params import get_custom_params
-    from bocomadp.tools.enterprise import usable_enterprise_tool_names
-
-    allowed |= usable_enterprise_tool_names(
-        get_custom_params().get("usableTools"),
-    )
-
-    # The framework ``Toolkit`` has no top-level ``tools`` attribute:
-    # tools live inside each ``ToolGroup`` (the "basic" group plus the
-    # extra groups from get_toolkit). Filter every group's tools, then
-    # drop non-basic groups that become empty: the builtin meta tool
-    # (``reset_tools``) is auto-exposed whenever any non-basic group
-    # exists, so leaving an empty group would still hand the agent a
-    # tool that advertises (and toggles) tool groups it should not see.
     groups = getattr(toolkit, "tool_groups", None) or []
     for group in groups:
-        group.tools = [t for t in group.tools if _keep(t, allowed)]
+        group.tools = [t for t in group.tools if _keep_default_or_whitelisted(t, always, allowed)]
     toolkit.tool_groups = [
         g
         for g in groups
@@ -118,4 +108,4 @@ def patch_get_toolkit() -> None:
     )
 
 
-__all__ = ["patch_get_toolkit"]
+__all__ = ["patch_get_toolkit", "set_project_tool_names"]

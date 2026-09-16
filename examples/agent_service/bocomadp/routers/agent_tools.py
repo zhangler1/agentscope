@@ -5,31 +5,32 @@ Endpoints
 ---------
 ``GET    /tools``                              — list all tools (global)
 ``GET    /mcps``                               — list all MCP servers (global)
-``GET    /agents/{agent_id}/tools``           — list tools with status
-``PUT    /agents/{agent_id}/tools/{name}``    — enable a tool
-``DELETE /agents/{agent_id}/tools/{name}``    — disable a tool
+``GET    /search``                             — search tools or MCPs by name
+``GET    /agents/{agent_id}/tools``           — list agent's tools with status
+``PUT    /agents/{agent_id}/tools/{name}``    — add a tool/MCP to agent
+``DELETE /agents/{agent_id}/tools/{name}``    — remove a tool/MCP from agent
 
-Tool sources — the configurable set ``M``, single-sourced from
-:mod:`bocomadp.tool_catalog`:
+Tool categories
+---------------
+**Default tools** (always available, not shown, not configurable):
 
-1. **Workspace builtins** — ``Bash/Read/Write/Edit/Glob/Grep``
-   (runtime names, capitalized; see ``agentscope.tool._builtin``).
-2. **Project tools** — from ``ToolRegistry`` (builtin_tools.py + custom/).
-3. **MCP servers** — names from ``McpRegistry``.
-4. **Framework team/planning tools** — ``Team*`` / ``Task*``.
-5. **Enterprise tools** — built by ``build_enterprise_tools``
-   (online search and the placeholder tools are excluded).
+- Builtins: ``Bash/Read/Write/Edit/Glob/Grep``
+- Framework: ``Team*/Task*``
+- Project: from ``ToolRegistry`` (builtin_tools.py + custom/)
 
-Semantics
----------
-``enabled_tools == []`` means **every tool in M is enabled**.
-The first *disable* operation expands ``[]`` to the full M list minus
-the disabled tool.  Subsequent toggles are plain list add / remove.
+**Configurable tools** (must be explicitly added to use & show):
 
-Every tool in M is toggleable — including the workspace builtins.
-The built-in agent-creator additionally *displays* its own factory
-tools on ``GET``; those are display-only (``toggleable=False``) and
-are intentionally not configurable.
+- Enterprise tools — built by ``build_enterprise_tools``
+- MCP servers — from ``McpRegistry``
+
+Whitelist semantics
+-------------------
+The whitelist stores **only** enterprise tools and MCP names.
+- ``whitelist == []`` → only default tools are available (enterprise/MCP disabled)
+- ``whitelist == ["通讯录查询", "browser-use"]`` → default + listed tools available
+
+Users browse candidates via ``GET /tools`` & ``GET /mcps``, then add/remove
+via ``PUT/DELETE /agents/{id}/tools/{name}``.
 """
 
 from __future__ import annotations
@@ -69,8 +70,7 @@ catalog_router = APIRouter(
 _BUILTIN_TOOLS: list[dict] = [dict(m) for m in BUILTIN_TOOLS_META]
 
 #: 团队/规划工具的静态元数据（name + 简短 description）。
-#: 单一数据源：``_all_tool_names()`` 据此推导可管理的工具名集合，
-#: ``GET /agents/{id}/tools`` 据此输出带 description 的展示条目。
+#: 默认工具（始终可用，不显示，不可配置）。
 _FRAMEWORK_TOOLS_META: list[dict] = [dict(m) for m in FRAMEWORK_TOOLS_META]
 
 #: 智能体工厂自带的工厂工具（仅供 ``_agent-creator`` 的 GET 展示，不可配置）。
@@ -209,7 +209,12 @@ async def _resolve_framework_agent(
 
 
 def _get_enabled_tools(agent_id: str) -> list[str]:
-    """Return the current enabled-tools list for *agent_id*."""
+    """Return the current enabled-tools whitelist for *agent_id*.
+
+    The whitelist contains **only** enterprise tool and MCP names.
+    Default tools (builtins / framework / project) are always available
+    and never appear in the whitelist.
+    """
     return list(_tool_whitelists.get(agent_id, []))
 
 
@@ -219,27 +224,13 @@ def _set_enabled_tools(agent_id: str, tools: list[str]) -> None:
     _persist_whitelists()
 
 
-def _resolve_enabled(all_tool_names: list[str], whitelist: list[str]) -> set[str]:
-    """Return the *set* of enabled tool names.
+def _configurable_tool_names(request: Request) -> set[str]:
+    """Enterprise tools + MCP names — the set that can be added/removed.
 
-    When *whitelist* is empty every tool is enabled; otherwise only
-    names in *whitelist* are active.
-    """
-    if not whitelist:
-        return set(all_tool_names)
-    return {n for n in whitelist if n in all_tool_names}
-
-
-def _all_tool_names(request: Request) -> set[str]:
-    """Every known tool name across all sources (the configurable set M).
-
-    Workspace builtins (Bash/Read/Write/Edit/Glob/Grep) and framework
-    team/planning tools (Team*/Task*) are always present at runtime and
-    are intentionally excluded from the configurable set — they cannot be
-    toggled via the whitelist API.
+    Default tools (builtins / framework / project) are always present
+    at runtime and are **not** part of this set.
     """
     names: set[str] = set()
-    names.update(_tool_registry(request).list_tool_names())
     mcp_reg = _mcp_registry(request)
     if mcp_reg is not None:
         for mcp in mcp_reg.list_mcps():
@@ -305,20 +296,21 @@ async def list_agent_tools(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Return every tool in M, annotated with its enabled state.
+    """Return the agent's tools: default (always on) + authorized (whitelist).
 
-    All configurable tools (builtins + project + framework + enterprise)
-    are returned in a flat ``tools`` list; MCP servers are in a separate
-    ``mcps`` list.  For the built-in agent-creator, its own factory tools
-    are appended as display-only entries (``toggleable=False``).
+    - Project tools: always shown, ``toggleable=False``
+    - Enterprise tools / MCPs: only shown when in the whitelist,
+      ``toggleable=True``
+
+    Builtins and framework tools are never shown.
 
     Response::
 
         {
           "agent_id": "...",
           "tools": [
-            {"name": "Bash", "description": "...", "enabled": true, "toggleable": true},
-            {"name": "echo", "description": "...", "enabled": false, "toggleable": true}
+            {"name": "echo", "description": "...", "enabled": true, "toggleable": false},
+            {"name": "通讯录查询", "description": "...", "enabled": true, "toggleable": true}
           ],
           "mcps": [
             {"name": "browser-use", "description": "...", "enabled": true, "toggleable": true}
@@ -329,42 +321,44 @@ async def list_agent_tools(
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    all_names = sorted(_all_tool_names(request))
-    enabled_tools = _get_enabled_tools(agent_id)
-    enabled_names = _resolve_enabled(all_names, enabled_tools)
+    whitelist = set(_get_enabled_tools(agent_id))
 
     tools: list[dict] = []
     mcps: list[dict] = []
 
-    # 1. 项目工具（ToolRegistry 注册）
+    # 1. 项目工具（始终可用，不可配置）
     for tool in _tool_registry(request).list_tools():
         name = _tool_name(tool)
         tools.append(
             {
                 "name": name,
                 "description": getattr(tool, "description", "") or "",
-                "enabled": name in enabled_names,
-                "toggleable": True,
+                "enabled": True,
+                "toggleable": False,
             },
         )
 
-    # 2. 企业工具（build_enterprise_tools 主动构建）
+    # 2. 企业工具（仅在白名单中才显示）
     for meta in _enterprise_tools_meta():
         name = meta["name"]
+        if name not in whitelist:
+            continue
         tools.append(
             {
                 "name": name,
                 "description": meta.get("description", ""),
-                "enabled": name in enabled_names,
+                "enabled": True,
                 "toggleable": True,
             },
         )
 
-    # 3. MCP servers → separate `mcps` list
+    # 3. MCP servers（仅在白名单中才显示）
     mcp_reg = _mcp_registry(request)
     if mcp_reg is not None:
         for mcp in mcp_reg.list_mcps():
             mcp_name = getattr(mcp, "name", "") or ""
+            if mcp_name not in whitelist:
+                continue
             mcps.append(
                 {
                     "name": mcp_name,
@@ -377,7 +371,7 @@ async def list_agent_tools(
                         )
                         or ""
                     ),
-                    "enabled": mcp_name in enabled_names,
+                    "enabled": True,
                     "toggleable": True,
                 },
             )
@@ -396,7 +390,7 @@ async def list_agent_tools(
 
 @agent_tools_router.put(
     "/{agent_id}/tools/{tool_name}",
-    summary="Enable a tool for the agent",
+    summary="Add a tool or MCP to the agent",
 )
 async def enable_agent_tool(
     agent_id: str,
@@ -404,30 +398,32 @@ async def enable_agent_tool(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Add *tool_name* to the agent's enabled-tools whitelist."""
+    """Add *tool_name* (enterprise tool or MCP) to the agent's whitelist.
+
+    Only enterprise tools and MCP names are accepted — default tools
+    (builtins / framework / project) are always available and cannot be
+    toggled.
+    """
     agent = await _resolve_framework_agent(request, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    toggleable = _all_tool_names(request)
-    if tool_name not in toggleable:
-        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    configurable = _configurable_tool_names(request)
+    if tool_name not in configurable:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{tool_name}' not found or not configurable",
+        )
 
     current = _get_enabled_tools(agent_id)
 
-    # [] means all enabled → already enabled, nothing to do
-    if not current:
-        _set_enabled_tools(agent_id, current)  # keep []
-        logger.info("agent_tools: %s enable %s (already all-enabled)", agent_id, tool_name)
-        return {"ok": True}
-
     if tool_name in current:
-        logger.info("agent_tools: %s enable %s (already enabled)", agent_id, tool_name)
+        logger.info("agent_tools: %s add %s (already in whitelist)", agent_id, tool_name)
         return {"ok": True}
 
     current.append(tool_name)
     _set_enabled_tools(agent_id, current)
-    logger.info("agent_tools: %s enable %s → enabled_tools=%s", agent_id, tool_name, current)
+    logger.info("agent_tools: %s add %s → whitelist=%s", agent_id, tool_name, current)
     return {"ok": True}
 
 
@@ -438,7 +434,7 @@ async def enable_agent_tool(
 
 @agent_tools_router.delete(
     "/{agent_id}/tools/{tool_name}",
-    summary="Disable a tool for the agent",
+    summary="Remove a tool or MCP from the agent",
 )
 async def disable_agent_tool(
     agent_id: str,
@@ -446,32 +442,31 @@ async def disable_agent_tool(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Remove *tool_name* from the agent's enabled-tools whitelist.
+    """Remove *tool_name* from the agent's whitelist.
 
-    When ``enabled_tools`` is empty (all-enabled), it is first expanded
-    to the full tool list so the disable can take effect.
+    The tool/MCP will no longer be available or shown for this agent.
+    Default tools (builtins / framework / project) cannot be removed.
     """
     agent = await _resolve_framework_agent(request, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    toggleable = _all_tool_names(request)
-    if tool_name not in toggleable:
-        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    configurable = _configurable_tool_names(request)
+    if tool_name not in configurable:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{tool_name}' not found or not configurable",
+        )
 
     current = _get_enabled_tools(agent_id)
 
-    # [] → expand to full list first, then remove
-    if not current:
-        current = list(toggleable)
-
     if tool_name not in current:
-        logger.info("agent_tools: %s disable %s (already disabled)", agent_id, tool_name)
+        logger.info("agent_tools: %s remove %s (not in whitelist)", agent_id, tool_name)
         return {"ok": True}
 
     current.remove(tool_name)
     _set_enabled_tools(agent_id, current)
-    logger.info("agent_tools: %s disable %s → enabled_tools=%s", agent_id, tool_name, current)
+    logger.info("agent_tools: %s remove %s → whitelist=%s", agent_id, tool_name, current)
     return {"ok": True}
 
 
@@ -665,6 +660,7 @@ __all__ = [
     "_tool_whitelists",
     "_get_enabled_tools",
     "_set_enabled_tools",
+    "_configurable_tool_names",
     "load_tool_whitelists",
     "_FRAMEWORK_TOOLS_META",
 ]

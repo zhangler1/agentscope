@@ -167,21 +167,15 @@ def init_factory_tools(
 
 
 def _known_tool_names() -> set[str]:
-    """Return the configurable tool set M.
+    """Return the configurable tool set (enterprise + MCP only).
 
-    Mirrors :func:`bocomadp.routers.agent_tools._all_tool_names` so the
-    factory tools validate names against the very universe the tool
-    config APIs accept (builtins + registry + MCP + framework +
-    enterprise).
+    Mirrors :func:`bocomadp.routers.agent_tools._configurable_tool_names`
+    so the factory tools validate names against the very universe the
+    tool config APIs accept. Default tools (builtins / framework / project)
+    are always available and are not configurable.
     """
-    names: set[str] = set(BUILTIN_TOOL_NAMES)
-    names.update(m["name"] for m in FRAMEWORK_TOOLS_META)
+    names: set[str] = set()
     names.update(m["name"] for m in enterprise_tools_meta())
-    if _tool_registry is not None:
-        try:
-            names.update(_tool_registry.list_tool_names())
-        except Exception:  # noqa: BLE001
-            logger.debug("list_tool_names failed", exc_info=True)
     if _mcp_registry is not None:
         try:
             for mcp in _mcp_registry.list_mcps():
@@ -196,10 +190,14 @@ def _known_tool_names() -> set[str]:
 def _normalize_tool_names(names: list[str]) -> tuple[list[str], list[str]]:
     """Normalize (case) and validate a requested tool-name list.
 
+    Only enterprise tools and MCP names are valid — default tools
+    (builtins / framework / project) are always available and not
+    configurable.
+
     Returns:
         tuple[list[str], list[str]]: ``(valid, unknown)`` — ``valid`` is
         the de-duplicated canonical name list; ``unknown`` holds names
-        that are not part of the configurable set M.
+        that are not part of the configurable set (enterprise + MCP).
     """
     canonical = [canonical_tool_name(n) for n in names or []]
     canonical = [n for n in canonical if n]
@@ -214,10 +212,9 @@ def _tool_state(payload: dict[str, Any]) -> tuple[set[str], set[str]]:
 
     Returns:
         tuple[set[str], set[str]]: ``(enabled, all_names)`` —— ``enabled``
-        是当前处于启用状态的可配置工具名；``all_names`` 是接口报告的全部
-        可配置工具名（即可配置集合 M）。展示用的工厂工具
-        （``toggleable=False``）两边都不计入，因为它们不在白名单里，
-        对它们发 PUT/DELETE 会 404。
+        是当前处于启用状态的可配置工具名（即白名单中的企业工具/MCP）；
+        ``all_names`` 是接口报告的全部可配置工具名。默认工具
+        （``toggleable=False``）两边都不计入，因为它们始终可用。
     """
     enabled: set[str] = set()
     all_names: set[str] = set()
@@ -497,15 +494,13 @@ async def create_agent(
         name (str): 显示名称，如 '客服助手'
         system_prompt (str): 决定智能体行为的核心提示词
         max_iters (int): 最大推理轮次（默认20，复杂任务可设30~50）
-        enabled_tools (list[str]): 要启用的工具名列表；空列表表示全部可用。
+        enabled_tools (list[str]): 要添加的企业工具/MCP名列表；空列表表示
+            仅使用默认工具（内置/框架/项目工具），不启用任何企业工具或MCP。
             工具名从 list_tools_for_agent 的结果中选取（大小写不敏感，
             但必须是其中的名字，否则创建失败并返回非法名清单）。
     """
     name = _clean_name(name)
 
-    # Validate/normalize the requested tool names *before* creating, so an
-    # invalid or mis-cased name never lands in the whitelist (a whitelist
-    # entry that matches nothing would silently strip every other tool).
     requested, unknown = _normalize_tool_names(enabled_tools)
     if unknown:
         return (
@@ -525,11 +520,9 @@ async def create_agent(
     if not agent_id:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
-    # Tool whitelist — build the whitelist directly for the requested
-    # tools. The PUT endpoint's semantics are「empty list = all enabled」,
-    # so per-tool PUT calls are no-ops on a fresh agent; writing the
-    # whitelist directly makes a non-empty ``enabled_tools`` actually
-    # restrict the agent to exactly those tools at runtime.
+    # Tool whitelist — write the requested enterprise/MCP names directly.
+    # Empty whitelist means only default tools (builtins/framework/project)
+    # are available; non-empty means default + whitelisted enterprise/MCP.
     if requested:
         from bocomadp.routers.agent_tools import _set_enabled_tools
 
@@ -537,9 +530,9 @@ async def create_agent(
 
     lines = [f"智能体 '{name}' 创建成功，agent_id: {agent_id}"]
     if requested:
-        lines.append(f"已启用工具: {', '.join(requested)}")
+        lines.append(f"已添加企业工具/MCP: {', '.join(requested)}")
     else:
-        lines.append("工具配置: 全部可用")
+        lines.append("工具配置: 仅默认工具（内置/框架/项目），未添加企业工具或MCP")
     return "\n".join(lines)
 
 
@@ -732,47 +725,52 @@ async def get_agent_tools(agent_id: str) -> str:
 def list_tools_for_agent() -> str:
     """列出系统中所有可分配给智能体的工具和MCP服务器。
 
-    输出的就是**可配置工具集合**（框架内置 / 项目工具 / 框架团队与规划 /
-    企业工具 / MCP 服务器），其中的工具名可直接用于 create_agent 的
-    ``enabled_tools`` 或 set_agent_tools，大小写需保持一致。
+    分为两大类：
 
-    每项只给一句话简介（长描述会被压成一行）；工具的详细用法由目标智能体
-    在运行时自行探索。
+    - **默认工具**（内置/框架/项目）：始终可用，不可配置，自动生效
+    - **企业工具 / MCP 服务器**：需通过 create_agent 的 enabled_tools
+      或 set_agent_tools 显式添加后才能使用
+
+    Args 里填的是**企业工具和MCP**的名字（大小写需保持一致）。
     """
-    lines: list[str] = ["# 可配置工具与 MCP", "", "## 框架内置工具（文件 / 命令）"]
+    lines: list[str] = ["# 工具与 MCP", "", "## 默认工具（始终可用，不可配置）"]
 
-    # 1. workspace builtins（运行时真值：首字母大写）
+    # 1. workspace builtins
+    lines.append("")
+    lines.append("### 框架内置工具（文件 / 命令）")
     for meta in BUILTIN_TOOLS_META:
         name = meta["name"]
         lines.append(f"- {name}: {_brief(meta['description'], name)}")
 
-    # 2. 项目工具
-    project_tools = _project_tools_meta()
-    if project_tools:
-        lines += ["", "## 项目工具"]
-        for name, desc in project_tools:
-            lines.append(f"- {name}: {_brief(desc, name)}" if desc else f"- {name}")
-
-    # 3. 框架团队/规划工具
-    lines += ["", "## 框架团队 / 规划工具（多智能体协作与任务规划）"]
+    # 2. 框架团队/规划工具
+    lines.append("")
+    lines.append("### 框架团队 / 规划工具（多智能体协作与任务规划）")
     for meta in FRAMEWORK_TOOLS_META:
         name = meta["name"]
         lines.append(f"- {name}: {_brief(meta['description'], name)}")
 
-    # 4. 企业工具
+    # 3. 项目工具
+    project_tools = _project_tools_meta()
+    if project_tools:
+        lines.append("")
+        lines.append("### 项目工具")
+        for name, desc in project_tools:
+            lines.append(f"- {name}: {_brief(desc, name)}" if desc else f"- {name}")
+
+    # 4. 企业工具（可配置）
     enterprise_tools = enterprise_tools_meta()
     if enterprise_tools:
-        lines += ["", "## 企业工具"]
+        lines += ["", "## 企业工具（需显式添加）"]
         for meta in enterprise_tools:
             name = meta.get("name", "")
             desc = meta.get("description", "")
             lines.append(f"- {name}: {_brief(desc, name)}" if desc else f"- {name}")
 
-    # 5. MCP 服务器
+    # 5. MCP 服务器（可配置）
     if _mcp_registry is not None:
         mcps = _mcp_registry.list_mcps()
         if mcps:
-            lines += ["", "## MCP 服务器"]
+            lines += ["", "## MCP 服务器（需显式添加）"]
             for mcp in mcps:
                 mcp_name = getattr(mcp, "name", "") or ""
                 mcp_desc = getattr(mcp, "description", None) or ""
@@ -789,14 +787,14 @@ async def set_agent_tools(
     agent_id: str,
     enabled_tools: list[str],
 ) -> str:
-    """全量设置智能体的工具白名单（覆盖式）。
+    """全量设置智能体的企业工具/MCP白名单（覆盖式）。
 
-    - enabled_tools 为空列表：全部工具可用
-    - enabled_tools 非空：只启用列表中的工具（按名称精确匹配）
+    - enabled_tools 为空列表：仅使用默认工具（内置/框架/项目），不启用任何企业工具或MCP
+    - enabled_tools 非空：默认工具 + 列表中的企业工具/MCP
 
-    内置工具（Bash/Read/Write/Edit/Glob/Grep）与其它工具同等对待，
-    可以启用也可以停用。工具名从 list_tools_for_agent 选取，大小写
-    不敏感但需存在于可配置集合中；**传入不存在的名字会直接拒绝且
+    默认工具（内置/框架/项目）始终可用，不可配置。只能管理企业工具和MCP。
+    工具名从 list_tools_for_agent 的「企业工具」和「MCP服务器」部分选取，
+    大小写不敏感但需存在于可配置集合中；**传入不存在的名字会直接拒绝且
     不做任何修改**。
 
     与 update_agent 一样，本工具会先校验目标智能体存在且对当前用户可
@@ -804,14 +802,12 @@ async def set_agent_tools(
 
     Args:
         agent_id (str): 目标智能体 ID
-        enabled_tools (list[str]): 工具名列表（从 list_tools_for_agent 选取）
+        enabled_tools (list[str]): 企业工具/MCP名列表（从 list_tools_for_agent 选取）
     """
     error = await _ensure_editable_agent(agent_id)
     if error:
         return error
 
-    # 工具名前置校验（与 create_agent 一致）：非法名直接拒绝，避免
-    # "先删掉旧工具、再发现新名字不存在"这种带副作用的半成品失败。
     target_list, unknown = _normalize_tool_names(enabled_tools)
     if unknown:
         return (
@@ -819,61 +815,44 @@ async def set_agent_tools(
             "获取可用工具名（注意大小写）：\n- " + "\n- ".join(unknown)
         )
 
-    # 1. Read current enabled state
+    # 1. Read current whitelist state
     result = await _api("GET", f"/{agent_id}/tools", base=_TOOLS_API)
     if isinstance(result, str):
         return result
-    current_enabled, all_names = _tool_state(result)
+    current_enabled, _ = _tool_state(result)
 
     target = set(target_list)
     errors: list[str] = []
 
-    # 2. Diff-align.
-    if not target:
-        # 空目标 = 全部可用：逐个停用当前已启用的工具，最后一次移除
-        # 落到空白名单，服务端语义即为「全部可用」。
-        if current_enabled == all_names:
-            return f"智能体 '{agent_id}' 的工具已是全部可用。"
-        for name in sorted(current_enabled):
-            r = await _api("DELETE", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
-            if isinstance(r, str):
-                errors.append(r)
-    else:
-        # **先加后删**：先把目标工具写进白名单，删除阶段就不可能把它
-        # 们删空。若反过来（先删后加），一旦「当前已启用」与目标无交集，
-        # 最后一个 DELETE 会把白名单写成 []，被服务端理解为「全部可用」，
-        # 于是后续 PUT 全部变成空操作 —— 结果是静默放开所有工具，却仍
-        # 返回成功文案。
-        for name in sorted(target - current_enabled):
-            r = await _api("PUT", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
-            if isinstance(r, str):
-                errors.append(r)
-        for name in sorted(current_enabled - target):
-            r = await _api("DELETE", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
-            if isinstance(r, str):
-                errors.append(r)
+    # 2. Diff-align: PUT additions first, then DELETE removals.
+    for name in sorted(target - current_enabled):
+        r = await _api("PUT", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
+        if isinstance(r, str):
+            errors.append(r)
+    for name in sorted(current_enabled - target):
+        r = await _api("DELETE", f"/{agent_id}/tools/{name}", base=_TOOLS_API)
+        if isinstance(r, str):
+            errors.append(r)
 
     if errors:
         return "工具配置部分失败:\n" + "\n".join(errors)
 
-    # 3. 回读校验：确认最终状态与目标一致。防止"报成功但实际不符"
-    # （如服务端与工具侧的工具集合不一致，导致某些 PUT/DELETE 未生效）。
+    # 3. 回读校验
     check = await _api("GET", f"/{agent_id}/tools", base=_TOOLS_API)
     if isinstance(check, str):
         return check
-    final_enabled, final_all = _tool_state(check)
-    expected = target if target else final_all
-    if final_enabled != expected:
+    final_enabled, _ = _tool_state(check)
+    if final_enabled != target:
         return (
-            f"工具配置未生效：期望 {', '.join(sorted(expected))}，"
+            f"工具配置未生效：期望 {', '.join(sorted(target))}，"
             f"实际 {', '.join(sorted(final_enabled))}。"
             "请重试，或用工具面板核对。"
         )
 
     if not target:
-        return f"智能体 '{agent_id}' 的工具已设置为全部可用。"
+        return f"智能体 '{agent_id}' 的企业工具/MCP已全部移除，仅保留默认工具。"
     return (
-        f"智能体 '{agent_id}' 的工具白名单已设置为: "
+        f"智能体 '{agent_id}' 的企业工具/MCP白名单已设置为: "
         f"{', '.join(sorted(target))}。"
     )
 
