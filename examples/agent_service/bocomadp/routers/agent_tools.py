@@ -562,6 +562,88 @@ async def list_all_mcps(request: Request) -> dict:
 
 
 # ------------------------------------------------------------------
+# GET /search  — search tools or mcps by name (global)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/search",
+    summary="Search tools or MCPs by name",
+)
+async def search_tools_or_mcps(
+    type: str,
+    name: str = "",
+    request: Request = Request,
+) -> dict:
+    """Search tools or MCP servers by name.
+
+    Args:
+        type: ``tools`` or ``mcps``.
+        name: Keyword to filter by name (case-insensitive, substring match).
+              Empty string returns all.
+
+    Response::
+
+        {"tools": [...]}   // when type=tools
+        {"mcps": [...]}    // when type=mcps
+    """
+    keyword = (name or "").lower()
+
+    if type == "tools":
+        items: list[dict] = []
+        for tool in _tool_registry(request).list_tools():
+            n = _tool_name(tool)
+            if keyword and keyword not in n.lower():
+                continue
+            items.append(
+                {
+                    "name": n,
+                    "description": getattr(tool, "description", "") or "",
+                },
+            )
+        for meta in _enterprise_tools_meta():
+            n = meta["name"]
+            if keyword and keyword not in n.lower():
+                continue
+            items.append(
+                {
+                    "name": n,
+                    "description": meta.get("description", ""),
+                },
+            )
+        return {"tools": items}
+
+    if type == "mcps":
+        items: list[dict] = []
+        mcp_reg = _mcp_registry(request)
+        if mcp_reg is not None:
+            for mcp in mcp_reg.list_mcps():
+                mcp_name = getattr(mcp, "name", "") or ""
+                if keyword and keyword not in mcp_name.lower():
+                    continue
+                items.append(
+                    {
+                        "name": mcp_name,
+                        "description": (
+                            getattr(mcp, "description", None)
+                            or getattr(
+                                getattr(mcp, "mcp_config", None),
+                                "url",
+                                "",
+                            )
+                            or ""
+                        ),
+                    },
+                )
+        return {"mcps": items}
+
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid type: must be 'tools' or 'mcps'",
+    )
+
+
+# ------------------------------------------------------------------
 # internal
 # ------------------------------------------------------------------
 
