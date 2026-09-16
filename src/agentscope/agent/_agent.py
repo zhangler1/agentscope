@@ -2798,6 +2798,14 @@ class Agent:
             self.state.tool_context.activated_groups,
         )
 
+        logger.info(
+            "_prepare_model_input: activated_groups=%s tool_schemas=%s "
+            "session=%s",
+            self.state.tool_context.activated_groups,
+            [t.get("function", {}).get("name", "?") for t in tools],
+            self.state.session_id,
+        )
+
         return {
             "messages": messages,
             "tools": tools,

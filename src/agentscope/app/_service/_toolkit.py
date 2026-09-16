@@ -33,6 +33,9 @@ from ...workspace import WorkspaceBase
 from ..access import ResourceKind
 from ._access import ResourceAccessService
 
+import logging as _logging
+_log = _logging.getLogger(__name__)
+
 
 async def get_toolkit(
     *,
@@ -249,6 +252,15 @@ optional):
     # Tools from middleware
     for mw in middlewares:
         tools.extend(await mw.list_tools())
+
+    _log.info(
+        "get_toolkit: final tools before Toolkit() names=%s "
+        "tool_groups=%s session=%s agent=%s",
+        [getattr(t, "name", "") for t in tools],
+        [g.name for g in tool_groups],
+        session_record.id,
+        agent_record.id,
+    )
 
     return Toolkit(
         tools=tools,
