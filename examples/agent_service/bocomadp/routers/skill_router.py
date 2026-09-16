@@ -27,6 +27,7 @@ from agentscope.app.hub._error import HubError
 from agentscope.app.storage import StorageBase
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 
+from ..skills._oa_context import OA_HEADER, get_current_oa
 from ..skills._schema import AgentSkillsListResponse, SkillActionResponse, SkillInfo
 from ..skills._skillhub_auth import (
     OA_SEPARATOR,
@@ -160,7 +161,8 @@ async def _session_used_names(
         "(identical algorithm to the frontend ``lib/skillhub/token.ts``):\n"
         "``key = <Beijing date YYYYMMDD>(8) + <SKILLHUB_CHANNEL_RAND>(8)``,"
         " ``token = hex(AES-128-ECB/PKCS7(\"{oa}#{13-digit ms timestamp}\"))``.\n"
-        "``oa`` defaults to the ``X-User-ID`` header. The credential is "
+        "``oa`` defaults to the ``oa`` header, then ``X-User-ID``. The "
+        "credential is "
         "only valid for ~5 minutes, so it is built on **every** call — "
         "never cache it."
     ),
@@ -168,13 +170,15 @@ async def _session_used_names(
 async def get_skillhub_aes_token(
     oa: str | None = Query(
         default=None,
-        description="OA 账号；省略时取 X-User-ID 请求头",
+        description="OA 账号；省略时依次取 oa 请求头 / X-User-ID",
     ),
+    oa_header: str | None = Header(default=None, alias=OA_HEADER),
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
     """本地生成 SkillHub 登录用的 AES 凭证（明文只含 OA 与毫秒时间戳）。
 
-    - ``oa`` 省略时取 ``X-User-ID``；为空 → 400，含分隔符 ``#`` → 422
+    - ``oa`` 省略时依次取 ``oa`` 请求头 → ``X-User-ID``；为空 → 400，
+      含分隔符 ``#`` → 422
     - 密钥后 8 字节取 ``SKILLHUB_CHANNEL_RAND``（必须 8 个 ASCII 字符）；
       长度不为 16 字节 → 500（配置错误，非调用方问题）
     - 返回 ``{oa, token, platform, timestamp, expires_in}``：
@@ -185,7 +189,7 @@ async def get_skillhub_aes_token(
     ``token`` 含登录态语义、有效期约 5 分钟：**每次调用现造**，调用方拿到后
     应立即使用，不要落库/缓存。
     """
-    account = (oa or user_id).strip()
+    account = (oa or oa_header or user_id).strip()
     if not account:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -243,6 +247,7 @@ async def get_agent_skills(
         description="标签 slug（来自 /skills/labels），透传远端按标签过滤",
     ),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     access: ResourceAccessService = Depends(get_resource_access_service),
     storage: StorageBase = Depends(get_storage),
@@ -279,7 +284,7 @@ async def get_agent_skills(
         cursor = f"page:{page}" if page else None
         try:
             page_result = await hub.list_skills(
-                user_id,
+                oa,
                 q=q or None,
                 cursor=cursor,
                 limit=size,
@@ -322,7 +327,7 @@ async def get_agent_skills(
     # 按标签过滤；sort 透传远端。三者互不干扰。
     try:
         return await list_raw(
-            user_id,
+            oa,
             q=q or None,
             page=page,
             limit=size,
@@ -356,6 +361,7 @@ async def get_bocom_skills(
     myOnly: bool = Query(default=False),
     size: int = Query(default=10, ge=1, le=200),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
@@ -392,7 +398,7 @@ async def get_bocom_skills(
         set_token(guwp_token)
 
     page_result = await hub.list_skills(
-        user_id,
+        oa,
         keyword=keyword,
         status=status,
         namespace=namespace,
@@ -440,6 +446,7 @@ async def get_uploaded_skills(
     page: int = Query(default=0, ge=0),
     size: int = Query(default=5, ge=1, le=200),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     access: ResourceAccessService = Depends(get_resource_access_service),
     storage: StorageBase = Depends(get_storage),
@@ -479,7 +486,7 @@ async def get_uploaded_skills(
         )
         try:
             page_result = await hub.list_uploaded_skills(
-                user_id,
+                oa,
                 page=page,
                 size=size,
             )
@@ -515,7 +522,7 @@ async def get_uploaded_skills(
             ),
         )
     try:
-        return await list_raw(user_id, page=page, size=size)
+        return await list_raw(oa, page=page, size=size)
     except HubError as e:
         raise _hub_error_to_502(e) from e
 
@@ -534,6 +541,7 @@ async def get_uploaded_skills(
 )
 async def get_skill_labels(
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
 ) -> dict:
@@ -557,7 +565,7 @@ async def get_skill_labels(
             ),
         )
     try:
-        return await list_raw(user_id)
+        return await list_raw(oa)
     except HubError as e:
         raise _hub_error_to_502(e) from e
 
@@ -578,6 +586,7 @@ async def get_starred_skills(
     page: int = Query(default=0, ge=0),
     size: int = Query(default=5, ge=1, le=200),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     access: ResourceAccessService = Depends(get_resource_access_service),
     hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
@@ -615,7 +624,7 @@ async def get_starred_skills(
             ),
         )
     try:
-        return await list_raw(user_id, page=page, size=size)
+        return await list_raw(oa, page=page, size=size)
     except HubError as e:
         raise _hub_error_to_502(e) from e
 
@@ -642,6 +651,7 @@ async def get_skill_markdown(
     namespace: str = Query(default="global", description="命名空间"),
     path: str = Query(default="SKILL.md", description="技能内文件路径"),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
 ) -> dict:
@@ -675,7 +685,7 @@ async def get_skill_markdown(
 
     try:
         content = await get_file(
-            user_id,
+            oa,
             slug=slug,
             version=version,
             namespace=namespace,
@@ -712,6 +722,7 @@ async def get_skill_markdown(
 async def star_skill(
     skill_id: str,
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
 ) -> dict:
@@ -740,7 +751,7 @@ async def star_skill(
         )
 
     try:
-        result = await star(user_id, skill_id)
+        result = await star(oa, skill_id)
     except HubError as e:
         raise _hub_error_to_502(e) from e
 
@@ -766,6 +777,7 @@ async def star_skill(
 async def unstar_skill(
     skill_id: str,
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
 ) -> dict:
@@ -787,7 +799,7 @@ async def unstar_skill(
         )
 
     try:
-        result = await unstar(user_id, skill_id)
+        result = await unstar(oa, skill_id)
     except HubError as e:
         raise _hub_error_to_502(e) from e
 
@@ -819,6 +831,7 @@ async def enable_agent_skill(
     agent_id: str = Query(...),
     session_id: str = Query(...),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
@@ -877,7 +890,7 @@ async def enable_agent_skill(
     hub = _external_hub(hubs)
     _set_token(hub, guwp_token)
     try:
-        archive = await hub.download(user_id, skill_name, namespace=category)
+        archive = await hub.download(oa, skill_name, namespace=category)
     except KeyError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -932,6 +945,7 @@ async def enable_bocom_skill(
     session_id: str = Query(...),
     namespaceSlug: str = Query(default="Global"),
     guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
@@ -983,7 +997,7 @@ async def enable_bocom_skill(
     _set_token(hub, guwp_token)
     try:
         archive = await hub.download(
-            user_id,
+            oa,
             name=skill_name,
             namespaceSlug=namespaceSlug,
         )
