@@ -40,7 +40,7 @@ class AgentCrossSearchConfig(BaseModel):
     """智能体级跨知识搜索配置。"""
 
     user_code: str = Field(default="", description="用户编码")
-    search_type: str | None = Field(default=None, description="检索类型：0=混合，1=全文，2=向量")
+    search_type: str = Field(default="0", description="检索类型：0=混合，1=全文，2=向量")
     space_code_list: list[str] = Field(default_factory=list, description="场景知识空间代码列表")
     team_space_code_list: list[str] = Field(default_factory=list, description="团队知识空间代码列表")
     psnl_space_code_id: str = Field(default="", description="个人知识空间代码ID")
