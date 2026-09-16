@@ -275,6 +275,51 @@ def test_usage_agents_groups_and_flags(seeded):
     ]
 
 
+def test_usage_agents_pagination(seeded):
+    """usage/agents 分页：page/size 切片，total 为分页前总数，has_more 正确。"""
+    # 第 1 页（size=2）：最近使用的前 2 个 plat-a(T3/T2)、own-a(T1)
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user", "page": 1, "size": 2},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3            # 分页前总数
+    assert body["page"] == 1 and body["size"] == 2
+    assert [a["agent_id"] for a in body["agents"]] == ["plat-a", "own-a"]
+    assert body["has_more"] is True
+
+    # 第 2 页：只剩 plat-b(T0)
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user", "page": 2, "size": 2},
+        headers=HDR_USER,
+    )
+    body = resp.json()
+    assert [a["agent_id"] for a in body["agents"]] == ["plat-b"]
+    assert body["has_more"] is False
+
+    # 越界页：空列表，total 不变
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user", "page": 9, "size": 2},
+        headers=HDR_USER,
+    )
+    body = resp.json()
+    assert body["agents"] == []
+    assert body["total"] == 3
+
+    # 不传分页参数 = 默认 page=1/size=20，现有调用方式兼容（3 条全回）
+    resp = seeded.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user"},
+        headers=HDR_USER,
+    )
+    body = resp.json()
+    assert body["total"] == 3 and len(body["agents"]) == 3
+
+
 def test_usage_agents_falls_back_to_header(seeded):
     """user_id 省略 → 回退 X-User-ID。"""
     resp = seeded.get("/sessions/usage/agents", headers=HDR_USER)
@@ -306,7 +351,14 @@ def test_usage_agents_empty_user(client):
         headers=HDR_USER,
     )
     assert resp.status_code == 200
-    assert resp.json() == {"user_id": "nobody", "agents": [], "total": 0}
+    assert resp.json() == {
+        "user_id": "nobody",
+        "agents": [],
+        "total": 0,
+        "page": 1,
+        "size": 20,
+        "has_more": False,
+    }
 
 
 # ---------------------------------------------------------------------------
