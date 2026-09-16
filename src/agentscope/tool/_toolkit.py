@@ -133,13 +133,6 @@ class Toolkit:
             ),
         ] + (tool_groups or [])
 
-        logger.info(
-            "Toolkit.__init__: id=%x basic_tools=%s all_groups=%s",
-            id(self),
-            [getattr(t, "name", "") for t in self.tool_groups[0].tools],
-            [g.name for g in self.tool_groups],
-        )
-
         # Check name conflict for tool groups
         if len(set(_.name for _ in self.tool_groups)) != len(
             self.tool_groups,
@@ -522,21 +515,6 @@ class Toolkit:
             for tool in group.tools:
                 cache_tools.append(tool)
 
-            logger.info(
-                "_get_available_tools: group=%s tools=%s "
-                "input_schemas_ok=%s",
-                group.name,
-                [getattr(t, "name", "") for t in cache_tools],
-                [
-                    getattr(t, "name", "") for t in cache_tools
-                    if getattr(t, "input_schema", None) is None or (
-                        isinstance(getattr(t, "input_schema", None), dict)
-                        and t.input_schema.get("type") == "object"
-                        and isinstance(t.input_schema.get("properties"), dict)
-                    )
-                ],
-            )
-
             # MCP tools
             for client in group.mcps:
                 try:
@@ -577,11 +555,6 @@ class Toolkit:
                         group.name,
                     )
 
-        logger.info(
-            "_get_available_tools: RETURN id=%x names=%s",
-            id(self),
-            list(available_tools.keys()),
-        )
         return available_tools
 
     async def check_tool_available(
