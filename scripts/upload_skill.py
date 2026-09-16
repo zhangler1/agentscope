@@ -46,7 +46,7 @@ import uuid
 #: ``POST {API_BASE}/workspace/skill/upload``。
 #: 注意服务以 ``python main.py`` 启动时全部路由挂在 ``/api`` 下，
 #: 故此处必须带 ``/api``；若用 ``uvicorn main:app`` 起内层 app 则去掉。
-API_BASE = "http://53.192.28.254:8000/api"
+API_BASE = "http://local:8000/api"
 
 #: 调用方用户 ID，作为 ``X-User-ID`` 请求头（接口 get_current_user_id 必需）。
 USER_ID = "9848203"
