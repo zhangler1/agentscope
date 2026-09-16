@@ -14,7 +14,7 @@ from bocomadp.tools.enterprise import build_enterprise_tools
 
 # 工具名默认中文，设置 BOCOMADP_TOOL_ASCII_NAMES=1 后为 ASCII；
 # 断言用 tool_name(...) 计算期望值，避免与开关耦合。
-_CROSS = tool_name("跨知识搜索", "cross_search")
+_CROSS = tool_name("混合搜索", "cross_search")
 _VECTOR = tool_name("行内搜索", "vector_search")
 _ONLINE = tool_name("联网搜索", "online_search")
 _PERSONAL = tool_name("个人知识库搜索", "personal_search")

@@ -88,7 +88,7 @@ from bocomadp.routers.stats import stats_router
 from bocomadp.routers.workspace_files import workspace_files_router
 from bocomadp.routers.oss_download import oss_download_router
 from bocomadp.routers.session_usage import session_usage_router
-from bocomadp.routers.agent_tools import agent_tools_router
+from bocomadp.routers.agent_tools import agent_tools_router, catalog_router
 from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
@@ -1025,6 +1025,7 @@ app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
+app.include_router(catalog_router)
 app.include_router(deerflow_router)
 # deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
 app.include_router(auth_stub_router)

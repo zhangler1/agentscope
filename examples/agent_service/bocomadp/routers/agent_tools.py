@@ -3,6 +3,8 @@
 
 Endpoints
 ---------
+``GET    /tools``                              — list all tools (global)
+``GET    /mcps``                               — list all MCP servers (global)
 ``GET    /agents/{agent_id}/tools``           — list tools with status
 ``PUT    /agents/{agent_id}/tools/{name}``    — enable a tool
 ``DELETE /agents/{agent_id}/tools/{name}``    — disable a tool
@@ -53,6 +55,10 @@ logger = logging.getLogger("bocomadp.agent_tools")
 agent_tools_router = APIRouter(
     prefix="/agents",
     tags=["agent-tools"],
+)
+
+catalog_router = APIRouter(
+    tags=["tool-catalog"],
 )
 
 # ------------------------------------------------------------------
@@ -470,6 +476,174 @@ async def disable_agent_tool(
 
 
 # ------------------------------------------------------------------
+# GET /tools  — list all tools (global, not per-agent)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/tools",
+    summary="List all available tools (global)",
+)
+async def list_all_tools(request: Request) -> dict:
+    """Return every tool across project + enterprise sources (excludes builtins).
+
+    Response::
+
+        {
+          "tools": [
+            {"name": "echo", "description": "..."},
+            {"name": "通讯录查询", "description": "..."}
+          ]
+        }
+    """
+    tools: list[dict] = []
+
+    for tool in _tool_registry(request).list_tools():
+        name = _tool_name(tool)
+        tools.append(
+            {
+                "name": name,
+                "description": getattr(tool, "description", "") or "",
+            },
+        )
+
+    for meta in _enterprise_tools_meta():
+        tools.append(
+            {
+                "name": meta["name"],
+                "description": meta.get("description", ""),
+            },
+        )
+
+    return {"tools": tools}
+
+
+# ------------------------------------------------------------------
+# GET /mcps  — list all MCP servers (global, not per-agent)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/mcps",
+    summary="List all MCP servers (global)",
+)
+async def list_all_mcps(request: Request) -> dict:
+    """Return every registered MCP server.
+
+    Response::
+
+        {
+          "mcps": [
+            {"name": "browser-use", "description": "..."}
+          ]
+        }
+    """
+    mcps: list[dict] = []
+    mcp_reg = _mcp_registry(request)
+    if mcp_reg is not None:
+        for mcp in mcp_reg.list_mcps():
+            mcp_name = getattr(mcp, "name", "") or ""
+            mcps.append(
+                {
+                    "name": mcp_name,
+                    "description": (
+                        getattr(mcp, "description", None)
+                        or getattr(
+                            getattr(mcp, "mcp_config", None),
+                            "url",
+                            "",
+                        )
+                        or ""
+                    ),
+                },
+            )
+
+    return {"mcps": mcps}
+
+
+# ------------------------------------------------------------------
+# GET /search  — search tools or mcps by name (global)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/search",
+    summary="Search tools or MCPs by name",
+)
+async def search_tools_or_mcps(
+    type: str,
+    name: str = "",
+    request: Request = Request,
+) -> dict:
+    """Search tools or MCP servers by name.
+
+    Args:
+        type: ``tools`` or ``mcps``.
+        name: Keyword to filter by name (case-insensitive, substring match).
+              Empty string returns all.
+
+    Response::
+
+        {"tools": [...]}   // when type=tools
+        {"mcps": [...]}    // when type=mcps
+    """
+    keyword = (name or "").lower()
+
+    if type == "tools":
+        items: list[dict] = []
+        for tool in _tool_registry(request).list_tools():
+            n = _tool_name(tool)
+            if keyword and keyword not in n.lower():
+                continue
+            items.append(
+                {
+                    "name": n,
+                    "description": getattr(tool, "description", "") or "",
+                },
+            )
+        for meta in _enterprise_tools_meta():
+            n = meta["name"]
+            if keyword and keyword not in n.lower():
+                continue
+            items.append(
+                {
+                    "name": n,
+                    "description": meta.get("description", ""),
+                },
+            )
+        return {"tools": items}
+
+    if type == "mcps":
+        items: list[dict] = []
+        mcp_reg = _mcp_registry(request)
+        if mcp_reg is not None:
+            for mcp in mcp_reg.list_mcps():
+                mcp_name = getattr(mcp, "name", "") or ""
+                if keyword and keyword not in mcp_name.lower():
+                    continue
+                items.append(
+                    {
+                        "name": mcp_name,
+                        "description": (
+                            getattr(mcp, "description", None)
+                            or getattr(
+                                getattr(mcp, "mcp_config", None),
+                                "url",
+                                "",
+                            )
+                            or ""
+                        ),
+                    },
+                )
+        return {"mcps": items}
+
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid type: must be 'tools' or 'mcps'",
+    )
+
+
+# ------------------------------------------------------------------
 # internal
 # ------------------------------------------------------------------
 
@@ -487,6 +661,7 @@ def _tool_name(tool: object) -> str:
 
 __all__ = [
     "agent_tools_router",
+    "catalog_router",
     "_tool_whitelists",
     "_get_enabled_tools",
     "_set_enabled_tools",
