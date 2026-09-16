@@ -16,7 +16,8 @@ Endpoint
       会话名按下述规则改写后返回（不落库）。
     - usage/agents：某用户**使用过的智能体清单**（sessions 按 agent_id
       分组聚合，含自建与市场智能体，排除系统内置），附会话数、最近
-      使用时间、智能体名与平台/自建标记。
+      使用时间、智能体名与市场/自建标记（``is_platform`` = 在
+      ``agent_market`` 名单内）。
     - usage/history：某用户**跨智能体的会话历史**（自建 + 平台都在
       内，按 updated_at 倒序统一分页），每条附 agent_name；可选
       agent_id 收窄到单个智能体。会话名改写规则与 limit 相同。
@@ -532,21 +533,24 @@ async def list_user_used_agents(
         description="目标用户；省略时回退 X-User-ID。",
     ),
     viewer_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
 ) -> dict:
     """某用户**使用过的智能体清单**（含自建与市场智能体）。
 
     - 数据源：``sessions`` 表按 ``agent_id`` 分组聚合（会话数 +
-      最近使用时间）——聊过就会留下会话，天然涵盖自建与平台智能体；
+      最近使用时间）——聊过就会留下会话，天然涵盖自建与市场智能体；
     - 附带智能体名（agents 表 ``payload["data"]["name"]``）、归属者
       ``owner_user_id`` 及 ``is_platform`` / ``is_self`` 标记，前端
-      可直接分组渲染；
+      可直接分组渲染。``is_platform`` = 该智能体在市场名单内
+      （``agent_market`` 表有行，即市场智能体——``user_id`` 已不再
+      承载"平台"语义）；``is_self`` = 归属者就是查询目标用户本人；
     - 排除系统内置智能体（``_`` 开头 id）——内部工具载体，不算
       "用户使用的智能体"；
     - 按最近使用时间倒序。
     """
     from sqlalchemy import text
 
-    from bocomadp.config.market_config import get_platform_user_id
+    from bocomadp.market_store import list_market_entries
     from bocomadp.pool_config import _get_engine
 
     target = _resolve_target_user(user_id, viewer_id)
@@ -568,7 +572,7 @@ async def list_user_used_agents(
 
     usage = [r for r in rows if not r.agent_id.startswith("_")]
     briefs = await _agent_brief_map(engine, [r.agent_id for r in usage])
-    platform = get_platform_user_id()
+    market_ids = {e.agent_id for e in await list_market_entries(storage)}
     agents = [
         {
             "agent_id": r.agent_id,
@@ -576,9 +580,7 @@ async def list_user_used_agents(
             "owner_user_id": (briefs.get(r.agent_id) or {}).get(
                 "owner_user_id",
             ),
-            "is_platform": (
-                (briefs.get(r.agent_id) or {}).get("owner_user_id") == platform
-            ),
+            "is_platform": r.agent_id in market_ids,
             "is_self": (
                 (briefs.get(r.agent_id) or {}).get("owner_user_id") == target
             ),
