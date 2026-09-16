@@ -389,10 +389,19 @@ async def build_agent_tools(
     # This makes the tool config APIs effective at runtime. For the
     # agent-creator its whitelist covers M plus its factory tools
     # (see _register_builtin_agents), so it keeps both.
+    #
+    # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
+    # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
+    # builtins / 工厂工具等非企业工具不豁免。
+    from bocomadp.deerflow.custom_params import get_custom_params
     from bocomadp.routers.agent_tools import _tool_whitelists
+    from bocomadp.tools.enterprise import usable_enterprise_tool_names
+
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
-        allowed = set(whitelist)
+        allowed = set(whitelist) | usable_enterprise_tool_names(
+            get_custom_params().get("usableTools"),
+        )
         tools = [
             t for t in tools if getattr(t, "name", "") in allowed
         ]

@@ -241,7 +241,12 @@ def test_raw_request_mounted_in_enterprise(monkeypatch):
             "online_search": {"api_url": "http://x", "timeout": 30, "max_results": 5},
         },
     )
-    token_params = set_custom_params({})
+    token_params = set_custom_params(
+        {"usableTools": [
+            tool_name("外数查", "raw_request_tool"),
+            tool_name("跨知识搜索", "cross_search"),
+        ]},
+    )
     try:
         tools = asyncio.run(build_enterprise_tools("u1", "a1", "s1"))
         names = [t.name for t in tools]

@@ -50,6 +50,7 @@ class BusBridge:
         last_event_id: str | None = None,
         heartbeat_interval: float = 15.0,
         run_finished: bool = False,
+        formatter: DeerflowSSEFormatter | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Yield this run's events: replay first, then live.
 
@@ -79,12 +80,16 @@ class BusBridge:
                 ``Last-Event-ID`` 请求头值；精确续传游标。
             heartbeat_interval (`float`, optional):
                 空闲心跳间隔（秒），对齐 deer-flow 默认 15s。
+            formatter (`DeerflowSSEFormatter | None`, optional):
+                外部翻译器实例；缺省时内部创建。传入实例可让调用方在
+                订阅结束后读取其累积状态（如 token 用量，供 values
+                快照组装 ``usage_metadata``）。
 
         Yields:
             `StreamEvent`:
                 已翻译的协议事件（id 已填充）；哨兵见模块说明。
         """
-        formatter = DeerflowSSEFormatter()
+        formatter = formatter or DeerflowSSEFormatter()
         key = MessageBusKeys.session_events(session_id)
 
         # ── 1. Replay：log_read(since) 精确续传 / 从头回放 ─────────────

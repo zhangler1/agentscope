@@ -105,10 +105,13 @@ from ..protocol import (
     EVENT_CUSTOM,
     EVENT_ERROR,
     EVENT_MESSAGES,
+    EVENT_VALUES,
     StreamEvent,
     format_sse,
 )
 from ..runs import RunManager, RunRecord, RunStatus
+from ..formatter import DeerflowSSEFormatter
+from .threads import build_thread_values
 
 logger = logging.getLogger(__name__)
 
@@ -1341,6 +1344,7 @@ def _sse_generator(
     on_disconnect: str,
     run_finished: bool = False,
     human_chunks: list[dict[str, Any]] | None = None,
+    storage: StorageBase | None = None,
 ) -> AsyncGenerator[str, None]:
     """回放 + live 订阅 → deer-flow 帧；断线/异常/结束均收敛为帧。
 
@@ -1352,7 +1356,12 @@ def _sse_generator(
             创建 run 时回显的用户输入 chunk（LangGraph human 消息，id 与
             storage 持久化一致）。SDK 依赖 messages 事件把用户消息并入
             ``values.messages``——缺失时前端 human 计数不增长，乐观消息
-            永不清理，界面出现两条用户输入（"问题显示两次"）。
+            永不清理，界面出现两条用户输入（“问题显示两次”）。
+        storage (`StorageBase | None`, optional):
+            会话存储；缺省时跳过 values 快照帧。end 哨兵前从 storage
+            拉全量消息组装 ``event: values``（对齐原生主通道帧，含
+            title 与最后一条 ai 消息的 ``usage_metadata``）。error 与
+            HITL park 情形不发 values（run 未正常完结）。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
@@ -1363,6 +1372,11 @@ def _sse_generator(
         # 确认的状态，确认应答将永远匹配不到工具调用。故 finally 里
         # 仅断线（未 park）才 interrupt。
         hitl_parked = False
+        # error 帧标志：error 流不发 values 快照（run 未正常完结）。
+        error_seen = False
+        # 翻译器实例跨回放 + live 共享：token 用量累积状态连续，
+        # end 哨兵前从 formatter.usage 取值组装 values 快照。
+        formatter = DeerflowSSEFormatter()
         try:
             # 首帧回显用户输入（先于一切总线事件，保证 values.messages
             # 顺序 [human, ai, ...]；id 与 storage 一致，刷新后去重不重复）
@@ -1380,15 +1394,32 @@ def _sse_generator(
                 # 空串 Last-Event-ID 头视为无游标，避免 log_read 收到 '' 崩溃
                 last_event_id=request.headers.get("Last-Event-ID") or None,
                 run_finished=run_finished,
+                formatter=formatter,
             ):
                 if evt is END_SENTINEL:
                     # 状态同步落定（end 帧与 done 回调之间存在毫秒级窗口，
                     # 提前落定可避免紧随其后的新 run 误判 409）；error 帧
                     # 已先行落定 ERROR，此处不覆盖。
                     _finish_if_running(run_manager, run_id, RunStatus.SUCCESS)
+                    if not error_seen and not hitl_parked:
+                        values = await _build_values_frame(
+                            storage,
+                            user_id,
+                            session_id,
+                            usage=formatter.usage,
+                        )
+                        if values is not None:
+                            yield format_sse(
+                                StreamEvent(
+                                    id="",
+                                    event=EVENT_VALUES,
+                                    data=values,
+                                ),
+                            )
                     yield format_sse(evt)
                     return
                 if evt.event == EVENT_ERROR:
+                    error_seen = True
                     _finish_if_running(run_manager, run_id, RunStatus.ERROR)
                 if (
                     evt.event == EVENT_CUSTOM
@@ -1446,6 +1477,35 @@ def _finish_if_running(
     rec = run_manager.get(run_id)
     if rec is not None and rec.active:
         run_manager.mark_finished(run_id, status)
+
+
+async def _build_values_frame(
+    storage: StorageBase | None,
+    user_id: str,
+    session_id: str,
+    *,
+    usage: dict[str, int] | None,
+) -> dict[str, Any] | None:
+    """end 哨兵前的 values 快照（storage 缺失/无消息时跳过）。
+
+    组装失败不阻断流——values 帧是视图同步优化，end 哨兵才是流终止
+    契约；storage 读取异常时仅记日志并跳过。
+    """
+    if storage is None:
+        return None
+    try:
+        return await build_thread_values(
+            storage,
+            user_id,
+            session_id,
+            usage=usage,
+        )
+    except Exception:  # noqa: BLE001 —— 快照失败降级为不发 values 帧
+        logger.exception(
+            "deerflow: failed to build values frame for run on thread %s",
+            session_id,
+        )
+        return None
 
 
 def _streaming_response(
@@ -1673,6 +1733,7 @@ async def create_run_stream(
             record.run_id,
             body.on_disconnect,
             human_chunks=human_chunks,
+            storage=storage,
         ),
     )
 
@@ -1860,6 +1921,7 @@ async def join_run_stream(
             "cancel" if cancel_on_disconnect else "continue",
             run_finished=run_finished,
             human_chunks=human_chunks,
+            storage=storage,
         ),
     )
 

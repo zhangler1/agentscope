@@ -58,3 +58,68 @@ def test_whitelist_only_keeps_allowed(monkeypatch):
     )
     out = _run(tw._whitelisted_get_toolkit(agent_record=type("A", (), {"id": "ag1"})()))
     assert _seen_names(out) == {"bash", "TeamCreate"}
+
+
+def test_whitelist_exempts_usable_enterprise_tools(monkeypatch):
+    """usableTools 名单内的企业工具豁免 per-agent 白名单（请求级优先）。"""
+    from bocomadp.tools._naming import tool_name
+
+    vector_cn = tool_name("行内搜索", "vector_search")
+    cross_cn = tool_name("跨知识搜索", "cross_search")
+    tk = _toolkit(["bash", "TeamCreate", vector_cn, cross_cn])
+
+    async def fake_orig(*args, **kwargs):
+        return tk
+
+    async def run():
+        from bocomadp.deerflow.custom_params import (
+            reset_custom_params,
+            set_custom_params,
+        )
+
+        token = set_custom_params({"usableTools": [vector_cn]})
+        try:
+            return await tw._whitelisted_get_toolkit(
+                agent_record=type("A", (), {"id": "ag1"})(),
+            )
+        finally:
+            reset_custom_params(token)
+
+    monkeypatch.setattr(tw, "_original_get_toolkit", fake_orig)
+    monkeypatch.setattr(
+        "bocomadp.routers.agent_tools._tool_whitelists",
+        {"ag1": ["bash", "TeamCreate"]},
+    )
+    out = _run(run())
+    # 名单内的 vector 豁免白名单；名单外的 cross 仍被白名单滤掉
+    assert _seen_names(out) == {"bash", "TeamCreate", vector_cn}
+
+
+def test_whitelist_exemption_never_covers_non_enterprise(monkeypatch):
+    """名单里写 builtins 名不豁免——豁免范围钉死在企业工具层。"""
+    tk = _toolkit(["bash", "read", "TeamCreate"])
+
+    async def fake_orig(*args, **kwargs):
+        return tk
+
+    async def run():
+        from bocomadp.deerflow.custom_params import (
+            reset_custom_params,
+            set_custom_params,
+        )
+
+        token = set_custom_params({"usableTools": ["read"]})
+        try:
+            return await tw._whitelisted_get_toolkit(
+                agent_record=type("A", (), {"id": "ag1"})(),
+            )
+        finally:
+            reset_custom_params(token)
+
+    monkeypatch.setattr(tw, "_original_get_toolkit", fake_orig)
+    monkeypatch.setattr(
+        "bocomadp.routers.agent_tools._tool_whitelists",
+        {"ag1": ["bash", "TeamCreate"]},
+    )
+    out = _run(run())
+    assert _seen_names(out) == {"bash", "TeamCreate"}
