@@ -46,17 +46,17 @@ import uuid
 #: ``POST {API_BASE}/workspace/skill/upload``。
 #: 注意服务以 ``python main.py`` 启动时全部路由挂在 ``/api`` 下，
 #: 故此处必须带 ``/api``；若用 ``uvicorn main:app`` 起内层 app 则去掉。
-API_BASE = "http://local:8000/api"
+API_BASE = "http://53.192.28.254:8000/api"
 
 #: 调用方用户 ID，作为 ``X-User-ID`` 请求头（接口 get_current_user_id 必需）。
-USER_ID = "9848203"
+USER_ID = "admin"
 
 #: 目标 agent ID：skill 会被装进该 agent 某个会话的 workspace。
 AGENT_ID = "_agent-creator"
 
 #: 目标会话 ID。留空（""）时脚本自动复用/创建该 agent 的一个会话；
 #: 批量上传时所有 skill 共用同一个会话（只解析一次）。
-SESSION_ID = "7552b1f2a8964546a90808d8ee35549c"
+SESSION_ID = "ca2effb74e554b2c9ea7dbdd63b45a99"
 
 #: 装着所有 skill 文件夹的总文件夹（相对本仓库或绝对路径均可）。
 #: 每个 skill 文件夹的根部必须有 ``SKILL.md``，该文件 YAML frontmatter
