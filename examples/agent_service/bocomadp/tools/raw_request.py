@@ -99,6 +99,8 @@ async def _raw_request_tool_impl(request_body: str, intent: str) -> str:
         )
 
     # 注入外部数据查询公共参数（来自 custom_params.tools_param.externalDataQuery）
+    # + requestId / thread_id（对齐 deerflow community/raw_request/tools.py，
+    # 下游联机接口用其做审计/链路追踪）。
     custom_params = get_custom_params()
     tools_param = custom_params.get("tools_param") or {}
     external = tools_param.get("externalDataQuery") or {}
@@ -107,6 +109,8 @@ async def _raw_request_tool_impl(request_body: str, intent: str) -> str:
             "sysCode": external.get("systemCode"),
             "businessType": external.get("businessType"),
             "requestCause": external.get("requestCause"),
+            "requestId": custom_params.get("requestId"),
+            "thread_id": custom_params.get("thread_id"),
         },
     )
 

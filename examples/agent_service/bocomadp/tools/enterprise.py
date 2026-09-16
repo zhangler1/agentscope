@@ -94,6 +94,43 @@ def usable_enterprise_tool_names(usable: Any) -> set[str]:
     return names
 
 
+def usable_tool_names(usable: Any) -> set[str]:
+    """把 ``custom_params.usableTools`` 名单换算为运行时形态的工具名集合。
+
+    与 :func:`usable_enterprise_tool_names` 不同，本函数把名单里**未命中**
+    企业工具名空间的条目原样保留（用于按名原样匹配项目工具等非企业工具），
+    使 ``usableTools`` 管辖范围覆盖工具列表接口可见的全部工具（项目工具 +
+    企业工具，不含 MCP / builtins / framework）。
+
+    匹配规则：
+
+    - 命中企业工具名空间（中/英文任一形态）的条目 → 经 :func:`tool_name`
+      归一为当前运行时形态（跟随 ``BOCOMADP_TOOL_ASCII_NAMES``）；
+    - 其余条目 → 原样保留（去除首尾空白），用于按工具名原样匹配项目工具
+      （项目工具名固定 ASCII，无中英文之分；builtins / 未知名原样保留
+      也不会误命中，因为项目工具里没有同名工具）。
+
+    Args:
+        usable: ``custom_params.usableTools`` 原始值（list / None / 其他）。
+
+    Returns:
+        运行时形态工具名集合；非 list / 空 list → 空集合。
+    """
+    if not isinstance(usable, list):
+        return set()
+    names: set[str] = set()
+    for item in usable:
+        s = str(item).strip()
+        if not s:
+            continue
+        canonical = _NAME_TO_CANONICAL.get(s)
+        if canonical:
+            names.add(tool_name(_CANONICAL_TO_CN[canonical], canonical))
+        else:
+            names.add(s)
+    return names
+
+
 async def build_enterprise_tools(
     user_id: str,
     agent_id: str,

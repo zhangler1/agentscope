@@ -1684,6 +1684,11 @@ async def create_run_stream(
         session_id,
         custom_params_part,
     )
+    # 注入 thread_id（= session_id）到 custom_params，对齐 deerflow
+    # lead_agent/agent.py:393-394；下游工具（如 raw_request）从
+    # custom_params 读取 thread_id 注入联机请求体做链路追踪。
+    if resolved_params:
+        resolved_params["thread_id"] = session_id
     ctx_token = set_custom_params(resolved_params)
     # 请求级 run 配置（context 平铺层根路径 5 键）：经 ContextVar 注入
     # 后台 run 任务；spawn 后 reset（create_task 已复制上下文快照，
@@ -1799,6 +1804,11 @@ async def create_run_wait(
         session_id,
         custom_params_part,
     )
+    # 注入 thread_id（= session_id）到 custom_params，对齐 deerflow
+    # lead_agent/agent.py:393-394；下游工具（如 raw_request）从
+    # custom_params 读取 thread_id 注入联机请求体做链路追踪。
+    if resolved_params:
+        resolved_params["thread_id"] = session_id
     ctx_token = set_custom_params(resolved_params)
     if "mode" in run_context:
         logger.debug(

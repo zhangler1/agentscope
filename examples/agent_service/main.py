@@ -351,7 +351,30 @@ async def build_agent_tools(
     # and refreshes the store; the resume path falls back to the store.
     _current_token.set(await _resolve_session_token(session_id))
 
+    from bocomadp.deerflow.custom_params import get_custom_params
+    from bocomadp.routers.agent_tools import _tool_whitelists
+    from bocomadp.tools.enterprise import (
+        usable_enterprise_tool_names,
+        usable_tool_names,
+    )
+
+    usable = get_custom_params().get("usableTools")
+
     tools = tool_registry.list_tools()
+    # usableTools 扩管到项目工具（对齐 GET /tools 可见范围：项目工具 +
+    # 企业工具，不含 MCP / builtins / framework）：
+    #   空/缺失/非数组 → 项目工具全禁（与企业工具层全禁语义一致）；
+    #   非空 → 只保留名单内工具，项目工具按名原样匹配，企业工具名经
+    #          归一后也在集合内（项目工具名不与企业工具名冲突）。
+    # 企业工具的过滤在 build_enterprise_tools 内单独完成，此处只处理
+    # 项目工具。工厂工具（agent-creator）不属于工具列表可见范围，不受
+    # usableTools 管辖，在下方按 agent_id 注入。
+    if isinstance(usable, list) and usable:
+        allowed_names = usable_tool_names(usable)
+        tools = [t for t in tools if getattr(t, "name", "") in allowed_names]
+    else:
+        tools = []
+
     tools.extend(
         await build_enterprise_tools(user_id, agent_id, session_id),
     )
@@ -394,15 +417,9 @@ async def build_agent_tools(
     # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
     # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
     # builtins / 工厂工具等非企业工具不豁免。
-    from bocomadp.deerflow.custom_params import get_custom_params
-    from bocomadp.routers.agent_tools import _tool_whitelists
-    from bocomadp.tools.enterprise import usable_enterprise_tool_names
-
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
-        allowed = set(whitelist) | usable_enterprise_tool_names(
-            get_custom_params().get("usableTools"),
-        )
+        allowed = set(whitelist) | usable_enterprise_tool_names(usable)
         tools = [
             t for t in tools if getattr(t, "name", "") in allowed
         ]
