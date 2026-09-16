@@ -320,7 +320,7 @@ class CreateRunRequest(BaseModel):
       缺省 :data:`DEFAULT_AGENT_ID`（jx_chat 前端不传该字段）。
     - ``input`` 接受 SDK 的 ``{"messages": [...]}`` / 单条消息 dict，
       转换后等价于原生 ``ChatRequest.input``。
-    - ``session_id`` 必填且必须等于 thread_id；deer-flow 扩展参数
+    - ``session_id`` 可选，缺省时用 thread_id；传则必须等于 thread_id；deer-flow 扩展参数
       （``stream_mode`` / ``multitask_strategy``）接受但忽略——本方案
       固定流模式与 reject 并发策略（裁剪项 1/2）。
     - ``context`` 为请求级参数容器（对齐 deer-flow context overrides）：
@@ -341,7 +341,8 @@ class CreateRunRequest(BaseModel):
     )
     session_id: str | None = Field(
         default=None,
-        description="原生 session id，必填且必须等于 thread_id（两者同一资源）。",
+        description="原生 session id，可选；传则必须等于 thread_id"
+        "（两者同一资源），不传时用 thread_id。",
     )
     input: (
         Msg
@@ -395,13 +396,11 @@ class CreateRunRequest(BaseModel):
 
 
 def _resolve_session_id(thread_id: str, body: CreateRunRequest) -> str:
-    """thread_id 与 session_id 同一资源；session_id 必填且必须一致。"""
-    if body.session_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="session_id is required and must equal thread_id.",
-        )
-    if body.session_id != thread_id:
+    """thread_id 与 session_id 同一资源；session_id 可选，缺省时用 thread_id。
+
+    传了 session_id 且与 thread_id 不一致则 400（防止误传不同值）。
+    """
+    if body.session_id is not None and body.session_id != thread_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
