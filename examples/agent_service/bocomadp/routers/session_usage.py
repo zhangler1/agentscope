@@ -287,26 +287,18 @@ async def list_session_ids_paginated(
 
     offset = (page - 1) * page_size
 
-    # Current page of session records, newest-first
-    async with engine.connect() as conn:
-        rows = (
-            await conn.execute(
-                text(
-                    "SELECT id, created_at, updated_at, user_id, agent_id, "
-                    "source, source_schedule_id, team_id, payload "
-                    "FROM sessions "
-                    "WHERE user_id = :user_id AND agent_id = :agent_id "
-                    "ORDER BY created_at DESC "
-                    "LIMIT :limit OFFSET :offset",
-                ),
-                {
-                    "user_id": user_id,
-                    "agent_id": agent_id,
-                    "limit": page_size,
-                    "offset": offset,
-                },
-            )
-        ).all()
+    # Current page of session records, newest-first.
+    # 两步查（先 id 排序分页，再按 id 回查完整行）：payload 是几十 KB 的
+    # 大 JSON，带着它排序会撑爆 MySQL sort buffer（错误 1038
+    # Out of sort memory，线上已触发），详见 _paged_session_rows。
+    rows = await _paged_session_rows(
+        engine,
+        where="WHERE user_id = :user_id AND agent_id = :agent_id",
+        params={"user_id": user_id, "agent_id": agent_id},
+        order_by="created_at DESC, id DESC",
+        limit=page_size,
+        offset=offset,
+    )
 
     # 行 → SessionRecord dict + 默认时间名改写（公共实现见下方两个
     # helper，与 /sessions/usage/history 共用）。
@@ -329,6 +321,79 @@ async def list_session_ids_paginated(
 # ---------------------------------------------------------------------------
 
 
+def _strip_session_context(session: dict) -> dict:
+    """列表接口**不下发会话里的消息明细**（``state.context``）。
+
+    ``sessions`` 与 ``messages`` 是两张表、两种职责：列表接口只给"目录"
+    （id / 名字 / 时间），完整对话走 ``GET /sessions/{session_id}/messages``
+    分页取。``state.context`` 里塞着全部消息、工具结果、token 用量，会随
+    对话轮数**线性膨胀**——数据一多就拖慢响应、甚至超时，所以在列表接口
+    统一裁掉。只删 ``context``，``state`` 其余字段（summary / reply_context
+    等）保留，兼容需要读会话状态的调用方。
+    """
+    state = session.get("state")
+    if isinstance(state, dict):
+        state.pop("context", None)
+    return session
+
+
+async def _paged_session_rows(
+    engine: Any,
+    where: str,
+    params: dict[str, Any],
+    order_by: str,
+    limit: int,
+    offset: int,
+) -> list[Any]:
+    """分页查会话：**先只查 id 排序分页，再按 id 回查完整行**。
+
+    直接 ``SELECT ..., payload ... ORDER BY ...`` 时，MySQL 要把含巨大
+    JSON（``state`` / 消息明细，单条可达几十 KB）的整行塞进 sort buffer
+    排序——会话一多就撑爆，报 **1038 Out of sort memory**
+    （线上已触发：user_id='admin' 的 /sessions/limit 请求）。
+    改成两步：
+
+    1. 只取 ``id``（行宽几十字节，排序几乎不占内存），LIMIT/OFFSET
+       仍由 DB 完成，分页语义不变；
+    2. 用这十来个 id 回查完整行——**不带 ORDER BY**（否则又要把
+       payload 装进排序堆），顺序在 Python 侧按第 1 步的 id 序列还原。
+
+    这样数据库全程不排序大字段，1038 再无触发点；``order_by`` 只作用于
+    第 1 步，最终顺序与原写法一致，调用方无感。
+    """
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        id_rows = (
+            await conn.execute(
+                text(
+                    "SELECT id FROM sessions "
+                    f"{where} ORDER BY {order_by} "
+                    "LIMIT :limit OFFSET :offset",
+                ),
+                {**params, "limit": limit, "offset": offset},
+            )
+        ).all()
+    if not id_rows:
+        return []
+    ids = [r.id for r in id_rows]
+    placeholders = ", ".join(f":i{i}" for i in range(len(ids)))
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT id, created_at, updated_at, user_id, agent_id, "
+                    "source, source_schedule_id, team_id, payload "
+                    f"FROM sessions WHERE id IN ({placeholders})",
+                ),
+                {f"i{i}": sid for i, sid in enumerate(ids)},
+            )
+        ).all()
+    # 按第 1 步的顺序还原（DB 侧不再排序，避免触碰 payload 排序堆）
+    by_id = {r.id: r for r in rows}
+    return [by_id[sid] for sid in ids if sid in by_id]
+
+
 def _session_rows_to_records(rows: list[Any]) -> list[dict]:
     """``text()`` 裸 SQL 查出的 sessions 行 → SessionRecord dict 列表。
 
@@ -338,6 +403,9 @@ def _session_rows_to_records(rows: list[Any]) -> list[dict]:
     回到这里（Postgres/asyncpg 则由驱动自动解码）。必须先解码成 dict，
     否则 ``dict("...")`` 会抛 ``ValueError: dictionary update sequence
     element #0 has length 1``。
+
+    重建后统一走 :func:`_strip_session_context` 裁掉消息明细（列表接口
+    不下发对话内容，见其文档）。
     """
     from agentscope.app.storage import SessionRecord
 
@@ -361,7 +429,9 @@ def _session_rows_to_records(rows: list[Any]) -> list[dict]:
         obj["source_schedule_id"] = row.source_schedule_id
         obj["team_id"] = row.team_id
         sessions.append(
-            SessionRecord.model_validate(obj).model_dump(mode="json")
+            _strip_session_context(
+                SessionRecord.model_validate(obj).model_dump(mode="json"),
+            ),
         )
     return sessions
 
@@ -581,19 +651,15 @@ async def list_user_session_history(
         ).scalar_one()
 
     offset = (page - 1) * page_size
-    async with engine.connect() as conn:
-        rows = (
-            await conn.execute(
-                text(
-                    "SELECT id, created_at, updated_at, user_id, agent_id, "
-                    "source, source_schedule_id, team_id, payload "
-                    f"FROM sessions {where} "
-                    "ORDER BY updated_at DESC, created_at DESC "
-                    "LIMIT :limit OFFSET :offset",
-                ),
-                {**params, "limit": page_size, "offset": offset},
-            )
-        ).all()
+    # 同 /limit：两步查，避免带着 payload 排序撑爆 sort buffer（错误 1038）
+    rows = await _paged_session_rows(
+        engine,
+        where=where,
+        params=params,
+        order_by="updated_at DESC, created_at DESC, id DESC",
+        limit=page_size,
+        offset=offset,
+    )
 
     sessions = _session_rows_to_records(rows)
     briefs = await _agent_brief_map(

@@ -145,13 +145,36 @@ def _add_session(
     *,
     name: str | None = None,
     first_user_msg: str | None = None,
+    with_state: bool = False,
 ) -> None:
-    """插一条会话；name=None 用框架默认时间名形态，first_user_msg 造首条输入。"""
+    """插一条会话；name=None 用框架默认时间名形态，first_user_msg 造首条输入。
+
+    ``with_state=True`` 时 payload 里带一份 ``state.context``（模拟真实
+    会话里塞满消息明细的形态），用于验证列表接口会把它裁掉。
+    """
     storage = client.app.state.storage
     config = {
         "workspace_id": "w-fixed",
         "name": name or updated_at.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    payload: dict = {"config": config}
+    if with_state:
+        payload["state"] = {
+            "session_id": sid,
+            "summary": "",
+            "context": [
+                {
+                    "name": "user",
+                    "role": "user",
+                    "content": [{"type": "text", "text": "历史消息明细"}],
+                    "id": "msg-1",
+                    "created_at": updated_at.isoformat(),
+                    "metadata": {},
+                    "usage": None,
+                    "error": None,
+                },
+            ],
+        }
 
     async def _go() -> None:
         async with storage._session_factory() as session:
@@ -161,7 +184,7 @@ def _add_session(
                     user_id=user_id,
                     agent_id=agent_id,
                     source="user",
-                    payload={"config": config},
+                    payload=payload,
                     created_at=updated_at,
                     updated_at=updated_at,
                 ),
@@ -367,6 +390,42 @@ def test_usage_history_falls_back_to_header(seeded):
     body = resp.json()
     assert body["user_id"] == "test-user"
     assert body["total"] == 4
+
+
+def test_list_apis_omit_message_context(client):
+    """列表接口不下发会话里的消息明细（state.context）。
+
+    会话列表只负责"目录"（id/名字/时间），完整对话走
+    GET /sessions/{id}/messages 分页取——消息明细随对话轮数线性膨胀，
+    塞进列表响应会拖慢甚至超时。
+    """
+    _seed_agents(client)
+    _add_session(
+        client, "ctx-1", "test-user", "plat-a", _T0,
+        name="带明细的会话", with_state=True,
+    )
+
+    # /sessions/limit（老接口）
+    resp = client.get(
+        "/sessions/limit", params={"agent_id": "plat-a"}, headers=HDR_USER,
+    )
+    assert resp.status_code == 200, resp.text
+    sessions = resp.json()["sessions"]
+    assert [s["id"] for s in sessions] == ["ctx-1"]
+    assert "context" not in (sessions[0].get("state") or {})
+    # 名字照常改写/保留（裁 context 不影响目录信息）
+    assert sessions[0]["config"]["name"] == "带明细的会话"
+
+    # /sessions/usage/history（新接口）
+    resp = client.get(
+        "/sessions/usage/history",
+        params={"user_id": "test-user"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 200, resp.text
+    for sess in resp.json()["sessions"]:
+        assert "context" not in (sess.get("state") or {})
+        assert sess["agent_name"]  # agent_name 照常附带
 
 
 def test_usage_history_empty_user(client):
