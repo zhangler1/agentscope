@@ -133,6 +133,13 @@ class Toolkit:
             ),
         ] + (tool_groups or [])
 
+        logger.info(
+            "Toolkit.__init__: id=%x basic_tools=%s all_groups=%s",
+            id(self),
+            [getattr(t, "name", "") for t in self.tool_groups[0].tools],
+            [g.name for g in self.tool_groups],
+        )
+
         # Check name conflict for tool groups
         if len(set(_.name for _ in self.tool_groups)) != len(
             self.tool_groups,
@@ -571,7 +578,8 @@ class Toolkit:
                     )
 
         logger.info(
-            "_get_available_tools: RETURN names=%s",
+            "_get_available_tools: RETURN id=%x names=%s",
+            id(self),
             list(available_tools.keys()),
         )
         return available_tools
