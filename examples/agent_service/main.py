@@ -804,13 +804,11 @@ app = create_app(
 
 
 def _configurable_tool_names() -> list[str]:
-    """Return the configurable tool set M.
+    """Return the full set of tool/MCP names for the agent-creator whitelist.
 
-    M = workspace builtins + ToolRegistry tools + MCP servers + framework
-    team/planning tools + enterprise tools. Mirrors
-    :func:`bocomadp.routers.agent_tools._all_tool_names` so the built-in
-    agent-creator's whitelist covers exactly what the tool config APIs
-    manage.
+    The agent-creator is a privileged system agent that needs access to
+    every tool. Its whitelist must include enterprise tools + MCP names
+    (the configurable set) plus its own factory tools.
     """
     from bocomadp.tool_catalog import (
         BUILTIN_TOOL_NAMES,
@@ -927,6 +925,10 @@ async def _lifespan_with_builtin_agents(app):
         await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
+        # 设置项目工具名集合（始终允许，不受白名单过滤）。
+        from bocomadp.toolkit_whitelist import set_project_tool_names
+
+        set_project_tool_names(set(tool_registry.list_tool_names()))
         patch_get_toolkit()
         # 请求级模型参数（thinking_enabled/reasoning_effort）：包装框架
         # get_model，run_context 携带时合并进模型 Parameters。
