@@ -33,13 +33,10 @@ class _WhitelistWorkspaceProxy(WorkspaceBase):
     真实工作区，行为不变。
     """
 
-    def __init__(self, workspace: Any, agent_id: str) -> None:
-        # ``object.__setattr__`` keeps ``__setattr__`` default so the
-        # proxy stays inert; ``__getattr__`` below only fires on miss.
-        # 不调用 ``super().__init__``：避免在代理上生成 workspace_id /
-        # workdir 等真实属性，使这些属性仍经 ``__getattr__`` 委托。
+    def __init__(self, workspace: Any, agent_id: str, mcp_registry: Any = None) -> None:
         object.__setattr__(self, "_workspace", workspace)
         object.__setattr__(self, "_agent_id", agent_id)
+        object.__setattr__(self, "_mcp_registry", mcp_registry)
 
     # ── WorkspaceBase 抽象方法：全部委托给真实工作区 ────────────
 
@@ -97,6 +94,11 @@ class _WhitelistWorkspaceProxy(WorkspaceBase):
 
         Whitelist empty + usableTools empty → no MCPs available
         (enterprise tools / MCPs require explicit enablement).
+
+        If a whitelisted MCP is missing from the workspace (e.g. it was
+        not part of ``default_mcps`` at startup), auto-register it from
+        ``mcp_registry`` so that ``PUT /agents/{id}/tools/{name}`` takes
+        effect without restarting the workspace.
         """
         from bocomadp.routers.agent_tools import _tool_whitelists
         from bocomadp.tools.enterprise import usable_enterprise_tool_names
@@ -106,6 +108,25 @@ class _WhitelistWorkspaceProxy(WorkspaceBase):
         whitelist = _tool_whitelists.get(self._agent_id, [])
         usable = get_custom_params().get("usableTools")
         allowed = set(whitelist) | usable_enterprise_tool_names(usable)
+
+        existing_names = {getattr(m, "name", "") for m in mcps}
+        missing_names = allowed - existing_names
+
+        if missing_names and self._mcp_registry is not None:
+            registry_map = {
+                getattr(m, "name", ""): m
+                for m in self._mcp_registry.list_mcps()
+            }
+            for name in missing_names:
+                spec = registry_map.get(name)
+                if spec is None:
+                    continue
+                try:
+                    await self._workspace.add_mcp(spec)
+                except (ValueError, RuntimeError):
+                    pass
+            mcps = await self._workspace.list_mcps()
+
         return [m for m in mcps if getattr(m, "name", "") in allowed]
 
     def __getattr__(self, item: str) -> Any:
@@ -122,8 +143,9 @@ class WhitelistWorkspaceManager:
     managers both work unchanged.
     """
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, mcp_registry: Any = None) -> None:
         self._inner = inner
+        self._mcp_registry = mcp_registry
 
     async def get_workspace(
         self,
@@ -138,7 +160,7 @@ class WhitelistWorkspaceManager:
             session_id,
             workspace_id,
         )
-        return _WhitelistWorkspaceProxy(ws, agent_id)
+        return _WhitelistWorkspaceProxy(ws, agent_id, self._mcp_registry)
 
     async def __aenter__(self) -> "WhitelistWorkspaceManager":
         await self._inner.__aenter__()

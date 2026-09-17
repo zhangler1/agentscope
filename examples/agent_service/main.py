@@ -656,7 +656,8 @@ _concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
-workspace_manager = WhitelistWorkspaceManager(workspace_manager)
+# 传入 mcp_registry 使白名单中新启用的 MCP 能自动注册到 workspace。
+workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
 
 # ---------------------------------------------------------------------------
 # 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
