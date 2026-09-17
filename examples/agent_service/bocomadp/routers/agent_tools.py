@@ -7,8 +7,8 @@ Endpoints
 ``GET    /mcps``                               — list all MCP servers (global)
 ``GET    /search``                             — search tools or MCPs by name
 ``GET    /agents/{agent_id}/tools``           — list agent's tools with status
-``PUT    /agents/{agent_id}/tools/{name}``    — add a tool/MCP to agent
-``DELETE /agents/{agent_id}/tools/{name}``    — remove a tool/MCP from agent
+``PUT    /agents/{agent_id}/tools?tool_name=...``   — add a tool/MCP to agent
+``DELETE /agents/{agent_id}/tools?tool_name=...``   — remove a tool/MCP from agent
 
 Tool categories
 ---------------
@@ -90,6 +90,11 @@ _FACTORY_TOOL_ATTRS: tuple[str, ...] = (
     "set_agent_tools",
     "list_available_skills",
     "enable_skill_for_agent",
+)
+
+_HIDDEN_PROJECT_TOOLS: frozenset[str] = frozenset(
+    {"回显", "获取当前时间", "列出上传文件", "读取上传文件",
+     "echo", "get_current_time", "list_uploaded_files", "read_uploaded_file"},
 )
 
 # ------------------------------------------------------------------
@@ -393,10 +398,6 @@ async def list_agent_tools(
 # ------------------------------------------------------------------
 
 
-@agent_tools_router.put(
-    "/{agent_id}/tools/{tool_name}",
-    summary="Add a tool or MCP to the agent",
-)
 def _resolve_configurable_name(
     raw_name: str,
     configurable: set[str],
@@ -420,6 +421,24 @@ def _resolve_configurable_name(
     return None
 
 
+def _is_agent_specific_tool(resolved_name: str) -> bool:
+    """Check whether *resolved_name* is an agent-specific enterprise tool.
+
+    Agent-specific tools (contact_search, physical_contact_search, etc.)
+    are controlled by ``usableTools`` at request level — they cannot be
+    enabled via the per-agent whitelist API.
+    """
+    from ..tools.enterprise import _NAME_TO_CANONICAL, _AGENT_SPECIFIC_CANONICAL
+    canonical = _NAME_TO_CANONICAL.get(resolved_name)
+    if canonical and canonical in _AGENT_SPECIFIC_CANONICAL:
+        return True
+    return False
+
+
+@agent_tools_router.put(
+    "/{agent_id}/tools",
+    summary="Add a tool or MCP to the agent",
+)
 async def enable_agent_tool(
     agent_id: str,
     tool_name: str,
@@ -445,6 +464,12 @@ async def enable_agent_tool(
             detail=f"Tool '{tool_name}' not found or not configurable",
         )
 
+    if _is_agent_specific_tool(resolved):
+        raise HTTPException(
+            status_code=403,
+            detail="此智能体无使用权限",
+        )
+
     current = _get_enabled_tools(agent_id)
 
     if resolved in current:
@@ -463,7 +488,7 @@ async def enable_agent_tool(
 
 
 @agent_tools_router.delete(
-    "/{agent_id}/tools/{tool_name}",
+    "/{agent_id}/tools",
     summary="Remove a tool or MCP from the agent",
 )
 async def disable_agent_tool(
@@ -527,6 +552,8 @@ async def list_all_tools(request: Request) -> dict:
 
     for tool in _tool_registry(request).list_tools():
         name = _tool_name(tool)
+        if name in _HIDDEN_PROJECT_TOOLS:
+            continue
         tools.append(
             {
                 "name": name,
@@ -620,6 +647,8 @@ async def search_tools_or_mcps(
         items: list[dict] = []
         for tool in _tool_registry(request).list_tools():
             n = _tool_name(tool)
+            if n in _HIDDEN_PROJECT_TOOLS:
+                continue
             if keyword and keyword not in n.lower():
                 continue
             items.append(
