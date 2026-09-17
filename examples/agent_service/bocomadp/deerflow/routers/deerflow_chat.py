@@ -1358,10 +1358,13 @@ def _sse_generator(
             ``values.messages``——缺失时前端 human 计数不增长，乐观消息
             永不清理，界面出现两条用户输入（“问题显示两次”）。
         storage (`StorageBase | None`, optional):
-            会话存储；缺省时跳过 values 快照帧。end 哨兵前从 storage
-            拉全量消息组装 ``event: values``（对齐原生主通道帧，含
-            title 与最后一条 ai 消息的 ``usage_metadata``）。error 与
-            HITL park 情形不发 values（run 未正常完结）。
+            会话存储；缺省时跳过 values 快照帧。formatter 每个节点
+            边界产出的 values 帧与 end 哨兵前的收尾快照均从 storage
+            拉历史消息 + 本轮结构化序列组装 ``event: values``（对齐
+            原生主通道帧，含 title 与 ai 消息的 ``usage_metadata``，
+            流中每节点边界一帧、messages 递增）。error 情形不发
+            values（run 未正常完结）；HITL park 时流中卡片快照照发，
+            仅跳过收尾全量快照。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
@@ -1432,6 +1435,31 @@ def _sse_generator(
                     and evt.data.get("type") == "on_require_confirm"
                 ):
                     hitl_parked = True
+                if evt.event == EVENT_VALUES:
+                    # formatter 节点边界快照帧（data 为当前 turn 序列）：
+                    # 组装原生 values 形态下发（storage 历史 + 本轮序列），
+                    # 对齐原生每 super-step 写 state 后一帧快照的流式语义。
+                    # error 流不发（run 未正常完结）；组装失败跳过该帧
+                    # （values 是视图同步优化，非流终止契约）。
+                    if not error_seen and evt.data:
+                        values = await _build_values_frame(
+                            storage,
+                            user_id,
+                            session_id,
+                            usage=None,
+                            turn_messages=evt.data,
+                            reply_id=formatter.reply_id,
+                        )
+                        if values is not None:
+                            evt = StreamEvent(
+                                id="",
+                                event=EVENT_VALUES,
+                                data=values,
+                            )
+                        else:
+                            continue
+                    else:
+                        continue
                 if await request.is_disconnected():
                     break
                 yield format_sse(evt)

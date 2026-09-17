@@ -11,7 +11,11 @@ from __future__ import annotations
 import pytest
 
 from bocomadp.deerflow.formatter import DeerflowSSEFormatter
-from bocomadp.deerflow.protocol import EVENT_MESSAGES, EVENT_UPDATES
+from bocomadp.deerflow.protocol import (
+    EVENT_MESSAGES,
+    EVENT_UPDATES,
+    EVENT_VALUES,
+)
 
 
 def _evt(evt_type: str, **payload) -> dict:
@@ -100,7 +104,7 @@ def test_tool_call_streaming_chunks(fmt):
     model_end_out = fmt.translate(
         _evt("MODEL_CALL_END", reply_id="r1", input_tokens=10, output_tokens=5),
     )
-    assert len(model_end_out) == 2  # 本轮 usage 增量帧 + updates 快照
+    assert len(model_end_out) == 3  # usage 增量帧 + updates 快照 + values 快照
     # usage 增量帧在前：对齐原生 messages 流最后一块（带 usage）先于
     # 节点写入 state 的快照
     usage_evt = model_end_out[0]
@@ -129,6 +133,9 @@ def test_tool_call_streaming_chunks(fmt):
         e.event != "custom"
         for e in start_out + delta_out + end_out + model_end_out
     )
+    # 尾帧为 values 快照帧（model 节点边界，对齐原生每节点快照）
+    assert model_end_out[2].event == EVENT_VALUES
+    assert model_end_out[2].data == [ai_msg]
 
 
 def test_tool_call_empty_delta_emits_nothing(fmt):
@@ -205,7 +212,7 @@ def test_model_call_end_updates_snapshot_groups_round(fmt):
     out = fmt.translate(
         _evt("MODEL_CALL_END", reply_id="r1", input_tokens=3, output_tokens=4),
     )
-    assert len(out) == 2  # usage 增量帧在前 + updates 快照在后
+    assert len(out) == 3  # usage 增量帧 + updates 快照 + values 快照
     ai_msg = out[1].data["model"]["messages"][0]
     assert ai_msg["content"] == "先说明"
     assert ai_msg["id"] == "r1:1"
@@ -222,6 +229,9 @@ def test_model_call_end_updates_snapshot_groups_round(fmt):
     usage_chunk, _usage_meta = out[0].data
     assert usage_chunk["id"] == "r1:1"
     assert usage_chunk["usage_metadata"] == ai_msg["usage_metadata"]
+    # 尾帧为 values 快照帧（model 节点边界，对齐原生每节点快照）
+    assert out[2].event == EVENT_VALUES
+    assert out[2].data == [ai_msg]
 
 
 def test_model_call_end_second_round_excludes_preexisting_calls(fmt):
@@ -272,7 +282,7 @@ def test_tool_result_only_emits_on_end(fmt):
         _evt("TOOL_RESULT_TEXT_DELTA", tool_call_id="c1", delta="out-2", reply_id="r1"),
     ) == []
     out = fmt.translate(_evt("TOOL_RESULT_END", tool_call_id="c1", reply_id="r1"))
-    assert len(out) == 2
+    assert len(out) == 3
     evt = out[0]
     assert evt.event == EVENT_MESSAGES
     chunk, metadata = evt.data
@@ -292,6 +302,17 @@ def test_tool_result_only_emits_on_end(fmt):
     assert tool_msg["type"] == "tool"
     assert tool_msg["tool_call_id"] == "c1"
     assert tool_msg["content"] == "out-1out-2"
+    # 尾帧为 values 快照帧（tools 节点边界，对齐原生每节点快照）
+    assert out[2].event == EVENT_VALUES
+    assert out[2].data == [
+        {
+            "type": "tool",
+            "content": "out-1out-2",
+            "name": "bash",
+            "tool_call_id": "c1",
+            "id": "tool:c1",
+        },
+    ]
 
 
 def test_tool_result_state_maps_to_status(fmt):

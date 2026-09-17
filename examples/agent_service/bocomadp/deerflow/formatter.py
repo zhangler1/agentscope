@@ -13,10 +13,10 @@
 | ``TextBlock*``                | ``messages``           | ``[{"type": "AIMessageChunk", "content", "id"}, metadata]`` |
 | ``ThinkingBlock*``            | ``messages``           | chunk 附 ``additional_kwargs.reasoning_content``，metadata 附 ``reasoning: true`` |
 | ``ToolCallStart/Delta/End``   | ``messages``           | 流式 ``AIMessageChunk`` 增量帧（``tool_call_chunks`` 首片带 name/id/index、delta 片只带 args，官方前端 SDK 按同 id concat 出 tool_calls）；end 只标记参数完成，完整 ai 消息快照由 MODEL_CALL_END 发 updates 帧 |
-| ``ToolResultStart/Text/End``  | ``messages`` + ``updates`` | tool 消息帧（``type=tool`` + ``tool_call_id``）+ ``{"tools": {"messages": [...]}}`` 写入快照 |
-| ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` |
+| ``ToolResultStart/Text/End``  | ``messages`` + ``updates`` + ``values`` | tool 消息帧（``type=tool`` + ``tool_call_id``）+ ``{"tools": {"messages": [...]}}`` 写入快照；随后 values 快照帧（对齐原生 tools 节点写 state 后快照） |
+| ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` + ``values`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` + values 快照帧（interrupt 快照含卡片 ToolMessage，对齐原生） |
 | ``ModelCallStartEvent``       | （内部消化）             | 记录 model_name，注入 messages 帧 metadata 的 ``ls_model_name`` |
-| ``ModelCallEndEvent``         | ``messages`` + ``updates`` | 累积 input/output tokens + 先补发一条本轮 usage 增量帧（chunk 挂 ``usage_metadata``，作为该轮流式最后一块——对齐原生 messages 流最后一块先于节点快照的时序，前端按消息 id 去重累加）；再按轮次发完整 ai 消息快照（``{"model": {"messages": [...]}}``，content + 本轮新增 tool_calls，消息挂该轮 ``usage_metadata``，对齐原生 model 节点写入时机） |
+| ``ModelCallEndEvent``         | ``messages`` + ``updates`` + ``values`` | 累积 input/output tokens + 先补发一条本轮 usage 增量帧（chunk 挂 ``usage_metadata``，作为该轮流式最后一块——对齐原生 messages 流最后一块先于节点快照的时序，前端按消息 id 去重累加）；再按轮次发完整 ai 消息快照（``{"model": {"messages": [...]}}``，content + 本轮新增 tool_calls，消息挂该轮 ``usage_metadata``，对齐原生 model 节点写入时机）；随后 values 快照帧（对齐原生 model 节点写 state 后快照，流中每节点边界一帧递增） |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
 | ``ReplyEndEvent(normal)``     | ``end``                | 哨兵（生成器收尾时升级为带 ``usage`` 累计值的 end 帧，对齐原生客户端跨消息累加后的 run 级总量） |
 | ``ReplyEndEvent(error)``      | ``error`` + ``end``    | ``{"message", "name"}`` 后接哨兵           |
@@ -40,6 +40,7 @@ from .protocol import (
     EVENT_MESSAGES,
     EVENT_METADATA,
     EVENT_UPDATES,
+    EVENT_VALUES,
     StreamEvent,
 )
 
@@ -298,6 +299,17 @@ class DeerflowSSEFormatter:
             return [error_frame, END_SENTINEL]
         return [END_SENTINEL]
 
+    def _values_frame(self, event: dict) -> StreamEvent:
+        """当前 turn 序列的 values 快照帧（节点边界对齐原生每节点快照）。
+
+        原生 ``stream_mode=["values"]`` 在每个 super-step（节点执行完
+        写入 state）后都产出一次 state 快照，流中多帧 messages 递增；
+        本适配层在节点边界（模型调用完成 / 工具结果完成 / HITL 卡片）
+        补发本帧，data 为当前 turn 序列快照，由 SSE 生成器组装成原生
+        values 形态（storage 历史 + 本轮序列）后下发。
+        """
+        return _evt(event, EVENT_VALUES, list(self._turn_messages))
+
     def _round_msg_id(self, reply_id: Any) -> str:
         """本轮模型调用的消息 id（每轮独立，对齐原生每轮 AIMessage 独立 id）。
 
@@ -529,9 +541,10 @@ class DeerflowSSEFormatter:
         updates 恒发（jx_chat 只读 model 键、官方 SDK 按 node 名解析，
         tools 键不冲突）。
 
-        不补 values 快照：快照的 ai 消息为扁平 assistant（无 tool_calls
-        字段），补入的 tool 消息无配对对象会成为孤儿（且与流式 tool 帧
-        重复）；该差异如实保留，属存储模型限制。
+        values 快照帧随后下发：tool 消息与同轮 ai 快照（含 tool_calls
+        + usage_metadata）配对，对齐原生 tools 节点写 state 后的快照
+        形态（storage 扁平 history 无工具痕迹的差异由生成器组装时以
+        本轮结构化序列兜底补齐）。
         """
         call_id = str(event.get("tool_call_id", ""))
         # 官方 ToolMessage 带 status/artifact；state 取原生
@@ -573,6 +586,7 @@ class DeerflowSSEFormatter:
                 [tool_msg, self._model_metadata("agent")],
             ),
             _evt(event, EVENT_UPDATES, {"tools": {"messages": [tool_msg]}}),
+            self._values_frame(event),
         ]
 
     # ── HITL / 自定义 / 兜底 ───────────────────────────────────────────
@@ -593,6 +607,10 @@ class DeerflowSSEFormatter:
         最后一块）——对齐原生：LangChain 每轮 AIMessageChunk 的最后
         一块自带该轮单次调用 usage_metadata，SDK concat 进该轮消息，
         前端按消息 id 去重累加出 run 级总量。
+
+        随后补 values 快照帧（当前 turn 序列），对齐原生 model 节点
+        写 state 后快照——流中每节点边界一帧、messages 递增，而非
+        仅末尾一次全量快照。
         """
         # 1) 累积 token 用量（reply 级聚合）
         input_tokens = int(event.get("input_tokens") or 0)
@@ -664,6 +682,8 @@ class DeerflowSSEFormatter:
                 [usage_chunk, self._model_metadata("model")],
             ),
             _evt(event, EVENT_UPDATES, {"model": {"messages": [ai_msg]}}),
+            # values 快照帧：对齐原生每节点写 state 后快照（流中多帧）
+            self._values_frame(event),
         ]
 
     @property
@@ -679,8 +699,9 @@ class DeerflowSSEFormatter:
         """本轮结构化消息序列（每轮 ai 快照与 tool 消息按事件顺序交错）。
 
         对齐原生 values 快照的 state.messages 形态（ai 消息含
-        tool_calls/usage_metadata、tool 消息紧随其调用），供 SSE 生成器
-        在 storage 落库晚于 REPLY_END 时补入完整本轮结构。
+        tool_calls/usage_metadata、tool 消息紧随其调用）。SSE 生成器
+        在流中每个节点边界帧（:meth:`_values_frame`）与收尾快照组装
+        时读取：storage 落库晚于 REPLY_END，本轮结构以此序列为准。
         """
         return list(self._turn_messages)
 
@@ -704,15 +725,29 @@ class DeerflowSSEFormatter:
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
+            card = build_confirm_card(tool_call)
             stream_events.append(
                 _evt(
                     event,
                     EVENT_MESSAGES,
                     [
-                        build_confirm_card(tool_call),
+                        card,
                         {"langgraph_node": "agent"},
                     ],
                 ),
+            )
+            # values 快照序列同步记录卡片（轻量形态，对齐原生
+            # interrupt 时 values 快照含卡片 ToolMessage 的
+            # _serialize_message 序列化——无 artifact，前端渲染靠
+            # messages 帧的完整卡片）
+            self._turn_messages.append(
+                {
+                    "type": "tool",
+                    "content": card["content"],
+                    "name": card["name"],
+                    "tool_call_id": card["tool_call_id"],
+                    "id": card["id"],
+                },
             )
         # 原 custom 事件保留（调试/兼容，置于 messages 帧之后）
         stream_events.append(
@@ -726,6 +761,9 @@ class DeerflowSSEFormatter:
                 },
             ),
         )
+        # values 快照帧：interrupt 快照含卡片 ToolMessage（对齐原生
+        # 等待确认时的 state 快照，前端刷新后仍能恢复卡片渲染）
+        stream_events.append(self._values_frame(event))
         # HITL park 收尾：原生在等待确认时不会发出 ReplyEndEvent（reply
         # 尚未结束，等待 Case B 续跑），bridge 的 live 订阅永远等不到 end
         # 哨兵，SSE 连接只靠心跳帧空转不关闭，前端 ``isStreaming`` 一直

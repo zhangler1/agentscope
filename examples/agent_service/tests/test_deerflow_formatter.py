@@ -13,6 +13,8 @@ from bocomadp.deerflow.protocol import (
     EVENT_ERROR,
     EVENT_MESSAGES,
     EVENT_METADATA,
+    EVENT_UPDATES,
+    EVENT_VALUES,
 )
 
 
@@ -148,7 +150,7 @@ def test_tool_call_accumulates_arguments() -> None:
     model_end = f.translate(
         {"type": "MODEL_CALL_END", "reply_id": "r1", "input_tokens": 10, "output_tokens": 5, "run_id": "run1"},
     )
-    assert len(model_end) == 2
+    assert len(model_end) == 3
     # usage 增量帧在前：对齐原生 messages 流最后一块先于节点快照
     assert model_end[0].event == EVENT_MESSAGES
     usage_chunk, usage_meta = model_end[0].data
@@ -170,6 +172,9 @@ def test_tool_call_accumulates_arguments() -> None:
         "output_tokens": 5,
         "total_tokens": 15,
     }
+    # 尾帧为 values 快照帧（model 节点边界，对齐原生每节点快照）
+    assert model_end[2].event == EVENT_VALUES
+    assert model_end[2].data == [ai_msg]
 
 
 # ── custom：工具结果（result 文本跨事件累积）─────────────────────────
@@ -211,6 +216,10 @@ def test_tool_result_accumulates_text() -> None:
             "id": "tool:c1",
         },
     ]
+    # 尾帧为 values 快照帧（tools 节点边界，对齐原生每节点快照）
+    assert end[1].event == EVENT_UPDATES
+    assert end[2].event == EVENT_VALUES
+    assert end[2].data == f.turn_messages
 
 
 # ── custom：HITL / 自定义事件 ────────────────────────────────────────
@@ -227,10 +236,21 @@ def test_require_user_confirm_maps_to_custom() -> None:
         },
     )
     # 前端不认识 custom on_require_confirm，但 custom 事件保留；
+    # custom 后补 values 快照帧（interrupt 快照含卡片，对齐原生），
     # 尾部 end 哨兵使本轮 SSE 在卡片帧后收尾（park 无 ReplyEndEvent，
     # 否则连接永不关闭、前端 isStreaming 卡死）
-    custom = evts[-2]
+    custom = evts[-3]
     assert evts[-1] is END_SENTINEL
+    assert evts[-2].event == EVENT_VALUES
+    assert evts[-2].data == [
+        {
+            "type": "tool",
+            "content": "确认执行以下工具调用？\n\nget_balance: (no arguments)",
+            "name": "ask_clarification",
+            "tool_call_id": "c1",
+            "id": "confirm-c1",
+        },
+    ]
     assert custom.event == EVENT_CUSTOM
     assert custom.data["type"] == "on_require_confirm"
     assert custom.data["reply_id"] == "r1"
@@ -278,7 +298,9 @@ def test_require_user_confirm_emits_human_input_card() -> None:
     assert "mkdir -p /tmp/demo" in human_input["question"]
     values = [o["value"] for o in human_input["options"]]
     assert values == ["confirm", "reject"]
-    assert len(evts) == 3
+    # 帧序：messages 卡片帧 → custom → values 快照帧 → end 哨兵
+    assert len(evts) == 4
+    assert evts[-2].event == EVENT_VALUES
     assert evts[-1] is END_SENTINEL
 
 
@@ -371,7 +393,7 @@ def test_model_call_end_emits_updates_snapshot_and_usage() -> None:
         {"type": "MODEL_CALL_START", "reply_id": "r1", "run_id": "run1"},
     )
     out = f.translate(_model_call_end(120, 45))
-    assert len(out) == 2
+    assert len(out) == 3
     # 本轮 usage 增量帧（该轮流式最后一块，同轮次 id，先于快照）
     assert out[0].event == EVENT_MESSAGES
     usage_chunk, usage_meta = out[0].data
@@ -394,6 +416,9 @@ def test_model_call_end_emits_updates_snapshot_and_usage() -> None:
     }
     # values 快照序列同步记录 ai 快照（无 tool 消息时仅一条）
     assert f.turn_messages == [ai_msg]
+    # 尾帧为 values 快照帧（model 节点边界，对齐原生每节点快照）
+    assert out[2].event == EVENT_VALUES
+    assert out[2].data == [ai_msg]
     assert f.usage == {
         "input_tokens": 120,
         "output_tokens": 45,
