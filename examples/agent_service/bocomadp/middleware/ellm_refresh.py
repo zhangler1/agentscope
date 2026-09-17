@@ -49,9 +49,9 @@ except ImportError:  # pragma: no cover — offline syntax fallback
 MiddlewareBase._is_agent_middleware = True  # type: ignore[attr-defined]
 
 from bocomadp.deerflow.custom_params import get_custom_params  # noqa: E402
-from bocomadp.providers.ellm_chat_model import (  # noqa: E402
-    EllmChatModel,
-    _get_think_tag,
+from bocomadp.providers.ellm_chat_model import EllmChatModel  # noqa: E402
+from bocomadp.routers.model_registry import (  # noqa: E402
+    resolve_model_meta,
 )
 
 
@@ -126,7 +126,8 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 # inject_think_tag 优先级：
                 #   1) 请求体 custom_params.add_think（deerflow run/stream
                 #      每轮携带，第一优先级）；
-                #   2) 模型库 model_registry（按模型名）；
+                #   2) 模型库 model_registry（按模型名，直读 DB；DB 异常时
+                #      回退快照，见 resolve_model_meta）；
                 #   3) 默认 False。
                 # 原生 /chat/ 或请求未携带 add_think 时，第 1 级返回
                 # None，自动回退到第 2/3 级，行为与之前一致。
@@ -136,8 +137,9 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 if req_think is not None:
                     current_model.inject_think_tag = req_think
                 else:
-                    current_model.inject_think_tag = _get_think_tag(
-                        current_model.model,
+                    meta = await resolve_model_meta(current_model.model)
+                    current_model.inject_think_tag = (
+                        bool(meta["think_tag"]) if meta else False
                     )
                 # 401 时的行为：
                 #   1) 强制刷新 key（force_refresh_key，锁保护）并用新 key

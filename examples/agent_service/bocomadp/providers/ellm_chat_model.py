@@ -16,11 +16,12 @@ The key-refresh logic (api-key header rotation) lives in the
 which injects the fresh key per call via :meth:`set_api_key`; this class
 only carries the protocol differences.
 
-Model candidates (``list_models``), ``context_size`` and ``inject_think_tag``
-are read from the DB-backed model library (``model_registry`` table) through
-its in-process read snapshot (see :mod:`bocomadp.routers.model_registry`),
-replacing the former Redis hash ``bocomadp:model:think_tag`` and the static
-``_models/*.yaml`` fallback.
+Model candidates (``list_models``) and ``context_size`` are read from the
+DB-backed model library (``model_registry`` table) through its in-process read
+snapshot (see :mod:`bocomadp.routers.model_registry`), replacing the former
+Redis hash ``bocomadp:model:think_tag`` and the static ``_models/*.yaml``
+fallback. ``inject_think_tag`` 由中间件按模型名**直读 DB** 决定
+（``resolve_model_meta``，异常时回退快照）。
 """
 import copy
 import logging
@@ -60,9 +61,11 @@ else:
 
 
 # ── 模型候选（model_registry 表为唯一真源） ────────────────
-# ``list_models`` / context_size / think_tag 统一从 ``model_registry`` 表的
-# 进程内只读快照读取（见 :mod:`bocomadp.routers.model_registry`）；快照由
-# 启动 lifespan 预热、模型库写接口成功后刷新。
+# ``list_models`` 与本函数（构造期兜底）是**同步**入口，从 ``model_registry``
+# 表的进程内只读快照读取（见 :mod:`bocomadp.routers.model_registry`）；快照由
+# 启动 lifespan 预热、模型库写接口成功后刷新、热路径直读成功时写穿。
+# 运行时行为参数不走这里：``context_size`` 由 ``model_patch`` 在模型构造后覆盖，
+# ``inject_think_tag`` 由 ``ellm_refresh`` 中间件取值，二者都直读 DB。
 # 构造回退值：库中无该模型时，context_size 保持原默认。
 _FALLBACK_CONTEXT_SIZE = 65536
 
@@ -83,24 +86,6 @@ def _get_model_context_size(model: str) -> int:
     if row is None:
         return _FALLBACK_CONTEXT_SIZE
     return int(row["context_size"])
-
-
-def _get_think_tag(model: str) -> bool:
-    """按模型名从模型库快照读取 ``inject_think_tag``（供中间件调用）。
-
-    Args:
-        model (`str`): 模型名（``model_registry.model_name``）。
-
-    Returns:
-        `bool`: 该模型的 think_tag；模型不在库中时返回 ``False``
-        （安全默认，不误加 ``<think>`` 前缀）。
-    """
-    from bocomadp.routers.model_registry import get_model_meta
-
-    row = get_model_meta(model)
-    if row is None:
-        return False
-    return bool(row["think_tag"])
 
 
 def _build_parameter_schema(

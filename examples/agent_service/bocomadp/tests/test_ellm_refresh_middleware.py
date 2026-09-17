@@ -35,7 +35,6 @@ from bocomadp.deerflow.custom_params import (
 )
 from bocomadp.middleware.ellm_refresh import (
     EllmKeyRefreshMiddleware,
-    _get_think_tag,
     _parse_add_think,
 )
 from bocomadp.providers.ellm_chat_model import EllmChatModel
@@ -152,8 +151,8 @@ class TestInjection:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key-abc", 1_500_000),
         ), mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=True),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": True}),
         ):
             result = asyncio.run(
                 mw.on_model_call(
@@ -184,8 +183,8 @@ class TestInjection:
                 "bocomadp.providers.ellm_key.fetch_ellm_key",
                 return_value=("new-key", 1_500_000),
             ), mock.patch(
-                "bocomadp.middleware.ellm_refresh._get_think_tag",
-                new=mock.Mock(return_value=True),  # registry says True
+                "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+                new=mock.AsyncMock(return_value={"think_tag": True}),  # registry says True
             ):
                 asyncio.run(
                     mw.on_model_call(
@@ -214,8 +213,8 @@ class TestInjection:
                 "bocomadp.providers.ellm_key.fetch_ellm_key",
                 return_value=("new-key", 1_500_000),
             ), mock.patch(
-                "bocomadp.middleware.ellm_refresh._get_think_tag",
-                new=mock.Mock(return_value=True),
+                "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+                new=mock.AsyncMock(return_value={"think_tag": True}),
             ):
                 asyncio.run(
                     mw.on_model_call(
@@ -287,8 +286,8 @@ class TestEndToEnd:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key-abc", 1_500_000),
         ) as fetch, mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=True),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": True}),
         ):
             final = asyncio.run(
                 agent.reply(UserMsg(name="user", content="hi")),

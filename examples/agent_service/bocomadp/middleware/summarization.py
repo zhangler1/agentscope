@@ -70,7 +70,7 @@ class SummarizationMiddleware(MiddlewareBase):
             )
             return await next_handler()
 
-        model = build_summarization_model(
+        model = await build_summarization_model(
             record.data,
             cfg.model_name,
             agent.model.context_size,
