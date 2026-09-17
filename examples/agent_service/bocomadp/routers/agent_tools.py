@@ -92,6 +92,11 @@ _FACTORY_TOOL_ATTRS: tuple[str, ...] = (
     "enable_skill_for_agent",
 )
 
+_HIDDEN_PROJECT_TOOLS: frozenset[str] = frozenset(
+    {"回显", "获取当前时间", "列出上传文件", "读取上传文件",
+     "echo", "get_current_time", "list_uploaded_files", "read_uploaded_file"},
+)
+
 # ------------------------------------------------------------------
 # Tool whitelist store
 # ------------------------------------------------------------------
@@ -527,6 +532,8 @@ async def list_all_tools(request: Request) -> dict:
 
     for tool in _tool_registry(request).list_tools():
         name = _tool_name(tool)
+        if name in _HIDDEN_PROJECT_TOOLS:
+            continue
         tools.append(
             {
                 "name": name,
@@ -620,6 +627,8 @@ async def search_tools_or_mcps(
         items: list[dict] = []
         for tool in _tool_registry(request).list_tools():
             n = _tool_name(tool)
+            if n in _HIDDEN_PROJECT_TOOLS:
+                continue
             if keyword and keyword not in n.lower():
                 continue
             items.append(
