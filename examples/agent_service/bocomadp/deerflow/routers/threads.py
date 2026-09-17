@@ -59,11 +59,51 @@ _MESSAGE_PAGE_FETCH_BATCH = 500
 _VALUES_SNAPSHOT_MESSAGES = 50
 
 
+def _usage_metadata_of(msg: Msg) -> dict[str, int] | None:
+    """消息的 ``usage_metadata``（上下文窗口占用口径）。
+
+    值来自 ``msg.metadata["context_usage"]``——落库时由 main.py 的 storage
+    proxy 写入，等于该 reply **最后一次**模型调用的 prompt/output 长度，
+    即当时上下文窗口的真实占用。
+
+    **不回退**：没有该字段的消息（本改造之前落库的历史数据）返回
+    ``None``，该消息在 values 快照里不带 ``usage_metadata``。框架的
+    ``msg.usage`` 是累加口径（一个 reply 内多次调用之和，多轮工具循环后
+    偏大 N 倍），与"上下文窗口占用"不是同一个量，因此不参与取值。
+
+    Args:
+        msg (`Msg`): 原生消息。
+
+    Returns:
+        `dict[str, int] | None`:
+            ``{input_tokens, output_tokens, total_tokens}``；无可用值时
+            ``None``。
+    """
+    metadata = getattr(msg, "metadata", None)
+    context_usage = (
+        metadata.get("context_usage") if isinstance(metadata, dict) else None
+    )
+    if not isinstance(context_usage, dict):
+        return None
+    input_tokens = int(context_usage.get("input_tokens") or 0)
+    if input_tokens <= 0:
+        return None
+    output_tokens = int(context_usage.get("output_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
 def _msg_to_langgraph(msg: Msg) -> dict[str, Any]:
     """原生 Msg → LangGraph 消息（type/content 块数组，仅保留 text 块）。
 
     role 映射：user→human / assistant→ai / system→system；content 无文本
-    块时为空字符串（前端渲染兜底）。
+    块时为空字符串（前端渲染兜底）。带 token 用量时附
+    ``usage_metadata``（窗口占用口径，见 :func:`_usage_metadata_of`），
+    使刷新 / 回放后前端仍能展示用量——此前该字段只在 SSE 实时阶段由
+    formatter 下发，刷新即丢。
     """
     role_map = {"user": "human", "assistant": "ai", "system": "system"}
     blocks = [
@@ -71,12 +111,16 @@ def _msg_to_langgraph(msg: Msg) -> dict[str, Any]:
         for block in msg.content
         if getattr(block, "type", None) == "text"
     ]
-    return {
+    result: dict[str, Any] = {
         "type": role_map.get(msg.role, "human"),
         # id 供前端历史分页去重（messageIdentity 以 content.id 为身份键）
         "id": msg.id,
         "content": blocks if blocks else "",
     }
+    usage_metadata = _usage_metadata_of(msg)
+    if usage_metadata is not None:
+        result["usage_metadata"] = usage_metadata
+    return result
 
 
 async def _load_messages(storage: StorageBase, user_id: str,
@@ -145,9 +189,12 @@ async def build_thread_values(
         "title": _title_from_messages(langgraph_messages),
     }
     if usage:
+        # 当前 reply 在 values 快照生成时尚未落库（落库在 ChatService 的
+        # finally，晚于 REPLY_END 的发布），其消息上没有 context_usage，
+        # 用 SSE 阶段累积的 usage 补上；已带 usage_metadata 的消息不覆盖。
         for msg in reversed(data["messages"]):
             if msg.get("type") == "ai":
-                msg["usage_metadata"] = usage
+                msg.setdefault("usage_metadata", usage)
                 break
     return data
 

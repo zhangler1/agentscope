@@ -9,7 +9,9 @@
 - 压缩模型实例**不缓存、不共享**：每次压缩临时构建、用后 ``aclose()``，
   消除 ``_api_key_override`` 等实例属性跨会话竞争；
 - ``context_size = min(会话模型.context_size, 压缩模型真实窗口)``：压缩调用必然
-  装进压缩模型窗口，且大上下文会话的触发阈值不被压缩模型窗口拉低。
+  装进压缩模型窗口，且大上下文会话的触发阈值不被压缩模型窗口拉低；
+- 两个函数都是 ``async``：压缩模型的真实窗口由 ``resolve_model_meta`` **直读
+  DB**（异常回退快照），不再吃进程内快照。
 """
 from __future__ import annotations
 
@@ -17,15 +19,25 @@ from typing import Any
 
 from agentscope.credential import CredentialFactory
 
-from bocomadp.providers.ellm_chat_model import EllmChatModel, _get_model_context_size
+from bocomadp.providers.ellm_chat_model import (
+    EllmChatModel,
+    _FALLBACK_CONTEXT_SIZE,
+)
+from bocomadp.routers.model_registry import resolve_model_meta
 
 
-def effective_context_size(session_context_size: int, model_name: str) -> int:
-    """压缩模型实例的 context_size：min(会话模型, 压缩模型真实窗口)。"""
-    return min(session_context_size, _get_model_context_size(model_name))
+async def effective_context_size(session_context_size: int, model_name: str) -> int:
+    """压缩模型实例的 context_size：min(会话模型, 压缩模型真实窗口)。
+
+    压缩模型的真实窗口直读 DB（``resolve_model_meta``）；库中无该模型时沿用既有
+    ``_FALLBACK_CONTEXT_SIZE``（65536）语义。
+    """
+    meta = await resolve_model_meta(model_name)
+    model_size = int(meta["context_size"]) if meta else _FALLBACK_CONTEXT_SIZE
+    return min(session_context_size, model_size)
 
 
-def build_summarization_model(
+async def build_summarization_model(
     credential_data: dict[str, Any],
     model_name: str,
     session_context_size: int,
@@ -46,7 +58,10 @@ def build_summarization_model(
     return model_cls(
         credential=credential,
         model=model_name,
-        context_size=effective_context_size(session_context_size, model_name),
+        context_size=await effective_context_size(
+            session_context_size,
+            model_name,
+        ),
     )
 
 

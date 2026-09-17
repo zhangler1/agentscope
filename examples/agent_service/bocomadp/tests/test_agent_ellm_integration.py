@@ -12,8 +12,9 @@ the model through the real :class:`Agent` reasoning loop
    >= 20 min ago) triggers ``fetch_ellm_key``; the fresh key is written back
    via ``StorageBase.upsert_credential``; the OpenAI ``create`` call receives
    ``extra_headers: {"Authorization": "Bearer new-key"}``; and the ``<think>``
-   tag lands in front of the first streamed text block because the credential's
-   ``inject_think_tag`` switch is (re)read at call time.
+   tag lands in front of the first streamed text block because the
+   ``inject_think_tag`` switch is (re)read at call time from the model
+   registry (``resolve_model_meta``, DB-direct with snapshot fallback).
 2. **Fresh → reuse stored key** — an unexpired credential is used as-is:
    ``fetch_ellm_key`` is never called, nothing is written back, and the gateway
    sees ``Authorization: Bearer stored-key``.
@@ -255,8 +256,8 @@ class TestAgentExpiredRefresh:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key", 1_500_000),
         ) as fetch, mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=True),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": True}),
         ):
             final_msg = asyncio.run(
                 agent.reply(UserMsg(name="user", content="Hello")),
@@ -311,8 +312,8 @@ class TestAgentExpiredRefresh:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key", 1_500_000),
         ), mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=True),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": True}),
         ):
             responses = asyncio.run(_call())
 
@@ -357,8 +358,8 @@ class TestAgentFreshKeyReuse:
             "bocomadp.providers.ellm_key.fetch_ellm_key",
             return_value=("new-key", 1_500_000),
         ) as fetch, mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=True),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": True}),
         ):
             asyncio.run(agent.reply(UserMsg(name="user", content="Hello")))
 
@@ -396,8 +397,8 @@ class TestAgentThinkTagDisabled:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
         ) as fetch, mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=False),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": False}),
         ):
             final_msg = asyncio.run(
                 agent.reply(UserMsg(name="user", content="Hello")),
@@ -427,8 +428,8 @@ class TestAgentThinkTagDisabled:
         with mock.patch(
             "bocomadp.providers.ellm_key.fetch_ellm_key",
         ), mock.patch(
-            "bocomadp.middleware.ellm_refresh._get_think_tag",
-            new=mock.Mock(return_value=False),
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": False}),
         ):
             final_msg = asyncio.run(
                 agent.reply(UserMsg(name="user", content="Hello")),

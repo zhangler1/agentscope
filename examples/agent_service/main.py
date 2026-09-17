@@ -72,6 +72,7 @@ from agentscope.middleware import TracingMiddleware
 from bocomadp.middleware.custom.event_log import EventLogMiddleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
+from bocomadp.middleware.tool_call_repair import ToolCallRepairMiddleware
 from bocomadp.middleware.request_log import AccessLogMiddleware
 from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
@@ -419,8 +420,10 @@ async def build_agent_middlewares(
     user_id: str,
     agent_id: str,
     session_id: str,
-):
-    middlewares = middleware_registry.list_middlewares()
+) -> list[Any]:
+    # 显式标注 list[Any]：中间件列表是异构的（registry 扫描 + 企业主动 build），
+    # 下面的重排若让推导收窄成某个具体中间件类型，会污染下游 append/extend。
+    middlewares: list[Any] = middleware_registry.list_middlewares()
     middlewares.extend(
         await build_enterprise_middlewares(
             user_id,
@@ -445,6 +448,15 @@ async def build_agent_middlewares(
             if not isinstance(m, (EventLogMiddleware, TracingMiddleware))
         ]
         middlewares.extend(inner)
+    # 体检/自愈（ToolCallRepairMiddleware）必须排在洋葱链**最外层**：
+    # 它先保证 messages 里历史 tool_call 参数合法（修复/剔除），下游
+    # （含最内层的 event_log / Langfuse）记录的才是真正发出去的内容。
+    # 用稳定排序原地重排（而非重建列表），避免收窄 middlewares 的推导类型。
+    middlewares.sort(
+        key=lambda m: (
+            0 if isinstance(m, ToolCallRepairMiddleware) else 1
+        ),
+    )
     return middlewares
 
 
@@ -585,6 +597,38 @@ class _BuiltinAgentStorageProxy:
                     exc_info=True,
                 )
         return ok
+
+    async def upsert_message(
+        self,
+        user_id: str,
+        session_id: str,
+        msg: Any,
+    ) -> None:
+        """消息落库前写入"上下文窗口占用"（``metadata.context_usage``）。
+
+        框架 ``Msg.append_event`` 把**一个 reply 内所有** ``MODEL_CALL_END``
+        的 usage 累加进 ``msg.usage``（官方设计：本轮总消耗），因此多轮
+        ReAct（工具调用循环）后 ``usage.input_tokens`` 已是 N 次请求之和，
+        不再等于上下文窗口大小。真正的窗口值由
+        :class:`~bocomadp.middleware.custom.context_usage.
+        ContextUsageMiddleware` 按 ``reply_id`` 逐次覆盖记录，此处用
+        ``msg.id``（== reply_id）取走并写进 metadata：
+
+        - ``context_usage.input_tokens`` —— 最后一次模型调用的 prompt
+          长度，即**当时上下文窗口的占用**；
+        - ``context_usage.output_tokens`` —— 最后一次调用的输出长度；
+        - ``context_usage.calls`` —— 该 reply 内的模型调用轮数（便于
+          分辨单轮回复与工具循环）。
+
+        ``msg.usage`` 原样保留（累加口径），两者并存互不影响。取不到记录
+        时（用户消息、失败上报消息，或中间件未覆盖的调用）原样透传。
+        """
+        from bocomadp.middleware.custom.context_usage import (
+            attach_context_usage,
+        )
+
+        attach_context_usage(msg)
+        await self._inner.upsert_message(user_id, session_id, msg)
 
     async def __aenter__(self) -> "_BuiltinAgentStorageProxy":
         await self._inner.__aenter__()

@@ -242,6 +242,52 @@ def list_model_metas() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# 运行时读取（async，热路径专用；与上方同步快照读取并列）
+# ---------------------------------------------------------------------------
+# 契约：本分节只提供 **async** API。同步消费者不得调用 `resolve_model_meta`，
+# 也不得为它包 ``asyncio.run()`` 桥——那会在运行中的事件循环里抛
+# ``RuntimeError: asyncio.run() cannot be called from a running event loop``；
+# 同步侧继续用上方的 ``get_model_meta``（读快照）。
+# 设计依据：docs/superpowers/specs/2026-09-17-model-registry-hotpath-realtime-design.md
+
+
+async def resolve_model_meta(model_name: str) -> dict[str, Any] | None:
+    """直读 DB 取模型元信息；异常时回退快照（本进程已知的最新值）。
+
+    与同步的 :func:`get_model_meta` 的区别：本函数每次都查库（行为参数不允许
+    陈旧），并在成功时把该行**写穿**回 ``_snapshot``，使快照始终等于"最近一次
+    成功直读的结果"——因此快照同时充当展示层与故障回退的单一数据源，无需第二份
+    状态。
+
+    Args:
+        model_name (`str`): 模型名（``model_registry.model_name``）。
+
+    Returns:
+        `dict[str, Any] | None`:
+            模型行；库中确无此模型、且快照也没有时为 ``None``（由调用方各自套用
+            安全默认）。
+    """
+    try:
+        row = await _fetch_one(model_name)
+    except Exception as e:  # noqa: BLE001 —— DB 瞬时故障：回退，不中断会话
+        logger.warning(
+            "model_registry: fetch %r failed, falling back to snapshot (%s)",
+            model_name,
+            e,
+        )
+        return get_model_meta(model_name)
+
+    if row is None:
+        # 库里确实没有这个模型（配置缺失，不是故障）：不动快照，交调用方兜底。
+        return None
+
+    # 写穿：让快照（展示层 + 故障回退）与本次直读结果保持一致。
+    # 同一事件循环内、await 返回后同步执行，无需加锁。
+    _snapshot[model_name] = row
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
 
@@ -682,4 +728,5 @@ __all__ = [
     "load_snapshot",
     "get_model_meta",
     "list_model_metas",
+    "resolve_model_meta",
 ]

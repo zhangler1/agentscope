@@ -15,7 +15,7 @@
 | ``ToolCallStart/Delta/End``   | ``messages`` + ``updates`` | 流式 ``AIMessageChunk`` 增量帧（``tool_call_chunks`` 首片带 name/id/index、delta 片只带 args，官方前端 SDK 按同 id concat 出 tool_calls）+ end 时 ``{"model": {"messages": [...]}}`` 完整 ai 消息快照（updates 帧，jx_chat 前端消费） |
 | ``ToolResultStart/Text/End``  | ``messages``           | ``[{"type": "tool", "content", "name", "tool_call_id", "id", "status", "artifact"}, metadata]`` |
 | ``RequireUserConfirmEvent``   | ``messages`` + ``custom`` | tool 消息帧（``artifact.human_input`` 确认卡片，前端 HumanInputCard 渲染）+ 原 ``on_require_confirm`` |
-| ``ModelCallEndEvent``         | （内部消化）             | 累积 input/output tokens，不产帧；随 reply_end 以 usage_metadata 下发 |
+| ``ModelCallEndEvent``         | （内部消化）             | input/output 均取最后一次调用（= 上下文窗口占用），不产帧；随 reply_end 以 usage_metadata 下发 |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
 | ``ReplyEndEvent(normal)``     | ``messages`` + ``end`` | 末尾 usage 增量帧（``usage_metadata``）+ 哨兵（data=None）  |
 | ``ReplyEndEvent(error)``      | ``error`` + ``end``    | ``{"message", "name"}`` 后接哨兵           |
@@ -164,8 +164,10 @@ class DeerflowSSEFormatter:
         self._tool_call_index: dict[str, int] = {}
         # tool_call_id -> 累积 result 文本（tool_result_text_delta 拼接）
         self._tool_result_text: dict[str, str] = {}
-        # 本 run 累积 token 用量（MODEL_CALL_END 累加，reply 级聚合；
-        # reply 内多轮模型调用合并计数，对齐原生单回复单 AI 消息语义）
+        # 本 run 的 token 用量：input/output 都取**最后一次**模型调用，
+        # 共同描述这条消息落定时上下文窗口的占用。口径与落库消息的
+        # ``metadata.context_usage`` 保持一致，详见
+        # :meth:`_on_model_call_end`。
         self._usage: dict[str, int] | None = None
 
     # ------------------------------------------------------------------
@@ -476,12 +478,20 @@ class DeerflowSSEFormatter:
     # ── HITL / 自定义 / 兜底 ───────────────────────────────────────────
 
     def _on_model_call_end(self, event: dict) -> list[StreamEvent]:
-        """ModelCallEndEvent → 累积 token 用量（内部消化，不产帧）。
+        """ModelCallEndEvent → 记录 token 用量（内部消化，不产帧）。
 
         原生 deer-flow 的 token 经 ``usage_metadata``（values 快照 / 末尾
         messages 增量）下发，没有独立的 custom 通道；此前本事件落入
         passthrough 以 ``model_call_end`` custom 帧泄漏，前端不认识。
-        改为内部累积，由 :meth:`_on_reply_end` 统一补发。
+        改为内部记录，由 :meth:`_on_reply_end` 统一补发。
+
+        口径：``input_tokens`` 与 ``output_tokens`` 都取**最后一次**调用的
+        值（latest-wins），共同描述"这条消息落定时上下文窗口的占用"——
+        ``input_tokens`` 是模型实际看到的 prompt 长度，``output_tokens``
+        是本次回复本身占用的长度。二者若累加，一次工具循环后会变成 N 轮
+        之和（实测 input 最高放大 13.8 倍），不再是窗口大小。该口径与
+        storage proxy 写入消息 metadata 的 ``context_usage`` 一致，保证
+        流式与刷新后展示同一组数字。
         """
         input_tokens = int(event.get("input_tokens") or 0)
         output_tokens = int(event.get("output_tokens") or 0)
@@ -491,9 +501,14 @@ class DeerflowSSEFormatter:
                 "output_tokens": 0,
                 "total_tokens": 0,
             }
-        self._usage["input_tokens"] += input_tokens
-        self._usage["output_tokens"] += output_tokens
-        self._usage["total_tokens"] += input_tokens + output_tokens
+        # 网关未下发 usage 时事件值为 0，保留上一个有效值，避免刷成 0。
+        if input_tokens > 0:
+            self._usage["input_tokens"] = input_tokens
+        if output_tokens > 0:
+            self._usage["output_tokens"] = output_tokens
+        self._usage["total_tokens"] = (
+            self._usage["input_tokens"] + self._usage["output_tokens"]
+        )
         return []
 
     @property
