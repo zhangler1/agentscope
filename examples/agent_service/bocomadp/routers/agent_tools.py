@@ -421,6 +421,20 @@ def _resolve_configurable_name(
     return None
 
 
+def _is_agent_specific_tool(resolved_name: str) -> bool:
+    """Check whether *resolved_name* is an agent-specific enterprise tool.
+
+    Agent-specific tools (contact_search, physical_contact_search, etc.)
+    are controlled by ``usableTools`` at request level — they cannot be
+    enabled via the per-agent whitelist API.
+    """
+    from ..tools.enterprise import _NAME_TO_CANONICAL, _AGENT_SPECIFIC_CANONICAL
+    canonical = _NAME_TO_CANONICAL.get(resolved_name)
+    if canonical and canonical in _AGENT_SPECIFIC_CANONICAL:
+        return True
+    return False
+
+
 @agent_tools_router.put(
     "/{agent_id}/tools",
     summary="Add a tool or MCP to the agent",
@@ -448,6 +462,12 @@ async def enable_agent_tool(
         raise HTTPException(
             status_code=404,
             detail=f"Tool '{tool_name}' not found or not configurable",
+        )
+
+    if _is_agent_specific_tool(resolved):
+        raise HTTPException(
+            status_code=403,
+            detail="此智能体无使用权限",
         )
 
     current = _get_enabled_tools(agent_id)
