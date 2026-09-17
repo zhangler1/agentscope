@@ -199,11 +199,12 @@ async def get_session_usage(
             detail=f"Session '{session_id}' not found",
         )
 
-    total_input = 0
-    total_output = 0
-    message_count = 0
+    # 从最新一条消息往前回溯，取最近一次模型调用的 usage。页内按时间正序
+    # 返回，因此倒序扫描；命中即停，找不到才继续翻更早的页。
+    input_tokens = 0
+    output_tokens = 0
     before: str | None = None
-    batch_limit = 200
+    batch_limit = 20
 
     while True:
         messages, has_more = await storage.list_messages(
@@ -212,14 +213,20 @@ async def get_session_usage(
             limit=batch_limit,
             before=before,
         )
-        for msg in messages:
-            message_count += 1
-            u = getattr(msg, "usage", None)
-            if u is not None:
-                total_input += getattr(u, "input_tokens", 0) or 0
-                total_output += getattr(u, "output_tokens", 0) or 0
+        if not messages:
+            break
 
-        if not has_more or not messages:
+        for msg in reversed(messages):
+            u = getattr(msg, "usage", None)
+            if u is None:
+                continue
+            u_input = getattr(u, "input_tokens", 0) or 0
+            if u_input > 0:
+                input_tokens = u_input
+                output_tokens = getattr(u, "output_tokens", 0) or 0
+                break
+
+        if input_tokens > 0 or not has_more:
             break
         # Move cursor to continue pagination
         before = messages[0].id
@@ -227,10 +234,10 @@ async def get_session_usage(
     return {
         "session_id": session_id,
         "agent_id": agent_id,
-        "input_tokens": total_input,
-        "output_tokens": total_output,
-        "total_tokens": total_input + total_output,
-        "message_count": message_count,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "message_count": 0,
     }
 
 
