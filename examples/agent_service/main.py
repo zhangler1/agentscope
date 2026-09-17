@@ -976,11 +976,17 @@ async def _lifespan_with_builtin_agents(app):
 
         await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
-        # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
-        # 设置项目工具名集合（始终允许，不受白名单过滤）。
-        from bocomadp.toolkit_whitelist import set_project_tool_names
+        # 在首次 chat run 前包一层，按每智能体白名单过滤企业工具/MCP。
+        # 设置需授权的工具名集合（企业工具 + MCP），其余全部放行。
+        from bocomadp.toolkit_whitelist import set_restricted_tool_names
+        from bocomadp.tools.enterprise_catalog import enterprise_tool_names
 
-        set_project_tool_names(set(tool_registry.list_tool_names()))
+        restricted: set[str] = set(enterprise_tool_names())
+        for mcp in mcp_registry.list_mcps():
+            name = getattr(mcp, "name", "") or ""
+            if name:
+                restricted.add(name)
+        set_restricted_tool_names(restricted)
         patch_get_toolkit()
         # 请求级模型参数（thinking_enabled/reasoning_effort）：包装框架
         # get_model，run_context 携带时合并进模型 Parameters。

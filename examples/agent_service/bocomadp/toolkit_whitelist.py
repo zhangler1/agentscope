@@ -11,17 +11,23 @@ caller-supplied ``extra_factory``:
 - team tools (TeamCreate / AgentCreate / TeamSay / TeamDelete /
   AgentInvite)
 - middleware-provided tools
+- project tools (from ToolRegistry)
+- enterprise tools (from build_enterprise_tools)
 
 The per-agent whitelist maintained by ``agent_tools_router``
 (PUT/DELETE ``/agents/{id}/tools/{name}``) stores **only** enterprise
-tools and MCP names. Default tools (builtins / framework / project)
-are always allowed. Enterprise tools and MCPs must be explicitly added
-to the whitelist to be available at runtime.
+tools and MCP names. All other tools (builtins / framework / project /
+middleware) are always allowed.
 
-Filter logic:
+Filter logic (reverse approach — only restrict what is explicitly
+configurable):
 
-- whitelist empty → only default tools survive (enterprise/MCP stripped)
-- whitelist non-empty → default tools + whitelisted enterprise/MCP survive
+- A tool whose name is **not** in the restricted set → always allowed
+- A tool whose name **is** in the restricted set → only allowed if in
+  the agent's whitelist
+
+The restricted set = enterprise tool names + MCP names, populated once
+at startup via :func:`set_restricted_tool_names`.
 """
 
 from __future__ import annotations
@@ -33,35 +39,29 @@ logger = logging.getLogger("bocomadp.toolkit_whitelist")
 
 _original_get_toolkit: Any = None
 
-_project_tool_names: set[str] = set()
+_restricted_tool_names: set[str] = set()
 
 
-def set_project_tool_names(names: set[str]) -> None:
-    """Set the project tool names (called once at startup from main.py)."""
-    global _project_tool_names
-    _project_tool_names = names
+def set_restricted_tool_names(names: set[str]) -> None:
+    """Set the restricted tool names (enterprise + MCP) that require whitelist.
+
+    Called once at startup from main.py. Only these names need whitelist
+    authorization; everything else is always allowed.
+    """
+    global _restricted_tool_names
+    _restricted_tool_names = names
 
 
-_DEFAULT_TOOL_NAMES: set[str] = {
-    "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-    "TeamCreate", "AgentCreate", "TeamSay", "TeamDelete", "AgentInvite",
-    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
-    "ToolStop",
-    "ScheduleCreate", "ScheduleDelete", "ScheduleList", "ScheduleUpdate",
-}
+def _keep_tool(tool: Any, whitelist: set[str]) -> bool:
+    """Return whether *tool* should survive the filter.
 
-
-def _always_allowed_names() -> set[str]:
-    """Default tools + project tools — always allowed, never filtered."""
-    return _DEFAULT_TOOL_NAMES | _project_tool_names
-
-
-def _keep_default_or_whitelisted(tool: Any, always: set[str], allowed: set[str]) -> bool:
-    """Return whether *tool* is always-allowed or in the whitelist."""
+    - Name not in restricted set → always allowed
+    - Name in restricted set → allowed only if in *whitelist*
+    """
     name = getattr(tool, "name", "")
-    if name in always:
+    if name not in _restricted_tool_names:
         return True
-    return name in allowed
+    return name in whitelist
 
 
 async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
@@ -73,13 +73,11 @@ async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
 
     from bocomadp.routers.agent_tools import _tool_whitelists
 
-    whitelist = _tool_whitelists.get(agent_id, [])
-    allowed = set(whitelist)
-    always = _always_allowed_names()
+    whitelist = set(_tool_whitelists.get(agent_id, []))
 
     groups = getattr(toolkit, "tool_groups", None) or []
     for group in groups:
-        group.tools = [t for t in group.tools if _keep_default_or_whitelisted(t, always, allowed)]
+        group.tools = [t for t in group.tools if _keep_tool(t, whitelist)]
     toolkit.tool_groups = [
         g
         for g in groups
@@ -108,4 +106,4 @@ def patch_get_toolkit() -> None:
     )
 
 
-__all__ = ["patch_get_toolkit", "set_project_tool_names"]
+__all__ = ["patch_get_toolkit", "set_restricted_tool_names"]
