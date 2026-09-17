@@ -3,31 +3,39 @@
 
 Endpoints
 ---------
-``GET    /agents/{agent_id}/tools``           — list tools with status
-``PUT    /agents/{agent_id}/tools/{name}``    — enable a tool
-``DELETE /agents/{agent_id}/tools/{name}``    — disable a tool
+``GET    /tools``                              — list all tools (global)
+``GET    /mcps``                               — list all MCP servers (global)
+``GET    /search``                             — search tools or MCPs by name
+``GET    /agents/{agent_id}/tools``           — list agent's tools with status
+``PUT    /agents/{agent_id}/tools?tool_name=...``   — add a tool/MCP to agent
+``DELETE /agents/{agent_id}/tools?tool_name=...``   — remove a tool/MCP from agent
 
-Tool sources — the configurable set ``M``, single-sourced from
-:mod:`bocomadp.tool_catalog`:
+Tool categories
+---------------
+**Default tools** (always available, not shown, not configurable):
 
-1. **Workspace builtins** — ``Bash/Read/Write/Edit/Glob/Grep``
-   (runtime names, capitalized; see ``agentscope.tool._builtin``).
-2. **Project tools** — from ``ToolRegistry`` (builtin_tools.py + custom/).
-3. **MCP servers** — names from ``McpRegistry``.
-4. **Framework team/planning tools** — ``Team*`` / ``Task*``.
-5. **Enterprise tools** — built by ``build_enterprise_tools``
-   (online search and the placeholder tools are excluded).
+- Builtins: ``Bash/Read/Write/Edit/Glob/Grep``
+- Framework: ``Team*/Task*``
+- Project: from ``ToolRegistry`` (builtin_tools.py + custom/)
 
-Semantics
----------
-``enabled_tools == []`` means **every tool in M is enabled**.
-The first *disable* operation expands ``[]`` to the full M list minus
-the disabled tool.  Subsequent toggles are plain list add / remove.
+**Configurable tools** (must be explicitly added to use & show):
 
-Every tool in M is toggleable — including the workspace builtins.
-The built-in agent-creator additionally *displays* its own factory
-tools on ``GET``; those are display-only (``toggleable=False``) and
-are intentionally not configurable.
+- Enterprise tools — built by ``build_enterprise_tools``
+- MCP servers — from ``McpRegistry``
+
+Whitelist semantics
+-------------------
+The whitelist stores enterprise tools and MCP names.
+- ``whitelist == []`` → only default tools available (enterprise/MCP disabled)
+- ``whitelist == ["通讯录查询", "browser-use"]`` → default + listed tools/MCPs available
+
+At runtime (``build_agent_tools`` / ``toolkit_whitelist``), enterprise tools
+can also be enabled via ``usableTools`` (request-level override), which
+bypasses the whitelist. This is for agents that cannot call the PUT API
+themselves (the caller injects usableTools on their behalf).
+
+Users browse candidates via ``GET /tools`` & ``GET /mcps``, then add/remove
+via ``PUT/DELETE /agents/{id}/tools/{name}``.
 """
 
 from __future__ import annotations
@@ -55,6 +63,10 @@ agent_tools_router = APIRouter(
     tags=["agent-tools"],
 )
 
+catalog_router = APIRouter(
+    tags=["tool-catalog"],
+)
+
 # ------------------------------------------------------------------
 # workspace builtins — 名称/描述统一取自 bocomadp.tool_catalog
 # ------------------------------------------------------------------
@@ -63,8 +75,7 @@ agent_tools_router = APIRouter(
 _BUILTIN_TOOLS: list[dict] = [dict(m) for m in BUILTIN_TOOLS_META]
 
 #: 团队/规划工具的静态元数据（name + 简短 description）。
-#: 单一数据源：``_all_tool_names()`` 据此推导可管理的工具名集合，
-#: ``GET /agents/{id}/tools`` 据此输出带 description 的展示条目。
+#: 默认工具（始终可用，不显示，不可配置）。
 _FRAMEWORK_TOOLS_META: list[dict] = [dict(m) for m in FRAMEWORK_TOOLS_META]
 
 #: 智能体工厂自带的工厂工具（仅供 ``_agent-creator`` 的 GET 展示，不可配置）。
@@ -79,6 +90,11 @@ _FACTORY_TOOL_ATTRS: tuple[str, ...] = (
     "set_agent_tools",
     "list_available_skills",
     "enable_skill_for_agent",
+)
+
+_HIDDEN_PROJECT_TOOLS: frozenset[str] = frozenset(
+    {"回显", "获取当前时间", "列出上传文件", "读取上传文件",
+     "echo", "get_current_time", "list_uploaded_files", "read_uploaded_file"},
 )
 
 # ------------------------------------------------------------------
@@ -203,7 +219,12 @@ async def _resolve_framework_agent(
 
 
 def _get_enabled_tools(agent_id: str) -> list[str]:
-    """Return the current enabled-tools list for *agent_id*."""
+    """Return the current enabled-tools whitelist for *agent_id*.
+
+    The whitelist contains **only** enterprise tool and MCP names.
+    Default tools (builtins / framework / project) are always available
+    and never appear in the whitelist.
+    """
     return list(_tool_whitelists.get(agent_id, []))
 
 
@@ -213,31 +234,19 @@ def _set_enabled_tools(agent_id: str, tools: list[str]) -> None:
     _persist_whitelists()
 
 
-def _resolve_enabled(all_tool_names: list[str], whitelist: list[str]) -> set[str]:
-    """Return the *set* of enabled tool names.
+def _configurable_tool_names(request: Request) -> set[str]:
+    """Enterprise tools + MCP names — the set that can be added/removed.
 
-    When *whitelist* is empty every tool is enabled; otherwise only
-    names in *whitelist* are active.
+    Default tools (builtins / framework / project) are always present
+    at runtime and are **not** part of this set.
     """
-    if not whitelist:
-        return set(all_tool_names)
-    return {n for n in whitelist if n in all_tool_names}
-
-
-def _all_tool_names(request: Request) -> set[str]:
-    """Every known tool name across all sources (the configurable set M)."""
-    names: set[str] = {bt["name"] for bt in _BUILTIN_TOOLS}
-    names.update(_tool_registry(request).list_tool_names())
+    names: set[str] = set()
     mcp_reg = _mcp_registry(request)
     if mcp_reg is not None:
         for mcp in mcp_reg.list_mcps():
             name = getattr(mcp, "name", "") or ""
             if name:
                 names.add(name)
-    # 团队/规划工具由框架 get_toolkit 挂载，纳入白名单接口管理。
-    names.update(m["name"] for m in _FRAMEWORK_TOOLS_META)
-    # 企业工具由 build_enterprise_tools 主动构建，纳入白名单接口管理。
-    # 名字取自工具实例，自动跟随 BOCOMADP_TOOL_ASCII_NAMES 切换中/英文。
     names.update(m["name"] for m in _enterprise_tools_meta())
     return names
 
@@ -297,20 +306,21 @@ async def list_agent_tools(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Return every tool in M, annotated with its enabled state.
+    """Return the agent's tools: default (always on) + authorized (whitelist).
 
-    All configurable tools (builtins + project + framework + enterprise)
-    are returned in a flat ``tools`` list; MCP servers are in a separate
-    ``mcps`` list.  For the built-in agent-creator, its own factory tools
-    are appended as display-only entries (``toggleable=False``).
+    - Project tools: always shown, ``toggleable=False``
+    - Enterprise tools / MCPs: only shown when in the whitelist,
+      ``toggleable=True``
+
+    Builtins and framework tools are never shown.
 
     Response::
 
         {
           "agent_id": "...",
           "tools": [
-            {"name": "Bash", "description": "...", "enabled": true, "toggleable": true},
-            {"name": "echo", "description": "...", "enabled": false, "toggleable": true}
+            {"name": "echo", "description": "...", "enabled": true, "toggleable": false},
+            {"name": "通讯录查询", "description": "...", "enabled": true, "toggleable": true}
           ],
           "mcps": [
             {"name": "browser-use", "description": "...", "enabled": true, "toggleable": true}
@@ -321,69 +331,44 @@ async def list_agent_tools(
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    all_names = sorted(_all_tool_names(request))
-    enabled_tools = _get_enabled_tools(agent_id)
-    enabled_names = _resolve_enabled(all_names, enabled_tools)
+    whitelist = set(_get_enabled_tools(agent_id))
 
     tools: list[dict] = []
     mcps: list[dict] = []
 
-    # 1. Workspace builtins + project tools → merged into `tools`
-    for bt in _BUILTIN_TOOLS:
-        tools.append({**bt, "enabled": bt["name"] in enabled_names, "toggleable": True})
-
+    # 1. 项目工具（始终可用，不可配置）
     for tool in _tool_registry(request).list_tools():
         name = _tool_name(tool)
         tools.append(
             {
                 "name": name,
                 "description": getattr(tool, "description", "") or "",
-                "enabled": name in enabled_names,
-                "toggleable": True,
+                "enabled": True,
+                "toggleable": False,
             },
         )
 
-    # 1b. 团队/规划工具（框架 get_toolkit 挂载）→ 追加进 `tools`，带简短 description
-    for meta in _FRAMEWORK_TOOLS_META:
-        name = meta["name"]
-        tools.append(
-            {
-                "name": name,
-                "description": meta.get("description", ""),
-                "enabled": name in enabled_names,
-                "toggleable": True,
-            },
-        )
-
-    # 1c. 企业工具（build_enterprise_tools 主动构建）→ 纳入可配置集合
+    # 2. 企业工具（仅在白名单中才显示）
     for meta in _enterprise_tools_meta():
         name = meta["name"]
+        if name not in whitelist:
+            continue
         tools.append(
             {
                 "name": name,
                 "description": meta.get("description", ""),
-                "enabled": name in enabled_names,
+                "enabled": True,
                 "toggleable": True,
             },
         )
 
-    # 1d. 智能体工厂自带的工厂工具 → 仅展示，不可配置
-    if agent_id == AGENT_CREATOR_ID:
-        for meta in _factory_tools_meta():
-            tools.append(
-                {
-                    "name": meta["name"],
-                    "description": meta.get("description", ""),
-                    "enabled": True,
-                    "toggleable": False,
-                },
-            )
-
-    # 2. MCP servers → separate `mcps` list
+    # 3. MCP servers（仅在白名单中才显示）
     mcp_reg = _mcp_registry(request)
     if mcp_reg is not None:
         for mcp in mcp_reg.list_mcps():
             mcp_name = getattr(mcp, "name", "") or ""
+            if mcp_name not in whitelist:
+                continue
             mcps.append(
                 {
                     "name": mcp_name,
@@ -396,7 +381,7 @@ async def list_agent_tools(
                         )
                         or ""
                     ),
-                    "enabled": mcp_name in enabled_names,
+                    "enabled": True,
                     "toggleable": True,
                 },
             )
@@ -413,9 +398,46 @@ async def list_agent_tools(
 # ------------------------------------------------------------------
 
 
+def _resolve_configurable_name(
+    raw_name: str,
+    configurable: set[str],
+) -> str | None:
+    """Resolve *raw_name* to a name in *configurable*.
+
+    Accepts both Chinese and English tool names (e.g. ``"利率查询"`` or
+    ``"interest_rate"``) and returns the actual runtime name present in
+    *configurable*.  Returns ``None`` if no match.
+    """
+    if raw_name in configurable:
+        return raw_name
+    from ..tools.enterprise import _NAME_TO_CANONICAL, _CANONICAL_TO_CN
+    from ..tools._naming import tool_name as _tool_name
+
+    canonical = _NAME_TO_CANONICAL.get(raw_name)
+    if canonical:
+        resolved = _tool_name(_CANONICAL_TO_CN[canonical], canonical)
+        if resolved in configurable:
+            return resolved
+    return None
+
+
+def _is_agent_specific_tool(resolved_name: str) -> bool:
+    """Check whether *resolved_name* is an agent-specific enterprise tool.
+
+    Agent-specific tools (contact_search, physical_contact_search, etc.)
+    are controlled by ``usableTools`` at request level — they cannot be
+    enabled via the per-agent whitelist API.
+    """
+    from ..tools.enterprise import _NAME_TO_CANONICAL, _AGENT_SPECIFIC_CANONICAL
+    canonical = _NAME_TO_CANONICAL.get(resolved_name)
+    if canonical and canonical in _AGENT_SPECIFIC_CANONICAL:
+        return True
+    return False
+
+
 @agent_tools_router.put(
-    "/{agent_id}/tools/{tool_name}",
-    summary="Enable a tool for the agent",
+    "/{agent_id}/tools",
+    summary="Add a tool or MCP to the agent",
 )
 async def enable_agent_tool(
     agent_id: str,
@@ -423,30 +445,40 @@ async def enable_agent_tool(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Add *tool_name* to the agent's enabled-tools whitelist."""
+    """Add *tool_name* (enterprise tool or MCP) to the agent's whitelist.
+
+    Only enterprise tools and MCP names are accepted — default tools
+    (builtins / framework / project) are always available and cannot be
+    toggled.  Both Chinese and English names are accepted (e.g.
+    ``"利率查询"`` and ``"interest_rate"``).
+    """
     agent = await _resolve_framework_agent(request, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    toggleable = _all_tool_names(request)
-    if tool_name not in toggleable:
-        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    configurable = _configurable_tool_names(request)
+    resolved = _resolve_configurable_name(tool_name, configurable)
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{tool_name}' not found or not configurable",
+        )
+
+    if _is_agent_specific_tool(resolved):
+        raise HTTPException(
+            status_code=403,
+            detail="此智能体无使用权限",
+        )
 
     current = _get_enabled_tools(agent_id)
 
-    # [] means all enabled → already enabled, nothing to do
-    if not current:
-        _set_enabled_tools(agent_id, current)  # keep []
-        logger.info("agent_tools: %s enable %s (already all-enabled)", agent_id, tool_name)
+    if resolved in current:
+        logger.info("agent_tools: %s add %s (already in whitelist)", agent_id, resolved)
         return {"ok": True}
 
-    if tool_name in current:
-        logger.info("agent_tools: %s enable %s (already enabled)", agent_id, tool_name)
-        return {"ok": True}
-
-    current.append(tool_name)
+    current.append(resolved)
     _set_enabled_tools(agent_id, current)
-    logger.info("agent_tools: %s enable %s → enabled_tools=%s", agent_id, tool_name, current)
+    logger.info("agent_tools: %s add %s → whitelist=%s", agent_id, resolved, current)
     return {"ok": True}
 
 
@@ -456,8 +488,8 @@ async def enable_agent_tool(
 
 
 @agent_tools_router.delete(
-    "/{agent_id}/tools/{tool_name}",
-    summary="Disable a tool for the agent",
+    "/{agent_id}/tools",
+    summary="Remove a tool or MCP from the agent",
 )
 async def disable_agent_tool(
     agent_id: str,
@@ -465,33 +497,206 @@ async def disable_agent_tool(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    """Remove *tool_name* from the agent's enabled-tools whitelist.
+    """Remove *tool_name* from the agent's whitelist.
 
-    When ``enabled_tools`` is empty (all-enabled), it is first expanded
-    to the full tool list so the disable can take effect.
+    The tool/MCP will no longer be available or shown for this agent.
+    Default tools (builtins / framework / project) cannot be removed.
+    Both Chinese and English names are accepted.
     """
     agent = await _resolve_framework_agent(request, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    toggleable = _all_tool_names(request)
-    if tool_name not in toggleable:
-        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    configurable = _configurable_tool_names(request)
+    resolved = _resolve_configurable_name(tool_name, configurable)
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{tool_name}' not found or not configurable",
+        )
 
     current = _get_enabled_tools(agent_id)
 
-    # [] → expand to full list first, then remove
-    if not current:
-        current = list(toggleable)
-
-    if tool_name not in current:
-        logger.info("agent_tools: %s disable %s (already disabled)", agent_id, tool_name)
+    if resolved not in current:
+        logger.info("agent_tools: %s remove %s (not in whitelist)", agent_id, resolved)
         return {"ok": True}
 
-    current.remove(tool_name)
+    current.remove(resolved)
     _set_enabled_tools(agent_id, current)
-    logger.info("agent_tools: %s disable %s → enabled_tools=%s", agent_id, tool_name, current)
+    logger.info("agent_tools: %s remove %s → whitelist=%s", agent_id, resolved, current)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# GET /tools  — list all tools (global, not per-agent)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/tools",
+    summary="List all available tools (global)",
+)
+async def list_all_tools(request: Request) -> dict:
+    """Return every tool across project + enterprise sources (excludes builtins).
+
+    Response::
+
+        {
+          "tools": [
+            {"name": "echo", "description": "..."},
+            {"name": "通讯录查询", "description": "..."}
+          ]
+        }
+    """
+    tools: list[dict] = []
+
+    for tool in _tool_registry(request).list_tools():
+        name = _tool_name(tool)
+        if name in _HIDDEN_PROJECT_TOOLS:
+            continue
+        tools.append(
+            {
+                "name": name,
+                "description": getattr(tool, "description", "") or "",
+            },
+        )
+
+    for meta in _enterprise_tools_meta():
+        tools.append(
+            {
+                "name": meta["name"],
+                "description": meta.get("description", ""),
+            },
+        )
+
+    return {"tools": tools}
+
+
+# ------------------------------------------------------------------
+# GET /mcps  — list all MCP servers (global, not per-agent)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/mcps",
+    summary="List all MCP servers (global)",
+)
+async def list_all_mcps(request: Request) -> dict:
+    """Return every registered MCP server.
+
+    Response::
+
+        {
+          "mcps": [
+            {"name": "browser-use", "description": "..."}
+          ]
+        }
+    """
+    mcps: list[dict] = []
+    mcp_reg = _mcp_registry(request)
+    if mcp_reg is not None:
+        for mcp in mcp_reg.list_mcps():
+            mcp_name = getattr(mcp, "name", "") or ""
+            mcps.append(
+                {
+                    "name": mcp_name,
+                    "description": (
+                        getattr(mcp, "description", None)
+                        or getattr(
+                            getattr(mcp, "mcp_config", None),
+                            "url",
+                            "",
+                        )
+                        or ""
+                    ),
+                },
+            )
+
+    return {"mcps": mcps}
+
+
+# ------------------------------------------------------------------
+# GET /search  — search tools or mcps by name (global)
+# ------------------------------------------------------------------
+
+
+@catalog_router.get(
+    "/search",
+    summary="Search tools or MCPs by name",
+)
+async def search_tools_or_mcps(
+    type: str,
+    name: str = "",
+    request: Request = Request,
+) -> dict:
+    """Search tools or MCP servers by name.
+
+    Args:
+        type: ``tools`` or ``mcps``.
+        name: Keyword to filter by name (case-insensitive, substring match).
+              Empty string returns all.
+
+    Response::
+
+        {"tools": [...]}   // when type=tools
+        {"mcps": [...]}    // when type=mcps
+    """
+    keyword = (name or "").lower()
+
+    if type == "tools":
+        items: list[dict] = []
+        for tool in _tool_registry(request).list_tools():
+            n = _tool_name(tool)
+            if n in _HIDDEN_PROJECT_TOOLS:
+                continue
+            if keyword and keyword not in n.lower():
+                continue
+            items.append(
+                {
+                    "name": n,
+                    "description": getattr(tool, "description", "") or "",
+                },
+            )
+        for meta in _enterprise_tools_meta():
+            n = meta["name"]
+            if keyword and keyword not in n.lower():
+                continue
+            items.append(
+                {
+                    "name": n,
+                    "description": meta.get("description", ""),
+                },
+            )
+        return {"tools": items}
+
+    if type == "mcps":
+        items: list[dict] = []
+        mcp_reg = _mcp_registry(request)
+        if mcp_reg is not None:
+            for mcp in mcp_reg.list_mcps():
+                mcp_name = getattr(mcp, "name", "") or ""
+                if keyword and keyword not in mcp_name.lower():
+                    continue
+                items.append(
+                    {
+                        "name": mcp_name,
+                        "description": (
+                            getattr(mcp, "description", None)
+                            or getattr(
+                                getattr(mcp, "mcp_config", None),
+                                "url",
+                                "",
+                            )
+                            or ""
+                        ),
+                    },
+                )
+        return {"mcps": items}
+
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid type: must be 'tools' or 'mcps'",
+    )
 
 
 # ------------------------------------------------------------------
@@ -512,9 +717,11 @@ def _tool_name(tool: object) -> str:
 
 __all__ = [
     "agent_tools_router",
+    "catalog_router",
     "_tool_whitelists",
     "_get_enabled_tools",
     "_set_enabled_tools",
+    "_configurable_tool_names",
     "load_tool_whitelists",
     "_FRAMEWORK_TOOLS_META",
 ]

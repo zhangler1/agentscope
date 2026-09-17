@@ -23,6 +23,8 @@ import logging
 import time
 from typing import Any
 
+from ._naming import tool_name
+
 logger = logging.getLogger(__name__)
 
 # 事件日志通道：``as`` logger 自带 events.log 滚动 handler 且经
@@ -60,6 +62,8 @@ def get_current_time() -> str:
 
     return datetime.now().isoformat()
 
+get_current_time._tool_display_name = tool_name("获取当前时间", "get_current_time")
+
 
 @tool
 def echo(text: str) -> str:
@@ -72,6 +76,8 @@ def echo(text: str) -> str:
         str: 原样返回的文本。
     """
     return text
+
+echo._tool_display_name = tool_name("回显", "echo")
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +133,8 @@ def list_uploaded_files(
             tag = f"已转文本({r.convert_format})" if r.converted else "仅原始文件"
         lines.append(f"- {r.original_name}  [{tag}]  virtual_path={r.virtual_path}")
     return "\n".join(lines)
+
+list_uploaded_files._tool_display_name = tool_name("列出上传文件", "list_uploaded_files")
 
 
 @tool
@@ -210,6 +218,8 @@ def read_uploaded_file(
     if len(text) > max_chars:
         return text[:max_chars] + f"\n…(已截断，共 {len(text)} 字符)"
     return text
+
+read_uploaded_file._tool_display_name = tool_name("读取上传文件", "read_uploaded_file")
 
 
 # ---------------------------------------------------------------------------
@@ -471,43 +481,41 @@ async def view_image_tool(
         prompt = _VISION_ANALYSIS_PROMPT.format(
             question=question or "请详细描述这张图片的内容",
         )
-        # try:
-        #     response = await vision_model.client.chat.completions.create(
-        #         model=vision_model.model,
-        #         messages=[
-        #             {
-        #                 "role": "user",
-        #                 "content": [
-        #                     {"type": "text", "text": prompt},
-        #                     {
-        #                         "type": "image_url",
-        #                         "image_url": {
-        #                             "url": f"data:{rec.mime_type};base64,{rec.base64}",
-        #                         },
-        #                     },
-        #                 ],
-        #             },
-        #         ],
-        #         stream=False,
-        #     )
-        # except Exception as exc:  # noqa: BLE001
-        #     logger.exception("view_image_tool: vision model call failed")
-        #     return f"多模态模型调用失败: {exc}"
+        try:
+            response = await vision_model.client.chat.completions.create(
+                model=vision_model.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{rec.mime_type};base64,{rec.base64}",
+                                },
+                            },
+                        ],
+                    },
+                ],
+                stream=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("view_image_tool: vision model call failed")
+            return f"多模态模型调用失败: {exc}"
     
-        # try:
-        #     text = response.choices[0].message.content or ""
-        # except Exception:  # noqa: BLE001
-        #     text = ""
-        # if not text.strip():
-        #     return f"多模态模型未返回有效内容（{filename}）。"
-        # logger.info(
-        #     "view_image_tool: analyzed %s (%s), result length=%d",
-        #     virtual_path,
-        #     rec.mime_type,
-        #     len(text),
-        # )
-        # return f"图片分析结果 ({filename}):\n\n{text}"
-        text = "这是一家交通银行logo"
+        try:
+            text = response.choices[0].message.content or ""
+        except Exception:  # noqa: BLE001
+            text = ""
+        if not text.strip():
+            return f"多模态模型未返回有效内容（{filename}）。"
+        logger.info(
+            "view_image_tool: analyzed %s (%s), result length=%d",
+            virtual_path,
+            rec.mime_type,
+            len(text),
+        )
         _events_logger.info(
             "VIEW_IMAGE_OUTPUT %s filename=%s mime_type=%s cost_ms=%d "
             "result_len=%d",
@@ -523,3 +531,5 @@ async def view_image_tool(
         close = getattr(vision_model, "aclose", None)
         if close is not None:
             await close()
+
+view_image_tool._tool_display_name = tool_name("图片解析", "view_image_tool")

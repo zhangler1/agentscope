@@ -107,7 +107,9 @@ def _auth_from_dict(data: dict[str, Any]) -> "ResolvedAuth":
         jrt_auth_code=str(data.get("jrt_auth_code") or ""),
         okic_token=str(data.get("okic_token") or ""),
         okic_type=str(data.get("okic_type") or ""),
+        guip_token=str(data.get("guip_token") or ""),
         muwp_user=data.get("muwp_user") or {},
+        guip_user=data.get("guip_user") or {},
     )
 
 

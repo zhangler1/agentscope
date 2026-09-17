@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 #: install; these bound the sandbox's disk and the time a slot is held.
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_BYTES = 500 * 1024 * 1024
-MAX_FILE_COUNT = 100
+MAX_FILE_COUNT = 200
 MAX_CONCURRENT_INSTALLS = 5
 
 _CHUNK_SIZE = 64 * 1024

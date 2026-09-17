@@ -49,7 +49,7 @@ from agentscope.app.workspace_manager import (
     IsolationPolicy,
     LocalWorkspaceManager,
 )
-from agentscope.mcp import MCPClient, StdioMCPConfig
+from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.rag import QdrantStore
 
 from bocomadp.agents.templates import load_subagent_templates
@@ -88,11 +88,12 @@ from bocomadp.routers.stats import stats_router
 from bocomadp.routers.workspace_files import workspace_files_router
 from bocomadp.routers.oss_download import oss_download_router
 from bocomadp.routers.session_usage import session_usage_router
-from bocomadp.routers.agent_tools import agent_tools_router
+from bocomadp.routers.agent_tools import agent_tools_router, catalog_router
 from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.open_agent_access import (
@@ -202,7 +203,7 @@ default_mcps = [
             args=["@playwright/mcp@latest"],
         ),
         is_stateful=True,
-    ),
+    )
 ]
 
 # ---------------------------------------------------------------------------
@@ -350,7 +351,21 @@ async def build_agent_tools(
     # and refreshes the store; the resume path falls back to the store.
     _current_token.set(await _resolve_session_token(session_id))
 
+    from bocomadp.deerflow.custom_params import get_custom_params
+    from bocomadp.routers.agent_tools import _tool_whitelists
+    from bocomadp.tools.enterprise import (
+        usable_enterprise_tool_names,
+        usable_tool_names,
+    )
+
+    _cp = get_custom_params()
+    usable = _cp.get("usableTools")
+
     tools = tool_registry.list_tools()
+    project_tool_names = {getattr(t, "name", "") for t in tools}
+    # 项目工具（builtin_tools.py + custom/）是基础能力，所有智能体均可使用，
+    # 不受 usableTools 过滤。企业工具的过滤在 build_enterprise_tools 内完成。
+
     tools.extend(
         await build_enterprise_tools(user_id, agent_id, session_id),
     )
@@ -382,29 +397,21 @@ async def build_agent_tools(
             enable_skill_for_agent,
         ])
 
-    # Apply the per-agent tool whitelist managed by agent_tools_router
-    # (PUT/DELETE /agents/{id}/tools/{name}):
-    #   empty  -> every tool above stays available
-    #   non-empty -> only the listed tool names survive
-    # This makes the tool config APIs effective at runtime. For the
-    # agent-creator its whitelist covers M plus its factory tools
-    # (see _register_builtin_agents), so it keeps both.
-    #
-    # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
-    # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
-    # builtins / 工厂工具等非企业工具不豁免。
-    from bocomadp.deerflow.custom_params import get_custom_params
-    from bocomadp.routers.agent_tools import _tool_whitelists
-    from bocomadp.tools.enterprise import usable_enterprise_tool_names
-
+    # 企业工具 / MCP 过滤（对齐 build_agent_tools 可用语义）：
+    # - 项目工具：始终可用（不在可配置集合 M 内）
+    # - 通用企业工具：白名单 或 usableTools 中任一命中即可用
+    # - 专用企业工具：仅 usableTools 控制（已由 build_enterprise_tools 过滤，
+    #   不受白名单管控，usableTools 命中即豁免）
+    # - MCP：仅白名单管控
+    # 白名单为空不代表"全放行"——无白名单且无 usableTools 时企业工具全部不可用。
     whitelist = _tool_whitelists.get(agent_id, [])
-    if whitelist:
-        allowed = set(whitelist) | usable_enterprise_tool_names(
-            get_custom_params().get("usableTools"),
-        )
-        tools = [
-            t for t in tools if getattr(t, "name", "") in allowed
-        ]
+    usable_enterprise = usable_enterprise_tool_names(usable)
+    enterprise_allowed = set(whitelist) | usable_enterprise
+    tools = [
+        t for t in tools
+        if getattr(t, "name", "") in project_tool_names
+        or getattr(t, "name", "") in enterprise_allowed
+    ]
 
     return tools
 
@@ -681,7 +688,8 @@ _concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
-workspace_manager = WhitelistWorkspaceManager(workspace_manager)
+# 传入 mcp_registry 使白名单中新启用的 MCP 能自动注册到 workspace。
+workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
 
 # ---------------------------------------------------------------------------
 # 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
@@ -844,13 +852,11 @@ app = create_app(
 
 
 def _configurable_tool_names() -> list[str]:
-    """Return the configurable tool set M.
+    """Return the full set of tool/MCP names for the agent-creator whitelist.
 
-    M = workspace builtins + ToolRegistry tools + MCP servers + framework
-    team/planning tools + enterprise tools. Mirrors
-    :func:`bocomadp.routers.agent_tools._all_tool_names` so the built-in
-    agent-creator's whitelist covers exactly what the tool config APIs
-    manage.
+    The agent-creator is a privileged system agent that needs access to
+    every tool. Its whitelist must include enterprise tools + MCP names
+    (the configurable set) plus its own factory tools.
     """
     from bocomadp.tool_catalog import (
         BUILTIN_TOOL_NAMES,
@@ -971,7 +977,17 @@ async def _lifespan_with_builtin_agents(app):
 
         await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
-        # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
+        # 在首次 chat run 前包一层，按每智能体白名单过滤企业工具/MCP。
+        # 设置需授权的工具名集合（企业工具 + MCP），其余全部放行。
+        from bocomadp.toolkit_whitelist import set_restricted_tool_names
+        from bocomadp.tools.enterprise_catalog import enterprise_tool_names
+
+        restricted: set[str] = set(enterprise_tool_names())
+        for mcp in mcp_registry.list_mcps():
+            name = getattr(mcp, "name", "") or ""
+            if name:
+                restricted.add(name)
+        set_restricted_tool_names(restricted)
         patch_get_toolkit()
         # 请求级模型参数（thinking_enabled/reasoning_effort）：包装框架
         # get_model，run_context 携带时合并进模型 Parameters。
@@ -1070,6 +1086,7 @@ app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
+app.include_router(catalog_router)
 app.include_router(deerflow_router)
 # deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
 app.include_router(auth_stub_router)
@@ -1083,6 +1100,8 @@ app.include_router(platform_health_router)
 app.include_router(skill_router)
 # 智能体沙箱并发管理（写 PG 真源 + 同步 Redis）
 app.include_router(agent_concurrency_router)
+# 智能体跨知识搜索配置管理（写 PG 真源，运行时工具直接读 PG）
+app.include_router(agent_cross_search_config_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）

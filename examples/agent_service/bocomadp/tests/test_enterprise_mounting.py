@@ -11,10 +11,11 @@ from bocomadp.deerflow.custom_params import (
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.tools._naming import tool_name
 from bocomadp.tools.enterprise import build_enterprise_tools
+from bocomadp.tools.enterprise import usable_tool_names
 
 # 工具名默认中文，设置 BOCOMADP_TOOL_ASCII_NAMES=1 后为 ASCII；
 # 断言用 tool_name(...) 计算期望值，避免与开关耦合。
-_CROSS = tool_name("跨知识搜索", "cross_search")
+_CROSS = tool_name("混合搜索", "cross_search")
 _VECTOR = tool_name("行内搜索", "vector_search")
 _ONLINE = tool_name("联网搜索", "online_search")
 _PERSONAL = tool_name("个人知识库搜索", "personal_search")
@@ -151,3 +152,47 @@ def test_usable_tools_does_not_override_switches():
     names = _mount({"usableTools": [_VECTOR, _ONLINE]})
     assert names == {_VECTOR}
     assert _ONLINE not in names
+
+
+# ---------------------------------------------------------------------------
+# usable_tool_names —— 扩管到项目工具的名单归一（项目工具名原样 +
+# 企业工具名中/英文归一；用于 build_agent_tools 对项目工具层过滤）
+# ---------------------------------------------------------------------------
+
+
+def test_usable_tool_names_empty_returns_empty():
+    assert usable_tool_names(None) == set()
+    assert usable_tool_names([]) == set()
+    assert usable_tool_names("not a list") == set()
+    assert usable_tool_names({"k": "v"}) == set()
+
+
+def test_usable_tool_names_keeps_project_tool_names_verbatim():
+    # 项目工具名原样保留（无中英文之分）
+    names = usable_tool_names(["echo", "get_current_time", _VECTOR])
+    assert "echo" in names
+    assert "get_current_time" in names
+    assert _VECTOR in names
+
+
+def test_usable_tool_names_normalizes_enterprise_names():
+    # 企业工具中/英文名归一为当前运行时形态
+    names = usable_tool_names(["行内搜索", "vector_search"])
+    assert names == {_VECTOR}
+
+
+def test_usable_tool_names_keeps_builtin_and_unknown_verbatim():
+    # builtins / 未知名原样保留（不归一、不报错）：按工具名原样匹配，
+    # 项目工具里无同名工具则自然不命中，不影响企业工具归一结果。
+    names = usable_tool_names(["Bash", "不存在的工具", _VECTOR])
+    assert names == {"Bash", "不存在的工具", _VECTOR}
+
+
+def test_usable_tool_names_strips_whitespace():
+    names = usable_tool_names(["  echo  "])
+    assert names == {"echo"}
+
+
+def test_usable_tool_names_skips_blank_entries():
+    names = usable_tool_names(["echo", "", "  "])
+    assert names == {"echo"}

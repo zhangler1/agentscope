@@ -48,6 +48,11 @@ db:
 ellm_key_refresh:
   refresh_ahead_secs: 120
 
+memory:
+  register_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/registerAgent.do"
+  retrieve_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/searchMemory.do"
+  extract_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/saveMemoriesStandard.do"
+  request_timeout_seconds: 30
 
 # ---------- Redis（消息总线 / 分布式锁 / 缓存） ----------
 # 存储后端已迁至上方 db（AsyncSQLAlchemyStorage）；Redis 仅保留给
@@ -106,7 +111,7 @@ workspace_dir: "./workspaces"
 # 字符串值支持 $VAR / ${VAR} 环境变量引用展开（如 api_url: $CROSS_SEARCH_API_URL）。
 cross_search:
   # api_url 支持环境变量引用展开，运行时需设置 CROSS_SEARCH_API_URL
-  api_url: $CROSS_SEARCH_API_URL
+  api_url: "http://12.244.113.82/EUVD.EUVD-ADAPTER.V-1.0/searchKnowledgeStandard.do"
   timeout: 30
   caller: "VD2026000"
   search_type: "0"
@@ -120,12 +125,11 @@ cross_search:
   rerank_rule_code: "RR0005"
   vector_min_score: 0.54
   user_role: "0"
-  space_code_list: []
-  team_space_code_list: []
-  user_code: "U000000000000000"
-  psnl_space_code_id: "PER754964863350213"
-  psnl_category_id_list: []
-  second_search_kb_codes: []
+  space_code_list: ["SP00000011", "SP10000011", "SP0000156"]
+  # team_space_code_list: []
+  user_code: "9501173"
+  # psnl_space_code_id: "PER754964863350213"
+  # psnl_category_id_list: []
   headers:
     Accept: "*/*"
     Accept-Encoding: "gzip, deflate, br"
@@ -137,17 +141,15 @@ cross_search:
 # ---------- 联网搜索（online_search，含 custom_search 请求逻辑） ----------
 # 扁平结构：键与 online_search_config.py 字段一一对应。
 online_search:
-  # 联机网关地址（在 .env 中设置）；本地联调可临时指向 mock：
-  #   api_url: "http://127.0.0.1:8001/online"
-  api_url: $CUSTOM_SEARCH_API_URL
+  # 指向本地 mock（examples/agent_service/mock_search_server.py）：
+  #   python mock_search_server.py  # 监听 0.0.0.0:8001
+  api_url: "http://12.244.66.225111111111/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
   timeout: 30
   max_results: 5
 
 # ---------- 个人知识库搜索（personal_search） ----------
 personal_search:
-  # 联机网关地址（在 .env 中设置）；本地联调可临时指向 mock：
-  #   api_url: "http://127.0.0.1:8001/personal"
-  api_url: $PERSONAL_SEARCH_API_URL
+  api_url: "http://12.244.66.225/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
   timeout: 30                         # 请求超时(秒)
   source_type: "WDZS"                 # 请求体 sourceType
   repository: "personal-search"       # 请求体 repository
@@ -157,9 +159,7 @@ personal_search:
 
 # ---------- 行内搜索（vector_search） ----------
 vector_search:
-  # 联机网关地址（在 .env 中设置）；本地联调可临时指向 mock：
-  #   api_url: "http://127.0.0.1:8001/vector"
-  api_url: $VECTOR_SEARCH_API_URL
+  api_url: "http://12.244.66.225/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
   timeout: 30
   page_size: 10
   text_top_n: 7
@@ -185,7 +185,7 @@ rate_currency:
 # 扁平结构：键与 contact_search_config.py 字段一一对应。
 # api_url 支持环境变量引用展开，运行时需设置 CONTACT_SEARCH_API_URL。
 contact_search:
-  api_url: $CONTACT_SEARCH_API_URL
+  api_url: "http://12.244.66.225/ELLM.ELLM-OFFICE.V-1.0/contactSearchTool.do"
   timeout: 30
   headers:                            # 可选：合并覆盖默认头
     jumpCloud-Env: "BASE"
@@ -195,7 +195,7 @@ contact_search:
 # 扁平结构：键与 physical_contact_search_config.py 字段一一对应。
 # api_url 支持环境变量引用展开，运行时需设置 PHYSICAL_CONTACT_SEARCH_API_URL。
 physical_contact_search:
-  api_url: $PHYSICAL_CONTACT_SEARCH_API_URL
+  api_url: "http://12.244.66.225/ELLM.ELLM-OFFICE.V-1.0/querySysInfoByKeyword.do"
   timeout: 30
   headers:                            # 可选：合并覆盖默认头
     jumpCloud-Env: "BASE"
