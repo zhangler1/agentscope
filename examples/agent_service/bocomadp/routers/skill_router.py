@@ -121,6 +121,20 @@ def _set_token(hub: SkillHubBase, guwp_token: str | None) -> None:
         set_token(guwp_token)
 
 
+def _card_version(metadata: dict) -> str:
+    """取远端目录项里的版本号。
+
+    只认**已发布版本** ``publishedVersion.version``（形如 ``v20260907.102346``）；
+    远端该项为 ``null``（未发布）时返回空串，不回退到 ``headlineVersion``。
+    ``external_hub._to_card()`` 把除 ``slug``/``summary`` 外的字段原样放进
+    ``card.metadata``，所以这里直接读。
+    """
+    node = metadata.get("publishedVersion")
+    if isinstance(node, dict) and node.get("version"):
+        return str(node["version"])
+    return ""
+
+
 async def _session_used_names(
     user_id: str,
     agent_id: str,
@@ -228,8 +242,10 @@ async def get_skillhub_aes_token(
     description=(
         "Query the external skillhub catalog. Two response modes:\n"
         "- With BOTH ``agent_id`` and ``session_id``: legacy processed "
-        "shape ``{skills: [{name, category, description, used}], "
-        "total}`` — ``category`` is the remote ``namespace``, ``used`` "
+        "shape ``{skills: [{name, category, description, version, used}], "
+        "total}`` — ``category`` is the remote ``namespace``, "
+        "``version`` is the catalog item's **published** version (empty "
+        "string when the remote reports ``publishedVersion: null``), ``used`` "
         "marks skills already equipped in the session's workspace.\n"
         "- Otherwise: the remote response verbatim "
         "(``{code, msg, data:{items, total, page, size}, timestamp, "
@@ -258,9 +274,10 @@ async def get_agent_skills(
     """查询外部 skillhub 目录，两种返回模式。
 
     - ``agent_id`` 与 ``session_id`` **同时提供** → 旧格式
-      ``{skills: [{name, category, description, used}], total}``：
-      ``category`` 取远端 ``namespace``，``used`` 标记会话 workspace
-      已装备的技能（session 无效 → 404）。
+      ``{skills: [{name, category, description, version, used}], total}``：
+      ``category`` 取远端 ``namespace``，``version`` 取目录项的
+      ``publishedVersion.version``（远端为 ``null`` 时给空串），
+      ``used`` 标记会话 workspace 已装备的技能（session 无效 → 404）。
     - 任一缺失 → 远端响应**原样透传**（``{code, msg, data, ...}``）。
 
     ``agent_id`` 传了才做归属校验（不属于调用者则 404）。
@@ -300,6 +317,7 @@ async def get_agent_skills(
                 name=card.name,
                 category=card.metadata.get("namespace") or "public",
                 description=card.description or "",
+                version=_card_version(card.metadata),
                 used=card.name in used_names,
             )
             for card in page_result.cards
@@ -435,8 +453,9 @@ async def get_bocom_skills(
         "Query the external skillhub for the skills the caller uploaded. "
         "Two response modes:\n"
         "- With BOTH ``agent_id`` and ``session_id``: legacy processed "
-        "shape ``{skills: [{name, category, description, used}], total}`` "
-        "(``category`` is the remote ``namespace``).\n"
+        "shape ``{skills: [{name, category, description, version, used}], "
+        "total}`` (``category`` is the remote ``namespace``, ``version`` "
+        "the published version, empty when ``publishedVersion`` is null).\n"
         "- Otherwise: the remote response verbatim. ``guwpToken`` is "
         "required in both modes (user-scoped endpoint)."
     ),
@@ -457,7 +476,7 @@ async def get_uploaded_skills(
     """返回调用者上传到外部 skillhub 的 skill，两种返回模式。
 
     - ``agent_id`` 与 ``session_id`` **同时提供** → 旧格式
-      ``{skills: [{name, category, description, used}], total}``。
+      ``{skills: [{name, category, description, version, used}], total}``。
     - 任一缺失 → 远端响应**原样透传**。
 
     ``guwpToken`` 两种模式都**必填**（用户级端点）。
@@ -499,6 +518,7 @@ async def get_uploaded_skills(
                 name=card.name,
                 category=card.metadata.get("namespace") or "public",
                 description=card.description or "",
+                version=_card_version(card.metadata),
                 used=card.name in used_names,
             )
             for card in page_result.cards
