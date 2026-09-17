@@ -25,9 +25,14 @@ Tool categories
 
 Whitelist semantics
 -------------------
-The whitelist stores **only** enterprise tools and MCP names.
-- ``whitelist == []`` → only default tools are available (enterprise/MCP disabled)
-- ``whitelist == ["通讯录查询", "browser-use"]`` → default + listed tools available
+The whitelist stores enterprise tools and MCP names.
+- ``whitelist == []`` → only default tools available (enterprise/MCP disabled)
+- ``whitelist == ["通讯录查询", "browser-use"]`` → default + listed tools/MCPs available
+
+At runtime (``build_agent_tools`` / ``toolkit_whitelist``), enterprise tools
+can also be enabled via ``usableTools`` (request-level override), which
+bypasses the whitelist. This is for agents that cannot call the PUT API
+themselves (the caller injects usableTools on their behalf).
 
 Users browse candidates via ``GET /tools`` & ``GET /mcps``, then add/remove
 via ``PUT/DELETE /agents/{id}/tools/{name}``.

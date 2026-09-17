@@ -23,6 +23,8 @@ import logging
 import time
 from typing import Any
 
+from ._naming import tool_name
+
 logger = logging.getLogger(__name__)
 
 # 事件日志通道：``as`` logger 自带 events.log 滚动 handler 且经
@@ -60,6 +62,8 @@ def get_current_time() -> str:
 
     return datetime.now().isoformat()
 
+get_current_time._tool_display_name = tool_name("获取当前时间", "get_current_time")
+
 
 @tool
 def echo(text: str) -> str:
@@ -72,6 +76,8 @@ def echo(text: str) -> str:
         str: 原样返回的文本。
     """
     return text
+
+echo._tool_display_name = tool_name("回显", "echo")
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +133,8 @@ def list_uploaded_files(
             tag = f"已转文本({r.convert_format})" if r.converted else "仅原始文件"
         lines.append(f"- {r.original_name}  [{tag}]  virtual_path={r.virtual_path}")
     return "\n".join(lines)
+
+list_uploaded_files._tool_display_name = tool_name("列出上传文件", "list_uploaded_files")
 
 
 @tool
@@ -210,6 +218,8 @@ def read_uploaded_file(
     if len(text) > max_chars:
         return text[:max_chars] + f"\n…(已截断，共 {len(text)} 字符)"
     return text
+
+read_uploaded_file._tool_display_name = tool_name("读取上传文件", "read_uploaded_file")
 
 
 # ---------------------------------------------------------------------------
@@ -521,3 +531,5 @@ async def view_image_tool(
         close = getattr(vision_model, "aclose", None)
         if close is not None:
             await close()
+
+view_image_tool._tool_display_name = tool_name("图片解析", "view_image_tool")
