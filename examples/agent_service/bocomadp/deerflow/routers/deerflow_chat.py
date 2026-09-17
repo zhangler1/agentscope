@@ -1531,6 +1531,12 @@ async def _build_values_frame(
     tool_calls/usage_metadata 与 tool 消息交错，对齐原生 values 快照
     的 state.messages 全量形态）。若本轮扁平 assistant 已落库（尾部
     消息 id == reply_id），先移除再补结构化序列，避免重复。
+
+    run 级累计 usage 在最终组装列表上兜底：仅当最后一条 ai 无
+    usage_metadata 时附加（storage 扁平历史旧消息无该字段的情形）。
+    本轮结构化 ai 快照自带该轮 usage_metadata（消息级语义），不覆盖
+    ——且绝不能在 storage 历史阶段附加（落库晚于 REPLY_END，会挂到
+    上一次 run 的 ai 消息上）。
     """
     if storage is None:
         return None
@@ -1539,7 +1545,6 @@ async def _build_values_frame(
             storage,
             user_id,
             session_id,
-            usage=usage,
         )
         if values is None:
             return None
@@ -1555,6 +1560,14 @@ async def _build_values_frame(
             messages = messages[:-1]
         if turn_messages:
             values["messages"] = [*messages, *turn_messages]
+        # run 级累计 usage 兜底（见 docstring）：最后一条 ai 无
+        # usage_metadata 才附加——本轮结构化快照自带轮次值时跳过
+        if usage:
+            for msg in reversed(values["messages"]):
+                if msg.get("type") == "ai":
+                    if not msg.get("usage_metadata"):
+                        msg["usage_metadata"] = usage
+                    break
         return values
     except Exception:  # noqa: BLE001 —— 快照失败降级为不发 values 帧
         logger.exception(

@@ -137,6 +137,7 @@ class FakeChatService:
                 {
                     "type": "MODEL_CALL_END",
                     "session_id": session_id,
+                    "reply_id": "r1",
                     "input_tokens": self._usage[0],
                     "output_tokens": self._usage[1],
                     "finished_reason": "stop",
@@ -281,8 +282,12 @@ def test_create_run_stream_echoes_human_message_first(monkeypatch) -> None:
     assert meta["run_id"]
     assert meta["thread_id"] == THREAD_ID
 
-    # 帧 3：run 已结束 → end 收尾
-    assert events[2] == ("end", "null")
+    # 帧 3：run 已结束 → end 收尾（data 携带 run 级累计 usage，无模型
+    # 调用时零值三字段，对齐原生 StreamEvent(type="end", data={"usage": ...})）
+    assert events[2][0] == "end"
+    assert json.loads(events[2][1]) == {
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
 
 
 def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
@@ -351,11 +356,14 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
         name == "custom" and "model_call_end" in data
         for name, data in events
     )
-    # 帧序：human 回显 → metadata → messages usage 增量 → values → end
+    # 帧序：human 回显 → metadata → messages usage 增量 → updates 快照
+    # → values（流中节点边界）→ values（收尾全量）→ end
     assert events_by_name == [
         "messages",
         "metadata",
         "messages",
+        "updates",
+        "values",
         "values",
         "end",
     ]
@@ -370,16 +378,25 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
     assert usage_chunk["content"] == ""
     assert usage_chunk["id"] == "r1"
     assert usage_chunk["usage_metadata"] == expected_usage
-    assert usage_meta == {"langgraph_node": "model"}
-    # values 快照：全量消息 + title + 最后一条 ai 附 usage_metadata
-    # （title 取 storage 内最近一条 human；请求输入尚未落库）
-    values = json.loads(events[3][1])
+    # metadata 注入业务字段（agent_name/thread_id；无 MODEL_CALL_START
+    # 时不注入 model_name/ls_model_name）
+    assert usage_meta["langgraph_node"] == "model"
+    assert usage_meta["agent_name"] == "agent_a"
+    assert usage_meta["thread_id"] == "t1"
+    # values 快照（收尾帧）：storage 历史（human + 上轮扁平 ai）+
+    # 本轮结构化 ai 快照在尾部，自带该轮 usage_metadata（消息级语义）；
+    # title 取 storage 内最近一条 human；请求输入尚未落库
+    values = json.loads(events[5][1])
     assert values["title"] == "德国的历史是什么？"
-    assert [m["type"] for m in values["messages"]] == ["human", "ai"]
-    assert values["messages"][-1]["id"] == "ai-1"
+    assert [m["type"] for m in values["messages"]] == ["human", "ai", "ai"]
+    assert values["messages"][-1]["id"] == "r1"
     assert values["messages"][-1]["usage_metadata"] == expected_usage
-    # end 哨兵收尾
-    assert events[4] == ("end", "null")
+    # run 级累计 usage 不挂到历史消息上（上轮扁平 ai-1 无 usage_metadata，
+    # 否则下一次 run 的收尾帧会把本轮 usage 错挂到上一条 run 的消息）
+    assert "usage_metadata" not in values["messages"][1]
+    # end 帧：run 级累计 usage
+    assert events[6][0] == "end"
+    assert json.loads(events[6][1])["usage"] == expected_usage
 
 
 def test_join_run_stream_echoes_human_messages() -> None:
@@ -434,5 +451,8 @@ def test_join_run_stream_echoes_human_messages() -> None:
         },
     ]
 
-    # 帧 3：run 已结束 → end 收尾
-    assert events[2] == ("end", "null")
+    # 帧 3：run 已结束 → end 收尾（无模型调用 → usage 零值）
+    assert events[2][0] == "end"
+    assert json.loads(events[2][1]) == {
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }

@@ -122,20 +122,23 @@ async def build_thread_values(
     storage: StorageBase,
     user_id: str,
     thread_id: str,
-    usage: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
     """组装 values 帧快照（``{messages, title, artifacts}``），无消息时返回 None。
 
     对齐 deer-flow 原生 ``stream_mode=["values"]`` 主通道帧：全量
     LangGraph 消息列表 + title + artifacts（本服务无 artifact 产出，
-    恒空列表兜底对齐原生三字段结构）；``usage`` 非空时附到最后一条
-    ai 消息的 ``usage_metadata``（token 下发通道）。供 SSE 生成器在
-    end 哨兵前补发最终快照（见 deerflow_chat._sse_generator）。
+    恒空列表兜底对齐原生三字段结构）。供 SSE 生成器组装 values 帧
+    （见 deerflow_chat._build_values_frame）。
 
     注：快照不含 ToolMessage——storage 扁平历史（human/assistant/system）
     无工具痕迹，且快照 ai 消息无 tool_calls 字段，补入 tool 消息会成为
     无配对对象的孤儿（见 formatter._on_tool_result_end），该差异如实
     保留。
+
+    usage_metadata 不在本函数附加：storage 历史里最后一条 ai 可能是
+    上一次 run 的消息（assistant 落库晚于 REPLY_END），在此附加会把
+    本轮 run 级 usage 挂到错误的消息上；由调用方在最终组装列表上
+    兜底（见 _build_values_frame）。
     """
     messages = await _load_messages(
         storage,
@@ -152,11 +155,6 @@ async def build_thread_values(
         # 对齐原生 values 帧三字段结构（本服务无 artifact 产出，恒空）
         "artifacts": [],
     }
-    if usage:
-        for msg in reversed(data["messages"]):
-            if msg.get("type") == "ai":
-                msg["usage_metadata"] = usage
-                break
     return data
 
 
