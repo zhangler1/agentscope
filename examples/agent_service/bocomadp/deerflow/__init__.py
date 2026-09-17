@@ -29,6 +29,7 @@ from .protocol import (
     EVENT_MESSAGES,
     EVENT_METADATA,
     StreamEvent,
+    end_frame,
     format_sse,
 )
 from .runs import RunManager, RunRecord, RunStatus
@@ -40,6 +41,7 @@ __all__ = [
     "RunRecord",
     "RunStatus",
     "StreamEvent",
+    "end_frame",
     "format_sse",
     "EVENT_METADATA",
     "EVENT_MESSAGES",

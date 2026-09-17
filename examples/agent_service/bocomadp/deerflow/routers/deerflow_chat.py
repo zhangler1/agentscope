@@ -107,6 +107,7 @@ from ..protocol import (
     EVENT_MESSAGES,
     EVENT_VALUES,
     StreamEvent,
+    end_frame,
     format_sse,
 )
 from ..runs import RunManager, RunRecord, RunStatus
@@ -1406,6 +1407,8 @@ def _sse_generator(
                             user_id,
                             session_id,
                             usage=formatter.usage,
+                            turn_messages=formatter.turn_messages,
+                            reply_id=formatter.reply_id,
                         )
                         if values is not None:
                             yield format_sse(
@@ -1415,7 +1418,10 @@ def _sse_generator(
                                     data=values,
                                 ),
                             )
-                    yield format_sse(evt)
+                    # 原生 end 帧 data 携带 run 级累计 usage（零值兜底
+                    # 三字段），替代裸哨兵（data: null），对齐 Python
+                    # 客户端 ``StreamEvent(type="end", data={"usage": ...})``
+                    yield format_sse(end_frame(formatter.usage))
                     return
                 if evt.event == EVENT_ERROR:
                     error_seen = True
@@ -1444,7 +1450,7 @@ def _sse_generator(
                     data={"message": str(e), "name": "StreamError"},
                 ),
             )
-            yield format_sse(END_SENTINEL)
+            yield format_sse(end_frame(formatter.usage))
         finally:
             if on_disconnect == "cancel" and not hitl_parked:
                 try:
@@ -1484,21 +1490,44 @@ async def _build_values_frame(
     session_id: str,
     *,
     usage: dict[str, int] | None,
+    turn_messages: list[dict[str, Any]] | None = None,
+    reply_id: str | None = None,
 ) -> dict[str, Any] | None:
     """end 哨兵前的 values 快照（storage 缺失/无消息时跳过）。
 
     组装失败不阻断流——values 帧是视图同步优化，end 哨兵才是流终止
     契约；storage 读取异常时仅记日志并跳过。
+
+    assistant 消息落库晚于 REPLY_END（异步写库），收尾快照常缺本轮
+    消息；此时用 formatter 本轮结构化序列兜底补入（每轮 ai 快照含
+    tool_calls/usage_metadata 与 tool 消息交错，对齐原生 values 快照
+    的 state.messages 全量形态）。若本轮扁平 assistant 已落库（尾部
+    消息 id == reply_id），先移除再补结构化序列，避免重复。
     """
     if storage is None:
         return None
     try:
-        return await build_thread_values(
+        values = await build_thread_values(
             storage,
             user_id,
             session_id,
             usage=usage,
         )
+        if values is None:
+            return None
+        messages = values.get("messages") or []
+        # 尾部是本轮扁平落库的 assistant（id == reply_id）时移除，
+        # 由下方结构化序列替代
+        if (
+            reply_id
+            and messages
+            and messages[-1].get("type") == "ai"
+            and messages[-1].get("id") == reply_id
+        ):
+            messages = messages[:-1]
+        if turn_messages:
+            values["messages"] = [*messages, *turn_messages]
+        return values
     except Exception:  # noqa: BLE001 —— 快照失败降级为不发 values 帧
         logger.exception(
             "deerflow: failed to build values frame for run on thread %s",
