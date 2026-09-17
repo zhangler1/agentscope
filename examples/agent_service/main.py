@@ -362,19 +362,9 @@ async def build_agent_tools(
     usable = _cp.get("usableTools")
 
     tools = tool_registry.list_tools()
-    # usableTools 扩管到项目工具（对齐 GET /tools 可见范围：项目工具 +
-    # 企业工具，不含 MCP / builtins / framework）：
-    #   空/缺失/非数组 → 项目工具全禁（与企业工具层全禁语义一致）；
-    #   非空 → 只保留名单内工具，项目工具按名原样匹配，企业工具名经
-    #          归一后也在集合内（项目工具名不与企业工具名冲突）。
-    # 企业工具的过滤在 build_enterprise_tools 内单独完成，此处只处理
-    # 项目工具。工厂工具（agent-creator）不属于工具列表可见范围，不受
-    # usableTools 管辖，在下方按 agent_id 注入。
-    if isinstance(usable, list) and usable:
-        allowed_names = usable_tool_names(usable)
-        tools = [t for t in tools if getattr(t, "name", "") in allowed_names]
-    else:
-        tools = []
+    project_tool_names = {getattr(t, "name", "") for t in tools}
+    # 项目工具（builtin_tools.py + custom/）是基础能力，所有智能体均可使用，
+    # 不受 usableTools 过滤。企业工具的过滤在 build_enterprise_tools 内完成。
 
     tools.extend(
         await build_enterprise_tools(user_id, agent_id, session_id),
@@ -407,23 +397,21 @@ async def build_agent_tools(
             enable_skill_for_agent,
         ])
 
-    # Apply the per-agent tool whitelist managed by agent_tools_router
-    # (PUT/DELETE /agents/{id}/tools/{name}):
-    #   empty  -> every tool above stays available
-    #   non-empty -> only the listed tool names survive
-    # This makes the tool config APIs effective at runtime. For the
-    # agent-creator its whitelist covers M plus its factory tools
-    # (see _register_builtin_agents), so it keeps both.
-    #
-    # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
-    # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
-    # builtins / 工厂工具等非企业工具不豁免。
+    # 企业工具 / MCP 过滤（对齐 build_agent_tools 可用语义）：
+    # - 项目工具：始终可用（不在可配置集合 M 内）
+    # - 通用企业工具：白名单 或 usableTools 中任一命中即可用
+    # - 专用企业工具：仅 usableTools 控制（已由 build_enterprise_tools 过滤，
+    #   不受白名单管控，usableTools 命中即豁免）
+    # - MCP：仅白名单管控
+    # 白名单为空不代表"全放行"——无白名单且无 usableTools 时企业工具全部不可用。
     whitelist = _tool_whitelists.get(agent_id, [])
-    if whitelist:
-        allowed = set(whitelist) | usable_enterprise_tool_names(usable)
-        tools = [
-            t for t in tools if getattr(t, "name", "") in allowed
-        ]
+    usable_enterprise = usable_enterprise_tool_names(usable)
+    enterprise_allowed = set(whitelist) | usable_enterprise
+    tools = [
+        t for t in tools
+        if getattr(t, "name", "") in project_tool_names
+        or getattr(t, "name", "") in enterprise_allowed
+    ]
 
     return tools
 

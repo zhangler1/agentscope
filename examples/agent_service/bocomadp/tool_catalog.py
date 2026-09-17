@@ -149,7 +149,9 @@ ENTERPRISE_EXCLUDED_NAMES: frozenset[str] = frozenset(
         "online_search",
         "联网搜索",
         "query_internal_doc",
+        "行内文档检索",
         "submit_it_ticket",
+        "提交IT工单",
     },
 )
 

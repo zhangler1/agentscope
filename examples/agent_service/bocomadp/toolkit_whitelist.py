@@ -15,17 +15,15 @@ caller-supplied ``extra_factory``:
 - enterprise tools (from build_enterprise_tools)
 
 The per-agent whitelist maintained by ``agent_tools_router``
-(PUT/DELETE ``/agents/{id}/tools/{name}``) stores **only** enterprise
-tools and MCP names. Default tools (builtins / framework / project)
-are always allowed. When the whitelist is **non-empty**, enterprise
-tools and MCPs must be explicitly listed (or in ``usableTools``) to
-survive; when **empty**, no filtering is applied.
+(PUT/DELETE ``/agents/{id}/tools/{name}``) stores enterprise tools
+and MCP names. Enterprise tools and MCPs must be explicitly listed
+in the whitelist or ``usableTools`` to survive; default tools
+(builtins / framework / project) are always allowed.
 
 Filter logic (aligned with ``build_agent_tools`` in main.py):
 
-- whitelist empty → no filtering (every tool stays available)
-- whitelist non-empty → default tools + whitelisted enterprise/MCP
-  survive; ``usableTools`` enterprise tools are also exempt
+- name not in restricted set → always allowed
+- name in restricted set → allowed if in whitelist OR usableTools
 """
 
 from __future__ import annotations
@@ -50,16 +48,16 @@ def set_restricted_tool_names(names: set[str]) -> None:
     _restricted_tool_names = names
 
 
-def _keep_tool(tool: Any, whitelist: set[str]) -> bool:
+def _keep_tool(tool: Any, allowed: set[str]) -> bool:
     """Return whether *tool* should survive the filter.
 
     - Name not in restricted set → always allowed
-    - Name in restricted set → allowed only if in *whitelist*
+    - Name in restricted set → allowed only if in *allowed*
     """
     name = getattr(tool, "name", "")
     if name not in _restricted_tool_names:
         return True
-    return name in whitelist
+    return name in allowed
 
 
 async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
@@ -67,10 +65,9 @@ async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
 
     Semantics aligned with ``build_agent_tools`` (main.py):
 
-    - whitelist empty → no filtering (every tool stays available)
-    - whitelist non-empty → default tools + whitelisted enterprise/MCP
-      survive; ``usableTools`` enterprise tools are also exempt (request-
-      level override, same as ``build_agent_tools``).
+    - name not in restricted set → always allowed (builtins / framework / project)
+    - name in restricted set → allowed if in whitelist OR usableTools
+    - whitelist empty + usableTools empty → restricted tools all removed
     """
     toolkit = await _original_get_toolkit(*args, **kwargs)
 
@@ -78,21 +75,16 @@ async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
     agent_id = getattr(agent_record, "id", "") or ""
 
     from bocomadp.routers.agent_tools import _tool_whitelists
-
-    whitelist = _tool_whitelists.get(agent_id, [])
-    if not whitelist:
-        return toolkit
-
     from bocomadp.tools.enterprise import usable_enterprise_tool_names
     from bocomadp.deerflow.custom_params import get_custom_params
 
+    whitelist = _tool_whitelists.get(agent_id, [])
     usable = get_custom_params().get("usableTools")
     allowed = set(whitelist) | usable_enterprise_tool_names(usable)
-    always = _always_allowed_names()
 
     groups = getattr(toolkit, "tool_groups", None) or []
     for group in groups:
-        group.tools = [t for t in group.tools if _keep_tool(t, whitelist)]
+        group.tools = [t for t in group.tools if _keep_tool(t, allowed)]
     toolkit.tool_groups = [
         g
         for g in groups
