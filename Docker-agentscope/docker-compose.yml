@@ -54,7 +54,10 @@ services:
       # K8s 沙箱：kubeconfig 挂载自宿主机 .kube/config（容器内路径）
       - ADP_K8S_KUBECONFIG=/app/kubeconfig/config
       - ADP_K8S_ENABLED=true
-      - BOCOMADP_TOOL_ASCII_NAMES=0
+      # 预构建沙箱镜像（含 uv+gateway，跳过 bootstrap，Pod 内无需外网）
+      - ADP_K8S_IMAGE=agentscope-k8s-workspace:latest
+      # deepseek 官方 API 工具名仅允许 [a-zA-Z0-9_-]，用 ASCII 名模式
+      - BOCOMADP_TOOL_ASCII_NAMES=1
     depends_on:
       redis:
         condition: service_started
@@ -76,8 +79,8 @@ services:
       - ../examples/agent_service/workspaces:/app/workspaces
       # Docker Socket（支持 Docker 工作区沙箱）
       - /var/run/docker.sock:/var/run/docker.sock
-      # K8s kubeconfig（K8s 沙箱模式必需）
-      - ./config:/app/kubeconfig/config:ro
+      # K8s kubeconfig（K8s 沙箱模式必需）：宿主机 docker-desktop 上下文
+      - C:\Users\86199\.kube\config:/app/kubeconfig/config:ro
       # AgentScope ``as`` logger 文件输出（与 main.py 中默认路径一致）
       - ./logs:/app/logs
 
