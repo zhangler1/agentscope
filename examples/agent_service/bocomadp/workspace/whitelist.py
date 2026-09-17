@@ -95,16 +95,17 @@ class _WhitelistWorkspaceProxy(WorkspaceBase):
     async def list_mcps(self) -> list:
         """Return MCPs allowed by the per-agent tool whitelist.
 
-        Empty whitelist means all available (same semantics as the
-        tool config APIs); non-empty keeps only listed names.
+        Whitelist empty + usableTools empty → no MCPs available
+        (enterprise tools / MCPs require explicit enablement).
         """
         from bocomadp.routers.agent_tools import _tool_whitelists
+        from bocomadp.tools.enterprise import usable_enterprise_tool_names
+        from bocomadp.deerflow.custom_params import get_custom_params
 
         mcps = await self._workspace.list_mcps()
         whitelist = _tool_whitelists.get(self._agent_id, [])
-        if not whitelist:
-            return mcps
-        allowed = set(whitelist)
+        usable = get_custom_params().get("usableTools")
+        allowed = set(whitelist) | usable_enterprise_tool_names(usable)
         return [m for m in mcps if getattr(m, "name", "") in allowed]
 
     def __getattr__(self, item: str) -> Any:
