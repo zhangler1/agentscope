@@ -14,6 +14,14 @@ class SkillInfo(BaseModel):
         default="",
         description="The user-facing description of the skill.",
     )
+    version: str = Field(
+        default="",
+        description=(
+            "The skill's **published** version, taken from the catalog item's "
+            "``publishedVersion.version`` (e.g. ``v20260907.102346``). Empty "
+            "string when the remote reports no published version (``null``)."
+        ),
+    )
     used: bool = Field(
         default=False,
         description="Whether the caller already installed this skill.",
