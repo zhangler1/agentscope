@@ -515,21 +515,6 @@ class Toolkit:
             for tool in group.tools:
                 cache_tools.append(tool)
 
-            logger.info(
-                "_get_available_tools: group=%s tools=%s "
-                "input_schemas_ok=%s",
-                group.name,
-                [getattr(t, "name", "") for t in cache_tools],
-                [
-                    getattr(t, "name", "") for t in cache_tools
-                    if getattr(t, "input_schema", None) is None or (
-                        isinstance(getattr(t, "input_schema", None), dict)
-                        and t.input_schema.get("type") == "object"
-                        and isinstance(t.input_schema.get("properties"), dict)
-                    )
-                ],
-            )
-
             # MCP tools
             for client in group.mcps:
                 try:
@@ -570,10 +555,6 @@ class Toolkit:
                         group.name,
                     )
 
-        logger.info(
-            "_get_available_tools: RETURN names=%s",
-            list(available_tools.keys()),
-        )
         return available_tools
 
     async def check_tool_available(

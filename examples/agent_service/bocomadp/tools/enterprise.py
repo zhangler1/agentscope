@@ -165,14 +165,6 @@ async def build_enterprise_tools(
     ContextVar 已随 ``asyncio.create_task`` 复制进来，可直接读取。
     """
     params = get_custom_params()
-    logger.info(
-        "build_enterprise_tools: session=%s agent=%s custom_params keys=%s "
-        "usableTools=%r",
-        session_id,
-        agent_id,
-        list(params.keys()),
-        params.get("usableTools"),
-    )
     tools: list[ToolBase] = [
         contact_search_tool,
         physical_contact_search_tool,
@@ -240,19 +232,6 @@ async def build_enterprise_tools(
         )
         return []
     allowed = usable_enterprise_tool_names(usable)
-    logger.info(
-        "build_enterprise_tools: usableTools=%s allowed(normalized)=%s "
-        "before_filter_names=%s (session=%s)",
-        usable,
-        sorted(allowed),
-        [getattr(t, "name", "") for t in tools],
-        session_id,
-    )
     tools = [t for t in tools if getattr(t, "name", "") in allowed]
-    logger.info(
-        "build_enterprise_tools: RETURN names=%s (session=%s)",
-        [getattr(t, "name", "") for t in tools],
-        session_id,
-    )
 
     return tools

@@ -360,14 +360,6 @@ async def build_agent_tools(
 
     _cp = get_custom_params()
     usable = _cp.get("usableTools")
-    logger.info(
-        "build_agent_tools: session=%s agent=%s custom_params keys=%s "
-        "usableTools=%r",
-        session_id,
-        agent_id,
-        list(_cp.keys()),
-        usable,
-    )
 
     tools = tool_registry.list_tools()
     # usableTools 扩管到项目工具（对齐 GET /tools 可见范围：项目工具 +
@@ -427,23 +419,11 @@ async def build_agent_tools(
     # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
     # builtins / 工厂工具等非企业工具不豁免。
     whitelist = _tool_whitelists.get(agent_id, [])
-    logger.info(
-        "build_agent_tools: before whitelist filter names=%s "
-        "whitelist=%s (session=%s)",
-        [getattr(t, "name", "") for t in tools],
-        whitelist,
-        session_id,
-    )
     if whitelist:
         allowed = set(whitelist) | usable_enterprise_tool_names(usable)
         tools = [
             t for t in tools if getattr(t, "name", "") in allowed
         ]
-    logger.info(
-        "build_agent_tools: RETURN names=%s (session=%s)",
-        [getattr(t, "name", "") for t in tools],
-        session_id,
-    )
 
     return tools
 

@@ -253,15 +253,6 @@ optional):
     for mw in middlewares:
         tools.extend(await mw.list_tools())
 
-    _log.info(
-        "get_toolkit: final tools before Toolkit() names=%s "
-        "tool_groups=%s session=%s agent=%s",
-        [getattr(t, "name", "") for t in tools],
-        [g.name for g in tool_groups],
-        session_record.id,
-        agent_record.id,
-    )
-
     return Toolkit(
         tools=tools,
         skills_or_loaders=await workspace.list_skills(),
