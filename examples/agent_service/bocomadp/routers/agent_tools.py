@@ -397,6 +397,29 @@ async def list_agent_tools(
     "/{agent_id}/tools/{tool_name}",
     summary="Add a tool or MCP to the agent",
 )
+def _resolve_configurable_name(
+    raw_name: str,
+    configurable: set[str],
+) -> str | None:
+    """Resolve *raw_name* to a name in *configurable*.
+
+    Accepts both Chinese and English tool names (e.g. ``"利率查询"`` or
+    ``"interest_rate"``) and returns the actual runtime name present in
+    *configurable*.  Returns ``None`` if no match.
+    """
+    if raw_name in configurable:
+        return raw_name
+    from ..tools.enterprise import _NAME_TO_CANONICAL, _CANONICAL_TO_CN
+    from ..tools._naming import tool_name as _tool_name
+
+    canonical = _NAME_TO_CANONICAL.get(raw_name)
+    if canonical:
+        resolved = _tool_name(_CANONICAL_TO_CN[canonical], canonical)
+        if resolved in configurable:
+            return resolved
+    return None
+
+
 async def enable_agent_tool(
     agent_id: str,
     tool_name: str,
@@ -407,14 +430,16 @@ async def enable_agent_tool(
 
     Only enterprise tools and MCP names are accepted — default tools
     (builtins / framework / project) are always available and cannot be
-    toggled.
+    toggled.  Both Chinese and English names are accepted (e.g.
+    ``"利率查询"`` and ``"interest_rate"``).
     """
     agent = await _resolve_framework_agent(request, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     configurable = _configurable_tool_names(request)
-    if tool_name not in configurable:
+    resolved = _resolve_configurable_name(tool_name, configurable)
+    if resolved is None:
         raise HTTPException(
             status_code=404,
             detail=f"Tool '{tool_name}' not found or not configurable",
@@ -422,13 +447,13 @@ async def enable_agent_tool(
 
     current = _get_enabled_tools(agent_id)
 
-    if tool_name in current:
-        logger.info("agent_tools: %s add %s (already in whitelist)", agent_id, tool_name)
+    if resolved in current:
+        logger.info("agent_tools: %s add %s (already in whitelist)", agent_id, resolved)
         return {"ok": True}
 
-    current.append(tool_name)
+    current.append(resolved)
     _set_enabled_tools(agent_id, current)
-    logger.info("agent_tools: %s add %s → whitelist=%s", agent_id, tool_name, current)
+    logger.info("agent_tools: %s add %s → whitelist=%s", agent_id, resolved, current)
     return {"ok": True}
 
 
@@ -451,13 +476,15 @@ async def disable_agent_tool(
 
     The tool/MCP will no longer be available or shown for this agent.
     Default tools (builtins / framework / project) cannot be removed.
+    Both Chinese and English names are accepted.
     """
     agent = await _resolve_framework_agent(request, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     configurable = _configurable_tool_names(request)
-    if tool_name not in configurable:
+    resolved = _resolve_configurable_name(tool_name, configurable)
+    if resolved is None:
         raise HTTPException(
             status_code=404,
             detail=f"Tool '{tool_name}' not found or not configurable",
@@ -465,13 +492,13 @@ async def disable_agent_tool(
 
     current = _get_enabled_tools(agent_id)
 
-    if tool_name not in current:
-        logger.info("agent_tools: %s remove %s (not in whitelist)", agent_id, tool_name)
+    if resolved not in current:
+        logger.info("agent_tools: %s remove %s (not in whitelist)", agent_id, resolved)
         return {"ok": True}
 
-    current.remove(tool_name)
+    current.remove(resolved)
     _set_enabled_tools(agent_id, current)
-    logger.info("agent_tools: %s remove %s → whitelist=%s", agent_id, tool_name, current)
+    logger.info("agent_tools: %s remove %s → whitelist=%s", agent_id, resolved, current)
     return {"ok": True}
 
 
