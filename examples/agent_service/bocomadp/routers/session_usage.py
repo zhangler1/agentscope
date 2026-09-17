@@ -168,6 +168,38 @@ def _as_payload_dict(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _context_usage_of(msg: Any) -> tuple[int, int]:
+    """取一条消息的上下文窗口占用 ``(input_tokens, output_tokens)``。
+
+    值来自 ``msg.metadata["context_usage"]``——由 ``main.py`` 的 storage
+    proxy 在落库时写入（见 ``_BuiltinAgentStorageProxy.upsert_message``），
+    等于该 reply **最后一次**模型调用的 prompt/output 长度。
+
+    **不回退**：没有该字段的消息（本改造之前落库的历史数据）返回
+    ``(0, 0)``。框架的 ``msg.usage`` 是累加口径（一个 reply 内多次调用
+    之和，多轮工具循环后偏大 N 倍），与"上下文窗口占用"不是同一个量，
+    因此不参与取值。
+
+    Args:
+        msg (`Any`): 框架 ``Msg`` 实例。
+
+    Returns:
+        `tuple[int, int]`:
+            ``(input_tokens, output_tokens)``；缺字段 / 非 dict / 值非法时
+            为 ``(0, 0)``。
+    """
+    metadata = getattr(msg, "metadata", None)
+    context_usage = (
+        metadata.get("context_usage") if isinstance(metadata, dict) else None
+    )
+    if not isinstance(context_usage, dict):
+        return (0, 0)
+    return (
+        int(context_usage.get("input_tokens") or 0),
+        int(context_usage.get("output_tokens") or 0),
+    )
+
+
 @session_usage_router.get(
     "/{session_id}/usage",
     summary="Get cumulative token usage for a session",
@@ -178,11 +210,20 @@ async def get_session_usage(
     user_id: str = Query(default="default", description="User id"),
     request: Request = None,  # type: ignore[assignment]
 ) -> dict:
-    """Sum token usage across all messages in a session.
+    """取会话当前的上下文窗口占用（input / output / total tokens）。
 
-    Iterates through the session's message list via paginated
-    ``list_messages``, accumulating ``usage.input_tokens`` and
-    ``usage.output_tokens`` from every :class:`Msg` that has them.
+    从最新一条消息往前回溯（页内按时间正序返回，因此倒序扫描），取第一条
+    带 ``metadata.context_usage`` 的消息即停——该字段由 storage proxy 在
+    落库时写入，值 = 该 reply 最后一次模型调用的 prompt/output 长度，即
+    当时上下文窗口的真实占用。
+
+    本改造之前落库的历史消息没有该字段，**不回退**到框架的 ``usage``
+    （那是"一个 reply 内多次调用之和"，与窗口占用不是同一个量，多轮工具
+    循环后偏大 N 倍），此类会话返回 0。
+
+    注意这也不是"整个会话的累计计费量"：一次对话内每轮请求都会重新带上
+    全部上下文，把各轮相加会得到远大于窗口长度的数字（实测单条最高放大
+    13.8 倍），因此本接口只回答"当前上下文占了多少"。
     """
     storage = getattr(request.app.state, "storage", None)
     if storage is None:
@@ -199,8 +240,9 @@ async def get_session_usage(
             detail=f"Session '{session_id}' not found",
         )
 
-    # 从最新一条消息往前回溯，取最近一次模型调用的 usage。页内按时间正序
-    # 返回，因此倒序扫描；命中即停，找不到才继续翻更早的页。
+    # 从最新一条消息往前回溯，取最近一条带"上下文窗口占用"的消息（页内按
+    # 时间正序返回，因此倒序扫描）；命中即停，找不到才继续翻更早的页。
+    # 历史消息（无 context_usage）不参与取值，全都没有时返回 0。
     input_tokens = 0
     output_tokens = 0
     before: str | None = None
@@ -217,13 +259,10 @@ async def get_session_usage(
             break
 
         for msg in reversed(messages):
-            u = getattr(msg, "usage", None)
-            if u is None:
-                continue
-            u_input = getattr(u, "input_tokens", 0) or 0
-            if u_input > 0:
-                input_tokens = u_input
-                output_tokens = getattr(u, "output_tokens", 0) or 0
+            found_input, found_output = _context_usage_of(msg)
+            if found_input > 0:
+                input_tokens = found_input
+                output_tokens = found_output
                 break
 
         if input_tokens > 0 or not has_more:

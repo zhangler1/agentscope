@@ -586,6 +586,38 @@ class _BuiltinAgentStorageProxy:
                 )
         return ok
 
+    async def upsert_message(
+        self,
+        user_id: str,
+        session_id: str,
+        msg: Any,
+    ) -> None:
+        """消息落库前写入"上下文窗口占用"（``metadata.context_usage``）。
+
+        框架 ``Msg.append_event`` 把**一个 reply 内所有** ``MODEL_CALL_END``
+        的 usage 累加进 ``msg.usage``（官方设计：本轮总消耗），因此多轮
+        ReAct（工具调用循环）后 ``usage.input_tokens`` 已是 N 次请求之和，
+        不再等于上下文窗口大小。真正的窗口值由
+        :class:`~bocomadp.middleware.custom.context_usage.
+        ContextUsageMiddleware` 按 ``reply_id`` 逐次覆盖记录，此处用
+        ``msg.id``（== reply_id）取走并写进 metadata：
+
+        - ``context_usage.input_tokens`` —— 最后一次模型调用的 prompt
+          长度，即**当时上下文窗口的占用**；
+        - ``context_usage.output_tokens`` —— 最后一次调用的输出长度；
+        - ``context_usage.calls`` —— 该 reply 内的模型调用轮数（便于
+          分辨单轮回复与工具循环）。
+
+        ``msg.usage`` 原样保留（累加口径），两者并存互不影响。取不到记录
+        时（用户消息、失败上报消息，或中间件未覆盖的调用）原样透传。
+        """
+        from bocomadp.middleware.custom.context_usage import (
+            attach_context_usage,
+        )
+
+        attach_context_usage(msg)
+        await self._inner.upsert_message(user_id, session_id, msg)
+
     async def __aenter__(self) -> "_BuiltinAgentStorageProxy":
         await self._inner.__aenter__()
         return self

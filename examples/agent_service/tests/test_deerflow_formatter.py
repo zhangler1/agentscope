@@ -318,15 +318,29 @@ def test_model_call_end_consumed_without_frames() -> None:
     }
 
 
-def test_model_call_end_accumulates_across_calls() -> None:
-    """多轮模型调用按 reply 聚合（对齐原生单回复单 AI 消息语义）。"""
+def test_context_usage_takes_last_call_only() -> None:
+    """多轮模型调用：input / output 都取最后一次（= 上下文窗口占用）。
+
+    一次 reply 内每轮调用都会把全部上下文重新作为 prompt 发出，各轮
+    input 相加会远大于窗口长度（实测最高放大 13.8 倍），output 相加也会
+    把多轮产出混在一起，故两个字段都采用 latest-wins。该口径与落库消息
+    ``metadata.context_usage`` 一致，保证流式与刷新后展示同一组数字。
+    """
     f = DeerflowSSEFormatter()
     f.translate(_model_call_end(100, 10))
     f.translate(_model_call_end(20, 35))
     assert f.usage == {
-        "input_tokens": 120,
-        "output_tokens": 45,
-        "total_tokens": 165,
+        "input_tokens": 20,  # 最后一次调用 = 当前上下文窗口占用
+        "output_tokens": 35,  # 最后一次调用的输出
+        "total_tokens": 55,
+    }
+
+    # 网关未下发 usage（0/0）时保留上一轮有效值，不把窗口占用刷成 0
+    f.translate(_model_call_end(0, 0))
+    assert f.usage == {
+        "input_tokens": 20,
+        "output_tokens": 35,
+        "total_tokens": 55,
     }
 
 
