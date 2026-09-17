@@ -65,8 +65,8 @@ CONFIGS: list[dict] = [
         "key": "memory",
         "payload": {
             "default_memory_prompt": "全局记忆配置",
-            "idle_minutes": 1,
-            "sweep_interval_seconds": 5,
+            "idle_minutes": 100,
+            "sweep_interval_seconds": 500,
             "max_tokens": 90000,
             # 记忆运行时状态保留天数：静默扫描器据此修剪超龄会话——
             # 最后活跃距今达到该天数的会话，其 active_sessions 成员 /

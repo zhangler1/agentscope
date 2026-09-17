@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -896,13 +897,35 @@ async def enable_agent_skill(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Skill '{skill_name}' not found on the remote skillhub.",
         ) from None
+    import time as _time
+
+    _t0 = _time.monotonic()
+    logger.info("[skill-dl] install start for %s (workspace=%s)", skill_name, getattr(workspace, "workdir", "?"))
     try:
         await workspace.add_skill_archive(
             archive.stream,
             archive.format,
             skill_name,
         )
+        logger.info(
+            "[skill-dl] add_skill_archive OK in %.2fs",
+            _time.monotonic() - _t0,
+        )
+    except asyncio.CancelledError:
+        logger.error(
+            "[skill-dl] INSTALL CANCELLED mid-flight for %s after %.2fs "
+            "(workspace teardown / request cancel?)",
+            skill_name,
+            _time.monotonic() - _t0,
+        )
+        raise
     except Exception as e:  # noqa: BLE001
+        logger.error(
+            "[skill-dl] add_skill_archive FAILED for %s after %.2fs: %r",
+            skill_name,
+            _time.monotonic() - _t0,
+            e,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Failed to install skill '{skill_name}': {e}",
@@ -920,7 +943,19 @@ async def enable_agent_skill(
             ),
         )
 
-    logger.info("Enabled skill '%s' for agent '%s'", skill_full_name, agent_id)
+    logger.info(
+        "Enabled skill '%s' for agent '%s'",
+        skill_full_name,
+        agent_id,
+    )
+    # 打印落盘的具体路径（宿主视角：workspace 目录 + skill 实际解压目录）
+    logger.info(
+        "Skill '%s' downloaded -> workspace host_workdir=%s, "
+        "landed dirs=%s",
+        skill_full_name,
+        getattr(workspace, "host_workdir", "?"),
+        sorted(s.dir for s in refreshed if s.name in new_names),
+    )
     return SkillActionResponse(
         success=True,
         action="enabled",

@@ -149,11 +149,24 @@ async def search_vector_backend(keyword: str) -> str:
     headers = dict(_DEFAULT_HEADERS)
     build_auth_headers(headers)
 
+    request_body = _build_request_body(keyword)
+    logger.info(
+        "[vector_search] 请求报文 url=%s headers=%s body=%s",
+        config.api_url,
+        headers,
+        json.dumps(request_body, ensure_ascii=False),
+    )
+
     async with httpx.AsyncClient(timeout=config.timeout) as client:
         response = await client.post(
             config.api_url,
             headers=headers,
-            json=_build_request_body(keyword),
+            json=request_body,
+        )
+        logger.info(
+            "[vector_search] 返回报文 status=%s body=%s",
+            response.status_code,
+            response.text,
         )
         response.raise_for_status()
 

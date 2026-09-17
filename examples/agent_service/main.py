@@ -49,7 +49,7 @@ from agentscope.app.workspace_manager import (
     IsolationPolicy,
     LocalWorkspaceManager,
 )
-from agentscope.mcp import MCPClient, StdioMCPConfig
+from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.rag import QdrantStore
 
 from bocomadp.agents.templates import load_subagent_templates
@@ -88,11 +88,12 @@ from bocomadp.routers.stats import stats_router
 from bocomadp.routers.workspace_files import workspace_files_router
 from bocomadp.routers.oss_download import oss_download_router
 from bocomadp.routers.session_usage import session_usage_router
-from bocomadp.routers.agent_tools import agent_tools_router
+from bocomadp.routers.agent_tools import agent_tools_router, catalog_router
 from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.open_agent_access import (
@@ -202,7 +203,7 @@ default_mcps = [
             args=["@playwright/mcp@latest"],
         ),
         is_stateful=True,
-    ),
+    )
 ]
 
 # ---------------------------------------------------------------------------
@@ -350,7 +351,31 @@ async def build_agent_tools(
     # and refreshes the store; the resume path falls back to the store.
     _current_token.set(await _resolve_session_token(session_id))
 
+    from bocomadp.deerflow.custom_params import get_custom_params
+    from bocomadp.routers.agent_tools import _tool_whitelists
+    from bocomadp.tools.enterprise import (
+        usable_enterprise_tool_names,
+        usable_tool_names,
+    )
+
+    _cp = get_custom_params()
+    usable = _cp.get("usableTools")
+
     tools = tool_registry.list_tools()
+    # usableTools 扩管到项目工具（对齐 GET /tools 可见范围：项目工具 +
+    # 企业工具，不含 MCP / builtins / framework）：
+    #   空/缺失/非数组 → 项目工具全禁（与企业工具层全禁语义一致）；
+    #   非空 → 只保留名单内工具，项目工具按名原样匹配，企业工具名经
+    #          归一后也在集合内（项目工具名不与企业工具名冲突）。
+    # 企业工具的过滤在 build_enterprise_tools 内单独完成，此处只处理
+    # 项目工具。工厂工具（agent-creator）不属于工具列表可见范围，不受
+    # usableTools 管辖，在下方按 agent_id 注入。
+    if isinstance(usable, list) and usable:
+        allowed_names = usable_tool_names(usable)
+        tools = [t for t in tools if getattr(t, "name", "") in allowed_names]
+    else:
+        tools = []
+
     tools.extend(
         await build_enterprise_tools(user_id, agent_id, session_id),
     )
@@ -393,15 +418,9 @@ async def build_agent_tools(
     # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
     # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
     # builtins / 工厂工具等非企业工具不豁免。
-    from bocomadp.deerflow.custom_params import get_custom_params
-    from bocomadp.routers.agent_tools import _tool_whitelists
-    from bocomadp.tools.enterprise import usable_enterprise_tool_names
-
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
-        allowed = set(whitelist) | usable_enterprise_tool_names(
-            get_custom_params().get("usableTools"),
-        )
+        allowed = set(whitelist) | usable_enterprise_tool_names(usable)
         tools = [
             t for t in tools if getattr(t, "name", "") in allowed
         ]
@@ -812,13 +831,11 @@ app = create_app(
 
 
 def _configurable_tool_names() -> list[str]:
-    """Return the configurable tool set M.
+    """Return the full set of tool/MCP names for the agent-creator whitelist.
 
-    M = workspace builtins + ToolRegistry tools + MCP servers + framework
-    team/planning tools + enterprise tools. Mirrors
-    :func:`bocomadp.routers.agent_tools._all_tool_names` so the built-in
-    agent-creator's whitelist covers exactly what the tool config APIs
-    manage.
+    The agent-creator is a privileged system agent that needs access to
+    every tool. Its whitelist must include enterprise tools + MCP names
+    (the configurable set) plus its own factory tools.
     """
     from bocomadp.tool_catalog import (
         BUILTIN_TOOL_NAMES,
@@ -940,6 +957,10 @@ async def _lifespan_with_builtin_agents(app):
         await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
         # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
+        # 设置项目工具名集合（始终允许，不受白名单过滤）。
+        from bocomadp.toolkit_whitelist import set_project_tool_names
+
+        set_project_tool_names(set(tool_registry.list_tool_names()))
         patch_get_toolkit()
         # 请求级模型参数（thinking_enabled/reasoning_effort）：包装框架
         # get_model，run_context 携带时合并进模型 Parameters。
@@ -1038,6 +1059,7 @@ app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
 app.include_router(agent_tools_router)
+app.include_router(catalog_router)
 app.include_router(deerflow_router)
 # deer-flow 前端认证桩（/api/deerflow/v1/auth/me、/api/deerflow/v1/auth/setup-status 固定用户）
 app.include_router(auth_stub_router)
@@ -1051,6 +1073,8 @@ app.include_router(platform_health_router)
 app.include_router(skill_router)
 # 智能体沙箱并发管理（写 PG 真源 + 同步 Redis）
 app.include_router(agent_concurrency_router)
+# 智能体跨知识搜索配置管理（写 PG 真源，运行时工具直接读 PG）
+app.include_router(agent_cross_search_config_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）

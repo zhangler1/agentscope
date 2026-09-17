@@ -18,6 +18,11 @@ from agentscope.tool import FunctionTool, ToolBase
 from ..deerflow.custom_params import get_custom_params
 from ._naming import tool_name
 from .contact_search import contact_search_tool
+from .cross_search import (
+    _current_agent_id as _cross_search_agent_id,
+    _current_user_id as _cross_search_user_id,
+    cross_search_tool,
+)
 from .cross_search import cross_search_tool  # 已是 FunctionTool 实例（带注入中间件）
 from .exchange_rate import exchange_rate_tool
 from .interest_rate import interest_rate_tool
@@ -89,6 +94,43 @@ def usable_enterprise_tool_names(usable: Any) -> set[str]:
     return names
 
 
+def usable_tool_names(usable: Any) -> set[str]:
+    """把 ``custom_params.usableTools`` 名单换算为运行时形态的工具名集合。
+
+    与 :func:`usable_enterprise_tool_names` 不同，本函数把名单里**未命中**
+    企业工具名空间的条目原样保留（用于按名原样匹配项目工具等非企业工具），
+    使 ``usableTools`` 管辖范围覆盖工具列表接口可见的全部工具（项目工具 +
+    企业工具，不含 MCP / builtins / framework）。
+
+    匹配规则：
+
+    - 命中企业工具名空间（中/英文任一形态）的条目 → 经 :func:`tool_name`
+      归一为当前运行时形态（跟随 ``BOCOMADP_TOOL_ASCII_NAMES``）；
+    - 其余条目 → 原样保留（去除首尾空白），用于按工具名原样匹配项目工具
+      （项目工具名固定 ASCII，无中英文之分；builtins / 未知名原样保留
+      也不会误命中，因为项目工具里没有同名工具）。
+
+    Args:
+        usable: ``custom_params.usableTools`` 原始值（list / None / 其他）。
+
+    Returns:
+        运行时形态工具名集合；非 list / 空 list → 空集合。
+    """
+    if not isinstance(usable, list):
+        return set()
+    names: set[str] = set()
+    for item in usable:
+        s = str(item).strip()
+        if not s:
+            continue
+        canonical = _NAME_TO_CANONICAL.get(s)
+        if canonical:
+            names.add(tool_name(_CANONICAL_TO_CN[canonical], canonical))
+        else:
+            names.add(s)
+    return names
+
+
 async def build_enterprise_tools(
     user_id: str,
     agent_id: str,
@@ -126,6 +168,7 @@ async def build_enterprise_tools(
     tools: list[ToolBase] = [
         contact_search_tool,
         physical_contact_search_tool,
+        # FunctionTool(query_employee_info, name="查询员工信息",is_read_only=True),
         FunctionTool(query_internal_doc, is_read_only=True),
         FunctionTool(submit_it_ticket),
         raw_request_tool,  # 已是 FunctionTool 实例（工具名"外数查"）
@@ -135,6 +178,8 @@ async def build_enterprise_tools(
     ]
 
     # cross_search 始终挂载（2026-08-20 起不再受 vector_search_switch 控制）
+    _cross_search_user_id.set(user_id)
+    _cross_search_agent_id.set(agent_id)
     tools.append(cross_search_tool)
 
     # vector_search_switch 显式 False → 不挂行内搜索；未传 / True 保持默认挂载
@@ -188,10 +233,5 @@ async def build_enterprise_tools(
         return []
     allowed = usable_enterprise_tool_names(usable)
     tools = [t for t in tools if getattr(t, "name", "") in allowed]
-    logger.info(
-        "enterprise tools: usableTools filter applied -> %s (session=%s)",
-        [getattr(t, "name", "") for t in tools],
-        session_id,
-    )
 
     return tools
