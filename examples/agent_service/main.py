@@ -72,7 +72,6 @@ from agentscope.middleware import TracingMiddleware
 from bocomadp.middleware.custom.event_log import EventLogMiddleware
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
-from bocomadp.middleware.tool_call_repair import ToolCallRepairMiddleware
 from bocomadp.middleware.request_log import AccessLogMiddleware
 from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
@@ -420,10 +419,8 @@ async def build_agent_middlewares(
     user_id: str,
     agent_id: str,
     session_id: str,
-) -> list[Any]:
-    # 显式标注 list[Any]：中间件列表是异构的（registry 扫描 + 企业主动 build），
-    # 下面的重排若让推导收窄成某个具体中间件类型，会污染下游 append/extend。
-    middlewares: list[Any] = middleware_registry.list_middlewares()
+):
+    middlewares = middleware_registry.list_middlewares()
     middlewares.extend(
         await build_enterprise_middlewares(
             user_id,
@@ -448,15 +445,6 @@ async def build_agent_middlewares(
             if not isinstance(m, (EventLogMiddleware, TracingMiddleware))
         ]
         middlewares.extend(inner)
-    # 体检/自愈（ToolCallRepairMiddleware）必须排在洋葱链**最外层**：
-    # 它先保证 messages 里历史 tool_call 参数合法（修复/剔除），下游
-    # （含最内层的 event_log / Langfuse）记录的才是真正发出去的内容。
-    # 用稳定排序原地重排（而非重建列表），避免收窄 middlewares 的推导类型。
-    middlewares.sort(
-        key=lambda m: (
-            0 if isinstance(m, ToolCallRepairMiddleware) else 1
-        ),
-    )
     return middlewares
 
 

@@ -15,7 +15,6 @@ from agentscope.middleware import MiddlewareBase
 
 from .custom_prompt import CustomPromptMiddleware
 from .slot_release import SlotReleaseMiddleware
-from .tool_call_repair import ToolCallRepairMiddleware
 from .tool_result_budget import ToolResultBudgetMiddleware
 from .tool_result_persistence import ToolResultPersistenceMiddleware
 
@@ -41,9 +40,6 @@ async def build_enterprise_middlewares(
     契约对齐而保留。
     """
     middlewares: list[MiddlewareBase] = [
-        # 体检/自愈：必须排在其它中间件之前（发送前先保证历史 tool_call 参数
-        # 合法），main.py 的 build_agent_middlewares 还会把它提到最外层。
-        ToolCallRepairMiddleware(),
         CustomPromptMiddleware(),
     ]
 
