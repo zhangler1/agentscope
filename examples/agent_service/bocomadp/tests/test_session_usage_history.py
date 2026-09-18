@@ -361,6 +361,45 @@ def test_usage_agents_empty_user(client):
     }
 
 
+def test_usage_agents_excludes_deleted_agent(client):
+    """已删除的智能体不进清单，但其残留会话在 history 里仍可查。
+
+    场景复刻：智能体删了、会话行残留（框架级联只删 owner 视角的
+    会话——聊的人不是 owner 时，别人的会话不会被删）。usage/agents
+    走 EXISTS 过滤 agents 表，孤儿 agent_id 不冒进清单、name 不会
+    变空串行；usage/history 是历史时间线，行为不变（agent_name 兜
+    底空串）。
+    """
+    _seed_agents(client)
+    # 会话挂在 ghost-agent 上，但 agents 表里没有这个智能体（已删）
+    _add_session(client, "s-ghost", "test-user", "ghost-agent", _T1)
+
+    # usage/agents：ghost-agent 被过滤，不出空名行
+    resp = client.get(
+        "/sessions/usage/agents",
+        params={"user_id": "test-user"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    ids = [a["agent_id"] for a in body["agents"]]
+    assert "ghost-agent" not in ids
+    assert body["total"] == 0
+    assert body["agents"] == []
+
+    # usage/history：历史记录保留，agent_name 兜底空串（口径不变）
+    resp = client.get(
+        "/sessions/usage/history",
+        params={"user_id": "test-user"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["sessions"][0]["id"] == "s-ghost"
+    assert body["sessions"][0]["agent_name"] == ""
+
+
 # ---------------------------------------------------------------------------
 # 2) GET /sessions/usage/history
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ from bocomadp.market_store import (
     get_market_entry,
     insert_market_entry,
     list_market_entries,
+    list_market_tags,
     set_market_tag,
 )
 from bocomadp.routers._schema.market import (
@@ -323,6 +324,26 @@ async def featured_market_agents(
         ],
         total=len(ranked),
     )
+
+
+# ---------------------------------------------------------------------------
+# 标签清单端点（全开放）：前端筛选下拉框数据源
+# ---------------------------------------------------------------------------
+
+
+@market_router.get(
+    "/tags",
+    summary="市场已使用的标签清单（去重，升序）",
+)
+async def list_market_tag_options(
+    storage: StorageBase = Depends(get_storage),
+) -> dict:
+    """全量标签：``agent_market.tag`` 现存量去重（空串不进清单）。
+
+    自由标签口径下不存在预设清单（旧版 ``config.yaml`` 的
+    ``domains`` 已废），这是前端标签下拉框的唯一真实数据源。
+    """
+    return {"tags": await list_market_tags(storage)}
 
 
 # ---------------------------------------------------------------------------
