@@ -195,6 +195,27 @@ async def list_market_entries(storage: Any) -> list[AgentMarketEntry]:
         ]
 
 
+async def list_market_tags(storage: Any) -> list[str]:
+    """市场已使用的标签清单（去重、升序，空串=未打标不进清单）。
+
+    数据源就是 ``agent_market.tag`` 现存量——自由标签口径下不存在
+    预设清单（旧版 ``config.yaml`` 的 ``domains`` 已随 37 课删除），
+    前端筛选下拉框直接吃这个。
+    """
+    factory = _session_factory(storage)
+    if factory is None:
+        return []
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                select(AgentMarketRow.tag)
+                .where(AgentMarketRow.tag != "")
+                .distinct(),
+            )
+        ).scalars().all()
+    return sorted(rows)
+
+
 async def delete_market_entry(storage: Any, agent_id: str) -> bool:
     """把智能体移出市场名单（unpublish / 删除级联共用）。
 
@@ -249,6 +270,7 @@ __all__ = [
     "get_market_entry",
     "insert_market_entry",
     "list_market_entries",
+    "list_market_tags",
     "prune_orphan_market_entries",
     "set_market_tag",
 ]

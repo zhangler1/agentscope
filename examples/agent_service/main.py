@@ -104,6 +104,7 @@ from bocomadp.open_agent_access import (
 from bocomadp.team_access import patch_team_access
 from bocomadp.team_briefing import patch_team_briefing
 from bocomadp.projectors import WorkerFailureNotifier
+from bocomadp.agent_session_purge import patch_agent_session_purge
 from bocomadp.session_team_cascade import patch_session_team_cascade
 from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.toolkit_whitelist import patch_get_toolkit
@@ -1000,6 +1001,9 @@ async def _lifespan_with_builtin_agents(app):
         # 原实现改 src/_service/_session.py 的 delete_agent，现搬迁到
         # bocomadp/session_team_cascade.py。
         patch_session_team_cascade()
+        # 智能体删除的全量使用痕迹清理（所有用户的 sessions/messages
+        # 一并删，框架级联只删 owner 视角）——bocomadp/agent_session_purge.py。
+        patch_agent_session_purge()
         # 开放智能体交互：任意用户可与任意智能体对话（除 team worker），
         # 创建/更新会话接口的 agent 归属与凭证归属校验一并放开；
         # 运行时凭证解析（chat/embedding/TTS）同样放开，密钥跨用户可用；
