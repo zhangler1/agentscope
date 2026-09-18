@@ -417,6 +417,53 @@ def test_tag_rejected_for_agents_not_in_market(client, market_ids):
 
 
 # ---------------------------------------------------------------------------
+# 4.1) GET /agent/market/tags —— 全量标签清单（去重、升序、排除空串）
+# ---------------------------------------------------------------------------
+
+
+def test_market_tags_dedup_sorted_and_excludes_empty(client, market_ids):
+    """清单 = agent_market.tag 现存量去重：升序、空串（未打标）不进。"""
+    platform_user, worker_id, _ = market_ids
+
+    # 初始全未打标 → 空清单（不返回 [""]）
+    resp = client.get("/agent/market/tags")
+    assert resp.status_code == 200
+    assert resp.json() == {"tags": []}
+
+    # 打两个标（含重复值场景：先打再改一个成相同值）
+    assert client.put(
+        f"/agent/market/{platform_user}",
+        json={"tag": "数据分析"},
+        headers=HDR_USER,
+    ).status_code == 200
+    assert client.put(
+        f"/agent/market/{worker_id}",
+        json={"tag": "客服"},
+        headers=HDR_USER,
+    ).status_code == 200
+
+    resp = client.get("/agent/market/tags")
+    assert resp.json() == {"tags": ["客服", "数据分析"]}  # 升序
+
+    # 撕标一个 → 从清单消失；未打标的 worker 行不影响清单
+    assert client.delete(
+        f"/agent/market/{platform_user}", headers=HDR_USER,
+    ).status_code == 204
+    assert client.get("/agent/market/tags").json() == {"tags": ["客服"]}
+
+
+def test_market_tags_isolated_from_market_rows(client, market_ids):
+    """只有名单内智能体的 tag 进清单；名单外智能体打不上标、不影响清单。"""
+    _, _, other_id = market_ids
+
+    # 名单外打标 404（不能隐式上架），清单仍为空
+    assert client.put(
+        f"/agent/market/{other_id}", json={"tag": "预打标"}, headers=HDR_USER,
+    ).status_code == 404
+    assert client.get("/agent/market/tags").json() == {"tags": []}
+
+
+# ---------------------------------------------------------------------------
 # 5) 热度统计范围（按 agent_id 聚合：外部用户的使用也要计入）
 # ---------------------------------------------------------------------------
 

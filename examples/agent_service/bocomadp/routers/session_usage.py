@@ -592,6 +592,10 @@ async def list_user_used_agents(
 
     - 数据源：``sessions`` 表按 ``agent_id`` 分组聚合（会话数 +
       最近使用时间）——聊过就会留下会话，天然涵盖自建与市场智能体；
+      且只统计 **agents 表里还存在的** 智能体（``EXISTS`` 过滤）：
+      删除智能体时 ``agent_session_purge`` 已全量清理所有用户的
+      会话，此处兜底**存量孤儿**与"删除瞬间他人对话落库重建"的
+      竞态残留行；
     - 分页：``page`` / ``size``（url 参数）；``total`` 为**分页前**
       的总条数，``has_more`` 标识是否还有下一页——聚合本身在 SQL
       侧完成（量级 = 用过的智能体数），Python 侧只做切片；
@@ -619,6 +623,12 @@ async def list_user_used_agents(
                     "MAX(updated_at) AS last_used_at "
                     "FROM sessions "
                     "WHERE user_id = :user_id "
+                    # 已删除的智能体不进清单：其会话行可能残留（框架级联
+                    # 只删 owner 视角的会话，市场智能体被别人聊过的部分
+                    # 留下来），纯 GROUP BY 会把它们当"用过"冒出来，
+                    # name 还查不到（agents 行已删）只能给空串。
+                    "AND EXISTS (SELECT 1 FROM agents a "
+                    "            WHERE a.id = sessions.agent_id) "
                     "GROUP BY agent_id "
                     "ORDER BY last_used_at DESC, agent_id",
                 ),
