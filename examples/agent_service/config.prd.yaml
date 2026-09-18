@@ -21,7 +21,7 @@ app_name: "交通银行智能体平台"
 
 # ---------- 日志 ----------
 # 调试技能/工具链路时改为 debug（agent 事件流、工具调用、沙箱执行细节）
-log_level: debug
+log_level: info
 logging:
   enhance:
     enabled: true          # trace_id 关联日志增强（TraceContextFilter + 格式化）
@@ -111,8 +111,7 @@ workspace_dir: "./workspaces"
 # 字符串值支持 $VAR / ${VAR} 环境变量引用展开（如 api_url: $CROSS_SEARCH_API_URL）。
 cross_search:
   # api_url 支持环境变量引用展开，运行时需设置 CROSS_SEARCH_API_URL
-  api_url: "http://12.244.113.82/EUVD.EUVD-ADAPTER.V-1.0/searchKnowledgeStandard.do"
-  # api_url: "http://klbs-glb-slb-7003.bocomm.com/EUVD.EUVD-ADAPTER.V-1.0/searchKnowledgeStandard.do"
+  api_url: "http://klbs-glb-slb-7003.bocomm.com/EUVD.EUVD-ADAPTER.V-1.0/searchKnowledgeStandard.do"
   timeout: 30
   caller: "VD2026000"
   search_type: "0"
