@@ -137,8 +137,9 @@ async def build_thread_values(
 
     usage_metadata 不在本函数附加：storage 历史里最后一条 ai 可能是
     上一次 run 的消息（assistant 落库晚于 REPLY_END），在此附加会把
-    本轮 run 级 usage 挂到错误的消息上；由调用方在最终组装列表上
-    兜底（见 _build_values_frame）。
+    本轮 run 级 usage 挂到错误的消息上；本轮消息级 usage 随 formatter
+    结构化快照自带，run 级累计 usage 由 end 帧 data 承载（见
+    protocol.end_frame），values 快照不附加。
     """
     messages = await _load_messages(
         storage,

@@ -181,8 +181,8 @@ class DeerflowSSEFormatter:
         # 本轮模型调用开始前已存在的工具调用 id（区分跨轮新增调用）
         self._model_preexisting_tool_ids: set[str] = set()
         # 本轮结构化消息序列（事件顺序 append：每轮 ai 快照 + tool 消息
-        # 交错，对齐原生 state.messages 形态；供 values 收尾快照补入，
-        # 使快照含完整 tool_calls/tool 消息而非仅扁平 assistant）
+        # 交错，对齐原生 state.messages 形态；供 values 节点边界快照
+        # 补入，使快照含完整 tool_calls/tool 消息而非仅扁平 assistant）
         self._turn_messages: list[dict[str, Any]] = []
         # 本 run 的 reply_id（reply_start 记录，供 values 快照判断
         # storage 尾部扁平 assistant 是否本轮落库）
@@ -690,7 +690,8 @@ class DeerflowSSEFormatter:
     def usage(self) -> dict[str, int] | None:
         """本 run 已累积的 token 用量（input/output/total），无调用时 None。
 
-        供 SSE 生成器在 end 前组装 values 快照时附加 ``usage_metadata``。
+        供 SSE 生成器组装 end 帧 data（run 级累计 usage，对齐原生
+        ``StreamEvent(type="end", data={"usage": ...})``）。
         """
         return dict(self._usage) if self._usage is not None else None
 
@@ -700,8 +701,8 @@ class DeerflowSSEFormatter:
 
         对齐原生 values 快照的 state.messages 形态（ai 消息含
         tool_calls/usage_metadata、tool 消息紧随其调用）。SSE 生成器
-        在流中每个节点边界帧（:meth:`_values_frame`）与收尾快照组装
-        时读取：storage 落库晚于 REPLY_END，本轮结构以此序列为准。
+        在流中每个节点边界帧（:meth:`_values_frame`）组装时读取：
+        storage 落库晚于 REPLY_END，本轮结构以此序列为准。
         """
         return list(self._turn_messages)
 

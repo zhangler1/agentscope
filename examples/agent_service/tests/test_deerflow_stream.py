@@ -292,7 +292,7 @@ def test_create_run_stream_echoes_human_message_first(monkeypatch) -> None:
 
 def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
     """token 下发通道：MODEL_CALL_END 消化后不泄漏 custom 帧，
-    改为 REPLY_END 末尾 messages usage 增量帧 + end 前 values 快照
+    改为 REPLY_END 末尾 messages usage 增量帧 + 节点边界 values 快照
     （最后一条 ai 消息带 usage_metadata，对齐原生形态）。
     """
     async def _no_binding(agent_id: str):
@@ -357,13 +357,13 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
         for name, data in events
     )
     # 帧序：human 回显 → metadata → messages usage 增量 → updates 快照
-    # → values（流中节点边界）→ values（收尾全量）→ end
+    # → values（流中节点边界）→ end（原生无额外收尾 values，见
+    # 原生 client.py ``stream()``：最后一个 super-step 快照后直接 end）
     assert events_by_name == [
         "messages",
         "metadata",
         "messages",
         "updates",
-        "values",
         "values",
         "end",
     ]
@@ -383,20 +383,20 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
     assert usage_meta["langgraph_node"] == "model"
     assert usage_meta["agent_name"] == "agent_a"
     assert usage_meta["thread_id"] == "t1"
-    # values 快照（收尾帧）：storage 历史（human + 上轮扁平 ai）+
+    # values 快照（节点边界帧）：storage 历史（human + 上轮扁平 ai）+
     # 本轮结构化 ai 快照在尾部，自带该轮 usage_metadata（消息级语义）；
     # title 取 storage 内最近一条 human；请求输入尚未落库
-    values = json.loads(events[5][1])
+    values = json.loads(events[4][1])
     assert values["title"] == "德国的历史是什么？"
     assert [m["type"] for m in values["messages"]] == ["human", "ai", "ai"]
     assert values["messages"][-1]["id"] == "r1"
     assert values["messages"][-1]["usage_metadata"] == expected_usage
     # run 级累计 usage 不挂到历史消息上（上轮扁平 ai-1 无 usage_metadata，
-    # 否则下一次 run 的收尾帧会把本轮 usage 错挂到上一条 run 的消息）
+    # 快照只含消息级语义，run 级累计由 end 帧 data 承载）
     assert "usage_metadata" not in values["messages"][1]
     # end 帧：run 级累计 usage
-    assert events[6][0] == "end"
-    assert json.loads(events[6][1])["usage"] == expected_usage
+    assert events[5][0] == "end"
+    assert json.loads(events[5][1])["usage"] == expected_usage
 
 
 def test_join_run_stream_echoes_human_messages() -> None:
@@ -438,21 +438,10 @@ def test_join_run_stream_echoes_human_messages() -> None:
         "content": [{"type": "text", "text": "德国的历史是什么？"}],
     }
 
-    # 帧 2：values 快照（end 哨兵前补发，对齐原生主通道帧）；
-    # 无模型调用 → 无 usage_metadata
-    assert events[1][0] == "values"
-    values = json.loads(events[1][1])
-    assert values["title"] == "德国的历史是什么？"
-    assert values["messages"] == [
-        {
-            "type": "human",
-            "id": "human-1",
-            "content": [{"type": "text", "text": "德国的历史是什么？"}],
-        },
-    ]
-
-    # 帧 3：run 已结束 → end 收尾（无模型调用 → usage 零值）
-    assert events[2][0] == "end"
-    assert json.loads(events[2][1]) == {
+    # 帧 2：run 已结束 → end 收尾（无模型调用 → usage 零值）。
+    # 原生无额外收尾 values：join 回放无节点边界帧，直接 end
+    # （见原生 client.py ``stream()``：最后一个 super-step 快照后直接 end）
+    assert events[1][0] == "end"
+    assert json.loads(events[1][1]) == {
         "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }

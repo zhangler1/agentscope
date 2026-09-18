@@ -1359,12 +1359,13 @@ def _sse_generator(
             永不清理，界面出现两条用户输入（“问题显示两次”）。
         storage (`StorageBase | None`, optional):
             会话存储；缺省时跳过 values 快照帧。formatter 每个节点
-            边界产出的 values 帧与 end 哨兵前的收尾快照均从 storage
-            拉历史消息 + 本轮结构化序列组装 ``event: values``（对齐
-            原生主通道帧，含 title 与 ai 消息的 ``usage_metadata``，
-            流中每节点边界一帧、messages 递增）。error 情形不发
-            values（run 未正常完结）；HITL park 时流中卡片快照照发，
-            仅跳过收尾全量快照。
+            边界产出的 values 帧均从 storage 拉历史消息 + 本轮结构化
+            序列组装 ``event: values``（对齐原生主通道帧，含 title 与
+            ai 消息的 ``usage_metadata``，流中每节点边界一帧、messages
+            递增）。收尾不发 values——原生在最后一个 super-step 边界
+            快照后直接 end（见原生 client.py ``stream()``）。error
+            情形不发 values（run 未正常完结）；HITL park 时卡片快照
+            帧照发（interrupt 快照对齐原生），随后直接 end。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
@@ -1378,7 +1379,7 @@ def _sse_generator(
         # error 帧标志：error 流不发 values 快照（run 未正常完结）。
         error_seen = False
         # 翻译器实例跨回放 + live 共享：token 用量累积状态连续，
-        # end 哨兵前从 formatter.usage 取值组装 values 快照。
+        # end 帧从 formatter.usage 取值组装 run 级累计 usage。
         formatter = DeerflowSSEFormatter()
         try:
             # 首帧回显用户输入（先于一切总线事件，保证 values.messages
@@ -1404,23 +1405,10 @@ def _sse_generator(
                     # 提前落定可避免紧随其后的新 run 误判 409）；error 帧
                     # 已先行落定 ERROR，此处不覆盖。
                     _finish_if_running(run_manager, run_id, RunStatus.SUCCESS)
-                    if not error_seen and not hitl_parked:
-                        values = await _build_values_frame(
-                            storage,
-                            user_id,
-                            session_id,
-                            usage=formatter.usage,
-                            turn_messages=formatter.turn_messages,
-                            reply_id=formatter.reply_id,
-                        )
-                        if values is not None:
-                            yield format_sse(
-                                StreamEvent(
-                                    id="",
-                                    event=EVENT_VALUES,
-                                    data=values,
-                                ),
-                            )
+                    # 原生流在最后一个 super-step 边界 values 帧后直接 end，
+                    # 无额外收尾快照（见原生 client.py ``stream()`` 末尾
+                    # ``yield StreamEvent(type="end", ...)``）——对齐该行为，
+                    # 收尾不发 values。
                     # 原生 end 帧 data 携带 run 级累计 usage（零值兜底
                     # 三字段），替代裸哨兵（data: null），对齐 Python
                     # 客户端 ``StreamEvent(type="end", data={"usage": ...})``
@@ -1446,7 +1434,6 @@ def _sse_generator(
                             storage,
                             user_id,
                             session_id,
-                            usage=None,
                             turn_messages=evt.data,
                             reply_id=formatter.reply_id,
                         )
@@ -1517,26 +1504,23 @@ async def _build_values_frame(
     user_id: str,
     session_id: str,
     *,
-    usage: dict[str, int] | None,
     turn_messages: list[dict[str, Any]] | None = None,
     reply_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """end 哨兵前的 values 快照（storage 缺失/无消息时跳过）。
+    """节点边界 values 快照组装（storage 缺失/无消息时跳过）。
 
-    组装失败不阻断流——values 帧是视图同步优化，end 哨兵才是流终止
+    组装失败不阻断流——values 帧是视图同步优化，end 帧才是流终止
     契约；storage 读取异常时仅记日志并跳过。
 
-    assistant 消息落库晚于 REPLY_END（异步写库），收尾快照常缺本轮
-    消息；此时用 formatter 本轮结构化序列兜底补入（每轮 ai 快照含
-    tool_calls/usage_metadata 与 tool 消息交错，对齐原生 values 快照
+    assistant 消息落库晚于 REPLY_END（异步写库），节点边界快照常缺
+    本轮消息；此时用 formatter 本轮结构化序列兜底补入（每轮 ai 快照
+    含 tool_calls/usage_metadata 与 tool 消息交错，对齐原生 values 快照
     的 state.messages 全量形态）。若本轮扁平 assistant 已落库（尾部
     消息 id == reply_id），先移除再补结构化序列，避免重复。
 
-    run 级累计 usage 在最终组装列表上兜底：仅当最后一条 ai 无
-    usage_metadata 时附加（storage 扁平历史旧消息无该字段的情形）。
-    本轮结构化 ai 快照自带该轮 usage_metadata（消息级语义），不覆盖
-    ——且绝不能在 storage 历史阶段附加（落库晚于 REPLY_END，会挂到
-    上一次 run 的 ai 消息上）。
+    run 级累计 usage 不在此附加：原生快照的 ai 消息 usage_metadata
+    为消息级语义（随本轮结构化快照自带），run 级累计 usage 由 end
+    帧 data 承载（见 protocol.end_frame）。
     """
     if storage is None:
         return None
@@ -1560,14 +1544,6 @@ async def _build_values_frame(
             messages = messages[:-1]
         if turn_messages:
             values["messages"] = [*messages, *turn_messages]
-        # run 级累计 usage 兜底（见 docstring）：最后一条 ai 无
-        # usage_metadata 才附加——本轮结构化快照自带轮次值时跳过
-        if usage:
-            for msg in reversed(values["messages"]):
-                if msg.get("type") == "ai":
-                    if not msg.get("usage_metadata"):
-                        msg["usage_metadata"] = usage
-                    break
         return values
     except Exception:  # noqa: BLE001 —— 快照失败降级为不发 values 帧
         logger.exception(
