@@ -282,12 +282,8 @@ def test_create_run_stream_echoes_human_message_first(monkeypatch) -> None:
     assert meta["run_id"]
     assert meta["thread_id"] == THREAD_ID
 
-    # 帧 3：run 已结束 → end 收尾（data 携带 run 级累计 usage，无模型
-    # 调用时零值三字段，对齐原生 StreamEvent(type="end", data={"usage": ...})）
-    assert events[2][0] == "end"
-    assert json.loads(events[2][1]) == {
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-    }
+    # 帧 2 后无帧：run 已结束，本层不下发 end 帧（流结束由连接关闭传递）
+    assert len(events) == 2
 
 
 def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
@@ -357,15 +353,15 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
         for name, data in events
     )
     # 帧序：human 回显 → metadata → messages usage 增量 → updates 快照
-    # → values（流中节点边界）→ end（原生无额外收尾 values，见
-    # 原生 client.py ``stream()``：最后一个 super-step 快照后直接 end）
+    # → values（流中节点边界）；无 end 帧（本层不下发，流结束由连接
+    # 关闭传递；原生最后一个 super-step 快照后直接 end，见原生
+    # client.py ``stream()``）
     assert events_by_name == [
         "messages",
         "metadata",
         "messages",
         "updates",
         "values",
-        "end",
     ]
     expected_usage = {
         "input_tokens": 120,
@@ -392,11 +388,9 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
     assert values["messages"][-1]["id"] == "r1"
     assert values["messages"][-1]["usage_metadata"] == expected_usage
     # run 级累计 usage 不挂到历史消息上（上轮扁平 ai-1 无 usage_metadata，
-    # 快照只含消息级语义，run 级累计由 end 帧 data 承载）
+    # 快照只含消息级语义，run 级总量由前端按 usage 增量帧累加）
     assert "usage_metadata" not in values["messages"][1]
-    # end 帧：run 级累计 usage
-    assert events[5][0] == "end"
-    assert json.loads(events[5][1])["usage"] == expected_usage
+    # 无 end 帧：流结束由连接关闭传递（events 末尾为 values 快照帧）
 
 
 def test_join_run_stream_echoes_human_messages() -> None:
@@ -438,10 +432,7 @@ def test_join_run_stream_echoes_human_messages() -> None:
         "content": [{"type": "text", "text": "德国的历史是什么？"}],
     }
 
-    # 帧 2：run 已结束 → end 收尾（无模型调用 → usage 零值）。
-    # 原生无额外收尾 values：join 回放无节点边界帧，直接 end
-    # （见原生 client.py ``stream()``：最后一个 super-step 快照后直接 end）
-    assert events[1][0] == "end"
-    assert json.loads(events[1][1]) == {
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-    }
+    # 帧 2 后无帧：run 已结束，本层不下发 end 帧（join 回放无节点边界
+    # 帧；原生最后一个 super-step 快照后直接 end，见原生 client.py
+    # ``stream()``）
+    assert len(events) == 1

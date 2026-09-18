@@ -18,8 +18,8 @@
 | ``ModelCallStartEvent``       | （内部消化）             | 记录 model_name，注入 messages 帧 metadata 的 ``ls_model_name`` |
 | ``ModelCallEndEvent``         | ``messages`` + ``updates`` + ``values`` | 累积 input/output tokens + 先补发一条本轮 usage 增量帧（chunk 挂 ``usage_metadata``，作为该轮流式最后一块——对齐原生 messages 流最后一块先于节点快照的时序，前端按消息 id 去重累加）；再按轮次发完整 ai 消息快照（``{"model": {"messages": [...]}}``，content + 本轮新增 tool_calls，消息挂该轮 ``usage_metadata``，对齐原生 model 节点写入时机）；随后 values 快照帧（对齐原生 model 节点写 state 后快照，流中每节点边界一帧递增） |
 | ``CustomEvent``               | ``custom``             | 原样透传                                   |
-| ``ReplyEndEvent(normal)``     | ``end``                | 哨兵（生成器收尾时升级为带 ``usage`` 累计值的 end 帧，对齐原生客户端跨消息累加后的 run 级总量） |
-| ``ReplyEndEvent(error)``      | ``error`` + ``end``    | ``{"message", "name"}`` 后接哨兵           |
+| ``ReplyEndEvent(normal)``     | （内部哨兵）           | 收尾信号（END_SENTINEL，驱动生成器收尾，不序列化下发帧；run 级总量由前端按每轮 usage 增量帧累加） |
+| ``ReplyEndEvent(error)``      | ``error`` +（内部哨兵）| ``{"message", "name"}`` 后接收尾信号（不下发帧）           |
 | 未知事件                      | ``custom``             | 原样透传而非丢弃 |
 
 输入侧按 TEXT/THINKING/TOOL 分支匹配，输出侧统一翻译为 deer-flow 协议。
@@ -35,7 +35,6 @@ from typing import Any
 from .protocol import (
     END_SENTINEL,
     EVENT_CUSTOM,
-    EVENT_END,
     EVENT_ERROR,
     EVENT_MESSAGES,
     EVENT_METADATA,
@@ -282,8 +281,8 @@ class DeerflowSSEFormatter:
 
         usage 不再在此补发——每轮 MODEL_CALL_END 已下发该轮 usage
         增量帧（对齐原生每轮最后一块 chunk 挂 ``usage_metadata``，
-        前端按消息 id 去重累加）；run 级累计值由生成器收尾写入 end
-        帧 ``data.usage``。
+        前端按消息 id 去重累加）；本层不下发 end 帧（END_SENTINEL 仅
+        作内部收尾信号，流结束由连接关闭传递）。
         """
         finished_reason = str(event.get("finished_reason", "")).upper()
         if finished_reason == "ERROR":
@@ -601,7 +600,7 @@ class DeerflowSSEFormatter:
         （``id=f"{reply_id}:{seq}"``，seq 由 MODEL_CALL_START 递增），
         一轮一条帧、含本轮全部新增调用。
 
-        token 用量同步累积（reply 级聚合，供 end 帧 ``data.usage``）；
+        token 用量同步累积（reply 级聚合，:attr:`usage` 只读视图）；
         本轮消息快照挂该轮 ``usage_metadata``，并补发一条本轮 usage
         增量帧（chunk 挂 ``usage_metadata``、同轮次 id，作为该轮流式
         最后一块）——对齐原生：LangChain 每轮 AIMessageChunk 的最后
@@ -690,8 +689,8 @@ class DeerflowSSEFormatter:
     def usage(self) -> dict[str, int] | None:
         """本 run 已累积的 token 用量（input/output/total），无调用时 None。
 
-        供 SSE 生成器组装 end 帧 data（run 级累计 usage，对齐原生
-        ``StreamEvent(type="end", data={"usage": ...})``）。
+        reply 级聚合只读视图：end 帧为 data: null 哨兵不携带 usage，
+        run 级总量由前端按每轮 usage 增量帧累加得出。
         """
         return dict(self._usage) if self._usage is not None else None
 
@@ -766,10 +765,11 @@ class DeerflowSSEFormatter:
         # 等待确认时的 state 快照，前端刷新后仍能恢复卡片渲染）
         stream_events.append(self._values_frame(event))
         # HITL park 收尾：原生在等待确认时不会发出 ReplyEndEvent（reply
-        # 尚未结束，等待 Case B 续跑），bridge 的 live 订阅永远等不到 end
-        # 哨兵，SSE 连接只靠心跳帧空转不关闭，前端 ``isStreaming`` 一直
-        # 卡死（确认卡片也因此 disabled）。此处补发 end 哨兵让本轮流在
-        # 卡片帧后正常收尾，用户点击确认/拒绝后由前端发起新 run 续跑。
+        # 尚未结束，等待 Case B 续跑），bridge 的 live 订阅永远等不到内部
+        # end 哨兵，SSE 连接只靠心跳帧空转不关闭，前端 ``isStreaming`` 一直
+        # 卡死（确认卡片也因此 disabled）。此处补发内部 end 哨兵（不下发
+        # 帧，仅驱动生成器收尾）让本轮流在卡片帧后正常结束，用户点击
+        # 确认/拒绝后由前端发起新 run 续跑。
         stream_events.append(END_SENTINEL)
         return stream_events
 

@@ -387,7 +387,7 @@ def _model_call_end(input_tokens: int, output_tokens: int) -> dict:
 def test_model_call_end_emits_updates_snapshot_and_usage() -> None:
     """MODEL_CALL_END 发本轮 usage 增量帧（先于快照，对齐原生 messages
     流最后一块先于节点写入 state）+ updates 完整 ai 消息快照（挂该轮
-    usage_metadata），并累积 reply 级 usage（end 帧用）。"""
+    usage_metadata），并累积 reply 级 usage（``f.usage`` 只读视图）。"""
     f = DeerflowSSEFormatter()
     f.translate(
         {"type": "MODEL_CALL_START", "reply_id": "r1", "run_id": "run1"},

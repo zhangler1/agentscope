@@ -107,7 +107,6 @@ from ..protocol import (
     EVENT_MESSAGES,
     EVENT_VALUES,
     StreamEvent,
-    end_frame,
     format_sse,
 )
 from ..runs import RunManager, RunRecord, RunStatus
@@ -1365,12 +1364,13 @@ def _sse_generator(
             递增）。收尾不发 values——原生在最后一个 super-step 边界
             快照后直接 end（见原生 client.py ``stream()``）。error
             情形不发 values（run 未正常完结）；HITL park 时卡片快照
-            帧照发（interrupt 快照对齐原生），随后直接 end。
+            帧照发（interrupt 快照对齐原生），随后直接收尾。本层不下发
+            ``event: end`` 帧：流结束由连接关闭传递。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
         # HITL park 标志：收到确认请求帧（on_require_confirm）后置真。
-        # park 是回复的正常终点（end 哨兵由 formatter 补发），此时
+        # park 是回复的正常终点（内部 end 哨兵由 formatter 补发），此时
         # interrupt 会走"锁已释放"分支，enqueue UserInterruptEvent 把
         # ASKING 的待确认工具调用全部标记 interrupted——摧毁等待用户
         # 确认的状态，确认应答将永远匹配不到工具调用。故 finally 里
@@ -1379,7 +1379,7 @@ def _sse_generator(
         # error 帧标志：error 流不发 values 快照（run 未正常完结）。
         error_seen = False
         # 翻译器实例跨回放 + live 共享：token 用量累积状态连续，
-        # end 帧从 formatter.usage 取值组装 run 级累计 usage。
+        # 本层不下发 end 帧（END_SENTINEL 仅驱动收尾，流结束由连接关闭传递）。
         formatter = DeerflowSSEFormatter()
         try:
             # 首帧回显用户输入（先于一切总线事件，保证 values.messages
@@ -1409,10 +1409,9 @@ def _sse_generator(
                     # 无额外收尾快照（见原生 client.py ``stream()`` 末尾
                     # ``yield StreamEvent(type="end", ...)``）——对齐该行为，
                     # 收尾不发 values。
-                    # 原生 end 帧 data 携带 run 级累计 usage（零值兜底
-                    # 三字段），替代裸哨兵（data: null），对齐 Python
-                    # 客户端 ``StreamEvent(type="end", data={"usage": ...})``
-                    yield format_sse(end_frame(formatter.usage))
+                    # 本层暂不下发 end 帧：END_SENTINEL 仅驱动收尾，流结束
+                    # 由连接关闭传递（run 级总量由前端按每轮 usage 增量帧
+                    # 累加）
                     return
                 if evt.event == EVENT_ERROR:
                     error_seen = True
@@ -1465,7 +1464,7 @@ def _sse_generator(
                     data={"message": str(e), "name": "StreamError"},
                 ),
             )
-            yield format_sse(end_frame(formatter.usage))
+            # 本层暂不下发 end 帧：流结束由连接关闭传递
         finally:
             if on_disconnect == "cancel" and not hitl_parked:
                 try:
@@ -1509,7 +1508,7 @@ async def _build_values_frame(
 ) -> dict[str, Any] | None:
     """节点边界 values 快照组装（storage 缺失/无消息时跳过）。
 
-    组装失败不阻断流——values 帧是视图同步优化，end 帧才是流终止
+    组装失败不阻断流——values 帧是视图同步优化，连接关闭才是流终止
     契约；storage 读取异常时仅记日志并跳过。
 
     assistant 消息落库晚于 REPLY_END（异步写库），节点边界快照常缺
@@ -1519,8 +1518,9 @@ async def _build_values_frame(
     消息 id == reply_id），先移除再补结构化序列，避免重复。
 
     run 级累计 usage 不在此附加：原生快照的 ai 消息 usage_metadata
-    为消息级语义（随本轮结构化快照自带），run 级累计 usage 由 end
-    帧 data 承载（见 protocol.end_frame）。
+    为消息级语义（随本轮结构化快照自带），run 级总量由前端按每轮
+    usage 增量帧累加；本层不下发 end 帧，values 快照亦不承载 run 级
+    聚合值。
     """
     if storage is None:
         return None
@@ -1572,13 +1572,13 @@ def _streaming_response(
 
 
 def _confirmation_pending_response(awaiting: list) -> StreamingResponse:
-    """HITL 挂起时对普通消息的明确拒绝流（error 帧 + end 哨兵）。
+    """HITL 挂起时对普通消息的明确拒绝流（error 帧）。
 
     会话仍在等待工具确认（ASKING）/外部执行（SUBMITTED）时，普通
     消息会在引擎内被拒（"Agent is waiting ... but received no event"）
     并泛化成误导性的 setup 错误；这里在路由层拦截，返回稳定命名的
     错误帧（不创建 run、不占用 RunManager 记账），前端可按 name 给出
-    提示"先处理确认卡"。
+    提示"先处理确认卡"。流结束由连接关闭传递（不下发 end 帧）。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
@@ -1596,7 +1596,6 @@ def _confirmation_pending_response(awaiting: list) -> StreamingResponse:
                 },
             ),
         )
-        yield format_sse(END_SENTINEL)
 
     return StreamingResponse(
         _gen(),

@@ -7,9 +7,9 @@
   ``event:`` → ``data:`` → ``id:``（可选）→ 空行，被 LangGraph Platform 生态
   （``useStream`` React Hook / ``langgraph-sdk`` SSE decoder）直接消费。
 - 心跳（``: heartbeat\\n\\n``）：纯注释帧，防止代理/浏览器超时断连。
-- 结束（``event: end``）：流终止哨兵，data 为 ``null``；正常收尾时由
-  :func:`end_frame` 升级为携带 run 级累计 ``usage``（对齐原生 Python
-  客户端 end 事件抽象，消费方仍按事件名识别流终止）。
+- 结束：本适配层**不**下发 ``event: end`` 帧（END_SENTINEL 仅作内部
+  收尾信号，流结束由连接关闭传递）；run 级 token 用量由每轮
+  MODEL_CALL_END 的 usage 增量帧承载（前端按消息 id 去重累加）。
 - 事件枚举（``backend/packages/harness/deerflow/runtime/stream_bridge/base.py``）：
   ``metadata`` / ``values`` / ``updates`` / ``messages`` / ``custom`` /
   ``error`` / ``end``。其中 ``values`` 为原生默认 ``stream_mode=["values"]``
@@ -49,10 +49,6 @@ EVENT_CUSTOM = "custom"
 EVENT_ERROR = "error"
 """错误帧，data 为 ``{"message", "name"}``。"""
 
-EVENT_END = "end"
-"""结束哨兵帧，data 为 ``None``；正常收尾可升级为带 ``usage``（见
-:func:`end_frame`）。"""
-
 
 @dataclass(frozen=True)
 class StreamEvent:
@@ -77,44 +73,11 @@ HEARTBEAT_SENTINEL = StreamEvent(id="", event="__heartbeat__", data=None)
 """心跳哨兵：订阅循环在空闲超时后产出，序列化为 ``: heartbeat\\n\\n``。"""
 
 END_SENTINEL = StreamEvent(id="", event="__end__", data=None)
-"""结束哨兵：订阅循环在收到终止事件后产出，序列化为 ``event: end``。
+"""结束哨兵：订阅循环在收到终止事件后产出，驱动生成器收尾。
 
-无 usage 上下文（error 流 / HITL 拒绝流 / 回放滚动覆盖快速收尾）时的
-兜底形态，data 为 ``null``；正常收尾路径由 :func:`end_frame` 构造带
-usage 的 end 帧替代。"""
-
-
-def end_frame(usage: dict[str, int] | None) -> StreamEvent:
-    """构造结束帧（``event: end``），data 携带 run 级累计 token 用量。
-
-    对齐原生 deer-flow Python 客户端的 end 事件抽象：
-    ``StreamEvent(type="end", data={"usage": cumulative_usage})``，其中
-    ``cumulative_usage`` 固定为 ``input_tokens`` / ``output_tokens`` /
-    ``total_tokens`` 三字段 dict，无任何模型调用时为零值兜底（见原生
-    ``backend/packages/harness/deerflow/client.py`` 的
-    ``_account_usage`` 聚合与末尾 ``yield``）。
-
-    LangGraph SDK / 前端按 ``event: end`` 事件名识别流终止（data 不
-    参与判断），因此由 ``null`` 升级为带 usage 的 dict 不破坏兼容性，
-    仅给直接解析 SSE 的消费方补上 token 用量通道。
-
-    Args:
-        usage:
-            ``formatter.usage`` 的累积结果；``None``（如 error 流、
-            模型从未成功调用）时按原生形态补零值三字段。
-    """
-    usage = usage or {}
-    return StreamEvent(
-        id="",
-        event=EVENT_END,
-        data={
-            "usage": {
-                "input_tokens": int(usage.get("input_tokens", 0)),
-                "output_tokens": int(usage.get("output_tokens", 0)),
-                "total_tokens": int(usage.get("total_tokens", 0)),
-            },
-        },
-    )
+仅作内部收尾信号（_sse_generator 识别后直接 return），**不**序列化
+为 ``event: end`` 帧下发——本适配层流结束由连接关闭传递。
+"""
 
 
 def format_sse(evt: StreamEvent) -> str:
@@ -125,10 +88,6 @@ def format_sse(evt: StreamEvent) -> str:
     """
     if evt is HEARTBEAT_SENTINEL:
         return ": heartbeat\n\n"
-    if evt is END_SENTINEL:
-        # 对齐 deer-flow sse_consumer：``format_sse("end", None)`` 产出
-        # ``event: end\ndata: null\n\n``（LangGraph SDK 以此识别流终止）。
-        return "event: end\ndata: null\n\n"
 
     data = json.dumps(evt.data, default=str, ensure_ascii=False)
     parts = [f"event: {evt.event}", f"data: {data}"]
@@ -157,11 +116,9 @@ __all__ = [
     "EVENT_MESSAGES",
     "EVENT_CUSTOM",
     "EVENT_ERROR",
-    "EVENT_END",
     "StreamEvent",
     "HEARTBEAT_SENTINEL",
     "END_SENTINEL",
     "format_sse",
-    "end_frame",
     "with_event_id",
 ]
