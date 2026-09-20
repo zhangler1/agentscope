@@ -241,7 +241,7 @@ async def download_urls_to_session(
     user_id: str,
     agent_id: str,
     session_id: str,
-    urls: list[str],
+    items: list[str | tuple[str, str]],
     storage: StorageBase,
     workspace_manager: WorkspaceManagerBase,
 ) -> list[UploadedFile]:
@@ -254,14 +254,19 @@ async def download_urls_to_session(
     下游链路立即可见。
 
     Args:
-        urls: 待下载的 OSS / HTTP(S) 地址列表（同名文件会被
-            ``normalize_filename`` 归一化；重复文件名直接覆盖）。
+        items: 待下载的 OSS / HTTP(S) 地址列表。元素可为：
+
+            - 裸 URL 字符串（``"http://oss/a.png"``），文件名从 URL 推断；
+            - ``(url, original_name)`` 元组，``original_name`` 为空时回退
+              到 URL 推断（保留前端传入的 ``file_name``）。
+
+            同名文件会被 ``normalize_filename`` 归一化；重复文件名直接覆盖。
 
     Returns:
         `list[UploadedFile]`: 成功保存的上传记录（按 URL 顺序）。
     """
     cfg = get_upload_config()
-    if not cfg.enabled or not urls:
+    if not cfg.enabled or not items:
         return []
     db = get_uploads_db()
     saved: list[UploadedFile] = []
@@ -269,7 +274,11 @@ async def download_urls_to_session(
         timeout=_URL_DOWNLOAD_TIMEOUT,
         follow_redirects=True,
     ) as client:
-        for url in urls:
+        for entry in items:
+            if isinstance(entry, tuple):
+                url, original_name = entry
+            else:
+                url, original_name = entry, ""
             try:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -314,7 +323,7 @@ async def download_urls_to_session(
                     session_id=session_id,
                     storage=storage,
                     workspace_manager=workspace_manager,
-                    original_name=_filename_from_url(url),
+                    original_name=original_name or _filename_from_url(url),
                     data=content,
                     content_type=resp.headers.get("content-type"),
                 )
