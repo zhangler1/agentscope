@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncGenerator
 from contextvars import Token
@@ -1074,6 +1075,45 @@ async def _resolve_run_context(
     return loaded or {}
 
 
+def _parse_additional_url_item(item: Any) -> tuple[str, str]:
+    """解析 ``additional_urls`` 单个元素为 ``(url, original_name)``。
+
+    对齐 deer-flow ``thread_runs.py`` 的 3 种元素格式：
+
+    - dict ``{file_url, file_name}`` → 取两个字段；
+    - JSON 字符串（``json.loads`` 解析出 dict）→ 取 ``file_url`` / ``file_name``；
+    - 裸 URL 字符串（解析失败或非 dict）→ 整串作 URL，文件名留空。
+
+    并统一 ``https://`` → ``http://``（内网回源要求，与 deer-flow 一致）。
+    非字符串 / 非 dict / 无 ``file_url`` 的元素返回 ``("", "")`` 被丢弃。
+    """
+    if isinstance(item, dict):
+        file_url = item.get("file_url", "")
+        file_name = item.get("file_name", "")
+    elif isinstance(item, str):
+        s = item.strip()
+        if not s:
+            return "", ""
+        parsed: Any = None
+        try:
+            parsed = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            file_url = parsed.get("file_url", "")
+            file_name = parsed.get("file_name", "")
+        else:
+            file_url, file_name = s, ""
+    else:
+        return "", ""
+
+    if not isinstance(file_url, str) or not file_url:
+        return "", ""
+    file_url = file_url.replace("https://", "http://")
+    file_name = file_name if isinstance(file_name, str) else ""
+    return file_url, file_name
+
+
 async def _download_additional_urls(
     body: CreateRunRequest,
     user_id: str,
@@ -1084,11 +1124,12 @@ async def _download_additional_urls(
 ) -> None:
     """下载 context.custom_params.additional_urls 到会话 uploads 目录（仅副作用）。
 
-    ``context.custom_params: {additional_urls: ["http://.../a.png", ...]}``
-    中的地址是 OSS / HTTP(S) 直链，需在 run 启动前下载并保存到会话
-    uploads 目录（与 ``POST /files/upload`` 同链路：落盘 + 图片 base64
-    / 文档 .md + uploads DB 记录，下游工具与 ``<context name="files">``
-    立即可见）。
+    ``context.custom_params: {additional_urls: [...]}`` 中的地址是 OSS /
+    HTTP(S) 直链（或 ``{file_url, file_name}`` dict / JSON 字符串），需在
+    run 启动前下载并保存到会话 uploads 目录（与 ``POST /files/upload``
+    同链路：落盘 + 图片 base64 / 文档 .md + uploads DB 记录，下游工具与
+    ``<context name="files">`` 立即可见）。前端传入的 ``file_name`` 作为
+    原始文件名保留，空则从 URL 推断。
 
     本函数不改变任何参数：context.custom_params（含 additional_urls）
     由调用方原样交给 ``_resolve_custom_params`` 整体落盘，便于事后查看
@@ -1100,17 +1141,19 @@ async def _download_additional_urls(
     if not custom or not custom.get("additional_urls"):
         return
     raw = custom.get("additional_urls")
-    urls = (
-        [u.strip() for u in raw if isinstance(u, str) and u.strip()]
-        if isinstance(raw, list)
-        else []
-    )
-    if urls:
+    if not isinstance(raw, list):
+        return
+    items: list[tuple[str, str]] = []
+    for entry in raw:
+        url, name = _parse_additional_url_item(entry)
+        if url:
+            items.append((url, name))
+    if items:
         downloaded = await download_urls_to_session(
             user_id,
             agent_id,
             session_id,
-            urls,
+            items,
             storage,
             workspace_manager,
         )
