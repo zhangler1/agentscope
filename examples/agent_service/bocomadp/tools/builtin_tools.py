@@ -98,8 +98,10 @@ def list_uploaded_files(
     物理保证，无需也不按虚拟路径中的 agent/user/session 反解。
 
     Args:
-        user_id (str): 租户 id（与上传时一致）。当前会话下可留空由框架注入。
-        session_id (str): 会话 id（与上传时一致）。当前会话下可留空由框架注入。
+        user_id (str): 租户 id（与上传时一致）。当前会话下可留空，由框架
+            自动注入（ChatRunRegistry 派生 run 时拷贝的 ContextVar）。
+        session_id (str): 会话 id（与上传时一致）。当前会话下可留空，由框架
+            自动注入。
         virtual_path (str): 保留参数，便于模型在消息中附带上下文虚拟路径时
             直接透传；本工具按 user/session 查库，不会据此反解或过滤。
 
@@ -109,6 +111,18 @@ def list_uploaded_files(
         标注为 [图片]，需解析时请调用 view_image_tool）。
     """
     from bocomadp.uploads.db import get_uploads_db
+
+    # 当前会话上下文自动注入（与 build_agent_tools 设置的 ContextVar 一致；
+    # 显式传入的参数优先）。
+    if not user_id or not session_id:
+        try:
+            from bocomadp.tools.agent_factory_tools import (
+                resolve_session_context,
+            )
+
+            user_id, session_id = resolve_session_context(user_id, session_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     if not user_id or not session_id:
         return (
@@ -153,7 +167,7 @@ def read_uploaded_file(
 
     方案 A 下的虚拟路径形如 ``/workspace/user-data/uploads/{filename}``，
     **不再编码** user/session，因此本工具需要直接传入 ``user_id`` /
-    ``session_id``（框架通常会自动注入当前会话）才能唯一定位记录；
+    ``session_id``（当前会话下可留空，由框架自动注入）才能唯一定位记录；
     ``virtual_path`` 仅用于反解文件名。``agent_id`` 可进一步精确过滤
     （同一 user/session 下不同 agent 上传同名文件时避免误命中）。
 
@@ -165,10 +179,12 @@ def read_uploaded_file(
     Args:
         virtual_path (str): 上传接口返回 / list_uploaded_files 列出的
             virtual_path，例如 /workspace/user-data/uploads/report.pdf.md。
-        user_id (str): 租户 id（与上传时一致）。当前会话下可留空由框架注入。
-        session_id (str): 会话 id（与上传时一致）。当前会话下可留空由框架注入。
-        agent_id (str): agent id（与上传时一致）。当前会话下可留空由框架注入；
-            空串时仅按 user/session 过滤。
+        user_id (str): 租户 id（与上传时一致）。当前会话下可留空，由框架
+            自动注入（ChatRunRegistry 派生 run 时拷贝的 ContextVar）。
+        session_id (str): 会话 id（与上传时一致）。当前会话下可留空，由框架
+            自动注入。
+        agent_id (str): agent id（与上传时一致）。空串时仅按 user/session
+            过滤。
         max_chars (int): 返回的最大字符数，防止超大文件撑爆上下文，
             默认 8000。
 
@@ -177,6 +193,18 @@ def read_uploaded_file(
     """
     from bocomadp.uploads.db import get_uploads_db
     from bocomadp.uploads.manager import resolve_upload_parts
+
+    # 当前会话上下文自动注入（与 build_agent_tools 设置的 ContextVar 一致；
+    # 显式传入的参数优先）。
+    if not user_id or not session_id:
+        try:
+            from bocomadp.tools.agent_factory_tools import (
+                resolve_session_context,
+            )
+
+            user_id, session_id = resolve_session_context(user_id, session_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     if not user_id or not session_id:
         return (
@@ -384,10 +412,12 @@ async def view_image_tool(
         virtual_path (str): 上传接口返回 / list_uploaded_files 列出的
             virtual_path，例如 /workspace/user-data/uploads/photo.png。
         question (str): 想了解的图片问题或方面，默认一般性描述。
-        user_id (str): 租户 id（与上传时一致）。当前会话下可留空由框架注入。
-        session_id (str): 会话 id（与上传时一致）。当前会话下可留空由框架注入。
-        agent_id (str): agent id（与上传时一致）。当前会话下可留空由框架注入；
-            空串时仅按 user/session 过滤。
+        user_id (str): 租户 id（与上传时一致）。当前会话下可留空，由框架
+            自动注入（ChatRunRegistry 派生 run 时拷贝的 ContextVar）。
+        session_id (str): 会话 id（与上传时一致）。当前会话下可留空，由框架
+            自动注入。
+        agent_id (str): agent id（与上传时一致）。空串时仅按 user/session
+            过滤。
 
     Returns:
         str: 图片分析结果文本；失败时返回错误说明。
@@ -400,12 +430,10 @@ async def view_image_tool(
     if not user_id or not session_id:
         try:
             from bocomadp.tools.agent_factory_tools import (
-                _current_session_id,
-                _current_user_id,
+                resolve_session_context,
             )
 
-            user_id = user_id or _current_user_id.get()
-            session_id = session_id or _current_session_id.get()
+            user_id, session_id = resolve_session_context(user_id, session_id)
         except Exception:  # noqa: BLE001
             pass
 
