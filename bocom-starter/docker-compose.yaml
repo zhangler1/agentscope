@@ -1,0 +1,49 @@
+# =============================================================================
+# bocom-starter docker-compose
+# - bocom-starter: agentscope 服务化示例（FastAPI/SSE, 端口 8000）
+# - redis: 应用主存储（RedisStorage：会话/凭证/agent）+ 行内模型平台
+#   （apikey 刷新、模型表 / think-tag 键）共用实例
+# 环境变量优先级：compose environment > 镜像默认值
+# =============================================================================
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: bocom-starter-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  bocom-starter:
+    build:
+      context: .
+      dockerfile: DockerFile
+    image: bocom-starter:latest
+    container_name: bocom-starter
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      ELLM_REDIS_HOST: redis
+      ELLM_REDIS_PORT: "6379"
+      # 本地开发热重载开关（镜像自包含部署默认关闭）
+      UVICORN_RELOAD: "false"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # 工作区持久化（agent 工作目录、长程记忆 Markdown）
+      - workspaces:/app/workspaces
+
+volumes:
+  redis-data:
+  workspaces:

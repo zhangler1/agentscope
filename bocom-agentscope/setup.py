@@ -83,7 +83,7 @@ def do_setup():
 
     setup(
         name="bocom_agentscope",
-        version="0.1.1",
+        version="0.5.1",
         maintainer="EUVD Team",
         maintainer_email="w_jinchao@bankbocom.com",
         description="Bocom AgentScope SDK - config and providers for internal model platform",

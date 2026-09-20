@@ -1,0 +1,49 @@
+# =============================================================================
+# bocom-starter Dockerfile
+# - 基础镜像 python:3.12（agentscope 要求 Python >= 3.12）
+# - 依赖安装：wheels/ 内本地 whl（自包含发行版 bocom_agentscope-0.5.1，
+#   自动解析 fastapi/uvicorn/redis/httpx/agentscope==2.0.5 等依赖），
+#   配合 --find-links 优先命中本地包
+# - 应用主存储为 Redis，地址由环境变量注入（见 docker-compose.yaml）
+# =============================================================================
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    # 应用主存储 & 行内模型平台 Redis 默认指向 compose 内的 redis 服务
+    # （compose environment 优先级高于此处）
+    REDIS_HOST=redis \
+    REDIS_PORT=6379 \
+    ELLM_REDIS_HOST=redis \
+    ELLM_REDIS_PORT=6379
+
+WORKDIR /app
+
+# 先装本地 whl（内容变动少，充分利用镜像层缓存）
+COPY wheels/ /app/wheels/
+RUN pip install --find-links=/app/wheels /app/wheels/*.whl
+
+# 再装应用代码
+COPY main.py requirements.txt ./
+
+# 工作区目录（LocalWorkspaceManager basedir / 长程记忆 Markdown 落盘处）
+RUN mkdir -p /app/workspaces \
+    && useradd --create-home appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=3).status < 500 else 1)"
+
+CMD ["python", "main.py"]
+
+# 注：main.py 默认注册 browser-use MCP（StdioMCPConfig, npx @playwright/mcp），
+# 容器内如需启用该 MCP，需安装 Node.js，取消下面注释：
+# RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+#     && rm -rf /var/lib/apt/lists/*

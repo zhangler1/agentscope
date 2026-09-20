@@ -1,4 +1,7 @@
-src/agentscope
-src/agentscope.egg*
-bocom-starter
-Agent.md
+# src/agentscope
+bocom_agentscope.egg-info
+# agentscope.egg-info
+# bocom-starter
+# Agent.md
+build
+dist
