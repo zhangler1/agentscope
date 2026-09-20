@@ -5,3 +5,4 @@ bocom_agentscope.egg-info
 # Agent.md
 build
 dist
+*.pyc

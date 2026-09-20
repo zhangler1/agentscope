@@ -16,46 +16,37 @@ The key-refresh logic (api-key header rotation) lives in the
 which injects the fresh key per call via :meth:`set_api_key`; this class
 only carries the protocol differences.
 
-Model candidates (``list_models``) are read from the Redis hash
-``bocomadp:model:think_tag`` — each field name is a model id and its
-value (``"1"`` / ``"0"``) toggles ``<think>`` injection — instead of the
-static ``_models/*.yaml`` files; the YAML directory remains as a
-fallback when Redis is unreachable.
+The model metadata (``inject_think_tag`` / ``context_size``) is decided at
+construction time by the caller, with built-in defaults when omitted;
+``list_models`` is served by the bundled ``_models/*.yaml`` model cards
+shipped with this package. No Redis is consulted anywhere in this module.
 """
-import copy
-import json
 import logging
 from collections import OrderedDict
 from datetime import datetime
-from functools import lru_cache
 from typing import (
-    Awaitable,
-    Callable,
-    Literal,
     Any,
     AsyncGenerator,
-    TYPE_CHECKING,
+    Awaitable,
+    Callable,
     List,
+    Literal,
+    TYPE_CHECKING,
     Type,
 )
 
-logger = logging.getLogger(__name__)
-
-import redis
-import redis.asyncio as aioredis
-
+import openai
 from pydantic import BaseModel, Field
 
-from config import get_ellm_settings
-
-from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
-from agentscope.model._model_card import ModelCard
-from agentscope.model._model_response import ChatResponse, StructuredResponse
-from agentscope.model._model_usage import ChatUsage
 from agentscope._utils._common import _generate_id
-from agentscope.formatter import FormatterBase, DeepSeekChatFormatter
-from agentscope.message import Msg, ThinkingBlock, ToolCallBlock, TextBlock
+from agentscope.formatter import DeepSeekChatFormatter, FormatterBase
+from agentscope.message import Msg, TextBlock, ThinkingBlock, ToolCallBlock
+from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
+from agentscope.model._model_response import ChatResponse
+from agentscope.model._model_usage import ChatUsage
 from agentscope.tool import ToolChoice
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from providers.credential import ELLMCredential
@@ -66,247 +57,6 @@ else:
     AsyncStream = Any
 
 
-# ── 模型候选（Redis 真源，替代 _models/*.yaml） ────────────────
-# ``list_models`` 从 Redis Hash ``bocomadp:model:think_tag`` 读取模型
-# 列表：field 即模型名，value 为 JSON（见 :func:`_parse_model_meta`，兼容
-# 旧格式 ``"0"`` / ``"1"``）。Redis 连接失败时降级读取本地
-# _models/*.yaml（原逻辑），保证模型列表查询不因 Redis 抖动而不可用。
-# key 可在启动时经环境变量 ``ELLM_MODEL_THINK_TAG_KEY`` 覆盖（默认值
-# 与既有模型表 key 一致，现有数据无缝兼容）。
-_MODEL_THINK_TAG_KEY = get_ellm_settings().model_think_tag_key
-# 会话级 think-tag 覆盖 key 前缀（新 key，无历史数据兼容需求，模块级常量）。
-_SESSION_ADD_THINK_KEY_PREFIX = "bocomadp:session:"
-# yaml 兜底默认值（与 providers/_models/*.yaml 一致）。
-_DEFAULT_CONTEXT_SIZE = 1000000
-_DEFAULT_OUTPUT_SIZE = 384000
-# 构造回退值：Redis 无该模型记录/不可用时，context_size 保持原默认。
-_FALLBACK_CONTEXT_SIZE = 65536
-
-
-def _get_sync_redis() -> redis.Redis:
-    """模块级共享的同步 Redis client（连接池复用，惰性创建）。
-
-    Redis 连接参数来自 :func:`config.get_ellm_settings`（env 驱动）；
-    ``max_connections`` 对齐配置的 ``redis_max_connections``，避免每调用
-    新建连接。
-    """
-    cfg = get_ellm_settings()
-    return redis.Redis(
-        host=cfg.redis_host,
-        port=cfg.redis_port,
-        socket_connect_timeout=cfg.redis_timeout,
-        socket_timeout=cfg.redis_timeout,
-        max_connections=cfg.redis_max_connections,
-    )
-
-
-@lru_cache
-def _get_async_redis() -> aioredis.Redis:
-    """模块级共享的异步 Redis client（连接池复用，惰性创建）。
-
-    ``lru_cache`` 保证进程内单例；连接池由 redis-py 内部管理，调用方
-    **不关闭** client（连接池复用）。
-    """
-    cfg = get_ellm_settings()
-    return aioredis.Redis(
-        host=cfg.redis_host,
-        port=cfg.redis_port,
-        socket_connect_timeout=cfg.redis_timeout,
-        socket_timeout=cfg.redis_timeout,
-        max_connections=cfg.redis_max_connections,
-    )
-
-
-def _get_model_context_size(model: str) -> int:
-    """按模型名从 Redis 读取 context_size；无记录/不可用回退默认值。
-
-    Args:
-        model (`str`): 模型名（Redis Hash ``bocomadp:model:think_tag`` 的 field）。
-
-    Returns:
-        `int`: 该模型的 context_size；Redis 无记录/查询失败时回退
-        ``_FALLBACK_CONTEXT_SIZE``（65536，保持原构造默认）。
-    """
-    try:
-        client = _get_sync_redis()
-        raw = client.hget(_MODEL_THINK_TAG_KEY, model)
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel: Redis read failed for context_size of "
-            "model %r; fallback to %d: %s",
-            model,
-            _FALLBACK_CONTEXT_SIZE,
-            e,
-        )
-        return _FALLBACK_CONTEXT_SIZE
-    if raw is None:
-        return _FALLBACK_CONTEXT_SIZE
-    _, context_size, _ = _parse_model_meta(raw)
-    return context_size
-
-
-async def _get_think_tag_from_redis(model: str) -> bool:
-    """按模型名从 Redis 读取 ``inject_think_tag``（供中间件异步调用）。
-
-    Args:
-        model (`str`): 模型名（Redis Hash ``bocomadp:model:think_tag`` 的 field）。
-
-    Returns:
-        `bool`: 该模型的 think_tag；Redis 无该模型记录/连接失败时返回
-        ``False``（安全默认，不误加 ``<think>`` 前缀）。
-    """
-    try:
-        client = _get_async_redis()
-        raw = await client.hget(_MODEL_THINK_TAG_KEY, model)
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel: Redis read failed for inject_think_tag of "
-            "model %r; fallback to False: %s",
-            model,
-            e,
-        )
-        return False
-    if raw is None:
-        return False
-    think, _, _ = _parse_model_meta(raw)
-    return think
-
-
-async def _get_session_add_think_from_redis(session_id: str) -> bool | None:
-    """按会话读取会话级 ``inject_think_tag`` 覆盖（供中间件异步调用）。
-
-    覆盖值由路由 ``PUT/DELETE /ellm-models/session/{session_id}/think-tag``
-    写入/清除（key ``bocomadp:session:{session_id}:add_think``，值
-    ``"1"`` / ``"0"``，TTL 4h）。
-
-    Args:
-        session_id (`str`): 会话 id。
-
-    Returns:
-        `bool | None`: 该会话的覆盖值；Redis 无记录/连接失败时返回
-        ``None``（未设置，由调用方回退下一优先级）。
-    """
-    try:
-        client = _get_async_redis()
-        raw = await client.get(
-            f"{_SESSION_ADD_THINK_KEY_PREFIX}{session_id}:add_think",
-        )
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel: Redis read failed for session add_think of "
-            "session %r; fallback to None: %s",
-            session_id,
-            e,
-        )
-        return None
-    if raw is None:
-        return None
-    value = (
-        raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-    )
-    if value in ("1", "true"):
-        return True
-    if value in ("0", "false"):
-        return False
-    return None
-
-
-def _parse_model_meta(value: Any) -> tuple[bool, int, int]:
-    """解析 Redis value 为 ``(think_tag, context_size, output_size)``。
-
-    仅接受 JSON 格式：``{"think_tag": 1, "context_size": 1000000, \
-"output_size": 384000}``；非 JSON 或字段缺失时回退默认值
-    （think_tag=False，context_size / output_size 取默认值）。
-    """
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", "replace")
-    try:
-        data = json.loads(value)
-        if isinstance(data, dict):
-            think = data.get("think_tag") in (1, True)
-            context_size = int(
-                data.get("context_size") or _DEFAULT_CONTEXT_SIZE
-            )
-            output_size = int(
-                data.get("output_size") or _DEFAULT_OUTPUT_SIZE
-            )
-            return think, context_size, output_size
-    except (ValueError, TypeError):
-        pass
-    return False, _DEFAULT_CONTEXT_SIZE, _DEFAULT_OUTPUT_SIZE
-
-
-def _build_parameter_schema(
-    output_types: list[str],
-    output_size: int,
-) -> dict[str, Any]:
-    """构造 ModelCard.parameter_schema（对齐 ``ModelCard.from_yaml`` 合并逻辑）。
-
-    - 不支持 thinking 输出（think_tag="0"）时剔除 thinking 参数；
-    - ``max_tokens.maximum`` 由 ``output_size`` 决定。
-    """
-    base_schema = EllmChatModel.Parameters.model_json_schema()
-    properties = copy.deepcopy(base_schema.get("properties", {}))
-    if "application/x-thinking" not in output_types:
-        properties.pop("thinking_enable", None)
-        properties.pop("thinking_budget", None)
-    if "max_tokens" in properties:
-        properties["max_tokens"]["maximum"] = output_size
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": base_schema.get("required", []),
-    }
-
-
-def _list_models_from_redis() -> list[ModelCard] | None:
-    """从 Redis 读取模型候选列表。
-
-    Returns:
-        `list[ModelCard] | None`: 读取成功返回卡片列表（可为空列表）；
-        Redis 连接失败返回 ``None``，由调用方降级读取 yaml。
-    """
-    try:
-        client = _get_sync_redis()
-        mapping = client.hgetall(_MODEL_THINK_TAG_KEY)
-    except Exception as e:  # pragma: no cover - Redis 不可用
-        logger.warning(
-            "EllmChatModel.list_models: Redis read failed, "
-            "fallback to _models yaml: %s",
-            e,
-        )
-        return None
-
-    cards: list[ModelCard] = []
-    for raw_name, raw_tag in (mapping or {}).items():
-        name = (
-            raw_name.decode("utf-8", "replace")
-            if isinstance(raw_name, bytes)
-            else str(raw_name)
-        )
-        think, context_size, output_size = _parse_model_meta(raw_tag)
-        output_types = ["text/plain"]
-        if think:
-            output_types.append("application/x-thinking")
-        cards.append(
-            ModelCard(
-                name=name,
-                label=name,
-                status="active",
-                input_types=["text/plain"],
-                output_types=output_types,
-                context_size=context_size,
-                output_size=output_size,
-                parameter_schema=_build_parameter_schema(
-                    output_types,
-                    output_size,
-                ),
-                parameters_overrides={},
-            ),
-        )
-    return cards
-
-
 class EllmChatModel(ChatModelBase):
     """The ELLM chat model."""
 
@@ -315,9 +65,9 @@ class EllmChatModel(ChatModelBase):
 
     inject_think_tag: bool = False
     """Whether to prepend a ``<think>`` tag to the first non-empty text
-    delta of streaming responses. The base class ``__init__`` does not
-    accept this argument, so it is toggled as an instance attribute
-    (``model.inject_think_tag = True``)."""
+    delta of streaming responses. Set from the ``inject_think_tag``
+    ``__init__`` parameter; the key-refresh middleware may still
+    override the attribute per call."""
 
     class Parameters(BaseModel):
         """The parameters for the ELLM chat model."""
@@ -368,11 +118,12 @@ class EllmChatModel(ChatModelBase):
         self,
         credential: "ELLMCredential",
         model: str,
+        context_size: int,
         parameters: "EllmChatModel.Parameters | None" = None,
         stream: bool = True,
         max_retries: int = 3,
         retry_delay: float = 1.0,
-        context_size: int | None = None,
+        inject_think_tag: bool = False,
         formatter: FormatterBase | None = None,
         client_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -383,6 +134,9 @@ class EllmChatModel(ChatModelBase):
                 The BOCOM ELLM credential used to authenticate API calls.
             model (`str`):
                 The ELLM model name, e.g. ``Qwen3-235B-A22B``.
+            context_size (`int`):
+                The model context size used for context compression
+                （必填，由调用方显式提供）。
             parameters (`EllmChatModel.Parameters | None`, defaults to \
             `None`):
                 The ELLM API parameters. When ``None``, the default
@@ -393,10 +147,9 @@ class EllmChatModel(ChatModelBase):
                 The maximum number of retries for the ELLM API.
             retry_delay (`float`, defaults to `1.0`):
                 Seconds to sleep between retry attempts.
-            context_size (`int | None`, defaults to `None`):
-                The model context size used for context compression.
-                ``None`` 时按 ``model`` 从 Redis（``bocomadp:model:think_tag``）
-                读取；Redis 无该模型记录或不可用时回退 65536。
+            inject_think_tag (`bool`, defaults to `False`):
+                Whether to prepend a ``<think>`` tag to the first non-empty
+                text delta of streaming responses.
             formatter (`FormatterBase | None`, defaults to `None`):
                 The formatter that converts ``Msg`` objects to the format
                 required by the ELLM API. When ``None``, a
@@ -405,9 +158,6 @@ class EllmChatModel(ChatModelBase):
                 Extra keyword arguments forwarded to ``openai.AsyncClient``
                 (e.g. ``timeout``, ``default_headers``, ``http_client``).
         """
-        # context_size 未显式指定时按模型名从 Redis 读取（覆盖默认值）
-        if context_size is None:
-            context_size = _get_model_context_size(model)
         super().__init__(
             credential=credential,
             model=model,
@@ -417,6 +167,7 @@ class EllmChatModel(ChatModelBase):
             retry_delay=retry_delay,
             context_size=context_size,
         )
+        self.inject_think_tag = inject_think_tag
         self.formatter = formatter or DeepSeekChatFormatter()
         self.client_kwargs = client_kwargs or {}
         # Request-level api key override, injected per call by the
@@ -442,8 +193,6 @@ class EllmChatModel(ChatModelBase):
         self._refresh_key_callback: (
             Callable[[], Awaitable[str]] | None
         ) = None
-
-        import openai
 
         self.client: openai.AsyncClient = openai.AsyncClient(
             api_key=self.credential.api_key.get_secret_value(),
@@ -559,36 +308,12 @@ class EllmChatModel(ChatModelBase):
 
     @classmethod
     def _get_retryable_exceptions(cls) -> tuple[Type[Exception], ...]:
-        import openai
-
         return (
             openai.APIConnectionError,
             openai.APITimeoutError,
             openai.RateLimitError,
             openai.InternalServerError,
         )
-
-    @classmethod
-    def list_models(
-        cls,
-        custom_yaml_dir: str | None = None,
-    ) -> list[ModelCard]:
-        """候选模型：优先 Redis（``bocomadp:model:think_tag``），失败降级 yaml。
-
-        覆盖基类 :meth:`ChatModelBase.list_models`。Redis Hash 的 field 即
-        模型名，值 ``"1"`` 启用 <think> 注入（output_types 含
-        ``application/x-thinking``），``"0"`` 不启用。
-
-        Args:
-            custom_yaml_dir (`str | None`): 降级 yaml 时使用的目录。
-
-        Returns:
-            `list[ModelCard]`: 模型候选卡片列表。
-        """
-        cards = _list_models_from_redis()
-        if cards is not None:
-            return cards
-        return super().list_models(custom_yaml_dir)
 
     async def _call_api(
         self,
@@ -960,6 +685,5 @@ class EllmChatModel(ChatModelBase):
             return tools, {"type": "function", "function": {"name": mode}}
 
         return tools, mode
-
 
 __all__ = ["EllmChatModel"]
