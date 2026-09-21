@@ -14,6 +14,13 @@ class CreateAgentRequest(BaseModel):
     """Request body for creating a new agent."""
 
     name: str = Field(description="Display name of the agent.")
+    description: str = Field(
+        default="",
+        description=(
+            "智能体简介（一句话说明它能做什么）。随 AgentData 存进 "
+            "``agents.payload``；不传则空串。"
+        ),
+    )
     system_prompt: str = Field(
         default="你是一个乐于助人的AI助手。",
         description="Base system prompt fed to the agent.",
@@ -68,6 +75,13 @@ class UpdateAgentRequest(BaseModel):
     """
 
     name: str | None = Field(default=None, description="New display name.")
+    description: str | None = Field(
+        default=None,
+        description=(
+            "New description. Omit to keep the current value; pass an "
+            "empty string to clear it."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None,
         description="New system prompt.",
@@ -126,6 +140,12 @@ class OwnedAgentView(BaseModel):
 
     id: str = Field(description="智能体 id。")
     name: str = Field(description="智能体名称。")
+    description: str = Field(
+        default="",
+        description=(
+            "智能体简介（AgentData.description）；历史脏数据缺字段时兜底空串。"
+        ),
+    )
     system_prompt: str = Field(
         default="",
         description=(
