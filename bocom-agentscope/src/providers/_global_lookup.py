@@ -8,8 +8,10 @@
 """
 from __future__ import annotations
 
-import logging
 from typing import Any
+
+# 与 SDK 共用同一个 logger（名为 "as"）：格式/级别与 agentscope 内部一致。
+from agentscope import logger
 
 # SQL 存储内部模型/转换函数仅在安装 SQL 依赖时可用：缺失（如纯 Redis
 # 主存储的 SDK 环境）时降级为 None，跨 owner 查询静默失效。
@@ -21,8 +23,6 @@ except ImportError:  # pragma: no cover — SQL 依赖未安装
     CredentialRecord = None
     _to_record = None
     CredentialRow = None
-
-logger = logging.getLogger("providers._global_lookup")
 
 
 async def get_credential_global(storage: Any, credential_id: str) -> Any | None:

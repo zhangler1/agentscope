@@ -29,7 +29,6 @@ at their directory once at startup via :meth:`EllmChatModel.set_models_dir`.
 and the runtime ``context_size`` always read one source.  No Redis is
 consulted anywhere in this module.
 """
-import logging
 import os
 from collections import OrderedDict
 from datetime import datetime
@@ -48,6 +47,9 @@ from typing import (
 import openai
 from pydantic import BaseModel, Field
 
+# 与 SDK 共用同一个 logger（名为 "as"）：日志格式、级别、handler 均与
+# agentscope 内部一致，由 ``agentscope.setup_logger`` 统一控制。
+from agentscope import logger
 from agentscope._utils._common import _generate_id
 from agentscope.formatter import DeepSeekChatFormatter, FormatterBase
 from agentscope.message import Msg, TextBlock, ThinkingBlock, ToolCallBlock
@@ -56,8 +58,6 @@ from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from agentscope.model._model_response import ChatResponse
 from agentscope.model._model_usage import ChatUsage
 from agentscope.tool import ToolChoice
-
-logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTEXT_SIZE = 32768
 """Context window used when the configured model cards carry no card that

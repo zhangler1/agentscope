@@ -40,19 +40,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any
 
 import httpx
 
+# 与 SDK 共用同一个 logger（名为 "as"）：格式/级别与 agentscope 内部一致。
+from agentscope import logger
 from agentscope.app.message_bus import MessageBus
 from agentscope.app.storage import CredentialRecord, StorageBase
 from agentscope.credential import CredentialFactory
 
 from providers._global_lookup import get_credential_global
-
-logger = logging.getLogger(__name__)
 
 # Values >= this threshold are treated as Unix timestamps (ms);
 # smaller values are treated as TTL durations (ms).

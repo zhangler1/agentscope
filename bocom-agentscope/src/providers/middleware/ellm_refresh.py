@@ -20,10 +20,7 @@ apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落�
 
 from __future__ import annotations
 
-import logging
 from typing import Any, AsyncGenerator
-
-logger = logging.getLogger(__name__)
 
 try:
     from agentscope.middleware import MiddlewareBase
@@ -45,6 +42,9 @@ except ImportError:  # pragma: no cover — offline syntax fallback
             return self.__class__.__name__
 
 MiddlewareBase._is_agent_middleware = True  # type: ignore[attr-defined]
+
+# 与 SDK 共用同一个 logger（名为 "as"）：格式/级别与 agentscope 内部一致。
+from agentscope import logger  # noqa: E402
 
 from providers.ellm_chat_model import EllmChatModel  # noqa: E402
 from providers.ellm_key import EllmKeyRefresher  # noqa: E402
