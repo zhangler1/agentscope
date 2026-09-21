@@ -9,8 +9,8 @@
 - :mod:`providers.routers` —— 模型凭证配置查询/部分更新等 HTTP 端点
   （服务端形态）；
 - :mod:`providers.ellm_chat_model` —— ELLM 模型实现（OpenAI 兼容网关，
-  模型名/元数据由构造参数或随包内置 ``_models/*.yaml`` 提供，不依赖
-  Redis）；
+  模型名/元数据由构造参数或启动程序指定的模型卡目录提供，见
+  ``EllmChatModel.set_models_dir``；不依赖 Redis）；
 - :mod:`providers.ellm_key` —— ELLM apikey 生命周期（惰性刷新/强制刷新）。
 
 运行所需参数均由调用方显式传入（构造参数 / 中间件工厂参数）。

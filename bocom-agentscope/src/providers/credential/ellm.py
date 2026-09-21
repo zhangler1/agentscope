@@ -8,8 +8,8 @@
   ``http://host.docker.internal:8001/v1``）；
 - 聊天模型直接复用官方的 :class:`OpenAIChatModel`（``get_chat_model_class``）；
 - 凭证**不绑定模型**：运行时的模型名由 agent/会话配置
-  ``chat_model_config.model`` 提供，候选模型见随包分发的
-  ``providers/_models/*.yaml``（``EllmChatModel.list_models``）。
+  ``chat_model_config.model`` 提供，候选模型见启动程序指定的模型卡目录
+  （``EllmChatModel.list_models``）。
 """
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ class ELLMCredential(CredentialBase):
     def get_chat_model_class(cls) -> Type[ChatModelBase]:
         """ELLM 是 OpenAI 兼容接口——基于本包的 :class:`EllmChatModel`。
 
-        子类化使 :meth:`list_models` 读取本包 ``providers/_models/*.yaml``
-        候选卡（而不是官方 OpenAI 的候选）。
+        子类化使 :meth:`list_models` 读取启动程序指定的模型卡目录
+        （而不是官方 OpenAI 的候选）。
         """
         return EllmChatModel

@@ -1,0 +1,5 @@
+name: deepseek-flash
+label: DeepSeek Flash
+status: active
+context_size: 100000
+output_size: 38400

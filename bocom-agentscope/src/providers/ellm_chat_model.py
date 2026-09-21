@@ -16,14 +16,24 @@ The key-refresh logic (api-key header rotation) lives in the
 which injects the fresh key per call via :meth:`set_api_key`; this class
 only carries the protocol differences.
 
-The model metadata (``inject_think_tag`` / ``context_size``) is decided at
-construction time by the caller, with built-in defaults when omitted;
-``list_models`` is served by the bundled ``_models/*.yaml`` model cards
-shipped with this package. No Redis is consulted anywhere in this module.
+``inject_think_tag`` is decided at construction time by the caller.
+``context_size`` is optional: when omitted it is resolved from the model card
+matching the requested model name — the service-mode factory
+(:func:`agentscope.app._service._model.get_model`) builds models from the
+session's ``ChatModelConfig`` only, which has no ``context_size`` field — and
+falls back to :data:`_DEFAULT_CONTEXT_SIZE` when no card matches.
+
+The model cards live **outside this package**: the serving application points
+at their directory once at startup via :meth:`EllmChatModel.set_models_dir`.
+``list_models`` serves the same cards to the frontend, so the candidate list
+and the runtime ``context_size`` always read one source.  No Redis is
+consulted anywhere in this module.
 """
 import logging
+import os
 from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
@@ -41,12 +51,24 @@ from pydantic import BaseModel, Field
 from agentscope._utils._common import _generate_id
 from agentscope.formatter import DeepSeekChatFormatter, FormatterBase
 from agentscope.message import Msg, TextBlock, ThinkingBlock, ToolCallBlock
+from agentscope.model import ModelCard
 from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from agentscope.model._model_response import ChatResponse
 from agentscope.model._model_usage import ChatUsage
 from agentscope.tool import ToolChoice
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CONTEXT_SIZE = 32768
+"""Context window used when the configured model cards carry no card that
+matches the requested model name.
+
+Mirrors the :class:`~agentscope.model.ChatModelBase` default so a mistyped or
+not-yet-carded model name degrades to the framework default instead of
+failing to construct.  A *missing or unconfigured card directory* is a
+configuration error and raises instead — see :meth:`EllmChatModel.
+set_models_dir`.
+"""
 
 if TYPE_CHECKING:
     from providers.credential import ELLMCredential
@@ -68,6 +90,17 @@ class EllmChatModel(ChatModelBase):
     delta of streaming responses. Set from the ``inject_think_tag``
     ``__init__`` parameter; the key-refresh middleware may still
     override the attribute per call."""
+
+    _models_dir: str | None = None
+    """Directory holding the ``*.yaml`` model cards, set once by the serving
+    application via :meth:`set_models_dir` before the app starts.
+
+    It has to live on the class rather than on an instance or a request:
+    ``GET /model/`` resolves candidates through the *classmethod*
+    :meth:`list_models` (see ``agentscope.app._router._model``), where no
+    credential instance exists.  Both that route and the runtime model
+    construction go through this same class, so one class-level setting is
+    enough for the candidate list and ``context_size`` to agree."""
 
     class Parameters(BaseModel):
         """The parameters for the ELLM chat model."""
@@ -114,11 +147,145 @@ class EllmChatModel(ChatModelBase):
             ),
         )
 
+    @classmethod
+    def set_models_dir(cls, path: str | os.PathLike[str] | None) -> None:
+        """Point model-card loading at ``path``.
+
+        Called once by the serving application at startup, before the app
+        starts serving.  It replaces the SDK default (``<package>/_models``,
+        which is not shipped here) for every consumer of this class.
+
+        Absolute and relative paths are both accepted; a relative path is
+        resolved against the *current working directory*, so prefer passing
+        an absolute one (e.g. built from ``__file__``) when the working
+        directory is not guaranteed.
+
+        Args:
+            path (`str | os.PathLike[str] | None`):
+                Directory holding the ``*.yaml`` model cards.  ``None``
+                clears the setting again (tests / embedded use); subsequent
+                card lookups then fail with a configuration error.
+
+        Raises:
+            FileNotFoundError:
+                When ``path`` does not exist or is not a directory.  The
+                directory is a deployment artifact, so a missing one is a
+                configuration error and must stop the service at startup
+                instead of degrading to an empty candidate list.
+        """
+        if path is None:
+            cls._models_dir = None
+            return
+
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(
+                f"ELLM model cards directory not found: {resolved}. "
+                "Create it (with the model card *.yaml files) or point "
+                "EllmChatModel.set_models_dir() at an existing directory.",
+            )
+        cls._models_dir = str(resolved)
+        logger.info("ELLM model cards directory: %s", cls._models_dir)
+
+    @classmethod
+    def _resolve_models_dir(cls) -> str:
+        """Return the configured card directory.
+
+        Returns:
+            `str`:
+                The directory set by :meth:`set_models_dir`.
+
+        Raises:
+            RuntimeError:
+                When no directory has been configured.  Failing loudly beats
+                silently returning an empty candidate list and silently
+                compressing context with :data:`_DEFAULT_CONTEXT_SIZE`.
+        """
+        if not cls._models_dir:
+            raise RuntimeError(
+                "ELLM model cards directory is not configured. Call "
+                "EllmChatModel.set_models_dir(<dir>) at startup.",
+            )
+        return cls._models_dir
+
+    @classmethod
+    def list_models(
+        cls,
+        custom_yaml_dir: str | None = None,
+    ) -> list[ModelCard]:
+        """List the ELLM candidate model cards.
+
+        Signature mirrors :meth:`agentscope.model.ChatModelBase.list_models`
+        so the framework's zero-argument call sites (``GET /model/``) and
+        :meth:`agentscope.credential.CredentialBase.list_models` keep working.
+
+        Args:
+            custom_yaml_dir (`str | None`, optional):
+                Explicit override, highest priority.  Defaults to the
+                directory configured via :meth:`set_models_dir`.
+
+        Returns:
+            `list[ModelCard]`:
+                The candidate models described by the card files.
+
+        Raises:
+            FileNotFoundError:
+                When the effective directory does not exist.
+            RuntimeError:
+                When neither ``custom_yaml_dir`` nor :meth:`set_models_dir`
+                was provided.
+        """
+        if custom_yaml_dir is not None:
+            resolved = Path(custom_yaml_dir).expanduser().resolve()
+            if not resolved.is_dir():
+                raise FileNotFoundError(
+                    f"ELLM model cards directory not found: {resolved}.",
+                )
+            return super().list_models(custom_yaml_dir=str(resolved))
+
+        return super().list_models(custom_yaml_dir=cls._resolve_models_dir())
+
+    @classmethod
+    def _resolve_context_size(cls, model: str) -> int:
+        """Resolve ``model``'s context window from its model card.
+
+        ``context_size`` cannot come from the caller on the service path:
+        :func:`agentscope.app._service._model.get_model` builds every chat
+        model from the session's ``ChatModelConfig``, which carries only
+        ``type`` / ``credential_id`` / ``model`` / ``parameters``.  The model
+        cards — the same ones :meth:`list_models` serves to the frontend —
+        hold the value instead.
+
+        A *missing card directory* propagates from :meth:`list_models` as a
+        configuration error on purpose; only a model name that has no card is
+        tolerated here.
+
+        Args:
+            model (`str`):
+                The model name to look up.
+
+        Returns:
+            `int`:
+                The matching card's ``context_size``, or
+                :data:`_DEFAULT_CONTEXT_SIZE` when no card matches.
+        """
+        for card in cls.list_models():
+            if card.name == model:
+                return card.context_size
+        logger.warning(
+            "No ELLM model card found for %r in %s; falling back to "
+            "context_size=%d",
+            model,
+            cls._models_dir,
+            _DEFAULT_CONTEXT_SIZE,
+        )
+        return _DEFAULT_CONTEXT_SIZE
+
     def __init__(
         self,
         credential: "ELLMCredential",
         model: str,
-        context_size: int,
+        context_size: int | None = None,
         parameters: "EllmChatModel.Parameters | None" = None,
         stream: bool = True,
         max_retries: int = 3,
@@ -134,9 +301,13 @@ class EllmChatModel(ChatModelBase):
                 The BOCOM ELLM credential used to authenticate API calls.
             model (`str`):
                 The ELLM model name, e.g. ``Qwen3-235B-A22B``.
-            context_size (`int`):
-                The model context size used for context compression
-                （必填，由调用方显式提供）。
+            context_size (`int | None`, defaults to `None`):
+                The model context size used for context compression. When
+                ``None`` (the service-mode path, where the framework does not
+                pass it) it is resolved from the model card matching
+                ``model`` in the directory configured via
+                :meth:`set_models_dir`, falling back to
+                :data:`_DEFAULT_CONTEXT_SIZE` when no card matches.
             parameters (`EllmChatModel.Parameters | None`, defaults to \
             `None`):
                 The ELLM API parameters. When ``None``, the default
@@ -158,6 +329,9 @@ class EllmChatModel(ChatModelBase):
                 Extra keyword arguments forwarded to ``openai.AsyncClient``
                 (e.g. ``timeout``, ``default_headers``, ``http_client``).
         """
+        if context_size is None:
+            context_size = self._resolve_context_size(model)
+
         super().__init__(
             credential=credential,
             model=model,
