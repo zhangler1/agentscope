@@ -6,6 +6,7 @@ that framework sources stay untouched: the framework router is detached
 in ``main.py`` and this router (including the 8 ``/team/*`` endpoints
 and the CRUD expert-team behavior) is registered instead.
 """
+import logging
 from datetime import datetime
 from typing import Literal
 
@@ -13,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, ValidationError
 
 from agentscope.agent import ContextConfig, ReActConfig
-from agentscope._utils._common import _flatten_json_schema
+from agentscope._utils._common import _flatten_json_schema, _generate_id
 from agentscope.app.access import ResourceKind
 from agentscope.app.deps import (
     get_current_user_id,
@@ -29,6 +30,7 @@ from bocomadp.routers._schema.agent import (
     OwnedAgentView,
     CreateAgentRequest,
     CreateAgentResponse,
+    CopyAgentRequest,
     UpdateAgentRequest,
     TeamAgentView,
 )
@@ -52,6 +54,8 @@ agent_router = APIRouter(
     tags=["agent"],
     responses={404: {"description": "Not found"}},
 )
+
+logger = logging.getLogger("bocomadp.agent")
 
 
 @agent_router.get(
@@ -466,6 +470,83 @@ async def create_agent(
     # 进名单；个人智能体由 owner 调 POST /agent/market/{id}/publish 上架。
 
     return CreateAgentResponse(agent_id=agent_id)
+
+
+@agent_router.post(
+    "/{agent_id}/copy",
+    response_model=CreateAgentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Copy an agent (payload only)",
+)
+async def copy_agent(
+    agent_id: str,
+    body: CopyAgentRequest,
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+    access: ResourceAccessService = Depends(get_resource_access_service),
+) -> CreateAgentResponse:
+    """只复制智能体**本体**（``AgentData``），其余关联数据一律不复制。
+
+    复制范围：
+
+    - **复制**：``name`` / ``description`` / ``system_prompt`` /
+      ``context_config`` / ``react_config`` / ``invite_config``
+      （``invite_config`` **原样**复制——``invitable`` 与
+      ``invite_description`` 都保留）；
+    - **不复制**：工具/MCP 启停白名单、技能、知识库配置、专家团
+      （成员 / 团队档案 / handoff）、市场名单、记忆配置、沙箱并发配置、
+      凭证绑定。
+
+    因此复制品的默认状态是：``is_team=False``、``parent_agent_id=None``、
+    工具与 MCP 全部启用（新 id 在白名单里没有条目）、无技能 / 无知识库
+    配置 / 无记忆、并发走默认值、模型凭证走运行时兜底解析。
+
+    权限：可读即可复制（:meth:`ResourceAccessService.resolve_agent`），
+    不可见 → 404。命名：``body.name`` 缺省为 ``"<源名> 副本"``，允许与
+    已有智能体重名。
+
+    Args:
+        agent_id (`str`):
+            源智能体 id。
+        body (`CopyAgentRequest`):
+            复制参数（当前只有新名字）。
+        user_id (`str`):
+            Injected authenticated user ID（复制品归属该用户）。
+        storage (`StorageBase`):
+            Injected storage backend.
+        access (`ResourceAccessService`):
+            Injected resource access service（可见性校验 + 取源记录）。
+
+    Returns:
+        `CreateAgentResponse`:
+            新智能体 id。
+
+    Raises:
+        `HTTPException`:
+            404 if the source agent is not visible to the caller.
+    """
+    src = await access.resolve_agent(user_id, agent_id)
+
+    # 两个 id 必须同时更换：``agents.id``（行主键）与 ``payload.data.id``
+    # 在框架里是各自独立生成的（存量行实测即不相等），只换主键会在 payload
+    # 里残留**源**的 data.id。
+    new_id = _generate_id()
+    payload = {**src.data.model_dump(exclude={"id"}), "id": new_id}
+    new_name = (body.name or "").strip()
+    payload["name"] = new_name or f"{src.data.name} 副本"
+
+    await storage.upsert_agent(
+        user_id,
+        AgentRecord(id=new_id, user_id=user_id, data=AgentData(**payload)),
+    )
+    logger.info(
+        "copy_agent: %s → %s (by=%s, name=%r)",
+        agent_id,
+        new_id,
+        user_id,
+        payload["name"],
+    )
+    return CreateAgentResponse(agent_id=new_id)
 
 
 @agent_router.patch(

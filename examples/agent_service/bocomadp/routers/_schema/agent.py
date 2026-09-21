@@ -68,6 +68,17 @@ class CreateAgentResponse(BaseModel):
     agent_id: str = Field(description="Server-assigned agent identifier.")
 
 
+class CopyAgentRequest(BaseModel):
+    """Request body for copying an agent (payload only)."""
+
+    name: str | None = Field(
+        default=None,
+        description=(
+            "新智能体名；缺省为 '<源名> 副本'。允许与已有智能体重名。"
+        ),
+    )
+
+
 class UpdateAgentRequest(BaseModel):
     """Request body for partially updating an agent.
 
