@@ -24,6 +24,7 @@ import uvicorn
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 
+from agentscope import setup_logger
 from agentscope.app import create_app, SubAgentTemplate
 from agentscope.app.hub import ClawSkillHub, GitHubMCPHub
 from agentscope.app.message_bus import RedisMessageBus
@@ -46,6 +47,7 @@ from providers.routers.credential_model import credential_model_router
 # set_models_dir 直接抛 FileNotFoundError 禁止启动——模型卡是交付物的一部分，
 # 缺了不能退化成"候选列表为空 + 上下文窗口悄悄变小"的静默故障。
 EllmChatModel.set_models_dir("./models")
+setup_logger("DEBUG")
 
 default_mcps = [
     MCPClient(
@@ -235,6 +237,8 @@ if __name__ == "__main__":
         "main_redis:app",
         host="0.0.0.0",
         port=9000,
+        # 与 SDK/providers 同一个 LOG_LEVEL（uvicorn 用小写级别名）
+        log_level="INFO",
         # 生产默认不 reload（镜像自包含部署）；本地开发可设 UVICORN_RELOAD=true
         reload=os.getenv("UVICORN_RELOAD", "false").lower()
         in ("1", "true", "yes"),

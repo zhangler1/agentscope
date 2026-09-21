@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import os
 import pathlib
 import sys
 import traceback
@@ -26,6 +27,7 @@ for _p in (
 
 import httpx
 
+from agentscope import setup_logger
 from agentscope.agent import Agent
 from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
@@ -34,6 +36,11 @@ from agentscope.message import Msg, TextBlock
 from providers.credential import ELLMCredential
 from providers.ellm_chat_model import EllmChatModel
 from providers.middleware.ellm_refresh import EllmKeyRefreshMiddleware
+
+# 日志级别：环境变量 LOG_LEVEL（默认 INFO）。SDK 与 providers 共用同一个
+# logger（"as"），一次 setup_logger 同时控制两者的格式与级别；本示例没有
+# uvicorn，故只有这一处。合法值：INFO/DEBUG/WARNING/ERROR/CRITICAL。
+setup_logger("DEBUG")
 
 # ---------------------------------------------------------------------------
 # 运行参数（按真实环境修改）
