@@ -3,3 +3,6 @@ label: DeepSeek Flash
 status: active
 context_size: 100000
 output_size: 38400
+# 本包扩展键：构造 EllmChatModel 未显式传 inject_think_tag 时取此值，
+# 省略即 False（服务模式即走这里，改完下一轮对话生效）。
+# inject_think_tag: true
