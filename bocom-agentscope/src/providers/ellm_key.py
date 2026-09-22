@@ -181,8 +181,9 @@ class EllmKeyRefresher:
     All key state lives in the user-scoped credential record identified by
     ``credential_id``; the record's ``data`` dict is expected to carry
     ``api_key``, ``scene_code`` and ``api_key_url``. The ``<think>``
-    injection switch is NOT stored on the credential — ``inject_think_tag``
-    is a model constructor parameter (``EllmChatModel(inject_think_tag=...)``).
+    injection switch is NOT stored on the credential — it is resolved by
+    :class:`EllmChatModel` from its constructor argument or the matching
+    model card (see ``EllmChatModel._resolve_inject_think_tag``).
         """
 
     _LOCK_TTL_SECS = _LOCK_TTL_SECS

@@ -4,8 +4,9 @@
 每次模型调用前，通过 :class:`EllmKeyRefresher` 惰性检查/刷新 ELLM
 apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落），
 再用 ``EllmChatModel.set_api_key`` 把新鲜 key 注入到当前模型实例的
-请求头（``Authorization: Bearer <key>``）。``<think>`` 注入由模型构造
-参数 ``inject_think_tag`` 决定，本中间件不再查询任何 Redis 模型配置。
+请求头（``Authorization: Bearer <key>``）。``<think>`` 注入由
+``EllmChatModel`` 在构造时决定（显式参数 > 模型卡 ``inject_think_tag``
+> ``False``），本中间件不再查询任何 Redis 模型配置。
 不换类、不重建 client，模型调用链保持不变。
 
 挂载方式::

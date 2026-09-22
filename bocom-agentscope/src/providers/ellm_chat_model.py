@@ -16,12 +16,24 @@ The key-refresh logic (api-key header rotation) lives in the
 which injects the fresh key per call via :meth:`set_api_key`; this class
 only carries the protocol differences.
 
-``inject_think_tag`` is decided at construction time by the caller.
-``context_size`` is optional: when omitted it is resolved from the model card
-matching the requested model name — the service-mode factory
+``context_size`` and ``inject_think_tag`` are both optional: when omitted they
+are resolved from the model card matching the requested model name — the
+service-mode factory
 (:func:`agentscope.app._service._model.get_model`) builds models from the
-session's ``ChatModelConfig`` only, which has no ``context_size`` field — and
-falls back to :data:`_DEFAULT_CONTEXT_SIZE` when no card matches.
+session's ``ChatModelConfig`` only, which carries neither field.  An explicit
+constructor argument always wins, so source-mode code keeps full control.
+
+Resolution rules for ``inject_think_tag`` (same shape as ``context_size``,
+except that a *missing card directory* is tolerated):
+
+- explicit argument → used as-is;
+- omitted, card directory configured *and* a card matches the model name →
+  that card's ``inject_think_tag`` (``False`` when the key is absent);
+- omitted, no card matches / no card directory configured → ``False``.
+
+The key is read from the raw card YAML rather than through
+:meth:`list_models`: :class:`~agentscope.model.ModelCard` maps only its
+declared fields, so a custom key never reaches the card object.
 
 The model cards live **outside this package**: the serving application points
 at their directory once at startup via :meth:`EllmChatModel.set_models_dir`.
@@ -45,6 +57,7 @@ from typing import (
 )
 
 import openai
+import yaml
 from pydantic import BaseModel, Field
 
 # 与 SDK 共用同一个 logger（名为 "as"）：日志格式、级别、handler 均与
@@ -87,8 +100,10 @@ class EllmChatModel(ChatModelBase):
 
     inject_think_tag: bool = False
     """Whether to prepend a ``<think>`` tag to the first non-empty text
-    delta of streaming responses. Set from the ``inject_think_tag``
-    ``__init__`` parameter; the key-refresh middleware may still
+    delta of streaming responses. Resolved at construction time: an explicit
+    ``inject_think_tag`` ``__init__`` argument wins, otherwise the matching
+    model card's ``inject_think_tag`` key is used, otherwise ``False`` (see
+    :meth:`_resolve_inject_think_tag`); the key-refresh middleware may still
     override the attribute per call."""
 
     _models_dir: str | None = None
@@ -246,6 +261,46 @@ class EllmChatModel(ChatModelBase):
         return super().list_models(custom_yaml_dir=cls._resolve_models_dir())
 
     @classmethod
+    def _resolve_card(cls, model: str) -> dict:
+        """Return the raw YAML config of the card matching ``model``.
+
+        The config is read as a plain ``dict`` rather than through
+        :meth:`list_models`: :class:`~agentscope.model.ModelCard` maps only
+        its declared fields, so runtime-only keys such as
+        ``inject_think_tag`` never reach the card object.
+
+        Args:
+            model (`str`):
+                The model name to look up.
+
+        Returns:
+            `dict`:
+                The matching card's raw YAML config, or an empty dict when no
+                card matches.  Unreadable / malformed cards are logged and
+                skipped, mirroring :meth:`list_models`.
+
+        Raises:
+            `RuntimeError`:
+                When the card directory is not configured — the same
+                configuration error :meth:`list_models` raises.
+        """
+        for yaml_file in Path(cls._resolve_models_dir()).glob("*.yaml"):
+            try:
+                with open(yaml_file, "r", encoding="utf-8") as file:
+                    config = yaml.safe_load(file) or {}
+            except Exception as e:  # pylint: disable=broad-except
+                # Log error but continue with other files
+                logger.warning(
+                    "Warning: Failed to load %s: %s",
+                    yaml_file,
+                    str(e),
+                )
+                continue
+            if config.get("name") == model:
+                return config
+        return {}
+
+    @classmethod
     def _resolve_context_size(cls, model: str) -> int:
         """Resolve ``model``'s context window from its model card.
 
@@ -256,9 +311,9 @@ class EllmChatModel(ChatModelBase):
         cards — the same ones :meth:`list_models` serves to the frontend —
         hold the value instead.
 
-        A *missing card directory* propagates from :meth:`list_models` as a
-        configuration error on purpose; only a model name that has no card is
-        tolerated here.
+        A *missing card directory* propagates from :meth:`_resolve_card` as a
+        configuration error on purpose; only a model name that has no card —
+        or whose card carries no usable ``context_size`` — is tolerated here.
 
         Args:
             model (`str`):
@@ -269,9 +324,13 @@ class EllmChatModel(ChatModelBase):
                 The matching card's ``context_size``, or
                 :data:`_DEFAULT_CONTEXT_SIZE` when no card matches.
         """
-        for card in cls.list_models():
-            if card.name == model:
-                return card.context_size
+        context_size = cls._resolve_card(model).get("context_size")
+        if (
+            isinstance(context_size, int)
+            and not isinstance(context_size, bool)
+            and context_size > 0
+        ):
+            return context_size
         logger.warning(
             "No ELLM model card found for %r in %s; falling back to "
             "context_size=%d",
@@ -280,6 +339,36 @@ class EllmChatModel(ChatModelBase):
             _DEFAULT_CONTEXT_SIZE,
         )
         return _DEFAULT_CONTEXT_SIZE
+
+    @classmethod
+    def _resolve_inject_think_tag(cls, model: str) -> bool:
+        """Resolve the ``<think>``-injection default from the model card.
+
+        Only called when the caller omitted ``inject_think_tag`` — which is
+        always the case on the service path, where
+        :func:`agentscope.app._service._model.get_model` passes only
+        ``credential / model / parameters``.
+
+        Unlike :meth:`_resolve_context_size`, a *missing card directory* is
+        not an error here: source-mode code that never calls
+        :meth:`set_models_dir` simply falls back to ``False`` instead of
+        failing to construct the model.
+
+        Args:
+            model (`str`):
+                The model name to look up.
+
+        Returns:
+            `bool`:
+                The matching card's ``inject_think_tag`` value; ``False``
+                when the key is absent, no card matches, or the card
+                directory is not configured.
+        """
+        try:
+            config = cls._resolve_card(model)
+        except RuntimeError:
+            return False
+        return bool(config.get("inject_think_tag", False))
 
     def __init__(
         self,
@@ -290,7 +379,7 @@ class EllmChatModel(ChatModelBase):
         stream: bool = True,
         max_retries: int = 3,
         retry_delay: float = 1.0,
-        inject_think_tag: bool = False,
+        inject_think_tag: bool | None = None,
         formatter: FormatterBase | None = None,
         client_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -318,9 +407,15 @@ class EllmChatModel(ChatModelBase):
                 The maximum number of retries for the ELLM API.
             retry_delay (`float`, defaults to `1.0`):
                 Seconds to sleep between retry attempts.
-            inject_think_tag (`bool`, defaults to `False`):
+            inject_think_tag (`bool | None`, defaults to `None`):
                 Whether to prepend a ``<think>`` tag to the first non-empty
-                text delta of streaming responses.
+                text delta of streaming responses. ``None`` (the service-mode
+                path, where the framework does not pass it) resolves the value
+                from the model card matching ``model`` in the directory
+                configured via :meth:`set_models_dir`; an explicit ``True`` /
+                ``False`` always wins. Falls back to ``False`` when the card
+                has no such key, no card matches, or no card directory is
+                configured.
             formatter (`FormatterBase | None`, defaults to `None`):
                 The formatter that converts ``Msg`` objects to the format
                 required by the ELLM API. When ``None``, a
@@ -331,6 +426,8 @@ class EllmChatModel(ChatModelBase):
         """
         if context_size is None:
             context_size = self._resolve_context_size(model)
+        if inject_think_tag is None:
+            inject_think_tag = self._resolve_inject_think_tag(model)
 
         super().__init__(
             credential=credential,
