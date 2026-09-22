@@ -190,6 +190,7 @@ def _row_to_view(
     return MarketAgentView(
         id=row.id,
         name=str(data.get("name", "")),
+        description=str(data.get("description", "")),
         system_prompt=str(data.get("system_prompt", "")),
         source=row.source,
         tag=tag or "",  # 名单内必有行，None 只是防御；空串 = 未打标

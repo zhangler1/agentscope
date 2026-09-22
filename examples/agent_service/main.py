@@ -965,6 +965,12 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import market_store
 
         await market_store.ensure_market_tables(storage)
+        # 智能体模板名单表（agent_template）——"可复制模板"白名单：
+        # 只有名单内且 enabled=true 的智能体允许被 POST /agent/{id}/copy。
+        # 与市场表同一套自建表模式：启动幂等建表（create_all），无迁移。
+        from bocomadp import agent_template_store
+
+        await agent_template_store.ensure_agent_template_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -1122,7 +1128,7 @@ app.include_router(agent_cross_search_config_router)
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）
 app.include_router(oss_download_router)
-# 按凭证查询模型（含单模型绑定过滤）
+# 按 (X-User-ID, credential_id) 查询凭证 payload（+ ELLM 凭证部分更新）
 app.include_router(credential_model_router)
 # 系统提示词管理（全局默认 + 按智能体自定义）
 from bocomadp.routers.system_prompt import system_prompt_router
@@ -1139,6 +1145,9 @@ app.include_router(agent_credential_router)
 # 智能体市场（平台应用列表 / 精选推荐 / 默认标签打标，全开放）
 from bocomadp.routers.market import market_router
 app.include_router(market_router)
+# 智能体模板名单（可复制白名单的 CRUD：/agent/template）
+from bocomadp.routers.agent_template import agent_template_router
+app.include_router(agent_template_router)
 
 
 # ---------------------------------------------------------------------------

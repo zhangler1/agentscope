@@ -14,6 +14,13 @@ class CreateAgentRequest(BaseModel):
     """Request body for creating a new agent."""
 
     name: str = Field(description="Display name of the agent.")
+    description: str = Field(
+        default="",
+        description=(
+            "智能体简介（一句话说明它能做什么）。随 AgentData 存进 "
+            "``agents.payload``；不传则空串。"
+        ),
+    )
     system_prompt: str = Field(
         default="你是一个乐于助人的AI助手。",
         description="Base system prompt fed to the agent.",
@@ -61,6 +68,24 @@ class CreateAgentResponse(BaseModel):
     agent_id: str = Field(description="Server-assigned agent identifier.")
 
 
+class CopyAgentRequest(BaseModel):
+    """Request body for copying an agent (payload + 已安装技能)。"""
+
+    name: str | None = Field(
+        default=None,
+        description=(
+            "新智能体名；缺省为 '<源名> 副本'。允许与已有智能体重名。"
+        ),
+    )
+    copy_skills: bool = Field(
+        default=True,
+        description=(
+            "是否同时复制该智能体已安装的技能。仅在 K8s 沙箱部署下生效；"
+            "本地模式技能按会话存储，会跳过并在 warnings 中说明。"
+        ),
+    )
+
+
 class UpdateAgentRequest(BaseModel):
     """Request body for partially updating an agent.
 
@@ -68,6 +93,13 @@ class UpdateAgentRequest(BaseModel):
     """
 
     name: str | None = Field(default=None, description="New display name.")
+    description: str | None = Field(
+        default=None,
+        description=(
+            "New description. Omit to keep the current value; pass an "
+            "empty string to clear it."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None,
         description="New system prompt.",
@@ -107,6 +139,32 @@ class TeamAgentView(AgentView):
     is_self_built: bool | None = None
 
 
+class CopyAgentResponse(TeamAgentView):
+    """Response body for ``POST /agent/{agent_id}/copy``.
+
+    与 ``GET /agent/`` 的列表元素、``PATCH /agent/{id}`` 的响应**同构**
+    （都是 :class:`TeamAgentView`）：``id`` / ``created_at`` / ``updated_at``
+    / ``user_id`` / ``source`` / ``data`` / ``editable`` / ``is_team`` /
+    ``parent_agent_id`` / ``is_self_built`` —— 前端可以把它直接当成一个
+    智能体对象插进列表，不需要再调一次 ``GET``。
+
+    不返回复制过程信息（已复制技能名、告警等）：那些只进服务端日志，
+    "复制成功"由 HTTP 201 表达。
+
+    - ``editable`` 恒为 ``True``（复制品归属调用者，与 ``PATCH`` 的响应
+      口径一致——那两处都是在权限校验之后构造的视图）；
+    - 新建的复制品 ``is_team=False`` / ``parent_agent_id=None`` /
+      ``is_self_built=None``（团队关系不复制）。
+    """
+
+    agent_id: str = Field(
+        description=(
+            "新智能体 id；与 :attr:`id` 同值，保留以兼容“只取 agent_id”"
+            "的旧调用方。"
+        ),
+    )
+
+
 class ListAgentsResponse(BaseModel):
     """Response body for listing agents."""
 
@@ -126,6 +184,12 @@ class OwnedAgentView(BaseModel):
 
     id: str = Field(description="智能体 id。")
     name: str = Field(description="智能体名称。")
+    description: str = Field(
+        default="",
+        description=(
+            "智能体简介（AgentData.description）；历史脏数据缺字段时兜底空串。"
+        ),
+    )
     system_prompt: str = Field(
         default="",
         description=(
