@@ -25,7 +25,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from agentscope.app.deps import get_current_user_id, get_storage
+from agentscope.app._service import ResourceAccessService
+from agentscope.app.access import ResourceKind
+from agentscope.app.deps import (
+    get_current_user_id,
+    get_resource_access_service,
+    get_storage,
+)
 from agentscope.app.storage import AgentData, StorageBase
 
 from bocomadp.agent_template_store import (
@@ -36,6 +42,7 @@ from bocomadp.agent_template_store import (
     list_template_entries,
     update_template_entry,
 )
+from bocomadp.team_store import list_teams
 
 logger = logging.getLogger("bocomadp.routers.agent_template")
 
@@ -101,10 +108,16 @@ class AgentTemplateDeleteResponse(BaseModel):
 
 
 class TemplateAgentItem(BaseModel):
-    """模板智能体的明细视图（**不含** editable / 团队标记字段）。
+    """模板智能体的明细视图。
 
-    按需求只暴露智能体本体与归属信息；``editable`` / ``is_team`` /
-    ``parent_agent_id`` / ``is_self_built`` 一律不返回。
+    在智能体本体与归属信息之外，额外带上：
+
+    - ``category``：模板表（``agent_template``）上的分类，前端按类目分组；
+    - ``editable`` / ``is_team`` / ``parent_agent_id`` / ``is_self_built``：
+      与 ``GET /api/agent/`` 的 :class:`TeamAgentView` 字段对齐，且**取值
+      同源**（都是现查表/权限算出来的，不是常量）：
+      ``editable`` 来自访问层（对当前 ``X-User-ID`` 而言能否 PATCH/DELETE），
+      团队三项来自 ``expert_team_relations`` 表。
     """
 
     id: str = Field(description="智能体 id（``agents`` 表主键）。")
@@ -118,6 +131,42 @@ class TemplateAgentItem(BaseModel):
     )
     created_at: datetime = Field(description="创建时间。")
     updated_at: datetime = Field(description="最后更新时间。")
+    category: str = Field(
+        default="",
+        description=(
+            "模板分类（``agent_template.category``）；仅作展示分组，"
+            "与 ``GET /agent/template`` 的过滤参数同名。"
+        ),
+    )
+    editable: bool = Field(
+        default=False,
+        description=(
+            "当前调用者能否 PATCH/DELETE 该智能体（viewer-relative）。"
+            "与 ``GET /api/agent/`` 同源：取访问层 ``list_resource`` 给出的"
+            " ``editable``；调用者列表里看不到的智能体（如 ``default`` 归属的"
+            "平台模板）为 ``false``。"
+        ),
+    )
+    is_team: bool = Field(
+        default=False,
+        description=(
+            "是否专家团团长：``expert_team_relations`` 里存在 "
+            "``leader_agent_id`` = 该智能体的团队档案。"
+        ),
+    )
+    parent_agent_id: str | None = Field(
+        default=None,
+        description=(
+            "作为自建成员挂靠的团长 id；不是团队成员为 ``null``。"
+        ),
+    )
+    is_self_built: bool | None = Field(
+        default=None,
+        description=(
+            "是否某团长的自建成员；不是团队成员为 ``null``"
+            "（与 ``routers/agent.py::_to_team_view`` 的判定一致）。"
+        ),
+    )
 
 
 class TemplateAgentsResponse(BaseModel):
@@ -148,6 +197,78 @@ async def _detect_owner(storage: Any, agent_id: str) -> str:
     if record is None:
         return ""
     return str(getattr(record, "user_id", "") or "")
+
+
+def _team_markers(
+    teams: list[Any],
+    agent_id: str,
+) -> tuple[bool, str | None, bool | None]:
+    """从团队档案推导 ``(is_team, parent_agent_id, is_self_built)``。
+
+    判定与 ``routers/agent.py::_to_team_view`` **逐条一致**：某团档案的
+    ``leader_agent_id`` 命中 → ``is_team=True``；出现在某团名册里且是
+    ``self_built`` → 回填团长 id 与 ``True``；两者都不命中 →
+    ``(False, None, None)``（``is_self_built`` 保持三态里的 ``null``，
+    与顶层 ``GET /api/agent/`` 的口径相同）。
+
+    Args:
+        teams (`list[Any]`):
+            某 owner 名下的全部团队档案（``team_store.list_teams``）。
+        agent_id (`str`):
+            待判定的智能体 id。
+    """
+    is_team = False
+    parent_agent_id: str | None = None
+    is_self_built: bool | None = None
+    for team in teams:
+        if team.leader_agent_id == agent_id:
+            is_team = True
+        if team.is_self_built(agent_id):
+            parent_agent_id = team.leader_agent_id
+            is_self_built = True
+    return is_team, parent_agent_id, is_self_built
+
+
+async def _editable_by_agent(
+    access: Any,
+    user_id: str,
+) -> dict[str, bool]:
+    """``GET /api/agent/`` 同源的 "可编辑" 映射：``agent_id -> editable``。
+
+    直接用访问层的 ``list_resource``（顶层，不传 ``parent_agent_id``），
+    拿到的每个 :class:`AgentView` 都带 viewer-relative 的 ``editable``，
+    与 ``GET /api/agent/`` 返回的那个布尔值**是同一个来源**，所以两边
+    永远一致（含"共享给调用者但只读"→ ``False`` 这类情况）。
+
+    列表里没出现的智能体（例如归属 ``default`` 的平台模板对普通用户
+    不可见）在调用方视角下本就不可编辑，统一按 ``False`` 处理。
+
+    Args:
+        access (`Any`):
+            ``ResourceAccessService`` 实例。
+        user_id (`str`):
+            调用者（``X-User-ID``）。
+    """
+    try:
+        views = await access.list_resource(user_id, ResourceKind.AGENT)
+    except Exception:  # noqa: BLE001 —— 取不到可见性时不阻断列表
+        logger.warning(
+            "agent_template: list_resource failed; editable defaults to false",
+            exc_info=True,
+        )
+        return {}
+    return {v.id: bool(getattr(v, "editable", False)) for v in views}
+
+
+async def _teams_of_owner(
+    storage: Any,
+    owner_id: str,
+    cache: dict[str, list[Any]],
+) -> list[Any]:
+    """按 owner 取团队档案（同一次请求内按 owner 缓存，避免逐条查库）。"""
+    if owner_id not in cache:
+        cache[owner_id] = await list_teams(storage, owner_id)
+    return cache[owner_id]
 
 
 # ---------------------------------------------------------------------------
@@ -230,20 +351,29 @@ async def list_template_agents(
     ),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
+    access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> TemplateAgentsResponse:
     """按 ``agent_template`` 名单批量返回对应智能体的完整信息。
 
     流程：先取模板名单（含已下架，除非按 ``enabled`` 过滤），按模板表顺序
     ``sort_order ASC, created_at DESC, agent_id ASC`` 分页，再逐个用模板行的
     ``owner_user_id`` 以 owner-scoped 方式读 ``agents`` 表，返回
-    ``{id, user_id, source, data, created_at, updated_at}``：
+    ``{id, user_id, source, data, created_at, updated_at, category,
+    editable, is_team, parent_agent_id, is_self_built}``：
 
     - ``data`` 经 :class:`~agentscope.app.storage.AgentData` 序列化，
       库里老行 payload 缺键（如 ``description``）会自动补模型默认值，
       与 ``GET /api/agent/`` 的 ``data`` 形状保持一致；
-    - **不返回** ``editable`` / ``is_team`` / ``parent_agent_id`` /
-      ``is_self_built``，也不返回模板自身字段（``title`` / ``category`` 等
-      只用于过滤与排序）；
+    - ``category`` 取自模板行（``agent_template.category``），供前端按类目
+      分组；其余模板字段（``title`` / ``sort_order`` / ``enabled``）仍只用于
+      过滤与排序，不返回；
+    - ``editable`` / ``is_team`` / ``parent_agent_id`` / ``is_self_built``
+      **与 ``GET /api/agent/`` 同源、按调用者现算**，不是常量：
+      ``editable`` 取访问层 ``list_resource``（顶层）给出的 viewer-relative
+      布尔值（同一次请求复用同一份映射）；团队三项由 ``expert_team_relations``
+      表按 ``owner_user_id`` 推导，判定逻辑与 ``routers/agent.py::_to_team_view``
+      一致。调用者列表里看不到的智能体（平台模板归属 ``default``）→
+      ``editable=False``；
     - 模板行是孤儿（``agents`` 表已无该 id）时跳过该条并打 warning，
       ``total`` 仍按模板表计数（因此 ``len(agents)`` 可能小于 ``pageSize``）。
 
@@ -257,9 +387,12 @@ async def list_template_agents(
         page_size (`int`):
             每页条数（query 名 ``pageSize``）。
         user_id (`str`):
-            Injected authenticated user ID（运营/只读接口，仅要求身份）。
+            Injected authenticated user ID（用于计算 ``editable``）。
         storage (`StorageBase`):
-            Injected storage backend.
+            Injected storage backend。
+        access (`ResourceAccessService`):
+            Injected access service —— ``editable`` 与 ``GET /api/agent/``
+            同源，避免两处口径漂移。
 
     Returns:
         `TemplateAgentsResponse`:
@@ -274,6 +407,11 @@ async def list_template_agents(
     start = (page_num - 1) * page_size
     page = entries[start : start + page_size]
 
+    # editable：一次 list_resource 拿全量，来源与 GET /api/agent/ 相同。
+    editable_map = await _editable_by_agent(access, user_id)
+    # 团队档案：按 owner 缓存（同一次请求里同一 owner 只查一次库）。
+    teams_cache: dict[str, list[Any]] = {}
+
     agents: list[TemplateAgentItem] = []
     for entry in page:
         record = await storage.get_agent(
@@ -287,6 +425,10 @@ async def list_template_agents(
                 entry.owner_user_id,
             )
             continue
+        is_team, parent_agent_id, is_self_built = _team_markers(
+            await _teams_of_owner(storage, entry.owner_user_id, teams_cache),
+            record.id,
+        )
         agents.append(
             TemplateAgentItem(
                 id=record.id,
@@ -295,6 +437,11 @@ async def list_template_agents(
                 data=record.data,
                 created_at=record.created_at,
                 updated_at=record.updated_at,
+                category=entry.category,
+                editable=editable_map.get(record.id, False),
+                is_team=is_team,
+                parent_agent_id=parent_agent_id,
+                is_self_built=is_self_built,
             ),
         )
     return TemplateAgentsResponse(agents=agents, total=total)

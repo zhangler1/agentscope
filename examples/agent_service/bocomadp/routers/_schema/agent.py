@@ -69,12 +69,36 @@ class CreateAgentResponse(BaseModel):
 
 
 class CopyAgentRequest(BaseModel):
-    """Request body for copying an agent (payload only)."""
+    """Request body for copying an agent (payload + 已安装技能)。"""
 
     name: str | None = Field(
         default=None,
         description=(
             "新智能体名；缺省为 '<源名> 副本'。允许与已有智能体重名。"
+        ),
+    )
+    copy_skills: bool = Field(
+        default=True,
+        description=(
+            "是否同时复制该智能体已安装的技能。仅在 K8s 沙箱部署下生效；"
+            "本地模式技能按会话存储，会跳过并在 warnings 中说明。"
+        ),
+    )
+
+
+class CopyAgentResponse(BaseModel):
+    """Response body after copying an agent."""
+
+    agent_id: str = Field(description="新智能体 id。")
+    copied_skills: list[str] = Field(
+        default_factory=list,
+        description="已复制的技能名列表；源无技能 / 未开启复制时为空。",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "非致命问题（如技能复制失败）。本体复制成功时仍返回 201，"
+            "由调用方决定是否提示用户。"
         ),
     )
 
