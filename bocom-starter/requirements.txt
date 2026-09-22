@@ -43,6 +43,5 @@ sqlalchemy[asyncio]>=2.0
 alembic>=1.13
 aiomysql>=0.2.0
 redis>=8.1.0
-qdrant-client
 aiodocker>=0.27.0
 
