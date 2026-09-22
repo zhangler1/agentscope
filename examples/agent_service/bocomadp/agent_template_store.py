@@ -272,6 +272,42 @@ async def list_template_entries(
     return [_to_entry(r) for r in rows]
 
 
+async def list_template_categories(
+    storage: Any,
+    *,
+    enabled: bool | None = None,
+) -> list[str]:
+    """列出模板名单里出现过的分类（去重 + 升序）。
+
+    与 :func:`list_template_entries` 的 ``category`` 过滤是同一列，供前端
+    渲染"分类下拉"用。规则：
+
+    - **排除空分类**（``category == ""``，即新增模板时没填分类的行）——
+      它不是一个可展示的类目，前端要"不过滤"直接不传 ``category`` 即可；
+    - 去重后按字典序升序返回，顺序稳定（不含数据库默认序的不确定性）；
+    - ``enabled`` 可选：只统计上架（``true``）/ 已下架（``false``）的模板，
+      与列表端点的同名参数口径一致。
+
+    Args:
+        storage (`Any`):
+            框架 storage（需含 ``_session_factory``）。
+        enabled (`bool | None`, optional):
+            可选启停过滤（``None`` = 全部，含已下架）。
+    """
+    factory = _session_factory(storage)
+    if factory is None:
+        return []
+    stmt = select(AgentTemplateRow.category).where(
+        AgentTemplateRow.category != "",
+    )
+    if enabled is not None:
+        stmt = stmt.where(AgentTemplateRow.enabled.is_(enabled))
+    stmt = stmt.distinct().order_by(AgentTemplateRow.category.asc())
+    async with factory() as session:
+        rows = (await session.execute(stmt)).scalars().all()
+    return [c for c in rows if c]
+
+
 async def update_template_entry(
     storage: Any,
     agent_id: str,
@@ -350,6 +386,7 @@ __all__ = [
     "ensure_agent_template_tables",
     "get_template_entry",
     "is_copyable_template",
+    "list_template_categories",
     "list_template_entries",
     "prune_orphan_template_entries",
     "update_template_entry",

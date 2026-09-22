@@ -4,6 +4,9 @@
 端点（本 router 自带 ``/agent/template`` 前缀，框架随后统一加 ``/api``）::
 
     GET    /api/agent/template              列出模板（可按分类/启停过滤）
+    GET    /api/agent/template/categories   列出已有分类（供前端筛选下拉）
+    GET    /api/agent/template/agents       按名单返回智能体明细（支持
+                                            ``category`` 过滤 + 分页）
     GET    /api/agent/template/{agent_id}   查询单条模板
     POST   /api/agent/template              新增模板（加入可复制名单）
     PUT    /api/agent/template/{agent_id}   部分更新模板
@@ -39,6 +42,7 @@ from bocomadp.agent_template_store import (
     create_template_entry,
     delete_template_entry,
     get_template_entry,
+    list_template_categories,
     list_template_entries,
     update_template_entry,
 )
@@ -174,6 +178,19 @@ class TemplateAgentsResponse(BaseModel):
 
     agents: list[TemplateAgentItem] = Field(default_factory=list)
     total: int = Field(default=0, description="模板总数（分页前）。")
+
+
+class AgentTemplateCategoriesResponse(BaseModel):
+    """``GET /agent/template/categories`` 响应体。"""
+
+    categories: list[str] = Field(
+        default_factory=list,
+        description=(
+            "模板名单里出现过的分类（去重、字典序升序、**不含空分类**）。"
+            "可直接用作 ``GET /agent/template/agents?category=`` 的候选值。"
+        ),
+    )
+    total: int = Field(default=0, description="分类数量（``len(categories)``）。")
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +464,48 @@ async def list_template_agents(
     return TemplateAgentsResponse(agents=agents, total=total)
 
 
+@agent_template_router.get(
+    "/categories",
+    response_model=AgentTemplateCategoriesResponse,
+    summary="列出模板已有分类（供前端筛选）",
+)
+async def list_agent_template_categories(
+    enabled: bool | None = Query(
+        default=None,
+        description="按模板启停过滤；缺省统计全部（含已下架）。",
+    ),
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+) -> AgentTemplateCategoriesResponse:
+    """列出 ``agent_template`` 里出现过的分类，供前端渲染分类筛选。
+
+    与 ``GET /agent/template/agents`` 的 ``category`` 参数同源（同一列），
+    因此返回的每个值都能直接拿去过滤；分类去重后按字典序升序返回。
+    **空分类不返回**（新增模板时未填 ``category`` 的行），这类模板在
+    列表端点里表现为"不传 ``category`` 时能看到、传任意分类时看不到"。
+
+    Args:
+        enabled (`bool | None`):
+            可选启停过滤：``true`` 只统计上架模板、``false`` 只统计已下架，
+            缺省统计全部。口径与列表端点一致。
+        user_id (`str`):
+            Injected authenticated user ID（运营/只读接口，仅要求身份）。
+        storage (`StorageBase`):
+            Injected storage backend.
+
+    Returns:
+        `AgentTemplateCategoriesResponse`:
+            ``{"categories": [...], "total": n}``。
+    """
+    categories = await list_template_categories(storage, enabled=enabled)
+    return AgentTemplateCategoriesResponse(
+        categories=categories,
+        total=len(categories),
+    )
+
+
+# 注意：与 ``/agents`` 同理，本端点必须声明在 ``GET /{agent_id}`` **之前**，
+# 否则 ``categories`` 会被 ``/{agent_id}`` 抢先匹配成 agent_id 并 404。
 @agent_template_router.get(
     "/{agent_id}",
     response_model=AgentTemplateEntry,
