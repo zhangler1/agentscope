@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""混合搜索工具（``cross_search_tool``）的配置模块。
+"""跨知识搜索工具（``cross_search_tool``）的配置模块。
 
 每个工具对应一个 ``*_config.py``，负责从单一 ``config.yaml`` 中提取
 本工具的配置节点（``cross_search``）。

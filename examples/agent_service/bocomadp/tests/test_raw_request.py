@@ -252,7 +252,7 @@ def test_raw_request_mounted_in_enterprise(monkeypatch):
         names = [t.name for t in tools]
         # 工具名默认中文，BOCOMADP_TOOL_ASCII_NAMES=1 时切 ASCII。
         assert tool_name("外数查", "raw_request_tool") in names
-        assert tool_name("混合搜索", "cross_search") in names
+        assert tool_name("跨知识搜索", "cross_search") in names
         assert tool_name("联网搜索", "online_search") not in names  # 默认不挂
     finally:
         reset_custom_params(token_params)
