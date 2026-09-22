@@ -1,36 +1,22 @@
 # -*- coding: utf-8 -*-
-"""bocom-as SDK 使用示例：Agent 对话 + api_key 中间件自动刷新。
+"""bocom_agentscope SDK 使用示例：Agent 对话 + api_key 中间件自动刷新。
+
+主存储走 SQL，防抖锁用 RedisMessageBus（多进程/多副本共享同一把锁）；
+依赖直接装到环境里即可，无需改动 sys.path：
+    pip install bocom_agentscope   # 提供 providers；agentscope SDK 由包依赖装上
+运行（仍需可达的数据库、Redis 与模型网关）：
+    python examples/sdk_demo_redis.py
 """
 
 import asyncio
 import os
-import pathlib
-import sys
 import traceback
-from typing import Any
-from urllib.parse import quote
-
-# 直接 `python examples/ellm_sdk_agent_demo.py` 时只有脚本目录进入 sys.path，
-# 仓库根不在搜索路径里：这里把 bocom-agentscope/src（providers 顶层包，含
-# credential / ellm_chat_model / middleware）与 src（agentscope 源码）补进去，
-# 未安装发行版也能直接跑。旧目录名 bocom-as 一并兼容（存在才加入）。
-# 必须在下面 import agentscope / providers **之前** 执行。
-_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _p in (
-    _ROOT / "bocom-as",  # 兼容旧目录名
-    _ROOT / "bocom-as" / "src",
-    _ROOT / "bocom-agentscope",
-    _ROOT / "bocom-agentscope" / "src",  # providers
-    _ROOT / "src",  # agentscope（未 pip 安装时）
-):
-    if _p.is_dir() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
 
 import httpx
 
 from agentscope import setup_logger
 from agentscope.agent import Agent
-from agentscope.app.message_bus import InMemoryMessageBus
+from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.message import Msg, TextBlock
 
@@ -38,9 +24,8 @@ from providers.credential import ELLMCredential
 from providers.ellm_chat_model import EllmChatModel
 from providers.middleware.ellm_refresh import EllmKeyRefreshMiddleware
 
-# 日志级别：环境变量 LOG_LEVEL（默认 INFO）。SDK 与 providers 共用同一个
-# logger（"as"），一次 setup_logger 同时控制两者的格式与级别；本示例没有
-# uvicorn，故只有这一处。合法值：INFO/DEBUG/WARNING/ERROR/CRITICAL。
+# 日志：SDK 与 providers 共用同一个 logger（"as"），这里一次 setup_logger
+# 同时控制两者的格式与级别，合法值 INFO/DEBUG/WARNING/ERROR/CRITICAL。
 setup_logger("INFO")
 
 # ---------------------------------------------------------------------------
@@ -58,36 +43,15 @@ SYSTEM_PROMPT = "你是一个乐于助人的助手，请用中文回答。"
 # 请求超时：连接/读写分开控制，避免小超时误判网关慢
 TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=120.0, pool=10.0)
 
-# 主存储：SQL（MySQL 协议，OB 走 SQLAlchemy 的 mysql 方言）——连接参数不读
-# 环境变量，按真实环境直接改下面这组常量。当前指向本机 OceanBase（MySQL 模式）
-# 开发实例：127.0.0.1:2881、租户 test、库 agentscope（见仓库根 ob-docker/，
-# 库需先建：ob-docker/scripts/init-db.sh）。
-# 接普通 MySQL / MariaDB：MYSQL_PORT 改 3306、MYSQL_TENANT 置空即可。
-MYSQL_HOST = "127.0.0.1"
-MYSQL_PORT = 2881
-MYSQL_USER = "root"
-MYSQL_TENANT = "test"  # OB 业务租户；普通 MySQL 留空
-MYSQL_PASSWORD = "ObDev_1234"
-MYSQL_DATABASE = "agentscope"
-# 非空时直接用完整 SQLAlchemy 异步 URL 覆盖上面的分项配置
+# 主存储：SQLAlchemy 异步 URL（MySQL / OB 兼容 MySQL 协议均可）；库需先建好
+# （create_tables=True 会自动建表）。
 MYSQL_URL = "mysql+aiomysql://agentscope:agentscope@127.0.0.1:3306/agentscope"
 
-
-def build_sql_url() -> str:
-    """拼 SQLAlchemy 异步连接 URL（OB / MySQL 通用，走 mysql 方言）。
-
-    用户名/密码必须百分号编码：OB 的登录名是 ``用户@租户``（root@test）
-    形式，其中的 ``@`` 不编码会被当成 URL 的 host 分隔符，这里统一用
-    ``quote(..., safe="")`` 处理。
-    """
-    if MYSQL_URL:
-        return MYSQL_URL
-    login = f"{MYSQL_USER}@{MYSQL_TENANT}" if MYSQL_TENANT else MYSQL_USER
-    return (
-        f"mysql+aiomysql://{quote(login, safe='')}:"
-        f"{quote(MYSQL_PASSWORD, safe='')}"
-        f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}?charset=utf8mb4"
-    )
+# 消息总线：RedisMessageBus（并发防抖锁落在 Redis 上，多进程/多副本共享）。
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
 
 # ---------------------------------------------------------------------------
@@ -100,25 +64,32 @@ def user_message(text: str) -> Msg:
 
 
 async def main() -> None:
-    """建 OceanBase(SQL) 存储连接，跑完对话后释放连接池。"""
-    # 凭证记录读写走 OB：连接池在 __aenter__ 创建、__aexit__ 关闭，避免退出时
-    # 残留连接。create_tables=True 由示例自动建表（生产改由 alembic 管理，置
-    # False）；pool_pre_ping/pool_recycle 规避服务端回收空闲连接导致的偶发断连。
+    """建 SQL 存储 + Redis 消息总线，跑完对话后释放两者。"""
+    # 凭证记录读写走 MYSQL_URL：连接池在 __aenter__ 创建、__aexit__ 关闭，避免
+    # 退出时残留连接。create_tables=True 由示例自动建表（生产改由 alembic 管理，
+    # 置 False）；pool_pre_ping/pool_recycle 规避服务端回收空闲连接导致的偶发断连。
     async with AsyncSQLAlchemyStorage(
-        build_sql_url(),
+        MYSQL_URL,
         create_tables=True,
         engine_kwargs={
             "pool_pre_ping": True,
             "pool_recycle": 3600,
         },
     ) as storage:
-        # 并发防抖锁：单进程用 InMemoryMessageBus；多进程换 RedisMessageBus
-        await _conversation(storage, InMemoryMessageBus())
+        # 并发防抖锁走 Redis：RedisMessageBus 的连接池同样在 __aenter__ 创建、
+        # __aexit__ 关闭，故与 storage 一样用 async with 包起来。
+        async with RedisMessageBus(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD,
+        ) as message_bus:
+            await _conversation(storage, message_bus)
 
 
 async def _conversation(
     storage: AsyncSQLAlchemyStorage,
-    message_bus: Any,
+    message_bus: RedisMessageBus,
 ) -> None:
     # 1. 建凭证并写入 storage（key 刷新状态就存这里）
     #    api_key 不填用占位值；中间件首次调用检测到无过期时间戳即触发刷新。
@@ -190,9 +161,14 @@ if __name__ == "__main__":
             "并确认 8001 端口/防火墙与 API key 场景有效。"
         )
         print(
-            "若为数据库连接类错误：确认 MYSQL_HOST:MYSQL_PORT（默认 "
-            "127.0.0.1:2881）可连通、租户与库已就绪（可先跑 "
-            "ob-docker/scripts/init-db.sh 建库）；报 No module named "
-            "'aiomysql' 说明驱动没装，执行 pip install "
+            "若为数据库连接类错误：确认 MYSQL_URL 的主机端口（默认 "
+            "127.0.0.1:3306）可连通、库已就绪（库需先建好）；"
+            "报 No module named 'aiomysql' 说明驱动没装，执行 pip install "
             "\"sqlalchemy[asyncio]\" aiomysql。"
+        )
+        print(
+            "若为 Redis 连接类错误：确认 REDIS_HOST/REDIS_PORT（默认 "
+            f"{REDIS_HOST}:{REDIS_PORT}）可达、REDIS_PASSWORD 正确；"
+            "报 No module named 'redis' 说明客户端没装，执行 pip install "
+            "\"redis[async]\"。"
         )

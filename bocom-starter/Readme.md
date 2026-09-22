@@ -10,14 +10,20 @@ chat、api_key 自动刷新**。
 ## 目录结构
 
 ```
-bocomm-agent/              # 交付物根（= Docker 构建上下文）
-├── bocom-as/              # 自包含发行版：config / providers / src（agentscope SDK）
-└── bocom-starter/         # 本启动程序
-    ├── main.py            # 服务入口（create_app + 行内模型平台路由）
-    ├── Dockerfile         # 生产自包含镜像（构建上下文 = 交付物根）
-    ├── docker-compose.yml # CI/CD 部署（agentscope 单服务，Redis 用生产实例）
-    ├── .env               # 环境变量示例（默认值，全部可省略）
-    └── Readme.md
+agentscope/                  # 仓库根
+├── src/agentscope/              # agentscope SDK 源码
+├── bocom-agentscope/            # 行内扩展包
+├── bocom-starter/               # 本启动程序
+│   ├── main_memory.py           # 服务入口：InMemoryMessageBus（单进程零中间件依赖）
+│   ├── main_redis.py            # 服务入口：RedisMessageBus（多进程 / 多副本）
+│   ├── models/                  # 模型卡目录（当前仅 deepseek-flash.yaml）
+│   ├── workspaces/ · blobs/     # 工作区数据
+│   ├── .env                     # 环境变量示例（默认值，全部可省略）
+│   ├── requirements.txt         # 本启动程序的额外依赖（当前为空）
+│   ├── Dockerfile               # 生产自包含镜像（构建上下文 = 仓库根）
+│   ├── docker-compose.yaml      # CI/CD 部署
+│   └── Readme.md · Development-Guide.md
+└── examples/                    # SDK 直用示例（sdk_demo_memory.py / sdk_demo_redis.py）
 ```
 
 ---
@@ -26,27 +32,50 @@ bocomm-agent/              # 交付物根（= Docker 构建上下文）
 
 ## 1. 环境准备
 
-```bash
 # 交付/验证环境：bocom-as 自包含发行版，SDK 源码随包分发（bocom-as/src/agentscope）
 pip install -e bocom-as
+
+
+### 1.1 数据库配置：MySQL / OceanBase
+
+**示例代码内配置 `MYSQL_URL` 用于连接数据库**：
+
+```text
+MYSQL_URL = "mysql+aiomysql://agentscope:agentscope@127.0.0.1:3306/agentscope"
 ```
 
-**依赖 Redis（仅主存储）**：本服务用 Redis 存会话/凭证/Agent 等业务数据；
-**行内模型平台本身不再依赖 Redis**（模型候选来自随包内置的
-`providers/_models/*.yaml` 模型卡，key 刷新走主存储凭证记录）。
+### 1.2 Redis（仅消息总线，只有 `main_redis.py` 需要）
 
-```bash
-export REDIS_HOST=localhost        # 应用主存储（会话、凭证、Agent 等）
-export REDIS_PORT=6379
-```
+`main_memory.py` 用 `InMemoryMessageBus`（单进程适用）；
+`main_redis.py` 用 `RedisMessageBus`（分布式锁落在 Redis 上，多进程共享）：
+
+| 变量 | 默认值 |
+|---|---|
+| `REDIS_HOST` | `localhost` |
+| `REDIS_PORT` | `6379` |
+| `REDIS_DB` | `0` |
+| `REDIS_PASSWORD` | 空 |
+
 
 ## 2. 启动服务
 
 ```bash
 cd bocom-starter
-uvicorn main:app --reload          # 开发模式（热重载）
-# 或 python main.py（reload 由 UVICORN_RELOAD=true 控制，默认关闭）
+python main_memory.py        # InMemoryMessageBus：单进程，无需 Redis
+python main_redis.py         # RedisMessageBus：多进程 / 多副本
 ```
+
+```bash
+uvicorn main_memory:app --reload
+uvicorn main_redis:app --reload
+```
+
+| 入口 | 消息总线 | 日志级别 | 监听地址 |
+|---|---|---|---|
+| `main_memory.py` | `InMemoryMessageBus` | `INFO` | `0.0.0.0:8000` |
+| `main_redis.py` | `RedisMessageBus` | `INFO` | `0.0.0.0:8000` |
+
+两个入口的差异**只有消息总线**。
 
 ## 3. 快速上手：行内凭证 + 行内模型 chat
 
@@ -110,11 +139,17 @@ curl -X POST http://localhost:8000/agent/ \
 
 ### 3.3 创建会话并绑定行内模型
 
-模型候选来自随包内置的 `providers/_models/*.yaml`（SDK 形态下模型名也可
-在代码中直接指定）：
+模型候选来自**指定目录下的 `models/` 目录**（入口里使用 `set_models_dir("./models")`），
+示例项目中，只有一张模型卡片 `models/deepseek-flash.yaml`：
+
+| 卡片字段 | 值 |
+|---|---|
+| `name` | `deepseek-flash` |
+| `context_size` | `100000` |
+| `output_size` | `38400` |
 
 ```bash
-# 查看该 provider 下当前候选（内置模型卡）
+# 查看该 provider 下当前候选（读 models/ 里的模型卡）
 curl -H 'x-user-id: test-user' \
   "http://localhost:8000/model/?provider=bocom_ellm_credential"
 ```
@@ -128,7 +163,7 @@ curl -X POST http://localhost:8000/sessions/ \
     "chat_model_config": {
       "type": "bocom_ellm_credential",
       "credential_id": "cred-xxx",
-      "model": "deepseek-v4-flash",
+      "model": "deepseek-flash",
       "parameters": {}
     }
   }'
@@ -211,7 +246,7 @@ data: {"type": "REPLY_END", "reply_id": "...", "finished_reason": "completed"}
 当前调用一次；刷新失败标记凭证过期，下次调用走惰性刷新恢复。
 日志关键字：`injected refreshed ELLM key`。
 
-> key 刷新依赖的是注入给中间件的 **主存储**（`storage`/`message_bus`），
+> key 刷新依赖的是注入给中间件的 **主存储**（`storage`），
 > 主存储配 SQL 或 Redis 都行，与模型候选无关。
 
 ---
@@ -257,7 +292,7 @@ docker compose -f bocom-starter/docker-compose.yml up -d
 
 - **单服务**：只部署 agentscope；**生产 Redis 复用行内实例，不自建**，
   地址由平台环境变量注入（见下节）；
-- **端口**：宿主 `9000`（默认，可用 `AGENTSCOPE_HOST_PORT` 覆盖）→ 容器 `8000`；
+- **端口**：宿主 `8000`（默认，可用 `AGENTSCOPE_HOST_PORT` 覆盖）→ 容器 `8000`；
 - **持久化**：`workspace-data` 命名 volume 挂载到
   `/app/bocom-starter/workspaces`（agent 工作区 + 长期记忆 Markdown 文件，
   容器重建不丢）；
@@ -271,11 +306,13 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `REDIS_HOST` / `REDIS_PORT` | ✅ | 生产 Redis（应用主存储：会话、凭证、Agent 等） |
-| `DASHSCOPE_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | 按需 | 各模型供应商 key |
+| `REDIS_HOST` / `REDIS_PORT` | ✅ | 消息总线 Redis（`main_redis.py` 的 `RedisMessageBus`：分布式锁） |
+| `REDIS_DB` / `REDIS_PASSWORD` | 按需 | Redis 库号（默认 `0`）与密码（默认空） |
 
-> 未注入的变量不进入容器，退化为 `bocom-starter/.env` 中的默认值
-> （`localhost` 类默认值仅适合本地直跑，生产必须注入真实地址）。
+> Redis 仅 `main_redis.py` 需要；`main_memory.py` 用 `InMemoryMessageBus`，
+> 无需注入 Redis 变量。未注入的变量不进入容器，退化为
+> `bocom-starter/.env` 中的默认值（`localhost` 类默认值仅适合本地直跑，
+> 生产必须注入真实地址）。
 
 ## 5. 部署运维要点
 
@@ -287,7 +324,7 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
 
   各实例共享生产 Redis（会话/凭证数据隔离由业务侧控制）；
 - **日志**：`docker compose -f bocom-starter/docker-compose.yml logs -f
-  agentscope`；API 文档见 `http://<宿主>:9000/docs`。
+  agentscope`；API 文档见 `http://<宿主>:8000/docs`。
 
 ---
 
@@ -299,6 +336,6 @@ compose 透传宿主环境变量（environment 优先于 `.env` 默认值），�
 | `UVICORN_RELOAD` | `false` | 是否开启 uvicorn 热重载（本地开发设 `true`） |
 
 > `.env` 由宿主应用加载（本仓库提供示例）。行内模型平台（bocom-as
-> `providers`）不再依赖独立 Redis / 额外配置：模型候选来自随包内置
+> `providers`）不再依赖独立 Redis / 额外配置：模型候选来自指定目录
 > 模型卡，api_key 刷新窗口默认 300s（`build_ellm_refresh_middleware`
 > 的 `refresh_ahead_secs`，非必填）。

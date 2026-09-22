@@ -1,24 +1,8 @@
 # -*- coding: utf-8 -*-
-"""The example script to start the agent service."""
-import os
-import pathlib
-import sys
-from urllib.parse import quote
+"""The example script to start the agent service (in-memory message bus).
+"""
 
-# 直接 `python main_memory.py` 时只有脚本目录进入 sys.path，仓库根不在搜索路径：
-# 这里把 providers（bocom-agentscope/src，含 credential / middleware / routers）
-# 与 agentscope 源码（src）补进去，未安装发行版也能直接跑。旧目录名 bocom-as
-# 一并兼容（存在才加入）。必须在下面 import agentscope / providers **之前** 执行。
-_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _p in (
-    _ROOT / "bocom-as",  # 兼容旧目录名
-    _ROOT / "bocom-as" / "src",
-    _ROOT / "bocom-agentscope",
-    _ROOT / "bocom-agentscope" / "src",  # providers
-    _ROOT / "src",  # agentscope（未 pip 安装时）
-):
-    if _p.is_dir() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+import os
 
 import uvicorn
 from fastapi.middleware import Middleware
@@ -26,27 +10,22 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agentscope import setup_logger
 from agentscope.app import create_app, SubAgentTemplate
-from agentscope.app.hub import ClawSkillHub, GitHubMCPHub
 from agentscope.app.message_bus import InMemoryMessageBus
-from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
 from agentscope.permission import PermissionContext, PermissionMode
-from agentscope.rag import ApproxTokenChunker, QdrantStore
 
-# -- 行内模型平台（bocom-as 发行版：providers）------------------------------
+# -- 行内模型平台（bocom_agentscope 发行版：providers）----------------------
 from providers.credential import ELLMCredential  # noqa: F401 — 导入即注册
 from providers.ellm_chat_model import EllmChatModel
 from providers.middleware.ellm_refresh import build_ellm_refresh_middleware
 from providers.routers.credential_model import credential_model_router
 
-# 模型卡目录：本入口文件同级的 models/。以 __file__ 为基准而非 cwd，保证
-# python main_memory.py / uvicorn main:app / uvicorn main_memory:app 三种启动
-# 方式解析一致；相对路径会按 cwd 解析，故这里显式给出绝对路径。目录缺失时
-# set_models_dir 直接抛 FileNotFoundError 禁止启动——模型卡是交付物的一部分，
-# 缺了不能退化成"候选列表为空 + 上下文窗口悄悄变小"的静默故障。
-EllmChatModel.set_models_dir("./models")
+# 模型卡目录：本入口文件同级的 models/（随 bocom-starter 交付，whl 内不含）。
+EllmChatModel.set_models_dir(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+)
 setup_logger("INFO")
 
 default_mcps = [
@@ -72,44 +51,17 @@ if os.getenv("AMAP_API_KEY"):
         ),
     )
 
-# 主存储：SQL（MySQL 协议，OB 走 SQLAlchemy 的 mysql 方言）。连接参数不读
-# 环境变量，按真实环境直接改下面这组常量。当前指向本机 OceanBase（MySQL 模式）
-# 开发实例：127.0.0.1:2881、租户 test、库 agentscope（见仓库根 ob-docker/，
-# 库需先建：ob-docker/scripts/init-db.sh）。
-# 接普通 MySQL / MariaDB：MYSQL_PORT 改 3306、MYSQL_TENANT 置空即可。
-MYSQL_HOST = "127.0.0.1"
-MYSQL_PORT = 2881
-MYSQL_USER = "root"
-MYSQL_TENANT = "test"  # OB 业务租户；普通 MySQL 留空
-MYSQL_PASSWORD = "ObDev_1234"
-MYSQL_DATABASE = "agentscope"
-# 非空时直接用完整 SQLAlchemy 异步 URL 覆盖上面的分项配置。
+# 主存储：SQLAlchemy 异步 URL（MySQL / OB 兼容 MySQL 协议均可）。
 # host 注意：本机直跑用 127.0.0.1（MySQL 容器已把 3306 发布到宿主机）；
 # 只有在 compose 网络内部的容器里跑，才用服务名 mysql。
 MYSQL_URL = "mysql+aiomysql://agentscope:agentscope@127.0.0.1:3306/agentscope"
-
-
-def build_sql_url() -> str:
-    """拼 SQLAlchemy 异步连接 URL（OB / MySQL 通用，走 mysql 方言）。
-
-    OB 的登录名是「用户@租户」（如 root@test），其中的 ``@`` 不编码会被
-    当成 URL 的 host 分隔符，所以统一做百分号编码。
-    """
-    if MYSQL_URL:
-        return MYSQL_URL
-    login = f"{MYSQL_USER}@{MYSQL_TENANT}" if MYSQL_TENANT else MYSQL_USER
-    return (
-        f"mysql+aiomysql://{quote(login, safe='')}:"
-        f"{quote(MYSQL_PASSWORD, safe='')}"
-        f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}?charset=utf8mb4"
-    )
 
 
 # create_tables=True 便于首次起服务自动建表（示例/开发用）；生产建议置 False，
 # 改为独立步骤执行 alembic upgrade head。pool_pre_ping/pool_recycle 规避服务端
 # 回收空闲连接导致的偶发断连。
 storage = AsyncSQLAlchemyStorage(
-    build_sql_url(),
+    MYSQL_URL,
     create_tables=True,
     engine_kwargs={
         "pool_pre_ping": True,
@@ -121,8 +73,6 @@ storage = AsyncSQLAlchemyStorage(
 # 消息中间件；多进程/多副本请改用同目录 main_redis.py 的 RedisMessageBus。
 # 与 create_app 共享同一实例（行内模型 key 刷新中间件复用）。
 message_bus = InMemoryMessageBus()
-
-vector_store = QdrantStore(location=":memory:")
 
 
 # 行内模型平台：ELLM api key 刷新中间件工厂（惰性预刷 + 401 强制刷新重试）。
@@ -137,8 +87,6 @@ _ellm_refresh_factory = build_ellm_refresh_middleware(
 app = create_app(
     storage=storage,
     message_bus=message_bus,
-    # message_bus 固定传上面的内存实例（InMemoryMessageBus）；需要 Redis 版
-    # 消息总线（多进程 / 多副本部署）请用同目录的 main_redis.py。
     workspace_manager=LocalWorkspaceManager(
         basedir=os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -147,22 +95,10 @@ app = create_app(
         # The default MCP servers that will be added into the workspace
         default_mcps=default_mcps,
     ),
-    # Knowledge base feature — backed by an in-memory Qdrant store. The
-    # CollectionPerKbManager allocates one collection per knowledge base,
-    # so any embedding dimension is allowed.
-    knowledge_base_manager=CollectionPerKbManager(
-        storage=storage,
-        vector_store=vector_store,
-    ),
-    # 本 SDK（2.0.5）只接受单个共享 chunker；不传时默认即
-    # ApproxTokenChunker()，这里显式写出便于后续按需换参数。
-    knowledge_chunker=ApproxTokenChunker(),
     # Resource hubs the UI browses under /hub. Neither needs credentials
     # of its own — an individual MCP card declares whatever key it wants
     # from the user in its ``inputs_schema``. Passing a ClawHub token
     # only raises the rate limit.
-    mcp_hubs=[GitHubMCPHub()],
-    skill_hubs=[ClawSkillHub(api_token=os.getenv("CLAWHUB_API_TOKEN"))],
     # Customize your own subagent templates
     custom_subagent_templates=[
         SubAgentTemplate(
@@ -226,8 +162,8 @@ if __name__ == "__main__":
         # 模块名必须与文件名一致（本文件是 main_memory.py）
         "main_memory:app",
         host="0.0.0.0",
-        port=9000,
-        # 与 SDK/providers 同一个 LOG_LEVEL（uvicorn 用小写级别名）
+        port=8000,
+        # uvicorn 级别用小写名（与上面 setup_logger 的级别各自独立）
         log_level="INFO",
         # 生产默认不 reload（镜像自包含部署）；本地开发可设 UVICORN_RELOAD=true
         reload=os.getenv("UVICORN_RELOAD", "false").lower()
