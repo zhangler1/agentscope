@@ -1,0 +1,41 @@
+# =============================================================================
+# bocom_agentscope — 现代构建配置（PEP 517 / PEP 621）
+# =============================================================================
+# 本文件自包含，不依赖 setup.py 即可构建 whl：
+#     python -m pip wheel --no-deps -w ../bocom-starter/wheels .
+# 元数据与 setup.py 保持逐项一致，保证行内平台（setup.py 入口）与本地
+# （pyproject.toml 入口）构建产物一致；依赖列表以 requirements.txt 为
+# 单一真源（dynamic 读取），改依赖只需要改 requirements.txt。
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bocom_agentscope"
+version = "0.5.2"
+description = "Bocom AgentScope SDK - config and providers for internal model platform"
+maintainers = [
+    { name = "EUVD Team", email = "w_jinchao@bankbocom.com" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.12"
+classifiers = ["Programming Language :: Python"]
+# 依赖列表动态读取 requirements.txt（setup.py 的 parse_requirements 同源）
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools]
+# 包源码位于 src/ 下（providers 包）
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# 模型卡数据目录（无 __init__.py，非包，随源码分发）
+providers = ["_models/*.yaml"]

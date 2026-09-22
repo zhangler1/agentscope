@@ -1,2 +1,48 @@
+# =============================================================================
+# bocom-starter — 快速启动工程依赖清单
+# =============================================================================
+# 运行环境：Python >= 3.12（bocom_agentscope whl 元数据要求）
+# 安装（请在本目录执行，下方相对路径按本目录解析）：
+#     pip install -r requirements.txt
+#
+# ── 外部服务（数据库 / 中间件）───────────────────────────────────────────────
+# * MySQL / OceanBase（MySQL 模式）── 必需：应用主存储
+#     main_memory.py / main_redis.py 均默认以 mysql+aiomysql:// 连接
+#     （本机 127.0.0.1:3306；OB 127.0.0.1:2881、租户 test），
+#     库 agentscope 需先建好（create_tables=True 会自动建表）。
+# * Redis ── 仅 main_redis.py 需要（RedisMessageBus，多进程 / 多副本部署）；
+#     main_memory.py 使用 InMemoryMessageBus，无需 Redis。
+# * Qdrant ── 无需部署服务：QdrantStore(location=":memory:") 为进程内模式，
+#     仅需安装 qdrant-client 库（见下）。
+#
+# ── 外部命令（非 pip，按需安装）──────────────────────────────────────────────
+# * rg（ripgrep）── LocalWorkspace 的 Grep 内置工具依赖，建议系统安装；
+# * node / npx ── 仅默认 browser-use MCP（npx @playwright/mcp）需要，可选。
+# =============================================================================
 
+# ---- 本项目发行版 whl（行内平台打包产物，含 config / providers）----
+# 直接安装 wheels/ 下的轮子；版本升级后同步此处文件名。
+# （wheels/ 下如留有旧版本，建议移除：Dockerfile 以 /app/wheels/*.whl
+#   通配安装，多只共存会重复安装。）
+./wheels/bocom_agentscope-0.5.2-py3-none-any.whl
+
+# ---- 显式兜底：whl 元数据同款 + 运行必需（whl 元数据缺项在此补全）----
+# 元依赖（pip 源官方 agentscope；运行时源码由 bocom-agentscope-sdk/src 遮蔽）
+agentscope==2.0.5
+# providers 直接依赖（openai 由 SDK 源码直接 import，whl 元数据未声明）
+fastapi>=0.141.1
+openai>=1.66.0
+httpx>=0.28.1
+pydantic>=2.13.5
+# 服务运行必需（whl 元数据未声明的部分：python-multipart 起，到 aiodocker 止）
+uvicorn>=0.52.4
+apscheduler>=3.11.3
+ag-ui-protocol>=0.1.10
+python-multipart>=0.0.18
+sqlalchemy[asyncio]>=2.0
+alembic>=1.13
+aiomysql>=0.2.0
+redis>=8.1.0
+qdrant-client
+aiodocker>=0.27.0
 

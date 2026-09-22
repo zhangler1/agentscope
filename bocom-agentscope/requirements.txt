@@ -1,20 +1,18 @@
 # bocom-as 依赖清单（与 pyproject.toml [project.dependencies] 保持一致）
 # agentscope 从 pip 源安装；本包只含 config / providers。
 agentscope==2.0.5
-
-# ---- bocom-starter 部署必需 ----
 fastapi>=0.141.1
+openai>=1.66.0
+httpx>=0.28.1
+pydantic>=2.13.5
+# 服务运行必需（whl 元数据未声明的部分：python-multipart 起，到 aiodocker 止）
 uvicorn>=0.52.4
 apscheduler>=3.11.3
 ag-ui-protocol>=0.1.10
-redis>=8.1.0 
+python-multipart>=0.0.18
+sqlalchemy[asyncio]>=2.0
+alembic>=1.13
+aiomysql>=0.2.0
+redis>=8.1.0
+qdrant-client
 aiodocker>=0.27.0
-
-# # ---- SQL 存储后端（应用主存储：数据库 / OceanBase 兼容 MySQL 协议）----
-# sqlalchemy[asyncio]>=2.0
-# alembic>=1.13
-# aiomysql>=0.2.0
-
-# ---- providers 直接依赖 ----
-httpx>=0.28.1
-pydantic>=2.13.5
