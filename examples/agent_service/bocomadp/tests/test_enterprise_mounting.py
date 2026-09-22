@@ -15,7 +15,7 @@ from bocomadp.tools.enterprise import usable_tool_names
 
 # 工具名默认中文，设置 BOCOMADP_TOOL_ASCII_NAMES=1 后为 ASCII；
 # 断言用 tool_name(...) 计算期望值，避免与开关耦合。
-_CROSS = tool_name("混合搜索", "cross_search")
+_CROSS = tool_name("跨知识搜索", "cross_search")
 _VECTOR = tool_name("行内搜索", "vector_search")
 _ONLINE = tool_name("联网搜索", "online_search")
 _PERSONAL = tool_name("个人知识库搜索", "personal_search")
@@ -115,42 +115,43 @@ def test_read_tool_result_tool_mounted():
 
 
 # ---------------------------------------------------------------------------
-# usableTools 请求级名单（只作用于企业工具层，优先级高于 per-agent 白名单）
+# usableTools 请求级名单（只作用于企业工具层，优先级高于 per-agent 白名单）。
+# read_tool_result 豁免名单（持久化配套读回工具，始终默认挂载）。
 # ---------------------------------------------------------------------------
 
 
-def test_usable_tools_missing_mounts_nothing():
-    assert _mount({}) == set()
+def test_usable_tools_missing_mounts_only_read_back():
+    assert _mount({}) == {"read_tool_result"}
 
 
-def test_usable_tools_none_mounts_nothing():
-    assert _mount({"usableTools": None}) == set()
+def test_usable_tools_none_mounts_only_read_back():
+    assert _mount({"usableTools": None}) == {"read_tool_result"}
 
 
-def test_usable_tools_empty_list_mounts_nothing():
-    assert _mount({"usableTools": []}) == set()
+def test_usable_tools_empty_list_mounts_only_read_back():
+    assert _mount({"usableTools": []}) == {"read_tool_result"}
 
 
 def test_usable_tools_keeps_only_listed():
     names = _mount({"usableTools": [_VECTOR, _CROSS]})
-    assert names == {_VECTOR, _CROSS}
+    assert names == {_VECTOR, _CROSS, "read_tool_result"}
 
 
 def test_usable_tools_matches_ascii_names():
     # 名单写英文名（与运行时形态无关）也能命中
     names = _mount({"usableTools": ["vector_search", "cross_search"]})
-    assert names == {_VECTOR, _CROSS}
+    assert names == {_VECTOR, _CROSS, "read_tool_result"}
 
 
 def test_usable_tools_ignores_unknown_and_non_enterprise_names():
     names = _mount({"usableTools": [_VECTOR, "Bash", "不存在的工具"]})
-    assert names == {_VECTOR}
+    assert names == {_VECTOR, "read_tool_result"}
 
 
 def test_usable_tools_does_not_override_switches():
     # 名单只收缩、不扩张：online_search_switch 未开，列入名单也不挂
     names = _mount({"usableTools": [_VECTOR, _ONLINE]})
-    assert names == {_VECTOR}
+    assert names == {_VECTOR, "read_tool_result"}
     assert _ONLINE not in names
 
 

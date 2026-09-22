@@ -161,6 +161,12 @@ async def build_enterprise_tools(
     - 非空数组 → 只保留名单内的工具（中/英文名均可匹配）；名单只收缩、
       不扩张——开关关闭的工具即使列入名单也不会挂载。
 
+    ``read_tool_result`` 不归本名单管辖：它是工具输出持久化的配套读回
+    工具（会话内只读、键由当前会话构造，模型无法跨会话读取），与
+    ToolResultPersistenceMiddleware 始终挂载对齐——任何名单形态下都默认
+    挂载。否则持久化生效时模型收到 ``<persisted-output>`` 预览却无工具
+    读回完整内容。
+
     本函数在 run 任务内由框架 AgentToolFactory 调用，custom_params
     ContextVar 已随 ``asyncio.create_task`` 复制进来，可直接读取。
     """
@@ -223,15 +229,20 @@ async def build_enterprise_tools(
     # - 缺失 / None / 非数组 / 空数组 → 不挂载任何企业工具（全禁用）；
     # - 非空数组 → 只保留名单内的工具（中/英文名均可匹配）。
     # 名单只收缩、不扩张：上方开关关闭的工具即使列入名单也不会挂载。
+    # read_tool_result 例外：它是工具输出持久化的配套读回工具（会话内
+    # 只读、键由当前会话构造），与 ToolResultPersistenceMiddleware 始终
+    # 挂载对齐——不受 usableTools 名单管辖，始终默认挂载。
     usable = params.get("usableTools")
+    read_back_name = getattr(read_tool_result_tool, "name", "") or "read_tool_result"
     if not isinstance(usable, list) or not usable:
         logger.info(
             "enterprise tools: usableTools missing or empty -> "
-            "no enterprise tool mounted (session=%s)",
+            "only read_tool_result mounted (session=%s)",
             session_id,
         )
-        return []
+        return [read_tool_result_tool]
     allowed = usable_enterprise_tool_names(usable)
+    allowed.add(read_back_name)
     tools = [t for t in tools if getattr(t, "name", "") in allowed]
 
     return tools

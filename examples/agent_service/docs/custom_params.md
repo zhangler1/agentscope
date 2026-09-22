@@ -235,7 +235,7 @@ class CustomPromptMiddleware(MiddlewareBase):
 | `vector_search_switch` | True | 显式 `False` → 不挂 vector_search 工具（cross_search 始终挂载） | `build_enterprise_tools` |
 | `online_search_switch` | False | 显式 `True` → 挂 online_search 联网搜索（默认不挂） | `build_enterprise_tools` |
 | `personal_search_switch` | False | 显式 `True` 且空间参数齐备 → 挂 personal_search 工具 | `build_enterprise_tools` |
-| `usableTools` | — | 请求级企业工具名单（见下方说明）：缺失/None/空数组 → 全禁用；非空 → 只挂名单内 | `build_enterprise_tools` + 白名单豁免 |
+| `usableTools` | — | 请求级企业工具名单（见下方说明）：缺失/None/空数组 → 全禁用；非空 → 只挂名单内；`read_tool_result` 豁免（始终默认挂载） | `build_enterprise_tools` + 白名单豁免 |
 
 ```python
 # enterprise.py（工具挂载开关，2026-08-20 起 cross_search 不受 vector 开关控制）
@@ -280,6 +280,9 @@ personal_search 工具（行内搜索之外的"个人知识库搜索"维度）�
 - 名单内的企业工具**豁免** per-agent 白名单（`main.py build_agent_tools`
   与 `toolkit_whitelist.py` 两处过滤同步豁免）——请求方可以在白名单之外
   临时启用某个企业工具，但名单外的企业工具仍被白名单约束。
+- `read_tool_result` **豁免本名单与 per-agent 白名单**：它是工具输出持久化
+  的配套读回工具（会话内只读、键由当前会话构造），与
+  ToolResultPersistenceMiddleware 始终挂载对齐，任何名单形态下都默认挂载。
 
 ### 6.4 认证参数（auth_context.py + 路由联动）
 
@@ -310,7 +313,7 @@ def resolve_auth_params(custom_params) -> ResolvedAuth:
 | `vector_search_switch` | bool | build_enterprise_tools | 显式 False 卸载 vector_search（默认挂载；cross_search 不受控） |
 | `online_search_switch` | bool | build_enterprise_tools | 显式 True 挂 online_search（默认不挂） |
 | `personal_search_switch` | bool | build_enterprise_tools | 显式 True 且空间参数齐备 → 挂 personal_search |
-| `usableTools` | list[str] | build_enterprise_tools + 白名单豁免 | 请求级企业工具名单：只挂名单内（中/英文名均可）；缺失/None/空数组 → 全禁用；名单内工具豁免 per-agent 白名单 |
+| `usableTools` | list[str] | build_enterprise_tools + 白名单豁免 | 请求级企业工具名单：只挂名单内（中/英文名均可）；缺失/None/空数组 → 全禁用；名单内工具豁免 per-agent 白名单；read_tool_result 豁免名单始终默认挂载 |
 | `tools_param.personalKnowledgeSearch` | dict | PersonalSpacecodeOverrideMiddleware | 个人空间参数（psnlSpaceCodeId / psnlCategoryIdList）强制覆盖 |
 | `tools_param.source_param` | dict | vector_search 后端 | sourceType / repository / aggRepositories / HNSSParam |
 | `guwp_token` / `jrt_auth_code` / `okic_token` / `okic_type` / `muwp_user` | str / dict | resolve_auth_params | 认证方案（优先级 guwp > jrt > okic > muwp） |

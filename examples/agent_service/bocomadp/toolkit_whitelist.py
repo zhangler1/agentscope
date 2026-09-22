@@ -50,6 +50,9 @@ _DEFAULT_TOOL_NAMES: set[str] = {
     "TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
     "ToolStop",
     "ScheduleCreate", "ScheduleDelete", "ScheduleList", "ScheduleUpdate",
+    # 工具输出持久化配套读回工具（会话内只读、键由会话构造），与
+    # ToolResultPersistenceMiddleware 始终挂载对齐，豁免白名单过滤。
+    "read_tool_result",
 }
 
 

@@ -417,10 +417,14 @@ async def build_agent_tools(
     #
     # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
     # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
-    # builtins / 工厂工具等非企业工具不豁免。
+    # builtins / 工厂工具等非企业工具不豁免。read_tool_result 同步豁免
+    # （与 build_enterprise_tools 的 usableTools 豁免同理）：它是工具输出
+    # 持久化的配套读回工具，否则白名单模式下模型收到
+    # <persisted-output> 预览却无工具读回完整内容。
     whitelist = _tool_whitelists.get(agent_id, [])
     if whitelist:
         allowed = set(whitelist) | usable_enterprise_tool_names(usable)
+        allowed.add("read_tool_result")
         tools = [
             t for t in tools if getattr(t, "name", "") in allowed
         ]
