@@ -86,23 +86,6 @@ class CopyAgentRequest(BaseModel):
     )
 
 
-class CopyAgentResponse(BaseModel):
-    """Response body after copying an agent."""
-
-    agent_id: str = Field(description="新智能体 id。")
-    copied_skills: list[str] = Field(
-        default_factory=list,
-        description="已复制的技能名列表；源无技能 / 未开启复制时为空。",
-    )
-    warnings: list[str] = Field(
-        default_factory=list,
-        description=(
-            "非致命问题（如技能复制失败）。本体复制成功时仍返回 201，"
-            "由调用方决定是否提示用户。"
-        ),
-    )
-
-
 class UpdateAgentRequest(BaseModel):
     """Request body for partially updating an agent.
 
@@ -154,6 +137,32 @@ class TeamAgentView(AgentView):
     # list was queried with ``parent_agent_id`` — mirrors the historical
     # framework ``AgentView`` contract.
     is_self_built: bool | None = None
+
+
+class CopyAgentResponse(TeamAgentView):
+    """Response body for ``POST /agent/{agent_id}/copy``.
+
+    与 ``GET /agent/`` 的列表元素、``PATCH /agent/{id}`` 的响应**同构**
+    （都是 :class:`TeamAgentView`）：``id`` / ``created_at`` / ``updated_at``
+    / ``user_id`` / ``source`` / ``data`` / ``editable`` / ``is_team`` /
+    ``parent_agent_id`` / ``is_self_built`` —— 前端可以把它直接当成一个
+    智能体对象插进列表，不需要再调一次 ``GET``。
+
+    不返回复制过程信息（已复制技能名、告警等）：那些只进服务端日志，
+    "复制成功"由 HTTP 201 表达。
+
+    - ``editable`` 恒为 ``True``（复制品归属调用者，与 ``PATCH`` 的响应
+      口径一致——那两处都是在权限校验之后构造的视图）；
+    - 新建的复制品 ``is_team=False`` / ``parent_agent_id=None`` /
+      ``is_self_built=None``（团队关系不复制）。
+    """
+
+    agent_id: str = Field(
+        description=(
+            "新智能体 id；与 :attr:`id` 同值，保留以兼容“只取 agent_id”"
+            "的旧调用方。"
+        ),
+    )
 
 
 class ListAgentsResponse(BaseModel):

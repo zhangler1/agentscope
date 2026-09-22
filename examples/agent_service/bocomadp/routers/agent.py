@@ -507,9 +507,10 @@ async def copy_agent(
     无记忆、并发走默认值、模型凭证走运行时兜底解析。
 
     技能复制是**尽力而为**：任何失败（沙箱不可用、超时、打包失败…）
-    只写进 ``warnings``，本体复制成功仍返回 201；源智能体没有技能时
-    直接跳过（不会为目标拉起沙箱）。本地模式（``ADP_K8S_ENABLED=false``）
-    技能按会话存储，跳过并在 ``warnings`` 说明。
+    都不影响本体复制，仍返回 201，失败原因写进服务端日志
+    （``copy_agent: <new_id> warn: ...``）；源智能体没有技能时直接跳过
+    （不会为目标拉起沙箱）。本地模式（``ADP_K8S_ENABLED=false``）技能按
+    会话存储，同样跳过并记日志。
 
     权限：可读即可复制（:meth:`ResourceAccessService.resolve_agent`），
     不可见 → 404。命名：``body.name`` 缺省为 ``"<源名> 副本"``，允许与
@@ -531,7 +532,9 @@ async def copy_agent(
 
     Returns:
         `CopyAgentResponse`:
-            新智能体 id + 已复制技能名单 + 告警列表。
+            新智能体的完整视图——与 ``GET /agent/`` 列表元素、``PATCH``
+            响应**同构**的 :class:`TeamAgentView`，可直接插进前端列表。
+            不返回技能名单 / 告警，那些只进日志。
 
     Raises:
         `HTTPException`:
@@ -552,21 +555,23 @@ async def copy_agent(
         AgentRecord(id=new_id, user_id=user_id, data=AgentData(**payload)),
     )
 
-    # 技能搬运：尽力而为，失败只降级为 warning（本体已经落库，不回收）。
     copied_skills: list[str] = []
     warnings: list[str] = []
+
+    # 技能搬运：尽力而为，失败只降级为 warning（本体已经落库，不回收）。
     if body.copy_skills:
         from bocomadp.workspace import is_k8s_enabled
 
         if is_k8s_enabled():
             from .skill_router import copy_agent_skills
 
-            copied_skills, warnings = await copy_agent_skills(
+            copied_skills, skill_warnings = await copy_agent_skills(
                 user_id,
                 agent_id,
                 new_id,
                 workspace_manager,
             )
+            warnings.extend(skill_warnings)
         else:
             warnings.append(
                 "skills: 本地模式技能按会话存储，已跳过技能复制。",
@@ -584,11 +589,22 @@ async def copy_agent(
         len(copied_skills),
         len(warnings),
     )
-    return CopyAgentResponse(
-        agent_id=new_id,
-        copied_skills=copied_skills,
-        warnings=warnings,
-    )
+    # 复制过程信息不再随响应返回，只在日志里留痕（便于排障）。
+    for item in warnings:
+        logger.warning("copy_agent: %s warn: %s", new_id, item)
+
+    # 响应 = 新智能体的完整视图（与 GET /agent/ 列表元素、PATCH 响应同构），
+    # 前端可直接把它当成一个智能体对象插进列表，省一次 GET。
+    # ``_to_team_view`` 就是 PATCH 用的那个构造函数（复制品归属调用者，
+    # 所以 editable 恒 True；团队关系不复制 → is_team=False）。
+    stored = await storage.get_agent(user_id, new_id)
+    if stored is None:  # 理论不可达：刚 upsert 的行读不到
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Copied agent was not persisted.",
+        )
+    view = await _to_team_view(storage, user_id, stored)
+    return CopyAgentResponse(**view.model_dump(), agent_id=new_id)
 
 
 @agent_router.patch(
