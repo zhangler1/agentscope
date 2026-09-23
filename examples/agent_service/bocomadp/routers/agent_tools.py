@@ -93,8 +93,8 @@ _FACTORY_TOOL_ATTRS: tuple[str, ...] = (
 )
 
 _HIDDEN_PROJECT_TOOLS: frozenset[str] = frozenset(
-    {"回显", "获取当前时间", "列出上传文件", "读取上传文件",
-     "echo", "get_current_time", "list_uploaded_files", "read_uploaded_file"},
+    {"回显", "获取当前时间",
+     "echo", "get_current_time"},
 )
 
 # ------------------------------------------------------------------

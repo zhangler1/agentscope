@@ -102,8 +102,7 @@ def resolve_session_context(
     读取（ChatRunRegistry 经 ``asyncio.create_task`` 派生 run，会拷贝
     当前 context，因此 run 内的工具可见）。
 
-    供上传相关工具（list_uploaded_files / read_uploaded_file /
-    view_image_tool）共享调用，避免每个工具各自重复 try/except 兜底。
+    供上传相关工具（view_image_tool）共享调用，避免每个工具各自重复 try/except 兜底。
 
     Args:
         user_id: 显式传入的租户 id，空串则取 ContextVar。

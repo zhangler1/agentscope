@@ -17,7 +17,6 @@ can be injected into the agent's :class:`Toolkit` at build time.
 - ``builtin_tools.py`` — example built-in tools
 - ``agent_factory_tools.py`` — agent-creator factory tools (not in global registry)
 - ``enterprise.py``  — 企业工具主动 build 工厂
-- ``placeholder.py`` — 企业工具占位实现（HR / 文档库 / ITSM）
 - ``custom/``        — product-specific tools (auto-scanned)
 """
 
