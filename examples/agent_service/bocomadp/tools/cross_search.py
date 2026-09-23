@@ -414,7 +414,7 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
         _cross_search_tool_impl,
         # 工具名默认中文（行内网关）；行外 DeepSeek 等 API 强校验
         # ^[a-zA-Z0-9_-]+$，设置 BOCOMADP_TOOL_ASCII_NAMES=1 切 ASCII。
-        name=tool_name("混合搜索", "cross_search"),
+        name=tool_name("跨知识搜索", "cross_search"),
         is_read_only=True,
     )
 else:

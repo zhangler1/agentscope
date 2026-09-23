@@ -21,7 +21,7 @@ from agentscope.message import Msg, TextBlock
 
 from bocomadp.deerflow.bridge import BusBridge
 from bocomadp.deerflow.routers.deerflow_chat import deerflow_router
-from bocomadp.deerflow.runs import RunManager
+from bocomadp.deerflow.runs import RunManager, RunStatus
 
 THREAD_ID = "t1"
 USER_ID = "user-1"
@@ -137,6 +137,7 @@ class FakeChatService:
                 {
                     "type": "MODEL_CALL_END",
                     "session_id": session_id,
+                    "reply_id": "r1",
                     "input_tokens": self._usage[0],
                     "output_tokens": self._usage[1],
                     "finished_reason": "stop",
@@ -281,13 +282,13 @@ def test_create_run_stream_echoes_human_message_first(monkeypatch) -> None:
     assert meta["run_id"]
     assert meta["thread_id"] == THREAD_ID
 
-    # 帧 3：run 已结束 → end 收尾
-    assert events[2] == ("end", "null")
+    # 帧 2 后无帧：run 已结束，本层不下发 end 帧（流结束由连接关闭传递）
+    assert len(events) == 2
 
 
 def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
     """token 下发通道：MODEL_CALL_END 消化后不泄漏 custom 帧，
-    改为 REPLY_END 末尾 messages usage 增量帧 + end 前 values 快照
+    改为 REPLY_END 末尾 messages usage 增量帧 + 节点边界 values 快照
     （最后一条 ai 消息带 usage_metadata，对齐原生形态）。
     """
     async def _no_binding(agent_id: str):
@@ -351,13 +352,16 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
         name == "custom" and "model_call_end" in data
         for name, data in events
     )
-    # 帧序：human 回显 → metadata → messages usage 增量 → values → end
+    # 帧序：human 回显 → metadata → messages usage 增量 → updates 快照
+    # → values（流中节点边界）；无 end 帧（本层不下发，流结束由连接
+    # 关闭传递；原生最后一个 super-step 快照后直接 end，见原生
+    # client.py ``stream()``）
     assert events_by_name == [
         "messages",
         "metadata",
         "messages",
+        "updates",
         "values",
-        "end",
     ]
     expected_usage = {
         "input_tokens": 120,
@@ -370,16 +374,23 @@ def test_create_run_stream_emits_usage_and_values(monkeypatch) -> None:
     assert usage_chunk["content"] == ""
     assert usage_chunk["id"] == "r1"
     assert usage_chunk["usage_metadata"] == expected_usage
-    assert usage_meta == {"langgraph_node": "model"}
-    # values 快照：全量消息 + title + 最后一条 ai 附 usage_metadata
-    # （title 取 storage 内最近一条 human；请求输入尚未落库）
-    values = json.loads(events[3][1])
+    # metadata 注入业务字段（agent_name/thread_id；无 MODEL_CALL_START
+    # 时不注入 model_name/ls_model_name）
+    assert usage_meta["langgraph_node"] == "model"
+    assert usage_meta["agent_name"] == "agent_a"
+    assert usage_meta["thread_id"] == "t1"
+    # values 快照（节点边界帧）：storage 历史（human + 上轮扁平 ai）+
+    # 本轮结构化 ai 快照在尾部，自带该轮 usage_metadata（消息级语义）；
+    # title 取 storage 内最近一条 human；请求输入尚未落库
+    values = json.loads(events[4][1])
     assert values["title"] == "德国的历史是什么？"
-    assert [m["type"] for m in values["messages"]] == ["human", "ai"]
-    assert values["messages"][-1]["id"] == "ai-1"
+    assert [m["type"] for m in values["messages"]] == ["human", "ai", "ai"]
+    assert values["messages"][-1]["id"] == "r1"
     assert values["messages"][-1]["usage_metadata"] == expected_usage
-    # end 哨兵收尾
-    assert events[4] == ("end", "null")
+    # run 级累计 usage 不挂到历史消息上（上轮扁平 ai-1 无 usage_metadata，
+    # 快照只含消息级语义，run 级总量由前端按 usage 增量帧累加）
+    assert "usage_metadata" not in values["messages"][1]
+    # 无 end 帧：流结束由连接关闭传递（events 末尾为 values 快照帧）
 
 
 def test_join_run_stream_echoes_human_messages() -> None:
@@ -421,18 +432,66 @@ def test_join_run_stream_echoes_human_messages() -> None:
         "content": [{"type": "text", "text": "德国的历史是什么？"}],
     }
 
-    # 帧 2：values 快照（end 哨兵前补发，对齐原生主通道帧）；
-    # 无模型调用 → 无 usage_metadata
-    assert events[1][0] == "values"
-    values = json.loads(events[1][1])
-    assert values["title"] == "德国的历史是什么？"
-    assert values["messages"] == [
-        {
-            "type": "human",
-            "id": "human-1",
-            "content": [{"type": "text", "text": "德国的历史是什么？"}],
-        },
-    ]
+    # 帧 2 后无帧：run 已结束，本层不下发 end 帧（join 回放无节点边界
+    # 帧；原生最后一个 super-step 快照后直接 end，见原生 client.py
+    # ``stream()``）
+    assert len(events) == 1
 
-    # 帧 3：run 已结束 → end 收尾
-    assert events[2] == ("end", "null")
+
+def test_spawn_run_interrupts_active_run() -> None:
+    """新请求优先（恒 interrupt 语义）：session 已有活跃 run 时，
+    ``_spawn_run`` 打断旧 run 并等待其结束后再创建新 run。
+
+    interrupt 模拟 CancelDispatcher 取消旧 task（真实链路经 MessageBus
+    广播 → CancelDispatcher → ``task.cancel()``）；旧 run 记账落定
+    INTERRUPTED，新 run 正常创建且 run_id 不同。
+    """
+    from bocomadp.deerflow.routers.deerflow_chat import _spawn_run
+
+    class InterruptingChatService(FakeChatService):
+        """interrupt 时取消 registry 里的活跃 task（模拟 CancelDispatcher）。"""
+
+        def __init__(
+            self,
+            bus: InMemoryMessageBus,
+            registry: FakeChatRunRegistry,
+        ) -> None:
+            super().__init__(bus)
+            self._registry = registry
+
+        async def interrupt(self, user_id: str, session_id: str, agent_id: str) -> None:
+            del user_id, session_id, agent_id
+            self._registry.cancel()
+
+    async def scenario() -> None:
+        bus = InMemoryMessageBus()
+        mgr = RunManager()
+        registry = FakeChatRunRegistry()
+        chat_service = InterruptingChatService(bus, registry)
+        record1, task1 = await _spawn_run(
+            mgr,
+            registry,
+            chat_service,
+            USER_ID,
+            THREAD_ID,
+            AGENT_ID,
+            None,
+        )
+        assert not task1.done()
+        record2, task2 = await _spawn_run(
+            mgr,
+            registry,
+            chat_service,
+            USER_ID,
+            THREAD_ID,
+            AGENT_ID,
+            None,
+        )
+        assert record2.run_id != record1.run_id
+        assert mgr.get(record1.run_id).status == RunStatus.INTERRUPTED
+        assert mgr.get(record2.run_id).status == RunStatus.RUNNING
+        # 新 run 正常收尾（等待 0.3s 后台任务完成，避免 loop 关闭时
+        # pending task 告警）
+        await asyncio.wait_for(asyncio.shield(task2), timeout=5.0)
+
+    asyncio.run(scenario())

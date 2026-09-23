@@ -155,6 +155,20 @@ class RunManager:
             return None
         return self._records.get(run_id)
 
+    def active_run_id(self, session_id: str) -> str | None:
+        """查询 session 当前活跃 run 的 run_id（无活跃 run 返回 ``None``）。
+
+        新请求打断旧 run（interrupt 语义）时用于定位待打断的 run。
+        """
+        self._cleanup_locked()
+        run_id = self._by_session.get(session_id)
+        if run_id is None:
+            return None
+        record = self._records.get(run_id)
+        if record is not None and record.active:
+            return run_id
+        return None
+
     # ── 状态更新 ──────────────────────────────────────────────────────
 
     def set_status(

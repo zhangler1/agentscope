@@ -11,7 +11,11 @@ AgentScope 的 ``on_system_prompt`` transformer 钩子，并在其上叠加
   然后**依次应用**实现了 ``on_system_prompt`` 的中间件，返回值为最终
   提示词（transformer 模式，见 ``agentscope/agent/_agent.py``）；
 - custom_params 携带非空 ``custom_prompt`` → 直接返回它，**整体覆盖**
-  （与 deer-flow 等价）；
+  （与 deer-flow 等价），同时把框架拼好的 ``<agent-skills>`` /
+  ``<workspace>`` 段追加回末尾——前端 custom_prompt 常自带技能路径描述，
+  覆盖后模型丢失“技能必须用 Skill 工具读取”的强指引，会用 Read 工具
+  按路径直读文件；技能清单与 workspace 是运行时环境事实，请求级
+  无法知道，必须由框架段补回；
 - 否则从 PostgreSQL ``system_prompts`` 表读取公共提示词（该智能体 →
   全局回退），把其中的 ``<技能注入>`` / ``<工作区>`` 占位符替换为框架拼好的
   ``<agent-skills>`` / ``<workspace>`` 段；没有占位符的段追加到末尾；
@@ -274,6 +278,26 @@ class CustomPromptMiddleware(MiddlewareBase):
                     len(current_prompt),
                     len(prompt),
                 )
+            # 整体覆盖后框架拼好的 <agent-skills> / <workspace> 段一并丢失：
+            # 前端 custom_prompt 里常自带技能路径描述，模型看不到“技能必须
+            # 用 Skill 工具读取”的强指引，会用 Read 工具按路径直读文件。
+            # 技能清单与 workspace 是运行时环境事实（该 agent 实际挂载的
+            # 技能、沙箱路径），请求级无法预知，故把框架段补回末尾。
+            additions = [
+                s
+                for s in (
+                    _extract_section(current_prompt, "agent-skills"),
+                    _extract_section(current_prompt, "workspace"),
+                )
+                if s
+            ]
+            if additions:
+                prompt = prompt.rstrip("\n") + "\n\n" + "\n\n".join(additions)
+            # 覆盖分支提前 return 会跳过下面 1.5 步的「本次请求指定技能」
+            # 提示：@skill:<name> 标记已被 ActiveSkillMiddleware 摘掉（消息
+            # 落库保持用户原话），此处不补的话模型无从得知用户指定了优先
+            # 使用哪些技能（与 PG 分支第 7 步行为对齐）。
+            prompt = prompt + _build_active_skill_note()
             return prompt
 
         # 1.5. 用户指定技能（@skill:<name>）：active_skill.py 只负责**摘掉
