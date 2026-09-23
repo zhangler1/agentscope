@@ -69,19 +69,12 @@ class CreateAgentResponse(BaseModel):
 
 
 class CopyAgentRequest(BaseModel):
-    """Request body for copying an agent (payload + 已安装技能)。"""
+    """Request body for copying an agent（只复制本体，不搬技能）。"""
 
     name: str | None = Field(
         default=None,
         description=(
             "新智能体名；缺省为 '<源名> 副本'。允许与已有智能体重名。"
-        ),
-    )
-    copy_skills: bool = Field(
-        default=True,
-        description=(
-            "是否同时复制该智能体已安装的技能。仅在 K8s 沙箱部署下生效；"
-            "本地模式技能按会话存储，会跳过并在 warnings 中说明。"
         ),
     )
 
@@ -148,8 +141,9 @@ class CopyAgentResponse(TeamAgentView):
     ``parent_agent_id`` / ``is_self_built`` —— 前端可以把它直接当成一个
     智能体对象插进列表，不需要再调一次 ``GET``。
 
-    不返回复制过程信息（已复制技能名、告警等）：那些只进服务端日志，
-    "复制成功"由 HTTP 201 表达。
+    只复制本体、不搬技能（技能按会话存储在 workspace 里，不属于智能体
+    配置），因此也没有任何"复制过程信息"需要返回："复制成功"由 HTTP 201
+    表达。
 
     - ``editable`` 恒为 ``True``（复制品归属调用者，与 ``PATCH`` 的响应
       口径一致——那两处都是在权限校验之后构造的视图）；
