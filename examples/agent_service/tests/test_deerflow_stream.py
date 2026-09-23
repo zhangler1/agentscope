@@ -21,7 +21,7 @@ from agentscope.message import Msg, TextBlock
 
 from bocomadp.deerflow.bridge import BusBridge
 from bocomadp.deerflow.routers.deerflow_chat import deerflow_router
-from bocomadp.deerflow.runs import RunManager
+from bocomadp.deerflow.runs import RunManager, RunStatus
 
 THREAD_ID = "t1"
 USER_ID = "user-1"
@@ -436,3 +436,62 @@ def test_join_run_stream_echoes_human_messages() -> None:
     # 帧；原生最后一个 super-step 快照后直接 end，见原生 client.py
     # ``stream()``）
     assert len(events) == 1
+
+
+def test_spawn_run_interrupts_active_run() -> None:
+    """新请求优先（恒 interrupt 语义）：session 已有活跃 run 时，
+    ``_spawn_run`` 打断旧 run 并等待其结束后再创建新 run。
+
+    interrupt 模拟 CancelDispatcher 取消旧 task（真实链路经 MessageBus
+    广播 → CancelDispatcher → ``task.cancel()``）；旧 run 记账落定
+    INTERRUPTED，新 run 正常创建且 run_id 不同。
+    """
+    from bocomadp.deerflow.routers.deerflow_chat import _spawn_run
+
+    class InterruptingChatService(FakeChatService):
+        """interrupt 时取消 registry 里的活跃 task（模拟 CancelDispatcher）。"""
+
+        def __init__(
+            self,
+            bus: InMemoryMessageBus,
+            registry: FakeChatRunRegistry,
+        ) -> None:
+            super().__init__(bus)
+            self._registry = registry
+
+        async def interrupt(self, user_id: str, session_id: str, agent_id: str) -> None:
+            del user_id, session_id, agent_id
+            self._registry.cancel()
+
+    async def scenario() -> None:
+        bus = InMemoryMessageBus()
+        mgr = RunManager()
+        registry = FakeChatRunRegistry()
+        chat_service = InterruptingChatService(bus, registry)
+        record1, task1 = await _spawn_run(
+            mgr,
+            registry,
+            chat_service,
+            USER_ID,
+            THREAD_ID,
+            AGENT_ID,
+            None,
+        )
+        assert not task1.done()
+        record2, task2 = await _spawn_run(
+            mgr,
+            registry,
+            chat_service,
+            USER_ID,
+            THREAD_ID,
+            AGENT_ID,
+            None,
+        )
+        assert record2.run_id != record1.run_id
+        assert mgr.get(record1.run_id).status == RunStatus.INTERRUPTED
+        assert mgr.get(record2.run_id).status == RunStatus.RUNNING
+        # 新 run 正常收尾（等待 0.3s 后台任务完成，避免 loop 关闭时
+        # pending task 告警）
+        await asyncio.wait_for(asyncio.shield(task2), timeout=5.0)
+
+    asyncio.run(scenario())
