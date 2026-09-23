@@ -1061,6 +1061,36 @@ async def _resolve_custom_params(
     return loaded or {}
 
 
+#: 固定注入 ``custom_params.usableTools`` 名单的工具（名单条目写中文名
+#: 即可，两层过滤会经 ``usable_enterprise_tool_names`` 归一为运行时形态
+#: 名，与 BOCOMADP_TOOL_ASCII_NAMES 开关无关）。
+_FIXED_USABLE_TOOLS: tuple[str, ...] = ("读取工具结果",)
+
+
+def _inject_fixed_usable_tools(params: dict[str, Any]) -> None:
+    """把固定工具追加进 ``custom_params.usableTools`` 名单（原地修改）。
+
+    ``read_tool_result``（持久化读回工具）固定启用，与调用方是否携带
+    ``usableTools``、是否配置 per-agent 白名单无关：两层过滤
+    （main.py ``build_agent_tools`` / ``toolkit_whitelist``）只放行名单内
+    工具，这里在解析后、ContextVar 注入前固定补上该条目。
+
+    usableTools 名单语义只收缩不扩张：缺失 / 非 list 时归一为空名单后
+    追加，其余专用企业工具的收缩行为不受影响（名单内只有固定工具时
+    专用工具仍全部不挂载）。名单内可能出现中/英文重复条目（调用方传
+    "read_tool_result" 时），归一为 set 后自然去重，无副作用。
+    """
+    usable = params.get("usableTools")
+    if not isinstance(usable, list):
+        usable = []
+    else:
+        usable = list(usable)
+    for name in _FIXED_USABLE_TOOLS:
+        if name not in usable:
+            usable.append(name)
+    params["usableTools"] = usable
+
+
 async def _resolve_run_context(
     session_id: str,
     requested: dict[str, Any] | None,
@@ -1899,6 +1929,9 @@ async def create_run_stream(
     # custom_params 读取 thread_id 注入联机请求体做链路追踪。
     if resolved_params:
         resolved_params["thread_id"] = session_id
+    # 固定工具名单注入：read_tool_result（读取工具结果）始终启用，
+    # 不依赖调用方携带 usableTools 或 per-agent 白名单。
+    _inject_fixed_usable_tools(resolved_params)
     ctx_token = set_custom_params(resolved_params)
     # 请求级 run 配置（context 平铺层根路径 5 键）：经 ContextVar 注入
     # 后台 run 任务；spawn 后 reset（create_task 已复制上下文快照，
@@ -2019,6 +2052,9 @@ async def create_run_wait(
     # custom_params 读取 thread_id 注入联机请求体做链路追踪。
     if resolved_params:
         resolved_params["thread_id"] = session_id
+    # 固定工具名单注入：read_tool_result（读取工具结果）始终启用，
+    # 不依赖调用方携带 usableTools 或 per-agent 白名单。
+    _inject_fixed_usable_tools(resolved_params)
     ctx_token = set_custom_params(resolved_params)
     if "mode" in run_context:
         logger.debug(
