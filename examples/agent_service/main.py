@@ -364,19 +364,9 @@ async def build_agent_tools(
     usable = _cp.get("usableTools")
 
     tools = tool_registry.list_tools()
-    # usableTools 扩管到项目工具（对齐 GET /tools 可见范围：项目工具 +
-    # 企业工具，不含 MCP / builtins / framework）：
-    #   空/缺失/非数组 → 项目工具全禁（与企业工具层全禁语义一致）；
-    #   非空 → 只保留名单内工具，项目工具按名原样匹配，企业工具名经
-    #          归一后也在集合内（项目工具名不与企业工具名冲突）。
-    # 企业工具的过滤在 build_enterprise_tools 内单独完成，此处只处理
-    # 项目工具。工厂工具（agent-creator）不属于工具列表可见范围，不受
-    # usableTools 管辖，在下方按 agent_id 注入。
-    if isinstance(usable, list) and usable:
-        allowed_names = usable_tool_names(usable)
-        tools = [t for t in tools if getattr(t, "name", "") in allowed_names]
-    else:
-        tools = []
+    project_tool_names = {getattr(t, "name", "") for t in tools}
+    # 项目工具（builtin_tools.py + custom/）是基础能力，所有智能体均可使用，
+    # 不受 usableTools 过滤。企业工具的过滤在 build_enterprise_tools 内完成。
 
     tools.extend(
         await build_enterprise_tools(user_id, agent_id, session_id),
@@ -409,27 +399,21 @@ async def build_agent_tools(
             enable_skill_for_agent,
         ])
 
-    # Apply the per-agent tool whitelist managed by agent_tools_router
-    # (PUT/DELETE /agents/{id}/tools/{name}):
-    #   empty  -> every tool above stays available
-    #   non-empty -> only the listed tool names survive
-    # This makes the tool config APIs effective at runtime. For the
-    # agent-creator its whitelist covers M plus its factory tools
-    # (see _register_builtin_agents), so it keeps both.
-    #
-    # usableTools 名单内的企业工具豁免此白名单（请求级优先，只作用于
-    # 企业工具层）：名单换算为当前运行时形态的工具名并入 allowed，
-    # builtins / 工厂工具等非企业工具不豁免。read_tool_result 同步豁免
-    # （与 build_enterprise_tools 的 usableTools 豁免同理）：它是工具输出
-    # 持久化的配套读回工具，否则白名单模式下模型收到
-    # <persisted-output> 预览却无工具读回完整内容。
+    # 企业工具 / MCP 过滤（对齐 build_agent_tools 可用语义）：
+    # - 项目工具：始终可用（不在可配置集合 M 内）
+    # - 通用企业工具：白名单 或 usableTools 中任一命中即可用
+    # - 专用企业工具：仅 usableTools 控制（已由 build_enterprise_tools 过滤，
+    #   不受白名单管控，usableTools 命中即豁免）
+    # - MCP：仅白名单管控
+    # 白名单为空不代表"全放行"——无白名单且无 usableTools 时企业工具全部不可用。
     whitelist = _tool_whitelists.get(agent_id, [])
-    if whitelist:
-        allowed = set(whitelist) | usable_enterprise_tool_names(usable)
-        allowed.add("read_tool_result")
-        tools = [
-            t for t in tools if getattr(t, "name", "") in allowed
-        ]
+    usable_enterprise = usable_enterprise_tool_names(usable)
+    enterprise_allowed = set(whitelist) | usable_enterprise
+    tools = [
+        t for t in tools
+        if getattr(t, "name", "") in project_tool_names
+        or getattr(t, "name", "") in enterprise_allowed
+    ]
 
     return tools
 
@@ -717,7 +701,8 @@ _concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
-workspace_manager = WhitelistWorkspaceManager(workspace_manager)
+# 传入 mcp_registry 使白名单中新启用的 MCP 能自动注册到 workspace。
+workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
 
 # ---------------------------------------------------------------------------
 # 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
@@ -1011,11 +996,17 @@ async def _lifespan_with_builtin_agents(app):
 
         await load_snapshot()
         # 框架 get_toolkit 全量注入 Task/Team/workspace/middleware 工具，
-        # 在首次 chat run 前包一层，按每智能体白名单过滤所有工具来源。
-        # 设置项目工具名集合（始终允许，不受白名单过滤）。
-        from bocomadp.toolkit_whitelist import set_project_tool_names
+        # 在首次 chat run 前包一层，按每智能体白名单过滤企业工具/MCP。
+        # 设置需授权的工具名集合（企业工具 + MCP），其余全部放行。
+        from bocomadp.toolkit_whitelist import set_restricted_tool_names
+        from bocomadp.tools.enterprise_catalog import enterprise_tool_names
 
-        set_project_tool_names(set(tool_registry.list_tool_names()))
+        restricted: set[str] = set(enterprise_tool_names())
+        for mcp in mcp_registry.list_mcps():
+            name = getattr(mcp, "name", "") or ""
+            if name:
+                restricted.add(name)
+        set_restricted_tool_names(restricted)
         patch_get_toolkit()
         # 请求级模型参数（thinking_enabled/reasoning_effort）：包装框架
         # get_model，run_context 携带时合并进模型 Parameters。

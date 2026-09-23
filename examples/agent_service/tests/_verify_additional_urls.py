@@ -250,8 +250,8 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
 
         seen = {}
 
-        async def fake_download(user_id, agent_id, session_id, urls, storage, wm):
-            seen["urls"] = urls
+        async def fake_download(user_id, agent_id, session_id, items, storage, wm):
+            seen["items"] = items
             return []
 
         body = CreateRunRequest(
@@ -275,10 +275,11 @@ class TestDownloadAdditionalUrls(unittest.TestCase):
                     body, "u1", "a1", "s1", FakeStorage(), FakeWorkspaceManager(),
                 )
             )
-        # URL 清洗 + 仅副作用：返回 None（context.custom_params 含
+        # 裸字符串 URL 清洗 + 仅副作用：返回 None（context.custom_params 含
         # additional_urls 整体由 _resolve_custom_params 落盘，便于查看历史传参）
         self.assertEqual(
-            seen["urls"], ["http://oss/a.png", "http://oss/b.txt"]
+            seen["items"],
+            [("http://oss/a.png", ""), ("http://oss/b.txt", "")],
         )
         self.assertIsNone(result)
 

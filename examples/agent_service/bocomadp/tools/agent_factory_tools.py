@@ -91,6 +91,35 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "agent_factory_session_id", default="",
 )
 
+
+def resolve_session_context(
+    user_id: str = "",
+    session_id: str = "",
+) -> tuple[str, str]:
+    """从当前会话 ContextVar 兜底补全 user_id / session_id。
+
+    显式传入的值优先；空串时从 ``build_agent_tools`` 设置的 ContextVar
+    读取（ChatRunRegistry 经 ``asyncio.create_task`` 派生 run，会拷贝
+    当前 context，因此 run 内的工具可见）。
+
+    供上传相关工具（view_image_tool）共享调用，避免每个工具各自重复 try/except 兜底。
+
+    Args:
+        user_id: 显式传入的租户 id，空串则取 ContextVar。
+        session_id: 显式传入的会话 id，空串则取 ContextVar。
+
+    Returns:
+        ``(user_id, session_id)``：补全后的二元组；ContextVar 也为空时
+        返回空串（由调用方决定如何报错）。
+    """
+    if not user_id or not session_id:
+        try:
+            user_id = user_id or _current_user_id.get()
+            session_id = session_id or _current_session_id.get()
+        except Exception:  # noqa: BLE001
+            pass
+    return user_id, session_id
+
 # Internal API root (same process, localhost is safe).
 # 服务以 ``root_app`` 启动时所有路由挂在 ``/api`` 下
 # （main.py 末尾：``root_app.mount("/api", app)``，Dockerfile CMD 即
@@ -970,4 +999,5 @@ __all__ = [
     "list_available_skills",
     "enable_skill_for_agent",
     "_current_session_id",
+    "resolve_session_context",
 ]

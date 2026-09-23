@@ -173,3 +173,4 @@ lerna-debug.log*
 
 /examples/agent_service/workspaces
 Docker-agentscope/logs/*
+mcp_service/

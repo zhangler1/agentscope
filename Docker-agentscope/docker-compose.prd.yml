@@ -1,5 +1,36 @@
-name: agentscope-stress
 services:
+  redis:
+    image: redis:7-bookworm
+    ports: ["6389:6379"]
+    volumes:
+      - redis-data:/data
+
+
+  mysql:
+    # mysql:8.0：与 OceanBase 的 MySQL 兼容模式（以 8.0 为基准）最贴近，
+    # 后续切 OceanBase 仅需改连接串 host，驱动与代码不变
+    image: mysql:8.0
+    ports: ["3306:3306"]
+    environment:
+      # 与 db.url 凭据保持一致
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=agentscope
+      - MYSQL_USER=agentscope
+      - MYSQL_PASSWORD=agentscope
+      - TZ=Asia/Shanghai
+    command:
+      # utf8mb4：消息/Agent 配置含中文与 emoji，默认 latin1 会报错
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 就绪探测：agentscope-service 等待其 healthy 后再启动
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uagentscope -pagentscope --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   agentscope-service:
     # 构建上下文为仓库根目录（与 Dockerfile 注释一致）
     # build:
@@ -8,7 +39,7 @@ services:
     # image: agentscope-service:latest
     image: agentscope-service:mysql
     command: ["python", "main.py"]
-    ports: ["8002:8000"]
+    ports: ["8000:8000"]
     # 相对本文件目录（Docker-agentscope/.env），含 DEEPSEEK_API_KEY 等密钥
     env_file: .env
     environment:
@@ -16,15 +47,19 @@ services:
       - TZ=Asia/Shanghai
       # 注意：AppConfig 只识别 BOCOMADP_ 前缀（嵌套字段用 __ 分隔），
       # 裸 REDIS_HOST 不会生效，会导致容器内连 localhost:6379 失败
-      - BOCOMADP_REDIS__HOST=53.192.28.254
-      - BOCOMADP_REDIS__PORT=6389
+      - BOCOMADP_REDIS__HOST=redis
       # 数据库：容器内走 mysql 服务（config.yaml 默认 localhost 无法直连）
       # 回退 postgres：postgresql+asyncpg://agentscope:agentscope@postgres:5432/agentscope
-      - BOCOMADP_DB__URL=mysql+aiomysql://agentscope:agentscope@53.192.28.254:3306/agentscope
+      - BOCOMADP_DB__URL=mysql+aiomysql://agentscope:agentscope@mysql:3306/agentscope
       # K8s 沙箱：kubeconfig 挂载自宿主机 .kube/config（容器内路径）
       - ADP_K8S_KUBECONFIG=/app/kubeconfig/config
       - ADP_K8S_ENABLED=true
       - BOCOMADP_TOOL_ASCII_NAMES=0
+    depends_on:
+      redis:
+        condition: service_started
+      mysql:
+        condition: service_healthy
     volumes:
       # 挂载源码（可编辑模式）
       - ../src:/app/src:ro
@@ -50,7 +85,7 @@ services:
   # /api/* → webui-backend:3000，其余 → 前端（dev:5173 / prod:80）
   nginx:
     image: nginx:alpine
-    ports: ["81:80"]
+    ports: ["9080:80"]
     volumes:
       # 以模板方式挂载，启动时经 envsubst 渲染为实际配置
       - ./nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
@@ -60,4 +95,3 @@ volumes:
   redis-data:
   pg-data:
   mysql-data:
-

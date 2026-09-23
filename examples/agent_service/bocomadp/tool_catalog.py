@@ -143,13 +143,10 @@ FRAMEWORK_TOOLS_META: tuple[dict[str, str], ...] = (
 # ---------------------------------------------------------------------------
 #: 企业工具中**不纳入**可配置集合的名字（覆盖中英文两种形态）。
 #: - 联网搜索：按要求暂不纳入；
-#: - query_internal_doc / submit_it_ticket：占位实现，暂不纳入。
 ENTERPRISE_EXCLUDED_NAMES: frozenset[str] = frozenset(
     {
         "online_search",
         "联网搜索",
-        "query_internal_doc",
-        "submit_it_ticket",
     },
 )
 

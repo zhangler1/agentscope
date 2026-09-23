@@ -79,10 +79,10 @@ class UploadsMiddleware(MiddlewareBase):
 
         if blocks:
             usage_hint = (
-                "\n\n提示：要列出本会话全部已上传文件，可调用 "
-                "list_uploaded_files()（框架会自动注入当前 user_id / session_id）；"
-                "需读取全文时调用 read_uploaded_file(virtual_path=...)，并同样传入"
-                "当前会话的 user_id / session_id；图片文件请调用 "
+                "\n\n提示：上传文件位于 user-data/uploads/ 目录下。"
+                "可用 Bash(ls user-data/uploads/) 列出文件，"
+                "用 Read 工具读取文本文件或同名 .md（转换后的文档）；"
+                "图片文件请调用 "
                 "view_image_tool(virtual_path=..., question=用户的问题)。"
             )
             injection = (
@@ -175,7 +175,7 @@ class UploadsMiddleware(MiddlewareBase):
                     f"- 文件: {filename}\n"
                     f"  虚拟路径: {virtual_path}\n"
                     f"  大纲/预览:\n{outline}\n"
-                    f"  (如需全文，请使用 list_uploaded_files / read 工具按虚拟路径读取)"
+                    f"  (如需全文，请使用 Read/Bash 工具读取 user-data/uploads/ 下的原始文件或同名 .md)"
                 )
         # 无 .md 时仅给文件名 + 路径引用
         return (
