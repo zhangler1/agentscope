@@ -71,6 +71,7 @@ from bocomadp.open_agent_access import get_agent_global
 from bocomadp.workspace._shared_pvc import NON_ADP_WORKSPACE_PREFIX
 from bocomadp.routers.agent_credential import get_agent_credential_id
 from bocomadp.routers.uploads import download_urls_to_session
+from bocomadp.uploads.db import UploadedFile
 
 from ..bridge import BusBridge
 from ..credentials import (
@@ -243,6 +244,39 @@ def _attach_files_metadata(input_msg: Any, files: list | None) -> None:
     for m in msgs:
         if isinstance(m, Msg):
             m.metadata["files"] = files
+
+
+def _merge_files_metadata(input_msg: Any, files: list | None) -> None:
+    """把 additional_urls 下载记录回填到 human 消息的 ``metadata.files``。
+
+    ``context.custom_params.additional_urls`` 只负责下载落库（不提示模型）；
+    这里把下载记录转成的 fmeta 与调用方显式传的 ``files`` 合并（按
+    virtual_path 去重），复用 UploadsMiddleware 的 ``<context name="files">``
+    渲染链路让模型感知本轮新下载的文件。事件类输入（确认卡片等）非
+    Msg，自动跳过。
+    """
+    if not files:
+        return
+    msgs = input_msg if isinstance(input_msg, list) else [input_msg]
+    for m in msgs:
+        if not isinstance(m, Msg):
+            continue
+        existing = m.metadata.get("files") or []
+        seen = {
+            f.get("virtual_path")
+            for f in existing
+            if isinstance(f, dict) and f.get("virtual_path")
+        }
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            vp = f.get("virtual_path")
+            if vp and vp in seen:
+                continue
+            existing.append(f)
+            if vp:
+                seen.add(vp)
+        m.metadata["files"] = existing
 
 
 def _msg_to_human_chunk(msg: Msg) -> dict[str, Any]:
@@ -1155,8 +1189,8 @@ async def _download_additional_urls(
     session_id: str,
     storage: StorageBase,
     workspace_manager: WorkspaceManagerBase,
-) -> None:
-    """下载 context.custom_params.additional_urls 到会话 uploads 目录（仅副作用）。
+) -> list[UploadedFile]:
+    """下载 context.custom_params.additional_urls 到会话 uploads 目录。
 
     ``context.custom_params: {additional_urls: [...]}`` 中的地址是 OSS /
     HTTP(S) 直链（或 ``{file_url, file_name}`` dict / JSON 字符串），需在
@@ -1165,18 +1199,20 @@ async def _download_additional_urls(
     ``<context name="files">`` 立即可见）。前端传入的 ``file_name`` 作为
     原始文件名保留，空则从 URL 推断。
 
-    本函数不改变任何参数：context.custom_params（含 additional_urls）
-    由调用方原样交给 ``_resolve_custom_params`` 整体落盘，便于事后查看
-    历史传参。下载仅在请求显式携带 additional_urls 时触发一次；回退
-    加载路径（请求未携带时从落盘文件恢复）不会再次触发下载，故
-    持久化不会导致重复下载。
+    返回成功下载的上传记录（调用方将其转成 fmeta 回填 human 消息
+    metadata.files，复用 UploadsMiddleware 渲染链路提示模型——
+    additional_urls 本身只落库、不注入）。本函数不改变任何请求参数：
+    context.custom_params（含 additional_urls）由调用方原样交给
+    ``_resolve_custom_params`` 整体落盘，便于事后查看历史传参。下载仅在
+    请求显式携带 additional_urls 时触发一次；回退加载路径（请求未携带
+    时从落盘文件恢复）不会再次触发下载，故持久化不会导致重复下载。
     """
     custom = _nested_custom_params(body.context)
     if not custom or not custom.get("additional_urls"):
-        return
+        return []
     raw = custom.get("additional_urls")
     if not isinstance(raw, list):
-        return
+        return []
     items: list[tuple[str, str]] = []
     for entry in raw:
         url, name = _parse_additional_url_item(entry)
@@ -1197,7 +1233,25 @@ async def _download_additional_urls(
                 len(downloaded),
                 session_id,
             )
+        return downloaded
+    return []
 
+
+def _uploaded_to_file_meta(rec: UploadedFile) -> dict[str, Any]:
+    """把下载记录转为 UploadsMiddleware 认识的 fmeta 形态。
+
+    与 ``context.custom_params.files`` 条目同构（filename / virtual_path /
+    stored_name / user_id / session_id / agent_id），中间件据此定位
+    uploads DB 记录渲染 ``<context name="files">`` 大纲/图片提示。
+    """
+    return {
+        "filename": rec.original_name or rec.stored_name,
+        "virtual_path": rec.virtual_path,
+        "stored_name": rec.stored_name,
+        "user_id": rec.user_id,
+        "session_id": rec.session_id,
+        "agent_id": rec.agent_id,
+    }
 
 async def _set_run_auth_contexts(
     session_id: str,
@@ -1911,7 +1965,7 @@ async def create_run_stream(
     # uploads 目录；随后 context 按通道拆分（平铺层根路径 5 键 →
     # run_context，嵌套 custom_params → custom_params）分别落盘/回退
     # 加载，reset 不影响已创建的后台 run 任务。
-    await _download_additional_urls(
+    downloaded = await _download_additional_urls(
         body,
         user_id,
         agent_id,
@@ -1919,6 +1973,14 @@ async def create_run_stream(
         storage,
         workspace_manager,
     )
+    # 下载记录回填 human 消息 metadata.files（与显式 files 合并去重），
+    # 复用 UploadsMiddleware 渲染 <context name="files"> 提示模型——
+    # 调用方只传 additional_urls 时模型同样能感知本轮新文件。
+    if downloaded:
+        _merge_files_metadata(
+            input_msg,
+            [_uploaded_to_file_meta(rec) for rec in downloaded],
+        )
     custom_params_part, run_context = _split_request_context(body.context)
     resolved_params = await _resolve_custom_params(
         session_id,
@@ -2034,7 +2096,7 @@ async def create_run_wait(
     # run_context，嵌套 custom_params → custom_params）分别落盘/回退
     # 加载，reset 不影响已创建的后台 run 任务（create_task 复制
     # ContextVar 上下文）。
-    await _download_additional_urls(
+    downloaded = await _download_additional_urls(
         body,
         user_id,
         agent_id,
@@ -2042,6 +2104,13 @@ async def create_run_wait(
         storage,
         workspace_manager,
     )
+    # 同 create_run_stream：下载记录回填 human 消息 metadata.files，
+    # 复用 UploadsMiddleware 渲染 <context name="files"> 提示模型。
+    if downloaded:
+        _merge_files_metadata(
+            input_msg,
+            [_uploaded_to_file_meta(rec) for rec in downloaded],
+        )
     custom_params_part, run_context = _split_request_context(body.context)
     resolved_params = await _resolve_custom_params(
         session_id,
