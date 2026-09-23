@@ -1632,6 +1632,10 @@ async def create_run_stream(
     会话（thread）懒创建：thread_id 对应的 session 不存在时按 agent_id
     自动建库，保证原生 ChatService.run 的 session 前置条件成立。
     """
+    logger.info(
+        "deerflow: create_run_stream request body: %s",
+        json.dumps(body.model_dump(), default=str, ensure_ascii=False),
+    )
     session_id = _resolve_session_id(thread_id, body)
     agent_id = await _check_agent_id(
         storage,
