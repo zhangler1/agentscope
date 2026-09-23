@@ -143,6 +143,12 @@ async def _build_leader_system_prompt(
                 "sent.\n"
                 "- Never skip a step: only delegate to the next member "
                 "after the current member has reported back.\n"
+                "- A member MAY be delegated to MORE THAN ONCE. The "
+                "chain is defined by the EDGES, not by ``each member "
+                "works exactly once``. If an edge points to a member "
+                "that already reported (e.g. ``C → B`` earlier and now "
+                "``D → B``), you MUST delegate to that member AGAIN, "
+                "passing the new upstream result.\n"
                 "- Forward the COMPLETE result (all details, numbers, "
                 "conclusions), not a summary.\n"
                 "\n"
@@ -155,8 +161,11 @@ async def _build_leader_system_prompt(
                 "4. Forward the complete result to the NEXT member via "
                 "``AgentInvite`` (or ``TeamSay`` if already in the "
                 "team).\n"
-                "5. Repeat until every member in the chain has "
-                "finished, then report the final result to the user."
+                "5. Repeat until every configured edge has been "
+                "followed — i.e. every ``to`` endpoint has received "
+                "its handoff, counting repeat visits for members that "
+                "appear as ``to`` endpoints of multiple edges — then "
+                "report the final result to the user."
             )
 
     return base + "".join(lines)
