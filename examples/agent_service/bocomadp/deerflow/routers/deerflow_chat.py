@@ -1619,22 +1619,32 @@ def _sse_generator(
             # 本层暂不下发 end 帧：流结束由连接关闭传递
         finally:
             if on_disconnect == "cancel" and not hitl_parked:
-                try:
-                    await chat_service.interrupt(
-                        user_id,
-                        session_id,
-                        agent_id,
-                    )
-                except LookupError:
-                    # run 已完成、session 已清理时的正常情形，不必告警
-                    pass
-                except Exception:  # noqa: BLE001 —— 兜底中断失败仅记日志
-                    logger.exception(
-                        "deerflow: interrupt on disconnect failed for "
-                        "session %s run %s",
-                        session_id,
-                        run_id,
-                    )
+                # 断线时 uvicorn 已取消本生成器 task：此处直接 await 会在
+                # 首个 await 点被二次 CancelledError 打断（interrupt 内
+                # DB 查询的 SQLAlchemy terminate 清理路径泄漏 traceback，
+                # 且断线取消实际未生效）。改为后台 task 执行：不继承外层
+                # 取消，可完整跑完 get_session → publish 广播链。异常仅
+                # 记日志（interrupt 幂等，遗漏由新请求的"直接 cancel 旧
+                # task"兜底）。
+                async def _interrupt_cleanup() -> None:
+                    try:
+                        await chat_service.interrupt(
+                            user_id,
+                            session_id,
+                            agent_id,
+                        )
+                    except LookupError:
+                        # run 已完成、session 已清理时的正常情形，不必告警
+                        pass
+                    except Exception:  # noqa: BLE001 —— 兜底中断失败仅记日志
+                        logger.exception(
+                            "deerflow: interrupt on disconnect failed for "
+                            "session %s run %s",
+                            session_id,
+                            run_id,
+                        )
+
+                asyncio.create_task(_interrupt_cleanup())
 
     return _gen()
 
