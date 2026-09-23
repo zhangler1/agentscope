@@ -130,7 +130,7 @@ async def _persist_uploaded_bytes(
 
     ``POST /files/upload`` 端点与 ``context.custom_params.additional_urls`` 下载
     共用本函数，保证两条路径的文件元数据与落盘格式完全一致（下游
-    ``list_uploaded_files`` / ``view_image_tool`` / ``<context name="files">``
+    ``view_image_tool`` / ``<context name="files">``
     均以 uploads DB 记录为感知通道）。
 
     Raises:

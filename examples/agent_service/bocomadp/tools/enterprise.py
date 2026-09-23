@@ -91,8 +91,6 @@ def usable_enterprise_tool_names(usable: Any) -> set[str]:
 _PROJECT_NAME_PAIRS: tuple[tuple[str, str], ...] = (
     ("回显", "echo"),
     ("获取当前时间", "get_current_time"),
-    ("列出上传文件", "list_uploaded_files"),
-    ("读取上传文件", "read_uploaded_file"),
     ("图片解析", "view_image_tool"),
 )
 
