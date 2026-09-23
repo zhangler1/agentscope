@@ -442,32 +442,30 @@ def test_spawn_run_interrupts_active_run() -> None:
     """新请求优先（恒 interrupt 语义）：session 已有活跃 run 时，
     ``_spawn_run`` 打断旧 run 并等待其结束后再创建新 run。
 
-    interrupt 模拟 CancelDispatcher 取消旧 task（真实链路经 MessageBus
-    广播 → CancelDispatcher → ``task.cancel()``）；旧 run 记账落定
-    INTERRUPTED，新 run 正常创建且 run_id 不同。
+    interrupt 模拟 is_locked=False 场景（旧 run 未持锁：组装阶段或
+    HITL parked），框架走 enqueue resume 分支、不会取消旧 task；打断
+    仍应立即生效——``_interrupt_active_run`` **直接取消本进程旧 task**
+    （不依赖广播消费）。旧 run 记账落定 INTERRUPTED，新 run 正常创建
+    且 run_id 不同。
     """
     from bocomadp.deerflow.routers.deerflow_chat import _spawn_run
 
     class InterruptingChatService(FakeChatService):
-        """interrupt 时取消 registry 里的活跃 task（模拟 CancelDispatcher）。"""
+        """interrupt 不做任何事（is_locked=False 时框架仅 enqueue resume）。
 
-        def __init__(
-            self,
-            bus: InMemoryMessageBus,
-            registry: FakeChatRunRegistry,
-        ) -> None:
-            super().__init__(bus)
-            self._registry = registry
+        打断必须由 ``_interrupt_active_run`` 直接 cancel 旧 task 完成，
+        否则会等待超时后 409。
+        """
 
         async def interrupt(self, user_id: str, session_id: str, agent_id: str) -> None:
             del user_id, session_id, agent_id
-            self._registry.cancel()
+            # no-op：模拟 enqueue resume 分支不取消旧 task
 
     async def scenario() -> None:
         bus = InMemoryMessageBus()
         mgr = RunManager()
         registry = FakeChatRunRegistry()
-        chat_service = InterruptingChatService(bus, registry)
+        chat_service = InterruptingChatService(bus)
         record1, task1 = await _spawn_run(
             mgr,
             registry,

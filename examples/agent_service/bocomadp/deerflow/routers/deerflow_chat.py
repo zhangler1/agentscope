@@ -1311,11 +1311,15 @@ async def _interrupt_active_run(
     """打断 session 当前活跃 run 并等待其结束（新请求优先语义）。
 
     旧 run 记账先落定 INTERRUPTED（与 cancel 端点同款，done 回调不
-    覆盖），随后原生 interrupt（幂等：运行中 → 广播取消旧 task；已
-    结束 → LookupError 吞掉）。最后等待本进程可见的旧 task 完成——
-    其清理释放 session 分布式锁后新 run 才能接管；跨进程场景旧 task
-    不在本进程，由新 run 内部 ``acquire_lock`` 阻塞排队兜底。旧 run
-    的 join 流收到 REPLY_END(INTERRUPTED) 翻译的 end 哨兵后自行断开。
+    覆盖），然后**直接取消本进程可见的旧 task**——不依赖
+    ``chat_service.interrupt`` 的 is_locked 判断：旧 run 处于组装
+    阶段（尚未 acquire session 锁）或 HITL parked（锁已释放）时
+    is_locked 为 False，interrupt 走 enqueue resume 分支、不会取消
+    旧 task，等待超时后重试仍撞活跃 run（30s 后 409）。
+    ``task.cancel()`` 后 ``done()`` 立即为 True，重试
+    ``create_or_reject`` 即可放行；旧 task 的 CancelledError 清理在
+    事件循环中异步完成，新 run 的 ``acquire_lock`` 会等待其释放
+    session 锁。interrupt 广播保留作跨进程兜底（幂等）。
     """
     old_run_id = run_manager.active_run_id(session_id)
     old_record = run_manager.get(old_run_id) if old_run_id else None
@@ -1327,6 +1331,24 @@ async def _interrupt_active_run(
             old_run_id,
             session_id,
         )
+
+    # 直接取消本进程旧 task（核心路径）：无论旧 run 是否持有 session
+    # 锁，本进程 registry 中的 task 都能立即取消；cancel 后 done()
+    # 立即为 True，后续 create_or_reject 重试与 spawn 均放行。
+    old_task = chat_run_registry.get(session_id)
+    if old_task is not None and not old_task.done():
+        logger.info(
+            "deerflow: cancelling active local run task directly "
+            "(run=%s, session=%s).",
+            old_run_id,
+            session_id,
+        )
+        old_task.cancel()
+
+    # interrupt 广播兜底：跨进程场景（旧 run 在其它 worker）由
+    # CancelDispatcher 按 session 定位并取消；本进程 task 已被直接
+    # 取消，重复广播幂等无害。未持锁时走 enqueue resume，由框架
+    # skip 逻辑与新 run 的活跃检查去重。
     try:
         await chat_service.interrupt(
             user_id,
@@ -1336,7 +1358,6 @@ async def _interrupt_active_run(
     except LookupError:
         # run 已完成、session 已清理时的正常情形，不必告警
         pass
-    old_task = chat_run_registry.get(session_id)
     if old_task is not None and not old_task.done():
         done, _ = await asyncio.wait(
             {old_task},
