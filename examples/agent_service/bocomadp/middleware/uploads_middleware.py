@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - agentscope 不可用时降级（如纯�
     TextBlock = None  # type: ignore
 
 from bocomadp.uploads.manager import to_virtual_path
-from bocomadp.uploads.file_outline import create_outline
+from bocomadp.uploads.file_outline import create_outline, create_outline_text
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,20 @@ class UploadsMiddleware(MiddlewareBase):
                     f"  (暂无可预览文本，请使用工具读取原始文件)"
                 )
 
+        # 调用方传的原始文件名与落盘文件名不一致（源平台把文档导出为
+        # 文本/其他格式后存储，落盘名跟随 URL 保证名字与内容一致）时，
+        # 在提示词中说明对应关系，模型按实际文件名读取。
+        name_note = ""
+        if (
+            record is not None
+            and record.original_name
+            and record.original_name != record.stored_name
+        ):
+            name_note = (
+                f"\n  (原始文件名: {record.original_name}；会话内实际文件为 "
+                f"{record.stored_name}，读取请使用实际文件名)"
+            )
+
         if record and record.is_image:
             # 图片：上传时已固化为 base64（view_image_tool 从元数据直读），
             # 正文不可内联预览，提示 Agent 调用图片解析工具。
@@ -166,6 +180,7 @@ class UploadsMiddleware(MiddlewareBase):
                 f"  虚拟路径: {virtual_path}\n"
                 f"  (图片内容不可内联预览；如需解析图片，请调用 "
                 f"view_image_tool 并传入上述 virtual_path 与用户的问题)"
+                f"{name_note}"
             )
 
         if record and record.markdown:
@@ -176,12 +191,14 @@ class UploadsMiddleware(MiddlewareBase):
                     f"  虚拟路径: {virtual_path}\n"
                     f"  大纲/预览:\n{outline}\n"
                     f"  (如需全文，请使用 Read/Bash 工具读取 user-data/uploads/ 下的原始文件或同名 .md)"
+                    f"{name_note}"
                 )
         # 无 .md 时仅给文件名 + 路径引用
         return (
             f"- 文件: {filename}\n"
             f"  虚拟路径: {virtual_path}\n"
             f"  (暂无可预览文本，请使用工具读取原始文件)"
+            f"{name_note}"
         )
 
     @staticmethod

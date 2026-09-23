@@ -125,6 +125,7 @@ async def _persist_uploaded_bytes(
     original_name: str,
     data: bytes,
     content_type: str | None,
+    stored_name_override: str | None = None,
 ) -> UploadedFile:
     """落盘原始文件 + 图片 base64 固化 / 文档转 .md + 写入 uploads DB。
 
@@ -137,7 +138,9 @@ async def _persist_uploaded_bytes(
         `UploadError`: 文件名非法 / 落盘失败（调用方按需处理）。
     """
     # 安全文件名
-    stored_name = normalize_filename(original_name or "file")
+    stored_name = normalize_filename(
+        stored_name_override or original_name or "file",
+    )
     validate_path_traversal(stored_name)
     virtual_path = to_virtual_path(stored_name)
 
@@ -237,6 +240,26 @@ def _filename_from_url(url: str) -> str:
     return name if name and name not in {".", ".."} else "downloaded"
 
 
+def _name_ext(name: str) -> str:
+    """取文件名扩展名（小写带点）；无扩展名返回空串。"""
+    n = (name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    return ("." + n.rsplit(".", 1)[-1].lower()) if "." in n else ""
+
+
+def _name_ext_conflict(original_name: str, url_name: str) -> bool:
+    """调用方 ``file_name`` 与 URL 推断名扩展名不一致（如 .xls vs .txt）。
+
+    源平台可能把文档导出为文本/其他格式后存储，URL 指向的名字才是与
+    内容一致的名字；此时落盘名跟随 URL，``file_name`` 仅作 original_name
+    记录，由 UploadsMiddleware 在提示词中说明对应关系。
+    """
+    if not original_name or not url_name or url_name == "downloaded":
+        return False
+    o_ext = _name_ext(original_name)
+    u_ext = _name_ext(url_name)
+    return bool(o_ext and u_ext and o_ext != u_ext)
+
+
 async def download_urls_to_session(
     user_id: str,
     agent_id: str,
@@ -317,13 +340,22 @@ async def download_urls_to_session(
                 )
                 break
             try:
+                url_name = _filename_from_url(url)
                 record = await _persist_uploaded_bytes(
                     user_id=user_id,
                     agent_id=agent_id,
                     session_id=session_id,
                     storage=storage,
                     workspace_manager=workspace_manager,
-                    original_name=original_name or _filename_from_url(url),
+                    original_name=original_name,
+                    # 扩展名冲突时（如 file_name=.xls 而 URL 实际是 .txt）
+                    # 落盘名跟随 URL，保证文件名与内容一致；file_name 仅作
+                    # original_name 记录，由中间件在提示词中说明对应关系。
+                    stored_name_override=(
+                        url_name
+                        if _name_ext_conflict(original_name, url_name)
+                        else None
+                    ),
                     data=content,
                     content_type=resp.headers.get("content-type"),
                 )

@@ -1245,7 +1245,10 @@ def _uploaded_to_file_meta(rec: UploadedFile) -> dict[str, Any]:
     uploads DB 记录渲染 ``<context name="files">`` 大纲/图片提示。
     """
     return {
-        "filename": rec.original_name or rec.stored_name,
+        # filename 展示实际落盘文件名（stored_name）；调用方传入的原始
+        # 文件名（original_name）与落盘名不一致时，由 UploadsMiddleware
+        # 按 uploads DB 记录在提示词中说明对应关系。
+        "filename": rec.stored_name or rec.original_name,
         "virtual_path": rec.virtual_path,
         "stored_name": rec.stored_name,
         "user_id": rec.user_id,
