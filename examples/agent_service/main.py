@@ -123,6 +123,7 @@ from bocomadp.mcp import McpRegistry
 from bocomadp.skills import ExternalSkillHub
 from bocomadp.skills.bocom_skill_hub import BocomSkillHub
 from bocomadp.tools import ToolRegistry, build_enterprise_tools, init_factory_tools
+from bocomadp.routers.uploads import set_upload_dependencies
 from bocomadp.uploads.manager import cleanup_stale_upload_staging_files
 
 from bocomadp.middleware.interrupt_guard import interrupt_guard_state
@@ -705,6 +706,11 @@ _concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
 # 传入 mcp_registry 使白名单中新启用的 MCP 能自动注册到 workspace。
 workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
+
+# 注册上传依赖（storage / workspace_manager 模块级单例）：run 任务内的
+# personal_knowledge_request 等工具无 FastAPI Depends，经此入口获取依赖后
+# 复用 download_urls_to_session 下载文件到会话 uploads 目录。
+set_upload_dependencies(storage, workspace_manager)
 
 # ---------------------------------------------------------------------------
 # 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
