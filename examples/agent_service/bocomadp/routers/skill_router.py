@@ -27,9 +27,16 @@ from agentscope.app.hub import SkillHubBase
 from agentscope.app.hub._error import HubError
 from agentscope.app.storage import StorageBase
 from agentscope.app.workspace_manager import WorkspaceManagerBase
+from agentscope.skill import Skill
 
 from ..skills._oa_context import OA_HEADER, get_current_oa
-from ..skills._schema import AgentSkillsListResponse, SkillActionResponse, SkillInfo
+from ..skills._schema import (
+    AgentSkillsListResponse,
+    EnsureSkillsRequest,
+    SkillActionResponse,
+    SkillInfo,
+    parse_skill_ref,
+)
 from ..skills._skillhub_auth import (
     OA_SEPARATOR,
     build_auth_token,
@@ -115,10 +122,176 @@ def _external_hub(
 
 
 def _set_token(hub: SkillHubBase, guwp_token: str | None) -> None:
-    """逐请求刷新 hub 的 guwpToken（仅 ExternalSkillHub 有该方法）。"""
+    """逐请求刷新 hub 的 guwp-token（仅 :class:`BocomSkillHub` 有该方法）。
+
+    ``ExternalSkillHub`` **没有** ``set_token``，它的鉴权是
+    ``oa``（回退 ``X-User-ID``）→ AES 凭证 → session cookie，请求头里
+    不带 guwp-token；因此对走 external 的端点（``/skill/ensure``、
+    ``/skill/download/{namespace}:{name}``、``/skills/*``）而言，
+    ``guwpToken`` 是**可选且当前无效**的——传不传行为一致。
+    """
     set_token = getattr(hub, "set_token", None)
     if set_token is not None:
         set_token(guwp_token)
+
+
+def _equipped_names(skills: list[Any]) -> set[str]:
+    """已装备技能的"可匹配名"集合：agent-facing 名 ∪ 目录名。
+
+    ``Skill.name`` 是 SKILL.md frontmatter 里的名字，而下载解压出来的
+    目录名是 hub 的 slug（如 ``rollback-check-sql``）——两者可能不同
+    （bocom 技能尤甚），所以**两路都要算**才判得准（与
+    ``enable_agent_skill`` / ``enable_bocom_skill`` 的判定口径一致）。
+    """
+    names: set[str] = set()
+    for skill in skills:
+        name = getattr(skill, "name", "")
+        if name:
+            names.add(str(name))
+        dir_name = os.path.basename(str(getattr(skill, "dir", "")).rstrip("/\\"))
+        if dir_name:
+            names.add(dir_name)
+    return names
+
+
+async def _install_skill_archive(
+    workspace: Any,
+    hubs: dict[str, SkillHubBase],
+    oa: str,
+    guwp_token: str | None,
+    namespace: str,
+    name: str,
+) -> None:
+    """从**外部** skillhub 下载一个技能并装进 workspace。
+
+    安装一律走 external hub —— 与 ``POST /skill/download/{namespace}:{name}``
+    是同一条路径、同一个远端接口
+    （``{base}/api/web/skills/{namespace}/{name}/download``）；引用里 ``:``
+    前的部分**原样作为远端 namespace 透传**（``global`` / ``bocom`` 都只是
+    namespace，**不切换 hub**）。
+
+    失败一律抛 ``HTTPException``（远端没有 → 404、安装失败原样抛出），
+    由调用方决定"整体失败"还是"记进失败清单"。
+    """
+    hub = _external_hub(hubs)
+    _set_token(hub, guwp_token)
+    try:
+        archive = await hub.download(oa, name, namespace=namespace)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Skill '{name}' not found on the remote skillhub.",
+        ) from None
+
+    await workspace.add_skill_archive(
+        archive.stream,
+        archive.format,
+        name,
+    )
+
+
+async def _ensure_skills(
+    workspace: Any,
+    refs: list[str],
+    hubs: dict[str, SkillHubBase],
+    oa: str,
+    guwp_token: str | None,
+) -> list[Skill]:
+    """查缺补装：返回**补装后**的完整技能清单（与查询接口同形）。
+
+    语义（"尽力而为"）：
+
+    - 已装备的引用直接跳过，**不会**发起远端请求（幂等，可重复调用）；
+    - 缺的逐个下载安装，**串行**执行（workspace 内部有 skill 锁，K8s 下
+      还会争抢沙箱与远端配额）；
+    - 单个失败**不中断**其余项，只打 warning —— 本函数只保证"把能装的
+      装上"，返回值就是当前实际情况，因此失败信息走日志而非响应体
+      （响应体必须与 ``GET /workspace/skill`` 完全同形）；
+    - 一个都没装成时直接返回上面那份列表，省一次沙箱列举往返。
+
+    **已知取舍**：已装备判定按 **name**（frontmatter 名 ∪ 目录名）匹配，
+    不带 namespace —— 与 ``/skill/download/*`` 的口径一致，也避免同名技能
+    被反复重下；代价是 ``global:x`` 与 ``bocom:x`` 会被视为同一个技能。
+
+    Args:
+        workspace (`Any`):
+            已解析的会话工作区（``list_skills`` / ``add_skill_archive``）。
+        refs (`list[str]`):
+            技能引用列表，元素 ``namespace:name``（模型层已校验）。
+        hubs (`dict[str, SkillHubBase]`):
+            已注册的 skillhub（安装只用到 ``external``）。
+        oa (`str`):
+            OA 账号（远端鉴权用；**这才是 external hub 真正的身份来源**）。
+        guwp_token (`str | None`):
+            逐请求透传给 hub 的 guwp-token；**当前对 external hub 无效**
+            （它没有 ``set_token``，鉴权走 oa + session cookie），保留只为
+            与 Bocom hub 共用同一套 helper。
+
+    Returns:
+        `list[Skill]`:
+            补装后工作区里的技能清单（``GET /workspace/skill`` 同形）。
+    """
+    existing = await workspace.list_skills()
+    equipped = _equipped_names(existing)
+
+    parsed = [parse_skill_ref(ref) for ref in refs]
+    requested = {name for _, name in parsed}
+    todo = [(ns, name) for ns, name in parsed if name not in equipped]
+    skipped = len(parsed) - len(todo)
+
+    installed = 0
+    for namespace, name in todo:
+        try:
+            await _install_skill_archive(
+                workspace,
+                hubs,
+                oa,
+                guwp_token,
+                namespace,
+                name,
+            )
+        except Exception as e:  # noqa: BLE001 —— 单个失败不拖垮整体
+            logger.warning(
+                "skill ensure: failed to install '%s:%s': %s",
+                namespace,
+                name,
+                e,
+            )
+            continue
+        equipped.add(name)
+        installed += 1
+
+    failed = len(todo) - installed
+
+    if installed == 0:
+        # 没有落盘变化：直接返回上面那份列表（省一次沙箱列举往返）。
+        # 注意 failed > 0 时上面每条失败都已单独打过 warning。
+        logger.info(
+            "skill ensure: requested=%d, skipped=%d, failed=%d, "
+            "nothing installed",
+            len(parsed),
+            skipped,
+            failed,
+        )
+        return existing
+
+    refreshed = await workspace.list_skills()
+    missing = sorted(requested - _equipped_names(refreshed))
+    if missing:
+        logger.warning(
+            "skill ensure: requested but missing after install: %s",
+            missing,
+        )
+    logger.info(
+        "skill ensure: requested=%d, installed=%d, skipped=%d, failed=%d, "
+        "missing=%d",
+        len(parsed),
+        installed,
+        skipped,
+        failed,
+        len(missing),
+    )
+    return refreshed
 
 
 def _card_version(metadata: dict) -> str:
@@ -1056,6 +1229,110 @@ async def enable_bocom_skill(
         success=True,
         action="enabled",
         skill_id=skill_name,
+    )
+
+
+@skill_router.post(
+    "/skill/ensure",
+    summary="Ensure Skills Installed (install the missing ones)",
+    description=(
+        "Given a list of skill refs (``namespace:name``), make sure they are "
+        "all present in the session's workspace: the ones already equipped "
+        "are skipped, the missing ones are downloaded from the **external** "
+        "skillhub (``{base}/api/web/skills/{namespace}/{name}/download``, "
+        "same path as ``POST /skill/download/{namespace}:{name}`` — the part "
+        "before ':' is passed through as the remote namespace) and "
+        "installed. "
+        "**The response body is byte-identical in shape to "
+        "``GET /workspace/skill``** (``[{name, description, dir, markdown, "
+        "updated_at}]``) — it is the workspace's skill list *after* the "
+        "ensure step, so the caller can render it directly. Per-skill "
+        "failures do not fail the request (they are logged); a malformed "
+        "ref fails the request with 422."
+    ),
+)
+async def ensure_agent_skills(
+    body: EnsureSkillsRequest,
+    agent_id: str = Query(...),
+    session_id: str = Query(...),
+    guwp_token: str | None = Header(default=None, alias="guwpToken"),
+    oa: str = Depends(get_current_oa),
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+    access: ResourceAccessService = Depends(get_resource_access_service),
+    workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
+    hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
+) -> list[Skill]:
+    """查缺补装：确保 ``body.skills`` 里的技能都在该工作区里。
+
+    典型用法是接在复制之后——``POST /agent/{id}/copy`` 返回的 ``skills``
+    直接作为本接口的请求体，一步把模板声明的技能补齐：
+
+    ```text
+    POST /api/workspace/skill/ensure?agent_id=<新id>&session_id=<会话>
+    {"skills": ["global:rollback-check-sql", "bocom:excel智能分析"]}
+    → 200 [{"name": "...", "description": "...", "dir": "...",
+            "markdown": "...", "updated_at": 0.0}, ...]
+    ```
+
+    行为：
+
+    - **幂等**：已装备的引用不请求远端（判定按 frontmatter 名 ∪ 目录名，
+      与 ``/skill/download/*`` 一致）；可安全重复调用；
+    - **响应体与 ``GET /workspace/skill`` 完全同形**（``list[Skill]``），
+      是补装**之后**的清单，前端可直接渲染；``body.skills`` 为空时等价于
+      一次普通查询；
+    - **单点失败不报错**：远端 404 / 沙箱不可用 / 解压出无效 SKILL.md
+      只写 warning 日志，其余项照装（响应里看不到失败明细——要保持与查询
+      接口同形；需要明细就调 ``GET /workspace/skill`` 自行比对）；
+    - 引用格式非法（缺 ``namespace``、含 ``/`` 或 ``..``）→ **422**
+      （模型层校验），不会进沙箱。
+
+    Args:
+        body (`EnsureSkillsRequest`):
+            期望安装的技能引用清单（``namespace:name``）。
+        agent_id (`str`):
+            智能体 id（query）。
+        session_id (`str`):
+            会话 id（query）——workspace 由会话记录解析，任意隔离策略下都准。
+        guwp_token (`str | None`):
+            逐请求透传给 hub 的 token。
+        oa (`str`):
+            Injected OA account.
+        user_id (`str`):
+            Injected authenticated user ID.
+        storage (`StorageBase`):
+            Injected storage backend.
+        access (`ResourceAccessService`):
+            Injected access service（可见性校验）。
+        workspace_manager (`WorkspaceManagerBase`):
+            Injected workspace manager.
+        hubs (`dict[str, SkillHubBase]`):
+            Injected skill hubs（安装只用 ``external``）。
+
+    Returns:
+        `list[Skill]`:
+            补装后的技能清单。
+
+    Raises:
+        `HTTPException`:
+            404 if the agent is not visible / the session does not exist;
+            422 if a skill ref is malformed.
+    """
+    await access.resolve_agent(user_id, agent_id)
+    workspace = await _resolve_workspace(
+        user_id,
+        agent_id,
+        session_id,
+        storage,
+        workspace_manager,
+    )
+    return await _ensure_skills(
+        workspace,
+        body.skills,
+        hubs,
+        oa,
+        guwp_token,
     )
 
 

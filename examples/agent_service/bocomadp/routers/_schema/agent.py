@@ -148,13 +148,27 @@ class CopyAgentResponse(TeamAgentView):
     - ``editable`` 恒为 ``True``（复制品归属调用者，与 ``PATCH`` 的响应
       口径一致——那两处都是在权限校验之后构造的视图）；
     - 新建的复制品 ``is_team=False`` / ``parent_agent_id=None`` /
-      ``is_self_built=None``（团队关系不复制）。
+      ``is_self_built=None``（团队关系不复制）；
+    - ``skills`` 是**源智能体所属模板行**声明的技能清单
+      （``agent_template.skills``），只透出、不安装。
     """
 
     agent_id: str = Field(
         description=(
             "新智能体 id；与 :attr:`id` 同值，保留以兼容“只取 agent_id”"
             "的旧调用方。"
+        ),
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description=(
+            "**源**智能体在 ``agent_template`` 名单里声明的 ``skills``"
+            "（期望安装的技能清单，元素形如 ``namespace:name``，如 "
+            "``global:rollback-check-sql``）。"
+            "取值与 ``GET /agent/template/agents`` 的模板行同源；"
+            "源不在模板名单内（或存储层不可用）时为空列表。"
+            "本端点只**返回清单**，不代为安装（技能仍由调用方按清单"
+            "逐个调 ``POST /workspace/skill/download/{namespace}:{name}``）。"
         ),
     )
 

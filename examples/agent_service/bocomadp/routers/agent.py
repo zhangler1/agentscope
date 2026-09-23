@@ -42,6 +42,7 @@ from agentscope.app.storage import (
     AgentRecord,
     InviteConfig,
 )
+from bocomadp.agent_template_store import get_template_entry
 from bocomadp.team_store import (
     ExpertTeamRelation,
     HandoffRelation,
@@ -498,6 +499,12 @@ async def copy_agent(
       配置）、工具/MCP 启停白名单、知识库配置、专家团（成员 / 团队档案 /
       handoff）、市场名单、记忆配置、沙箱并发配置、凭证绑定。
 
+    响应里的 ``skills`` 取自**源**智能体在 ``agent_template`` 名单里的
+    那一行（``agent_template.skills``，元素形如 ``namespace:name``），
+    即"该模板期望安装的技能清单"：本端点只**返回清单**，不代为安装。
+    源不在模板名单内（或存储层不可用）时为空列表——注意这**不是**权限
+    判断，复制本身仍是"可读即可复制"。
+
     因此复制品的默认状态是：``is_team=False``、``parent_agent_id=None``、
     无技能、工具与 MCP 全部启用（新 id 在白名单里没有条目）、无知识库
     配置 / 无记忆、并发走默认值、模型凭证走运行时兜底解析。
@@ -521,7 +528,9 @@ async def copy_agent(
     Returns:
         `CopyAgentResponse`:
             新智能体的完整视图——与 ``GET /agent/`` 列表元素、``PATCH``
-            响应**同构**的 :class:`TeamAgentView`，可直接插进前端列表。
+            响应**同构**的 :class:`TeamAgentView`，可直接插进前端列表；
+            额外带 ``agent_id``（与 ``id`` 同值）与 ``skills``（源模板行
+            声明的技能清单）。
 
     Raises:
         `HTTPException`:
@@ -561,7 +570,18 @@ async def copy_agent(
             detail="Copied agent was not persisted.",
         )
     view = await _to_team_view(storage, user_id, stored)
-    return CopyAgentResponse(**view.model_dump(), agent_id=new_id)
+
+    # 模板声明的技能清单：``agent_template`` 里**源**智能体那一行的
+    # ``skills``（"该模板期望安装的技能"，元素 namespace:name）。只透出
+    # 清单、不代为安装；不在名单内 / 存储层不可用 → 空列表。
+    template = await get_template_entry(storage, agent_id)
+    template_skills = list(template.skills) if template is not None else []
+
+    return CopyAgentResponse(
+        **view.model_dump(),
+        agent_id=new_id,
+        skills=template_skills,
+    )
 
 
 @agent_router.patch(
