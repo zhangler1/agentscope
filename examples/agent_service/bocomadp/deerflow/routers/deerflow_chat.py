@@ -14,7 +14,10 @@
 
 - thread_id == session_id（同一资源）；run_id 由 RunManager 预生成，
   ``Content-Location`` 头可提前填充。
-- 并发 409 复用 ``ChatRunRegistry.spawn`` + 分布式锁；cancel 映射原生
+- 并发默认 interrupt：新请求打断旧 run 并等待其结束（记账先落定
+  INTERRUPTED + 原生 interrupt 广播 + 本进程旧 task 完成），旧 run 的
+  join 流收到 end 哨兵自行断开；打断失败/超时等兜底场景仍由 409 表达
+  （复用 ``ChatRunRegistry.spawn`` + 分布式锁）；cancel 映射原生
   ``ChatService.interrupt``（一个 session 至多一个 run，run 级 == session 级）。
 - 断线默认 ``on_disconnect=cancel``：检测到断线后调用原生 interrupt，
   停止后台任务不再消耗模型额度；``continue`` 时仅断开订阅，run 继续。
@@ -320,7 +323,7 @@ class CreateRunRequest(BaseModel):
       缺省 :data:`DEFAULT_AGENT_ID`（jx_chat 前端不传该字段）。
     - ``input`` 接受 SDK 的 ``{"messages": [...]}`` / 单条消息 dict，
       转换后等价于原生 ``ChatRequest.input``。
-    - ``session_id`` 必填且必须等于 thread_id；deer-flow 扩展参数
+    - ``session_id`` 可选，缺省时用 thread_id；传则必须等于 thread_id；deer-flow 扩展参数
       （``stream_mode`` / ``multitask_strategy``）接受但忽略——本方案
       固定流模式与 reject 并发策略（裁剪项 1/2）。
     - ``context`` 为请求级参数容器（对齐 deer-flow context overrides）：
@@ -341,7 +344,8 @@ class CreateRunRequest(BaseModel):
     )
     session_id: str | None = Field(
         default=None,
-        description="原生 session id，必填且必须等于 thread_id（两者同一资源）。",
+        description="原生 session id，可选；传则必须等于 thread_id"
+        "（两者同一资源），不传时用 thread_id。",
     )
     input: (
         Msg
@@ -362,7 +366,8 @@ class CreateRunRequest(BaseModel):
     )
     multitask_strategy: str = Field(
         default="reject",
-        description="接受但忽略：恒为 reject（409 语义由原生注册表保证）。",
+        description="接受但忽略：恒为 interrupt（新请求自动打断旧 run，"
+        "打断失败/超时等兜底场景仍返回 409）。",
     )
     on_disconnect: Literal["cancel", "continue"] = Field(
         default="cancel",
@@ -395,13 +400,11 @@ class CreateRunRequest(BaseModel):
 
 
 def _resolve_session_id(thread_id: str, body: CreateRunRequest) -> str:
-    """thread_id 与 session_id 同一资源；session_id 必填且必须一致。"""
-    if body.session_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="session_id is required and must equal thread_id.",
-        )
-    if body.session_id != thread_id:
+    """thread_id 与 session_id 同一资源；session_id 可选，缺省时用 thread_id。
+
+    传了 session_id 且与 thread_id 不一致则 400（防止误传不同值）。
+    """
+    if body.session_id is not None and body.session_id != thread_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -1248,7 +1251,65 @@ async def _build_user_confirm_event(
     )
 
 
-def _spawn_run(
+# 打断旧 run 后等待其结束的超时（秒）：interrupt 广播 → 旧 task 的
+# CancelledError 清理释放 session 分布式锁通常毫秒级；超时仅记日志、
+# 不阻断新 run（真撞锁时由下方 409 兜底表达）。
+_INTERRUPT_WAIT_TIMEOUT = 30.0
+
+
+async def _interrupt_active_run(
+    run_manager: RunManager,
+    chat_run_registry: ChatRunRegistry,
+    chat_service: ChatService,
+    user_id: str,
+    session_id: str,
+    new_agent_id: str,
+) -> None:
+    """打断 session 当前活跃 run 并等待其结束（新请求优先语义）。
+
+    旧 run 记账先落定 INTERRUPTED（与 cancel 端点同款，done 回调不
+    覆盖），随后原生 interrupt（幂等：运行中 → 广播取消旧 task；已
+    结束 → LookupError 吞掉）。最后等待本进程可见的旧 task 完成——
+    其清理释放 session 分布式锁后新 run 才能接管；跨进程场景旧 task
+    不在本进程，由新 run 内部 ``acquire_lock`` 阻塞排队兜底。旧 run
+    的 join 流收到 REPLY_END(INTERRUPTED) 翻译的 end 哨兵后自行断开。
+    """
+    old_run_id = run_manager.active_run_id(session_id)
+    old_record = run_manager.get(old_run_id) if old_run_id else None
+    if old_record is not None:
+        run_manager.mark_finished(old_run_id, RunStatus.INTERRUPTED)
+        logger.info(
+            "deerflow: interrupting active run %s (session=%s) "
+            "for new run.",
+            old_run_id,
+            session_id,
+        )
+    try:
+        await chat_service.interrupt(
+            user_id,
+            session_id,
+            old_record.agent_id if old_record is not None else new_agent_id,
+        )
+    except LookupError:
+        # run 已完成、session 已清理时的正常情形，不必告警
+        pass
+    old_task = chat_run_registry.get(session_id)
+    if old_task is not None and not old_task.done():
+        done, _ = await asyncio.wait(
+            {old_task},
+            timeout=_INTERRUPT_WAIT_TIMEOUT,
+        )
+        if not done:
+            logger.warning(
+                "deerflow: old run %s (session=%s) not finished "
+                "after %ss; spawning new run anyway.",
+                old_run_id,
+                session_id,
+                _INTERRUPT_WAIT_TIMEOUT,
+            )
+
+
+async def _spawn_run(
     run_manager: RunManager,
     chat_run_registry: ChatRunRegistry,
     chat_service: ChatService,
@@ -1257,7 +1318,12 @@ def _spawn_run(
     agent_id: str,
     input_msg: Any,
 ) -> tuple[RunRecord, asyncio.Task]:
-    """RunManager 记账 + 原生注册表 spawn；任何冲突 → 409。"""
+    """RunManager 记账 + 原生注册表 spawn。
+
+    新请求优先（恒 interrupt 语义）：session 已有活跃 run 时先打断
+    旧 run 并等待其结束，再创建新 run；打断失败/超时等兜底场景仍由
+    409 表达（原 reject 语义保留为冲突兜底）。
+    """
     try:
         record = run_manager.create_or_reject(
             user_id,
@@ -1266,10 +1332,31 @@ def _spawn_run(
             native_registry=chat_run_registry,
         )
     except RuntimeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        ) from e
+        logger.info(
+            "deerflow: session %s busy (%s); interrupting active run.",
+            session_id,
+            e,
+        )
+        await _interrupt_active_run(
+            run_manager,
+            chat_run_registry,
+            chat_service,
+            user_id,
+            session_id,
+            agent_id,
+        )
+        try:
+            record = run_manager.create_or_reject(
+                user_id,
+                session_id,
+                agent_id,
+                native_registry=chat_run_registry,
+            )
+        except RuntimeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
 
     try:
         # spawn 前绑定 run_id：asyncio.create_task 复制调用方上下文，
@@ -1358,15 +1445,20 @@ def _sse_generator(
             ``values.messages``——缺失时前端 human 计数不增长，乐观消息
             永不清理，界面出现两条用户输入（“问题显示两次”）。
         storage (`StorageBase | None`, optional):
-            会话存储；缺省时跳过 values 快照帧。end 哨兵前从 storage
-            拉全量消息组装 ``event: values``（对齐原生主通道帧，含
-            title 与最后一条 ai 消息的 ``usage_metadata``）。error 与
-            HITL park 情形不发 values（run 未正常完结）。
+            会话存储；缺省时跳过 values 快照帧。formatter 每个节点
+            边界产出的 values 帧均从 storage 拉历史消息 + 本轮结构化
+            序列组装 ``event: values``（对齐原生主通道帧，含 title 与
+            ai 消息的 ``usage_metadata``，流中每节点边界一帧、messages
+            递增）。收尾不发 values——原生在最后一个 super-step 边界
+            快照后直接 end（见原生 client.py ``stream()``）。error
+            情形不发 values（run 未正常完结）；HITL park 时卡片快照
+            帧照发（interrupt 快照对齐原生），随后直接收尾。本层不下发
+            ``event: end`` 帧：流结束由连接关闭传递。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
         # HITL park 标志：收到确认请求帧（on_require_confirm）后置真。
-        # park 是回复的正常终点（end 哨兵由 formatter 补发），此时
+        # park 是回复的正常终点（内部 end 哨兵由 formatter 补发），此时
         # interrupt 会走"锁已释放"分支，enqueue UserInterruptEvent 把
         # ASKING 的待确认工具调用全部标记 interrupted——摧毁等待用户
         # 确认的状态，确认应答将永远匹配不到工具调用。故 finally 里
@@ -1375,7 +1467,7 @@ def _sse_generator(
         # error 帧标志：error 流不发 values 快照（run 未正常完结）。
         error_seen = False
         # 翻译器实例跨回放 + live 共享：token 用量累积状态连续，
-        # end 哨兵前从 formatter.usage 取值组装 values 快照。
+        # 本层不下发 end 帧（END_SENTINEL 仅驱动收尾，流结束由连接关闭传递）。
         formatter = DeerflowSSEFormatter()
         try:
             # 首帧回显用户输入（先于一切总线事件，保证 values.messages
@@ -1401,22 +1493,13 @@ def _sse_generator(
                     # 提前落定可避免紧随其后的新 run 误判 409）；error 帧
                     # 已先行落定 ERROR，此处不覆盖。
                     _finish_if_running(run_manager, run_id, RunStatus.SUCCESS)
-                    if not error_seen and not hitl_parked:
-                        values = await _build_values_frame(
-                            storage,
-                            user_id,
-                            session_id,
-                            usage=formatter.usage,
-                        )
-                        if values is not None:
-                            yield format_sse(
-                                StreamEvent(
-                                    id="",
-                                    event=EVENT_VALUES,
-                                    data=values,
-                                ),
-                            )
-                    yield format_sse(evt)
+                    # 原生流在最后一个 super-step 边界 values 帧后直接 end，
+                    # 无额外收尾快照（见原生 client.py ``stream()`` 末尾
+                    # ``yield StreamEvent(type="end", ...)``）——对齐该行为，
+                    # 收尾不发 values。
+                    # 本层暂不下发 end 帧：END_SENTINEL 仅驱动收尾，流结束
+                    # 由连接关闭传递（run 级总量由前端按每轮 usage 增量帧
+                    # 累加）
                     return
                 if evt.event == EVENT_ERROR:
                     error_seen = True
@@ -1427,6 +1510,30 @@ def _sse_generator(
                     and evt.data.get("type") == "on_require_confirm"
                 ):
                     hitl_parked = True
+                if evt.event == EVENT_VALUES:
+                    # formatter 节点边界快照帧（data 为当前 turn 序列）：
+                    # 组装原生 values 形态下发（storage 历史 + 本轮序列），
+                    # 对齐原生每 super-step 写 state 后一帧快照的流式语义。
+                    # error 流不发（run 未正常完结）；组装失败跳过该帧
+                    # （values 是视图同步优化，非流终止契约）。
+                    if not error_seen and evt.data:
+                        values = await _build_values_frame(
+                            storage,
+                            user_id,
+                            session_id,
+                            turn_messages=evt.data,
+                            reply_id=formatter.reply_id,
+                        )
+                        if values is not None:
+                            evt = StreamEvent(
+                                id="",
+                                event=EVENT_VALUES,
+                                data=values,
+                            )
+                        else:
+                            continue
+                    else:
+                        continue
                 if await request.is_disconnected():
                     break
                 yield format_sse(evt)
@@ -1445,7 +1552,7 @@ def _sse_generator(
                     data={"message": str(e), "name": "StreamError"},
                 ),
             )
-            yield format_sse(END_SENTINEL)
+            # 本层暂不下发 end 帧：流结束由连接关闭传递
         finally:
             if on_disconnect == "cancel" and not hitl_parked:
                 try:
@@ -1484,22 +1591,48 @@ async def _build_values_frame(
     user_id: str,
     session_id: str,
     *,
-    usage: dict[str, int] | None,
+    turn_messages: list[dict[str, Any]] | None = None,
+    reply_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """end 哨兵前的 values 快照（storage 缺失/无消息时跳过）。
+    """节点边界 values 快照组装（storage 缺失/无消息时跳过）。
 
-    组装失败不阻断流——values 帧是视图同步优化，end 哨兵才是流终止
+    组装失败不阻断流——values 帧是视图同步优化，连接关闭才是流终止
     契约；storage 读取异常时仅记日志并跳过。
+
+    assistant 消息落库晚于 REPLY_END（异步写库），节点边界快照常缺
+    本轮消息；此时用 formatter 本轮结构化序列兜底补入（每轮 ai 快照
+    含 tool_calls/usage_metadata 与 tool 消息交错，对齐原生 values 快照
+    的 state.messages 全量形态）。若本轮扁平 assistant 已落库（尾部
+    消息 id == reply_id），先移除再补结构化序列，避免重复。
+
+    run 级累计 usage 不在此附加：原生快照的 ai 消息 usage_metadata
+    为消息级语义（随本轮结构化快照自带），run 级总量由前端按每轮
+    usage 增量帧累加；本层不下发 end 帧，values 快照亦不承载 run 级
+    聚合值。
     """
     if storage is None:
         return None
     try:
-        return await build_thread_values(
+        values = await build_thread_values(
             storage,
             user_id,
             session_id,
-            usage=usage,
         )
+        if values is None:
+            return None
+        messages = values.get("messages") or []
+        # 尾部是本轮扁平落库的 assistant（id == reply_id）时移除，
+        # 由下方结构化序列替代
+        if (
+            reply_id
+            and messages
+            and messages[-1].get("type") == "ai"
+            and messages[-1].get("id") == reply_id
+        ):
+            messages = messages[:-1]
+        if turn_messages:
+            values["messages"] = [*messages, *turn_messages]
+        return values
     except Exception:  # noqa: BLE001 —— 快照失败降级为不发 values 帧
         logger.exception(
             "deerflow: failed to build values frame for run on thread %s",
@@ -1527,13 +1660,13 @@ def _streaming_response(
 
 
 def _confirmation_pending_response(awaiting: list) -> StreamingResponse:
-    """HITL 挂起时对普通消息的明确拒绝流（error 帧 + end 哨兵）。
+    """HITL 挂起时对普通消息的明确拒绝流（error 帧）。
 
     会话仍在等待工具确认（ASKING）/外部执行（SUBMITTED）时，普通
     消息会在引擎内被拒（"Agent is waiting ... but received no event"）
     并泛化成误导性的 setup 错误；这里在路由层拦截，返回稳定命名的
     错误帧（不创建 run、不占用 RunManager 记账），前端可按 name 给出
-    提示"先处理确认卡"。
+    提示"先处理确认卡"。流结束由连接关闭传递（不下发 end 帧）。
     """
 
     async def _gen() -> AsyncGenerator[str, None]:
@@ -1551,7 +1684,6 @@ def _confirmation_pending_response(awaiting: list) -> StreamingResponse:
                 },
             ),
         )
-        yield format_sse(END_SENTINEL)
 
     return StreamingResponse(
         _gen(),
@@ -1684,6 +1816,11 @@ async def create_run_stream(
         session_id,
         custom_params_part,
     )
+    # 注入 thread_id（= session_id）到 custom_params，对齐 deerflow
+    # lead_agent/agent.py:393-394；下游工具（如 raw_request）从
+    # custom_params 读取 thread_id 注入联机请求体做链路追踪。
+    if resolved_params:
+        resolved_params["thread_id"] = session_id
     ctx_token = set_custom_params(resolved_params)
     # 请求级 run 配置（context 平铺层根路径 5 键）：经 ContextVar 注入
     # 后台 run 任务；spawn 后 reset（create_task 已复制上下文快照，
@@ -1700,7 +1837,7 @@ async def create_run_stream(
     rc_token = set_run_context(resolved_run_context)
     auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
-        record, _task = _spawn_run(
+        record, _task = await _spawn_run(
             run_manager,
             chat_run_registry,
             chat_service,
@@ -1799,6 +1936,11 @@ async def create_run_wait(
         session_id,
         custom_params_part,
     )
+    # 注入 thread_id（= session_id）到 custom_params，对齐 deerflow
+    # lead_agent/agent.py:393-394；下游工具（如 raw_request）从
+    # custom_params 读取 thread_id 注入联机请求体做链路追踪。
+    if resolved_params:
+        resolved_params["thread_id"] = session_id
     ctx_token = set_custom_params(resolved_params)
     if "mode" in run_context:
         logger.debug(
@@ -1812,7 +1954,7 @@ async def create_run_wait(
     rc_token = set_run_context(resolved_run_context)
     auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
-        record, task = _spawn_run(
+        record, task = await _spawn_run(
             run_manager,
             chat_run_registry,
             chat_service,

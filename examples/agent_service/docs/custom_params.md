@@ -56,9 +56,9 @@ deerflow_chat.py  路由层（FastAPI 端点）
         │
         ▼  run 任务内（ContextVar 已复制进来）
   ┌─────────────────────────────────────────────────────────────┐
-  │ AgentToolFactory → build_enterprise_tools()                 │
-  │   · cross_search 始终挂载                                    │
-  │   · vector_search_switch=False → 不挂 vector_search 工具     │
+│ AgentToolFactory → build_enterprise_tools()                 │
+│   · cross_search 始终挂载（参数从智能体级配置读取）          │
+│   · vector_search_switch=False → 不挂 vector_search 工具     │
   │   · online_search_switch=true → 挂 online_search             │
   │   · personal_search_switch=true + 空间参数齐备 → 挂 personal_search │
   │                                                             │
@@ -83,7 +83,7 @@ Redis: bocomadp:session:{session_id}:custom_params（TTL 4h 原生过期，多 w
 | `bocomadp/deerflow/_session_store.py` | 会话级 Redis 存储（custom_params + auth 同 key 同 TTL） |
 | `bocomadp/deerflow/auth_context.py` | 认证方案解析（ResolvedAuth）+ ContextVar + save_auth/load_auth |
 | `bocomadp/deerflow/routers/deerflow_chat.py` | 路由层入口：resolve → set → spawn → reset |
-| `bocomadp/tools/cross_search.py` | 空间码覆盖中间件 + personal 开关参数层处理 |
+| `bocomadp/tools/cross_search.py` | 参数从智能体级配置（PG）读取，不在 custom_params 中 |
 | `bocomadp/middleware/custom_prompt.py` | 自定义提示词注入中间件 |
 | `bocomadp/middleware/factory.py` + `bocomadp/tools/enterprise.py` | 中间件/工具装配点（读取开关） |
 
@@ -155,37 +155,43 @@ custom_params 同 key 同 TTL，HITL 续跑等场景一并回退恢复。
 
 ## 6. 各消费点详解
 
-### 6.1 空间码强制覆盖（cross_search.py）
+### 6.1 跨知识搜索参数（智能体级配置，非 custom_params）
 
-**目的**：模型有时会"擅自修改"或"遗忘"空间码。请求方（前端）知道用户真实的空间范围，必须**强制纠正**，不能信任模型传参。
+**设计决策**：`cross_search` 的参数（空间码、用户编码、检索类型等）是**智能体级别**的配置，而非单次对话级别。某个智能体的所有会话共享同一套 cross_search 参数，类似于技能（skill）配置。
 
-**实现**：`FunctionTool` 挂载工具级中间件（AgentScope 的 `ToolMiddlewareBase` 洋葱模型），每次 tool call 前对覆盖键直接赋值：
+**实现**：通过独立的管理接口配置，存储在 PG `agent_cross_search_configs` 表，运行时由 cross_search 工具从智能体配置读取：
 
-```python
-_OVERRIDE_KEYS = (
-    "space_code_list", "team_space_code_list", "psnl_space_code_id",
-    "user_code", "search_type", "customized_tag_list", "psnl_category_id_list",
-)
-
-class _SpacecodeOverrideMiddleware(ToolMiddlewareBase):
-    async def on_tool_call(self, tool, input_kwargs, next_handler):
-        params = get_custom_params()
-        for key in _OVERRIDE_KEYS:
-            value = params.get(key)
-            if value is not None:
-                input_kwargs[key] = value          # 强制覆盖，模型传错的也纠正
-        async for chunk in next_handler(**input_kwargs):
-            yield chunk
-
-cross_search_tool = FunctionTool(
-    _cross_search_tool_impl,
-    name="cross_search",                           # 对齐 deer-flow 检索工具语义（函数名必须为 ASCII）
-    is_read_only=True,
-    middlewares=[_SpacecodeOverrideMiddleware()],
-)
+```bash
+# 配置智能体的 cross_search 参数
+PUT /agents/{agent_id}/cross-search-config
+{
+  "user_code": "U001",
+  "search_type": "0",
+  "space_code_list": ["SP0000001"],
+  "team_space_code_list": ["TEAM01"],
+  "psnl_space_code_id": "",
+  "psnl_category_id_list": [],
+  "customized_tag_list": [],
+  "text_top_n": 5,
+  "vector_top_n": 5
+}
 ```
 
-**覆盖语义细节**：`value is not None` 才覆盖。这意味着**没有配置的 key 完全放行模型传参**（回退到 config.yaml 默认值），只有请求方显式给了值才纠正。
+工具运行时优先级：智能体级配置（PG）→ config.yaml 全局默认值。
+
+```python
+async def _cross_search_tool_impl(keyword: str) -> str:
+    agent_config = await _get_agent_cross_search_config()
+    # agent_config 为 None 时回退到 config.yaml 默认值
+    return await search_cross_backend(keyword, agent_config=agent_config)
+```
+
+**优势**：
+- 参数不暴露给 LLM，安全性高
+- 智能体级配置，所有会话共享，无需每次请求携带
+- 与 vector_search 的 `tools_param.source_param` 等参数天然隔离，无同名冲突
+
+> 详细接口说明见 `API接口文档.md` 的智能体跨知识搜索配置章节。
 
 ### 6.2 自定义提示词（middleware/custom_prompt.py）
 
@@ -229,7 +235,7 @@ class CustomPromptMiddleware(MiddlewareBase):
 | `vector_search_switch` | True | 显式 `False` → 不挂 vector_search 工具（cross_search 始终挂载） | `build_enterprise_tools` |
 | `online_search_switch` | False | 显式 `True` → 挂 online_search 联网搜索（默认不挂） | `build_enterprise_tools` |
 | `personal_search_switch` | False | 显式 `True` 且空间参数齐备 → 挂 personal_search 工具 | `build_enterprise_tools` |
-| `usableTools` | — | 请求级企业工具名单（见下方说明）：缺失/None/空数组 → 全禁用；非空 → 只挂名单内 | `build_enterprise_tools` + 白名单豁免 |
+| `usableTools` | — | 请求级企业工具名单（见下方说明）：缺失/None/空数组 → 全禁用；非空 → 只挂名单内；`read_tool_result` 豁免（始终默认挂载） | `build_enterprise_tools` + 白名单豁免 |
 
 ```python
 # enterprise.py（工具挂载开关，2026-08-20 起 cross_search 不受 vector 开关控制）
@@ -274,6 +280,9 @@ personal_search 工具（行内搜索之外的"个人知识库搜索"维度）�
 - 名单内的企业工具**豁免** per-agent 白名单（`main.py build_agent_tools`
   与 `toolkit_whitelist.py` 两处过滤同步豁免）——请求方可以在白名单之外
   临时启用某个企业工具，但名单外的企业工具仍被白名单约束。
+- `read_tool_result` **豁免本名单与 per-agent 白名单**：它是工具输出持久化
+  的配套读回工具（会话内只读、键由当前会话构造），与
+  ToolResultPersistenceMiddleware 始终挂载对齐，任何名单形态下都默认挂载。
 
 ### 6.4 认证参数（auth_context.py + 路由联动）
 
@@ -300,18 +309,11 @@ def resolve_auth_params(custom_params) -> ResolvedAuth:
 
 | key | 类型 | 消费点 | 语义 |
 |---|---|---|---|
-| `space_code_list` | list[str] | 覆盖中间件 | 场景知识空间代码列表，强制覆盖 |
-| `team_space_code_list` | list[str] | 覆盖中间件 | 团队知识空间代码列表，强制覆盖 |
-| `psnl_space_code_id` | str | 覆盖中间件 | 个人知识空间 ID，强制覆盖 |
-| `user_code` | str | 覆盖中间件 | 用户编码，强制覆盖 |
-| `search_type` | str | 覆盖中间件 | 检索类型（0 混合 / 1 全文 / 2 向量） |
-| `customized_tag_list` | list[str] | 覆盖中间件 | 自定义标签过滤，强制覆盖 |
-| `psnl_category_id_list` | list[str] | 覆盖中间件 | 个人知识分类 ID，强制覆盖 |
 | `custom_prompt` | str | CustomPromptMiddleware | 请求级自定义提示词（整体覆盖 system 提示词） |
 | `vector_search_switch` | bool | build_enterprise_tools | 显式 False 卸载 vector_search（默认挂载；cross_search 不受控） |
 | `online_search_switch` | bool | build_enterprise_tools | 显式 True 挂 online_search（默认不挂） |
 | `personal_search_switch` | bool | build_enterprise_tools | 显式 True 且空间参数齐备 → 挂 personal_search |
-| `usableTools` | list[str] | build_enterprise_tools + 白名单豁免 | 请求级企业工具名单：只挂名单内（中/英文名均可）；缺失/None/空数组 → 全禁用；名单内工具豁免 per-agent 白名单 |
+| `usableTools` | list[str] | build_enterprise_tools + 白名单豁免 | 请求级企业工具名单：只挂名单内（中/英文名均可）；缺失/None/空数组 → 全禁用；名单内工具豁免 per-agent 白名单；read_tool_result 豁免名单始终默认挂载 |
 | `tools_param.personalKnowledgeSearch` | dict | PersonalSpacecodeOverrideMiddleware | 个人空间参数（psnlSpaceCodeId / psnlCategoryIdList）强制覆盖 |
 | `tools_param.source_param` | dict | vector_search 后端 | sourceType / repository / aggRepositories / HNSSParam |
 | `guwp_token` / `jrt_auth_code` / `okic_token` / `okic_type` / `muwp_user` | str / dict | resolve_auth_params | 认证方案（优先级 guwp > jrt > okic > muwp） |
@@ -335,11 +337,7 @@ if max_results is not None:
     ...  # 你的业务逻辑
 ```
 
-**Step 2（可选）：如需强制覆盖模型传参**，把 key 加进 `_OVERRIDE_KEYS`：
-
-```python
-_OVERRIDE_KEYS = (..., "max_results")   # cross_search.py
-```
+**Step 2（可选）：如需让参数不暴露给 LLM**，从工具函数签名中移除该参数，改为在函数体内从智能体级配置（PG 侧边表）读取（参见 6.1 的 cross_search 模式）。如参数属于智能体级（所有会话共享），应创建管理接口和 PG 侧边表，而非使用 custom_params。
 
 **Step 3（可选）：如需在中间件/工厂装配时生效**，在对应工厂函数里读取（参见 6.3 的 `vector_search_switch` 模式）。
 
@@ -351,7 +349,7 @@ _OVERRIDE_KEYS = (..., "max_results")   # cross_search.py
 
 1. 消费点**只读** `get_custom_params()`，绝不写入；
 2. 判断方向对齐 deer-flow 默认值（`is False` / `is True`，不要用 `not params.get(...)` 一锅端）；
-3. 覆盖/注入操作都要有 `logger.info` 日志（生产排障看 `SpacecodeOverride:` / `CustomPromptMiddleware:` 前缀）。
+3. 覆盖/注入操作都要有 `logger.info` 日志（生产排障看 `CrossSearchParams:` / `CustomPromptMiddleware:` 前缀）。
 
 ## 9. 常见坑清单
 
@@ -396,7 +394,7 @@ CustomPromptMiddleware._ensure_system_message(msg_objs, "PROMPT")   # False（�
 
 **端到端验证**（运行时）：启动 bocomadp 服务后，`POST /threads/{id}/runs/stream` 携带 `context.custom_params`，观察日志：
 
-- `SpacecodeOverride: space_code_list ['WRONG'] -> ['S1']`（覆盖生效）
+- cross_search 空间码由智能体级配置（PG 侧边表）注入，LLM 无法接触
 - `CustomPromptMiddleware: custom_prompt overrides system prompt (was N chars, now M chars)`（提示词整体覆盖）
 - 再次请求不带 `context.custom_params` 时，覆盖日志仍出现（Redis 回退加载生效）
 
@@ -404,7 +402,7 @@ CustomPromptMiddleware._ensure_system_message(msg_objs, "PROMPT")   # False（�
 
 | 能力 | deer-flow | bocomadp | 差异说明 |
 |---|---|---|---|
-| 空间码注入 | SpacecodeOverrideMiddleware 读落盘文件 | 工具中间件读 ContextVar | 数据源不同（文件 vs 内存），覆盖语义一致 |
+| 空间码注入 | SpacecodeOverrideMiddleware 读落盘文件 | 智能体级配置（PG 侧边表）+ 管理接口 | 数据源不同（文件 vs PG），参数不暴露给 LLM，智能体级（非会话级） |
 | custom_prompt | 构建时整体替换 system_prompt | `on_system_prompt` 整体覆盖 | 语义一致（无差异） |
 | 检索开关 | 构建时过滤工具列表 | 工具工厂挂载开关 | vector/online/personal 均以开关决定挂载 |
 | 认证解析 | _resolve_auth_params | resolve_auth_params | 优先级、字段、降级逻辑逐一对齐 |
@@ -464,7 +462,7 @@ curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-1/runs/st
 CustomPromptMiddleware: custom_prompt overrides system prompt (was N chars, now M chars)   ← 提示词整体覆盖
 ```
 
-> `SpacecodeOverride:` 覆盖日志**仅在模型实际调用 cross_search（行内搜索）工具时出现**——先随便聊一轮确认服务连通，再用 12.3 的提问触发检索工具。
+> cross_search 参数注入日志**仅在模型实际调用 cross_search 工具时出现**——先随便聊一轮确认服务连通，再用 12.3 的提问触发检索工具。cross_search 参数需提前通过 `PUT /agents/{id}/cross-search-config` 接口配置。
 
 ### 12.2 同一 thread 不带 context（回退加载）
 
@@ -480,9 +478,30 @@ curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-1/runs/st
 
 **预期**：请求体没有 context，但 `CustomPromptMiddleware: custom_prompt overrides system prompt` 仍出现——证明参数从 Redis（按 session_id）回退加载成功。
 
-### 12.3 触发检索工具验证空间码覆盖
+### 12.3 触发检索工具验证空间码注入
 
-提问方向明确指向知识检索（引导模型调用 cross_search 工具）：
+提问方向明确指向知识检索（引导模型调用 cross_search 工具）。
+
+**前置步骤**：先通过智能体配置接口设置 cross_search 参数：
+
+```bash
+curl -s -X PUT http://localhost:8000/api/agents/{agent_id}/cross-search-config \
+  -H 'Content-Type: application/json' \
+  -H 'X-User-ID: tester' \
+  -d '{
+    "user_code": "U001",
+    "search_type": "0",
+    "space_code_list": ["SP0000001"],
+    "team_space_code_list": [],
+    "psnl_space_code_id": "",
+    "psnl_category_id_list": [],
+    "customized_tag_list": [],
+    "text_top_n": 5,
+    "vector_top_n": 5
+  }'
+```
+
+然后发起对话：
 
 ```bash
 curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-2/runs/stream \
@@ -500,18 +519,17 @@ curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-2/runs/st
   }'
 ```
 
-**服务端日志预期**（模型调用工具时逐条打印）：
+**服务端日志预期**（模型调用工具时打印）：
 
 ```text
-SpacecodeOverride: space_code_list [...] -> ['SP0000001']
-SpacecodeOverride: user_code ... -> 'U001'
+CrossSearchParams: agent_config loaded for agent=xxx, user_code=U001, space_codes=['SP0000001']
 ```
 
-无论模型传什么值，都会被请求方指定的空间码纠正。
+空间码由智能体配置注入，LLM 无法接触或篡改。
 
-### 12.4 新值覆盖旧值（Redis 覆盖语义）
+### 12.4 更新智能体配置（PG 覆盖语义）
 
-对**同一个 thread**（t-verify-2）换 `user_code` 再请求，然后回到 12.2 观察回退值：
+对**同一个智能体**换 `user_code` 再配置：
 
 ```bash
 curl -s -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-2/runs/wait \
@@ -577,15 +595,11 @@ curl -N -X POST http://localhost:8000/api/bocomadp/v1/threads/t-verify-4/runs/st
 > 仅开关为 True 但空间参数缺失（无 psnlSpaceCodeId 或 psnlCategoryIdList）时不挂载
 > 该工具（见 `build_enterprise_tools`）。
 
-### 12.7 查看 Redis 存储（持久化证据）
+### 12.7 查看 PG 存储（智能体配置持久化证据）
 
 ```bash
-# 连接 AppConfig.redis 对应实例（默认 localhost:6379）
-redis-cli keys 'bocomadp:session:*'
-redis-cli hgetall 'bocomadp:session:t-verify-2:custom_params'
-# 预期 params 字段为 12.4 覆盖后的值：
-# {"user_code": "U002", "space_code_list": ["SP0000002"]}
-redis-cli ttl 'bocomadp:session:t-verify-2:custom_params'   # 剩余 TTL（<4h）
+# 连接 AppConfig.db 对应 PG 实例
+psql -c "SELECT * FROM agent_cross_search_configs WHERE agent_id = '{agent_id}';"
 ```
 
 > key 语义：`bocomadp:session:{session_id}:custom_params`，hash 字段 `params`
@@ -600,8 +614,8 @@ redis-cli ttl 'bocomadp:session:t-verify-2:custom_params'   # 剩余 TTL（<4h�
 |---|---|---|---|
 | 1 | 带 params 首次请求 | 12.1 | `custom_prompt overrides system prompt` 日志出现 |
 | 2 | 不带 params 回退 | 12.2 | `custom_prompt overrides system prompt` 仍出现（Redis 回退） |
-| 3 | 空间码覆盖 | 12.3 | 日志 `SpacecodeOverride: space_code_list ... -> ['SP0000001']` |
-| 4 | Redis 覆盖语义 | 12.4 | Redis `params` 字段变为 U002 / SP0000002 |
+| 3 | 智能体配置注入 | 12.3 | 日志 `CrossSearchParams: agent_config loaded` |
+| 4 | 智能体配置覆盖 | 12.4 | PG 记录变为 U002 / SP0000002 |
 | 5 | 行内检索开关 | 12.5 | 日志 `vector_search disabled by vector_search_switch=false` |
 | 6 | 个人检索挂载 | 12.6 | `personal_search_switch=true` + 空间参数齐备 → 挂 personal_search |
-| 7 | Redis 持久化 | 12.7 | `redis-cli hgetall` 取到记录且 TTL<4h |
+| 7 | PG 持久化 | 12.7 | `psql SELECT` 取到记录 |

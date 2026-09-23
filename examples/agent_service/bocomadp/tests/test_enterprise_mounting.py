@@ -11,6 +11,7 @@ from bocomadp.deerflow.custom_params import (
 from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.tools._naming import tool_name
 from bocomadp.tools.enterprise import build_enterprise_tools
+from bocomadp.tools.enterprise import usable_tool_names
 
 # 工具名默认中文，设置 BOCOMADP_TOOL_ASCII_NAMES=1 后为 ASCII；
 # 断言用 tool_name(...) 计算期望值，避免与开关耦合。
@@ -114,40 +115,85 @@ def test_read_tool_result_tool_mounted():
 
 
 # ---------------------------------------------------------------------------
-# usableTools 请求级名单（只作用于企业工具层，优先级高于 per-agent 白名单）
+# usableTools 请求级名单（只作用于企业工具层，优先级高于 per-agent 白名单）。
+# read_tool_result 豁免名单（持久化配套读回工具，始终默认挂载）。
 # ---------------------------------------------------------------------------
 
 
-def test_usable_tools_missing_mounts_nothing():
-    assert _mount({}) == set()
+def test_usable_tools_missing_mounts_only_read_back():
+    assert _mount({}) == {"read_tool_result"}
 
 
-def test_usable_tools_none_mounts_nothing():
-    assert _mount({"usableTools": None}) == set()
+def test_usable_tools_none_mounts_only_read_back():
+    assert _mount({"usableTools": None}) == {"read_tool_result"}
 
 
-def test_usable_tools_empty_list_mounts_nothing():
-    assert _mount({"usableTools": []}) == set()
+def test_usable_tools_empty_list_mounts_only_read_back():
+    assert _mount({"usableTools": []}) == {"read_tool_result"}
 
 
 def test_usable_tools_keeps_only_listed():
     names = _mount({"usableTools": [_VECTOR, _CROSS]})
-    assert names == {_VECTOR, _CROSS}
+    assert names == {_VECTOR, _CROSS, "read_tool_result"}
 
 
 def test_usable_tools_matches_ascii_names():
     # 名单写英文名（与运行时形态无关）也能命中
     names = _mount({"usableTools": ["vector_search", "cross_search"]})
-    assert names == {_VECTOR, _CROSS}
+    assert names == {_VECTOR, _CROSS, "read_tool_result"}
 
 
 def test_usable_tools_ignores_unknown_and_non_enterprise_names():
     names = _mount({"usableTools": [_VECTOR, "Bash", "不存在的工具"]})
-    assert names == {_VECTOR}
+    assert names == {_VECTOR, "read_tool_result"}
 
 
 def test_usable_tools_does_not_override_switches():
     # 名单只收缩、不扩张：online_search_switch 未开，列入名单也不挂
     names = _mount({"usableTools": [_VECTOR, _ONLINE]})
-    assert names == {_VECTOR}
+    assert names == {_VECTOR, "read_tool_result"}
     assert _ONLINE not in names
+
+
+# ---------------------------------------------------------------------------
+# usable_tool_names —— 扩管到项目工具的名单归一（项目工具名原样 +
+# 企业工具名中/英文归一；用于 build_agent_tools 对项目工具层过滤）
+# ---------------------------------------------------------------------------
+
+
+def test_usable_tool_names_empty_returns_empty():
+    assert usable_tool_names(None) == set()
+    assert usable_tool_names([]) == set()
+    assert usable_tool_names("not a list") == set()
+    assert usable_tool_names({"k": "v"}) == set()
+
+
+def test_usable_tool_names_keeps_project_tool_names_verbatim():
+    # 项目工具名原样保留（无中英文之分）
+    names = usable_tool_names(["echo", "get_current_time", _VECTOR])
+    assert "echo" in names
+    assert "get_current_time" in names
+    assert _VECTOR in names
+
+
+def test_usable_tool_names_normalizes_enterprise_names():
+    # 企业工具中/英文名归一为当前运行时形态
+    names = usable_tool_names(["行内搜索", "vector_search"])
+    assert names == {_VECTOR}
+
+
+def test_usable_tool_names_keeps_builtin_and_unknown_verbatim():
+    # builtins / 未知名原样保留（不归一、不报错）：按工具名原样匹配，
+    # 项目工具里无同名工具则自然不命中，不影响企业工具归一结果。
+    names = usable_tool_names(["Bash", "不存在的工具", _VECTOR])
+    assert names == {"Bash", "不存在的工具", _VECTOR}
+
+
+def test_usable_tool_names_strips_whitespace():
+    names = usable_tool_names(["  echo  "])
+    assert names == {"echo"}
+
+
+def test_usable_tool_names_skips_blank_entries():
+    names = usable_tool_names(["echo", "", "  "])
+    assert names == {"echo"}
