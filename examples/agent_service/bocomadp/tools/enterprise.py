@@ -29,10 +29,6 @@ from .interest_rate import interest_rate_tool
 from .online_search import online_search_tool
 from .personal_search import personal_search_tool
 from .physical_contact_search import physical_contact_search_tool
-from .placeholder import (
-    query_internal_doc,
-    submit_it_ticket,
-)
 from .raw_request import raw_request_tool
 from .read_tool_result import read_tool_result_tool
 from .vector_search import vector_search_tool
@@ -55,8 +51,6 @@ _ENTERPRISE_NAME_PAIRS: tuple[tuple[str, str], ...] = (
     ("行内搜索", "vector_search"),
     ("个人知识库搜索", "personal_search"),
     ("联网搜索", "online_search"),
-    ("行内文档检索", "query_internal_doc"),
-    ("提交IT工单", "submit_it_ticket"),
 )
 
 #: 任一形态名（中/英文）→ 基准英文名的归一映射。
@@ -185,7 +179,7 @@ async def build_enterprise_tools(
     加了也不可用。
 
     **通用工具**（所有智能体可通过添加接口启用）：
-    cross_search / read_tool_result / query_internal_doc / submit_it_ticket。
+    cross_search / read_tool_result。
     不受 ``usableTools`` 控制，由 per-agent 白名单管控启用/禁用。
 
     检索开关（对齐 deer-flow custom_params，显式才生效）：
@@ -212,8 +206,6 @@ async def build_enterprise_tools(
     _cross_search_agent_id.set(agent_id)
     universal_tools.append(cross_search_tool)
     universal_tools.append(read_tool_result_tool)
-    universal_tools.append(FunctionTool(query_internal_doc, name=tool_name("行内文档检索", "query_internal_doc"), is_read_only=True))
-    universal_tools.append(FunctionTool(submit_it_ticket, name=tool_name("提交IT工单", "submit_it_ticket")))
 
     # ── 智能体专用工具（受 usableTools 请求级开关控制） ──
     specific_tools: list[ToolBase] = [
