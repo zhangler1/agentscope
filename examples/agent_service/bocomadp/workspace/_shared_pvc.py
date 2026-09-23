@@ -299,6 +299,7 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             "\n\n### Python 环境"
             "\n- 沙箱预置了Python虚拟环境`/root/.agentscope/.venv`。"
             "\n- 执行Python脚本前，先激活该环境：`source /root/.agentscope/.venv/bin/activate`"
+            "\n- 安装包如：uv pip / pip install docstring_parser --index-url=http://afty.bocomm.tst/repo/api/pypi/pypi-public/simple --trusted-host=afty.bocomm.tst"
             "\n</workspace>"
         ).format(
             backend="Kubernetes-based (shared-PVC)",

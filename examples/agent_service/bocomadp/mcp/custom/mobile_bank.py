@@ -12,6 +12,6 @@ from agentscope.mcp import MCPClient, HttpMCPConfig
 
 mobile_bank = MCPClient(
     name="mobile-bank",
-    mcp_config=HttpMCPConfig(url="http://12.244.107.162:8000/mcp"),
+    mcp_config=HttpMCPConfig(url="http://53.92.28.254:8200/mcp"),
     is_stateful=False,
 )
