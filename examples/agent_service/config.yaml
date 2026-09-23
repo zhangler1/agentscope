@@ -150,7 +150,7 @@ online_search:
 
 # ---------- 个人知识库搜索（personal_search） ----------
 personal_search:
-  api_url: "http://12.244.66.225/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
+  api_url: "http://12.244.113.82/EUVD.EUVD-JXCHAT.V-1.0/querySources.do"
   timeout: 30                         # 请求超时(秒)
   source_type: "WDZS"                 # 请求体 sourceType
   repository: "personal-search"       # 请求体 repository
@@ -160,7 +160,7 @@ personal_search:
 
 # ---------- 行内搜索（vector_search） ----------
 vector_search:
-  api_url: "http://12.244.66.225/ELLM.ELLM-OFFICE.V-1.0/querySources.do"
+  api_url: "http://12.244.113.82/EUVD.EUVD-JXCHAT.V-1.0/querySources.do"
   timeout: 30
   page_size: 10
   text_top_n: 7
@@ -171,14 +171,14 @@ vector_search:
 # 扁平结构：键与 raw_request_config.py 字段一一对应。
 raw_request:
   # 联机根地址（在 .env 中设置，9 个接口路径固定，域名可切）。
-  api_url: $RAW_REQUEST_API_URL
+  api_url: "http://12.244.113.82"
   timeout: 30
 
 
 # ---------- 利率汇率（rate_currency：汇率查询 + 利率查询） ----------
 # 根地址与原 deerflow 工程一致；生产环境可用 $RATE_CURRENCY_API_URL 切换。
 rate_currency:
-  api_url: "http://12.244.167.46"
+  api_url: "http://12.244.113.82"
   timeout: 30
 
 

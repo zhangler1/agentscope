@@ -47,15 +47,15 @@ logger = logging.getLogger(__name__)
 # yq_info_detail    : 舆情信息详情查询
 # zg_credit_info    : 中国信用目录信息
 DEFAULT_API_PATHS: dict[str, str] = {
-    "enterprise_detail": "/ELLM.ELLM-OFFICE.V-1.0/gsEntDetailTool.do",
-    "shell_company": "/ELLM.ELLM-OFFICE.V-1.0/eicsHDShellCompanyDataTool.do",
-    "litigation": "/ELLM.ELLM-OFFICE.V-1.0/eicsHighLawOutCaseInfoTool.do",
-    "hd_enterprise": "/ELLM.ELLM-OFFICE.V-1.0/eicsQueryHDEnterpriseListFree.do",
-    "intel_info": "/ELLM.ELLM-OFFICE.V-1.0/eicsQueryEntIntePropService.do",
-    "qycxjf_info": "/ELLM.ELLM-OFFICE.V-1.0/eicsQueryQycxjfzsjPatent.do",
-    "yq_info": "/ELLM.ELLM-OFFICE.V-1.0/eicsGetZsyqInfoList.do",
-    "yq_info_detail": "/ELLM.ELLM-OFFICE.V-1.0/eicsGetZsyqInfoDetail.do",
-    "zg_credit_info": "/ELLM.ELLM-OFFICE.V-1.0/eicsSearchXyzgCreditInfo.do",
+    "enterprise_detail": "/EUVD.EUVD-JXCHAT.V-1.0/gsEntDetailTool.do",
+    "shell_company": "/EUVD.EUVD-JXCHAT.V-1.0/eicsHDShellCompanyDataTool.do",
+    "litigation": "/EUVD.EUVD-JXCHAT.V-1.0/eicsHighLawOutCaseInfoTool.do",
+    "hd_enterprise": "/EUVD.EUVD-JXCHAT.V-1.0/eicsQueryHDEnterpriseListFree.do",
+    "intel_info": "/EUVD.EUVD-JXCHAT.V-1.0/eicsQueryEntIntePropService.do",
+    "qycxjf_info": "/EUVD.EUVD-JXCHAT.V-1.0/eicsQueryQycxjfzsjPatent.do",
+    "yq_info": "/EUVD.EUVD-JXCHAT.V-1.0/eicsGetZsyqInfoList.do",
+    "yq_info_detail": "/EUVD.EUVD-JXCHAT.V-1.0/eicsGetZsyqInfoDetail.do",
+    "zg_credit_info": "/EUVD.EUVD-JXCHAT.V-1.0/eicsSearchXyzgCreditInfo.do",
 }
 
 # 舆情查询需要额外携带的情感参数（原逻辑）
