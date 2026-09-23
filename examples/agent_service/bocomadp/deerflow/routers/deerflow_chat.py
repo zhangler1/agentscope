@@ -14,7 +14,10 @@
 
 - thread_id == session_id（同一资源）；run_id 由 RunManager 预生成，
   ``Content-Location`` 头可提前填充。
-- 并发 409 复用 ``ChatRunRegistry.spawn`` + 分布式锁；cancel 映射原生
+- 并发默认 interrupt：新请求打断旧 run 并等待其结束（记账先落定
+  INTERRUPTED + 原生 interrupt 广播 + 本进程旧 task 完成），旧 run 的
+  join 流收到 end 哨兵自行断开；打断失败/超时等兜底场景仍由 409 表达
+  （复用 ``ChatRunRegistry.spawn`` + 分布式锁）；cancel 映射原生
   ``ChatService.interrupt``（一个 session 至多一个 run，run 级 == session 级）。
 - 断线默认 ``on_disconnect=cancel``：检测到断线后调用原生 interrupt，
   停止后台任务不再消耗模型额度；``continue`` 时仅断开订阅，run 继续。
@@ -363,7 +366,8 @@ class CreateRunRequest(BaseModel):
     )
     multitask_strategy: str = Field(
         default="reject",
-        description="接受但忽略：恒为 reject（409 语义由原生注册表保证）。",
+        description="接受但忽略：恒为 interrupt（新请求自动打断旧 run，"
+        "打断失败/超时等兜底场景仍返回 409）。",
     )
     on_disconnect: Literal["cancel", "continue"] = Field(
         default="cancel",
@@ -1247,7 +1251,65 @@ async def _build_user_confirm_event(
     )
 
 
-def _spawn_run(
+# 打断旧 run 后等待其结束的超时（秒）：interrupt 广播 → 旧 task 的
+# CancelledError 清理释放 session 分布式锁通常毫秒级；超时仅记日志、
+# 不阻断新 run（真撞锁时由下方 409 兜底表达）。
+_INTERRUPT_WAIT_TIMEOUT = 30.0
+
+
+async def _interrupt_active_run(
+    run_manager: RunManager,
+    chat_run_registry: ChatRunRegistry,
+    chat_service: ChatService,
+    user_id: str,
+    session_id: str,
+    new_agent_id: str,
+) -> None:
+    """打断 session 当前活跃 run 并等待其结束（新请求优先语义）。
+
+    旧 run 记账先落定 INTERRUPTED（与 cancel 端点同款，done 回调不
+    覆盖），随后原生 interrupt（幂等：运行中 → 广播取消旧 task；已
+    结束 → LookupError 吞掉）。最后等待本进程可见的旧 task 完成——
+    其清理释放 session 分布式锁后新 run 才能接管；跨进程场景旧 task
+    不在本进程，由新 run 内部 ``acquire_lock`` 阻塞排队兜底。旧 run
+    的 join 流收到 REPLY_END(INTERRUPTED) 翻译的 end 哨兵后自行断开。
+    """
+    old_run_id = run_manager.active_run_id(session_id)
+    old_record = run_manager.get(old_run_id) if old_run_id else None
+    if old_record is not None:
+        run_manager.mark_finished(old_run_id, RunStatus.INTERRUPTED)
+        logger.info(
+            "deerflow: interrupting active run %s (session=%s) "
+            "for new run.",
+            old_run_id,
+            session_id,
+        )
+    try:
+        await chat_service.interrupt(
+            user_id,
+            session_id,
+            old_record.agent_id if old_record is not None else new_agent_id,
+        )
+    except LookupError:
+        # run 已完成、session 已清理时的正常情形，不必告警
+        pass
+    old_task = chat_run_registry.get(session_id)
+    if old_task is not None and not old_task.done():
+        done, _ = await asyncio.wait(
+            {old_task},
+            timeout=_INTERRUPT_WAIT_TIMEOUT,
+        )
+        if not done:
+            logger.warning(
+                "deerflow: old run %s (session=%s) not finished "
+                "after %ss; spawning new run anyway.",
+                old_run_id,
+                session_id,
+                _INTERRUPT_WAIT_TIMEOUT,
+            )
+
+
+async def _spawn_run(
     run_manager: RunManager,
     chat_run_registry: ChatRunRegistry,
     chat_service: ChatService,
@@ -1256,7 +1318,12 @@ def _spawn_run(
     agent_id: str,
     input_msg: Any,
 ) -> tuple[RunRecord, asyncio.Task]:
-    """RunManager 记账 + 原生注册表 spawn；任何冲突 → 409。"""
+    """RunManager 记账 + 原生注册表 spawn。
+
+    新请求优先（恒 interrupt 语义）：session 已有活跃 run 时先打断
+    旧 run 并等待其结束，再创建新 run；打断失败/超时等兜底场景仍由
+    409 表达（原 reject 语义保留为冲突兜底）。
+    """
     try:
         record = run_manager.create_or_reject(
             user_id,
@@ -1265,10 +1332,31 @@ def _spawn_run(
             native_registry=chat_run_registry,
         )
     except RuntimeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        ) from e
+        logger.info(
+            "deerflow: session %s busy (%s); interrupting active run.",
+            session_id,
+            e,
+        )
+        await _interrupt_active_run(
+            run_manager,
+            chat_run_registry,
+            chat_service,
+            user_id,
+            session_id,
+            agent_id,
+        )
+        try:
+            record = run_manager.create_or_reject(
+                user_id,
+                session_id,
+                agent_id,
+                native_registry=chat_run_registry,
+            )
+        except RuntimeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
 
     try:
         # spawn 前绑定 run_id：asyncio.create_task 复制调用方上下文，
@@ -1749,7 +1837,7 @@ async def create_run_stream(
     rc_token = set_run_context(resolved_run_context)
     auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
-        record, _task = _spawn_run(
+        record, _task = await _spawn_run(
             run_manager,
             chat_run_registry,
             chat_service,
@@ -1866,7 +1954,7 @@ async def create_run_wait(
     rc_token = set_run_context(resolved_run_context)
     auth_tokens = await _set_run_auth_contexts(session_id, resolved_params)
     try:
-        record, task = _spawn_run(
+        record, task = await _spawn_run(
             run_manager,
             chat_run_registry,
             chat_service,
