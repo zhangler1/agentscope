@@ -27,6 +27,12 @@ from .cross_search import cross_search_tool  # 已是 FunctionTool 实例（带�
 from .exchange_rate import exchange_rate_tool
 from .interest_rate import interest_rate_tool
 from .online_search import online_search_tool
+from .personal_knowledge_request import (
+    _current_agent_id as _pk_request_agent_id,
+    _current_session_id as _pk_request_session_id,
+    _current_user_id as _pk_request_user_id,
+)
+from .personal_knowledge_request import personal_knowledge_request_tool
 from .personal_search import personal_search_tool
 from .physical_contact_search import physical_contact_search_tool
 from .raw_request import raw_request_tool
@@ -50,6 +56,7 @@ _ENTERPRISE_NAME_PAIRS: tuple[tuple[str, str], ...] = (
     ("混合搜索", "cross_search"),
     ("行内搜索", "vector_search"),
     ("个人知识库搜索", "personal_search"),
+    ("个人知识库全文检索", "personal_knowledge_request"),
     ("联网搜索", "online_search"),
 )
 
@@ -156,6 +163,7 @@ _AGENT_SPECIFIC_CANONICAL: frozenset[str] = frozenset(
         "interest_rate",
         "vector_search",
         "personal_search",
+        "personal_knowledge_request",
         "online_search",
     },
 )
@@ -172,7 +180,8 @@ async def build_enterprise_tools(
 
     **智能体专用工具**（受 ``usableTools`` 请求级开关控制）：
     contact_search / physical_contact_search / raw_request / exchange_rate /
-    interest_rate / vector_search / personal_search / online_search。
+    interest_rate / vector_search / personal_search /
+    personal_knowledge_request / online_search。
     调用方传 ``usableTools`` 才表示要使用，不传则即使 per-agent 白名单
     加了也不可用。
 
@@ -191,6 +200,11 @@ async def build_enterprise_tools(
     - ``personal_search_switch`` 显式 ``True`` 且 ``tools_param`` 的
       ``personalKnowledgeSearch`` 空间参数（psnlSpaceCodeId /
       psnlCategoryIdList）齐备 → 构建个人知识库搜索工具（personal_search）。
+    - ``personal_knowledge_request``（个人知识库全文检索：文档列表查询 /
+      文件链接获取 + 下载到会话 uploads 目录）无条件构建，可用性仅由
+      ``usableTools`` 控制；分类参数
+      （``tools_param.personalKnowledgeSearch.psnlCategoryIdList``）缺失时
+      调用返回明确错误（与 ``personal_search_switch`` 无关）。
 
     本函数在 run 任务内由框架 AgentToolFactory 调用，custom_params
     ContextVar 已随 ``asyncio.create_task`` 复制进来，可直接读取。
@@ -204,6 +218,12 @@ async def build_enterprise_tools(
     _cross_search_agent_id.set(agent_id)
     universal_tools.append(cross_search_tool)
     universal_tools.append(read_tool_result_tool)
+
+    # 个人知识库全文检索：下载文件需要 user/agent/session 三元组定位会话
+    # uploads 目录（download_urls_to_session），此处注入（对齐 cross_search）。
+    _pk_request_user_id.set(user_id)
+    _pk_request_agent_id.set(agent_id)
+    _pk_request_session_id.set(session_id)
 
     # ── 智能体专用工具（受 usableTools 请求级开关控制） ──
     specific_tools: list[ToolBase] = [
@@ -249,6 +269,10 @@ async def build_enterprise_tools(
             "session=%s)",
             session_id,
         )
+
+    # 个人知识库全文检索：无条件构建（可用性由 usableTools 过滤控制，
+    # 分类参数缺失时工具调用返回明确错误，见工具文件）。
+    specific_tools.append(personal_knowledge_request_tool)
 
     # usableTools 请求级过滤（只作用于智能体专用工具）：
     # - 缺失 / None / 非数组 / 空数组 → 专用工具全部不挂载；

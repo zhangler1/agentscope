@@ -237,6 +237,39 @@ def _filename_from_url(url: str) -> str:
     return name if name and name not in {".", ".."} else "downloaded"
 
 
+# ---------------------------------------------------------------------------
+# 工具层依赖注入（run 任务内无 FastAPI Depends，工具须经本入口复用
+# download_urls_to_session 下载文件到会话 uploads 目录）
+# ---------------------------------------------------------------------------
+_upload_deps_storage: StorageBase | None = None
+_upload_deps_workspace_manager: WorkspaceManagerBase | None = None
+
+
+def set_upload_dependencies(
+    storage: StorageBase,
+    workspace_manager: WorkspaceManagerBase,
+) -> None:
+    """注册全局 storage / workspace_manager（main.py 启动时调用一次）。"""
+    global _upload_deps_storage, _upload_deps_workspace_manager
+    _upload_deps_storage = storage
+    _upload_deps_workspace_manager = workspace_manager
+
+
+def get_upload_dependencies() -> tuple[StorageBase, WorkspaceManagerBase]:
+    """读取已注册的 ``(storage, workspace_manager)``。
+
+    Raises:
+        RuntimeError: 尚未注册（main.py 启动序列未执行 / 测试环境未注入）。
+    """
+    if _upload_deps_storage is None or _upload_deps_workspace_manager is None:
+        raise RuntimeError(
+            "upload dependencies not registered; call "
+            "set_upload_dependencies(storage, workspace_manager) "
+            "at startup (main.py)"
+        )
+    return _upload_deps_storage, _upload_deps_workspace_manager
+
+
 async def download_urls_to_session(
     user_id: str,
     agent_id: str,

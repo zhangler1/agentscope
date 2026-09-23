@@ -18,6 +18,7 @@ from .contact_search import contact_search_tool
 from .cross_search import cross_search_tool
 from .exchange_rate import exchange_rate_tool
 from .interest_rate import interest_rate_tool
+from .personal_knowledge_request import personal_knowledge_request_tool
 from .personal_search import personal_search_tool
 from .physical_contact_search import physical_contact_search_tool
 from .raw_request import raw_request_tool
@@ -38,6 +39,7 @@ _ENTERPRISE_TOOLS: tuple = (
     cross_search_tool,
     vector_search_tool,
     personal_search_tool,
+    personal_knowledge_request_tool,
 )
 
 
