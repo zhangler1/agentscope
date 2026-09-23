@@ -948,6 +948,12 @@ async def _lifespan_with_builtin_agents(app):
     async with _original_lifespan(app):
         # 恢复持久化的工具白名单（内存存储重启会丢）
         load_tool_whitelists()
+        # 市场审批人白名单（JSON 文件持久化 + 接口管理，末位保护：
+        # 名单不可清空）——文件缺失时用 SEED_REVIEWERS 种子名单首次
+        # 播种，之后文件即唯一真相源。
+        from bocomadp import market_reviewers
+
+        market_reviewers.load_whitelist()
         # 专家团关系表（expert_team_relations）——团队档案从 AgentData
         # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
         # 必须早于下面所有读团队档案的补丁挂载。
@@ -959,6 +965,11 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import market_store
 
         await market_store.ensure_market_tables(storage)
+        # 发布审批表（agent_market_review）——发布走审批流，approve 后
+        # 才插 agent_market 名单行（一智能体一记录，upsert 覆盖）。
+        from bocomadp import market_review_store
+
+        await market_review_store.ensure_review_tables(storage)
         # 智能体模板名单表（agent_template）——"可复制模板"白名单：
         # 只有名单内且 enabled=true 的智能体允许被 POST /agent/{id}/copy。
         # 与市场表同一套自建表模式：启动幂等建表（create_all），无迁移。
