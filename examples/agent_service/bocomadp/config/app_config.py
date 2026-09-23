@@ -48,6 +48,7 @@ _BUSINESS_KEYS: frozenset[str] = frozenset(
         "cross_search",
         "online_search",
         "personal_search",
+        "personal_knowledge_request",
         "physical_contact_search",
         "vector_search",
         "raw_request",
