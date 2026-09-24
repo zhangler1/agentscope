@@ -122,6 +122,33 @@ class UpdateAgentRequest(BaseModel):
     )
 
 
+class PublishInfoView(BaseModel):
+    """发布档案（用户点发布时填的表单原值）。
+
+    挂在 ``TeamAgentView.publish_info`` 下，**包成对象**而不是摊平成
+    顶层字段：``data.description`` 是"智能体简介"（智能体本体的
+    AgentData 字段），本模型的 ``description`` 是"发布说明"（发布弹窗
+    填的那栏）——两者同名不同义，放进各自的容器里就不会撞车。
+    """
+
+    department: str = Field(
+        default="",
+        description="所属部门（发布弹窗填写的原值；未发布过为空串）。",
+    )
+    system_name: str = Field(
+        default="",
+        description="所属系统（发布弹窗填写的原值；未发布过为空串）。",
+    )
+    tag: str = Field(
+        default="",
+        description="业务条线（发布时选择，即市场标签；未发布过为空串）。",
+    )
+    description: str = Field(
+        default="",
+        description="发布说明（发布弹窗填写的用途介绍）；未发布过为空串。",
+    )
+
+
 class TeamAgentView(AgentView):
     """Agent view re-deriving the expert-team fields.
 
@@ -137,6 +164,47 @@ class TeamAgentView(AgentView):
     # list was queried with ``parent_agent_id`` — mirrors the historical
     # framework ``AgentView`` contract.
     is_self_built: bool | None = None
+    # 发布/审批状态（列表接口批量附带，与 GET /agent/owned 的
+    # OwnedAgentView.publish_status 同口径）。
+    publish_status: str = Field(
+        default="not_submitted",
+        description=(
+            "发布/审批状态：not_submitted（未发布/待发布）/ pending"
+            "（待审核）/ approved（已通过，= 已在市场）/ rejected"
+            "（已驳回）。已在市场的智能体（含平台内置手动上架）恒为"
+            " approved。"
+        ),
+    )
+    publish_info: PublishInfoView = Field(
+        default_factory=PublishInfoView,
+        description=(
+            "发布档案（用户点发布时填的表单原值）：department / "
+            "system_name / tag / description，供前端回显发布弹窗"
+            "（已驳回重新发布时省得重填）。无档案（not_submitted）时"
+            "四项皆为空串。**包成对象**是为了和 data.description"
+            "（智能体简介）区分开，两者同名的 description 含义不同。"
+        ),
+    )
+    review_reason: str | None = Field(
+        default=None,
+        description=(
+            "审批结论（审批人写的那段话，已办结就有值）：publish_status"
+            "=rejected 时是**驳回理由**、=approved 时是**审批意见**"
+            "（通过时没写意见则为空串）；pending / not_submitted 为 "
+            "null。**前端按 publish_status 决定这栏显示什么文案**。"
+        ),
+    )
+    reviewer: str = Field(
+        default="",
+        description=(
+            "审批人 user_id。未提交过发布（not_submitted）或审批记录"
+            "已随下架清除时为空串。"
+        ),
+    )
+    reviewed_at: datetime | None = Field(
+        default=None,
+        description="审批时间（ISO 8601）；未审批为 null。",
+    )
 
 
 class CopyAgentResponse(TeamAgentView):
@@ -208,6 +276,43 @@ class OwnedAgentView(BaseModel):
     )
     created_at: datetime | None = Field(default=None, description="创建时间。")
     updated_at: datetime | None = Field(default=None, description="最后更新时间。")
+    publish_status: str = Field(
+        default="not_submitted",
+        description=(
+            "发布/审批状态：not_submitted（从未提交）/ pending（审核中）"
+            "/ approved（已上架市场）/ rejected（已拒绝）。已在市场的"
+            "智能体（含平台内置手动上架）恒为 approved。"
+        ),
+    )
+    publish_info: PublishInfoView = Field(
+        default_factory=PublishInfoView,
+        description=(
+            "发布档案（用户点发布时填的表单原值）：department / "
+            "system_name / tag / description，供前端回显发布弹窗"
+            "（已驳回重新发布时省得重填）。无档案（not_submitted）时"
+            "四项皆为空串。与 GET /agent/ 的同名字段同口径。"
+        ),
+    )
+    reviewer: str = Field(
+        default="",
+        description=(
+            "审批人 user_id；未提交过发布、或审批记录已随下架清除时为"
+            "空串。与 GET /agent/ 的同名字段同口径。"
+        ),
+    )
+    reviewed_at: datetime | None = Field(
+        default=None,
+        description="审批时间（ISO 8601）；未审批为 null。",
+    )
+    review_reason: str | None = Field(
+        default=None,
+        description=(
+            "审批结论（审批人写的那段话，已办结就有值）：publish_status"
+            "=rejected 时是**驳回理由**、=approved 时是**审批意见**"
+            "（通过时没写意见则为空串）；pending / not_submitted 为 "
+            "null。**前端按 publish_status 决定这栏显示什么文案**。"
+        ),
+    )
 
 
 class ListOwnedAgentsResponse(BaseModel):
