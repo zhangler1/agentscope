@@ -110,6 +110,10 @@ from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 from bocomadp.tool_catalog import AGENT_CREATOR_ID
 from bocomadp.deerflow.model_patch import patch_get_model
+# 会话默认权限模式：给原生 POST /sessions/ 前插包裹路由（一处配置生效）
+from bocomadp.session_default_mode import (
+    install_create_session_default_mode,
+)
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
     agent_router as _framework_agent_router,
@@ -1099,6 +1103,11 @@ app.include_router(agent_router)
 # （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
 # _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
 memory_module.install_memory(app)
+# 会话默认权限模式（create_app 之后、/api 子应用挂载之前）：
+# 原生 POST /sessions/ 与 bocomadp POST /sessions/create 统一取
+# config.yaml 的 default_permission_mode（显式传入时以显式值为准），
+# 见 bocomadp/session_default_mode.py。
+install_create_session_default_mode(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
