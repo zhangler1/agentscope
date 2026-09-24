@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -188,6 +190,69 @@ async def _install_skill_archive(
         archive.format,
         name,
     )
+
+
+@asynccontextmanager
+async def _pool_activity_guard(workspace: Any) -> AsyncIterator[None]:
+    """安装期间把 workspace 标记为"使用中"（池 Pod 回收的护盾）。
+
+    池模式（``SharedPvcK8sWorkspace``）的 sweeper 每 ``sweep_interval``
+    扫一轮：全池最后活跃时间超 ``pool_idle_ttl`` 就回收 Pod（PVC 保留），
+    框架的缓存 TTL 到期也会回收。活跃信号有两处——``set_run_active``
+    （本进程 ``_pool_busy`` 据此跳过空闲回收）与 ``refresh_active``
+    （写 Pod 的 last-active annotation，K8s 侧全局一致，多实例也认）；
+    此前只有 agent run 经 ``SlotReleaseMiddleware`` 设置，**技能安装这类
+    非 run 的写操作完全没有保护** → 安装中途 Pod 被回收，下一条 exec 报
+    ``500, message='Invalid response status'``（命令根本没跑）。
+
+    本地 / 按需模式的 workspace 没有这两个方法 → 自动降级为 no-op；
+    两个调用都是"尽力而为"，失败只打 warning，绝不影响安装本身。
+
+    Args:
+        workspace (`Any`):
+            已解析的会话工作区（通常是被 ``_WhitelistWorkspaceProxy``
+            包了一层的真实 workspace，``__getattr__`` 会透传这两个方法）。
+    """
+    set_active = getattr(workspace, "set_run_active", None)
+    refresh = getattr(workspace, "refresh_active", None)
+
+    if set_active is not None:
+        try:
+            set_active(True)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "skill install: set_run_active(True) failed",
+                exc_info=True,
+            )
+    if refresh is not None:
+        try:
+            await refresh()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "skill install: refresh_active failed",
+                exc_info=True,
+            )
+    try:
+        yield
+    finally:
+        # 顺序与 SlotReleaseMiddleware 一致：先刷活跃（空闲计时从"结束"
+        # 重新起算），再清 busy 标记。
+        if refresh is not None:
+            try:
+                await refresh()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "skill install: refresh_active (release) failed",
+                    exc_info=True,
+                )
+        if set_active is not None:
+            try:
+                set_active(False)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "skill install: set_run_active(False) failed",
+                    exc_info=True,
+                )
 
 
 async def _ensure_skills(
@@ -1091,11 +1156,14 @@ async def enable_agent_skill(
             detail=f"Skill '{skill_name}' not found on the remote skillhub.",
         ) from None
     try:
-        await workspace.add_skill_archive(
-            archive.stream,
-            archive.format,
-            skill_name,
-        )
+        # 安装期间置"使用中"：否则 sweeper 可能把正在写的池 Pod 当空闲
+        # 回收，下一条 exec 被 apiserver 拒 → 500 Invalid response status。
+        async with _pool_activity_guard(workspace):
+            await workspace.add_skill_archive(
+                archive.stream,
+                archive.format,
+                skill_name,
+            )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1201,11 +1269,13 @@ async def enable_bocom_skill(
             detail=f"Skill '{skill_name}' not found on the Bocom skillhub.",
         ) from None
     try:
-        await workspace.add_skill_archive(
-            archive.stream,
-            archive.format,
-            skill_name,
-        )
+        # 同 /skill/download/{namespace}:{name}：安装期间不许 sweeper 回收池 Pod。
+        async with _pool_activity_guard(workspace):
+            await workspace.add_skill_archive(
+                archive.stream,
+                archive.format,
+                skill_name,
+            )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1285,6 +1355,10 @@ async def ensure_agent_skills(
     - **单点失败不报错**：远端 404 / 沙箱不可用 / 解压出无效 SKILL.md
       只写 warning 日志，其余项照装（响应里看不到失败明细——要保持与查询
       接口同形；需要明细就调 ``GET /workspace/skill`` 自行比对）；
+    - **安装期间不被回收**：整段补装过程给 workspace 打"使用中"标记
+      （池模式 ``set_run_active`` + ``refresh_active``，见
+      :func:`_pool_activity_guard`），避免 sweeper 把正在写的池 Pod 当
+      空闲回收；
     - 引用格式非法（缺 ``namespace``、含 ``/`` 或 ``..``）→ **422**
       （模型层校验），不会进沙箱。
 
@@ -1327,13 +1401,17 @@ async def ensure_agent_skills(
         storage,
         workspace_manager,
     )
-    return await _ensure_skills(
-        workspace,
-        body.skills,
-        hubs,
-        oa,
-        guwp_token,
-    )
+    # 整个补装过程置"使用中"：技能安装不是 agent run，没有
+    # SlotReleaseMiddleware 那层保护，否则 sweeper 可能中途回收池 Pod
+    # （表现为某几个技能 failed、exec 报 500 Invalid response status）。
+    async with _pool_activity_guard(workspace):
+        return await _ensure_skills(
+            workspace,
+            body.skills,
+            hubs,
+            oa,
+            guwp_token,
+        )
 
 
 __all__ = ["skill_router"]
