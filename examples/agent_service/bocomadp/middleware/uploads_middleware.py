@@ -115,9 +115,10 @@ class UploadsMiddleware(MiddlewareBase):
         if not blocks:
             return
         usage_hint = (
-            "\n\n提示：上传文件位于 user-data/uploads/ 目录下。"
-            "可用 Bash(ls user-data/uploads/) 列出文件，"
-            "用 Read 工具读取文本文件或同名 .md（转换后的文档）；"
+            "\n\n提示：上传文件位于工作目录下的 user-data/uploads/ 目录。"
+            "沙箱内请用相对该目录的路径读取：Bash 用 ls user-data/uploads/ "
+            "列出文件；Glob 用 path=user-data/uploads；Read 需绝对路径，"
+            "请用你的工作目录拼接（user-data/uploads/xxx 相对工作目录）。"
             "图片文件请调用 "
             "view_image_tool(virtual_path=..., question=用户的问题)。"
         )
@@ -219,8 +220,8 @@ class UploadsMiddleware(MiddlewareBase):
                 logger.warning("skip file (metadata miss): %s (%s)", virtual_path, e)
                 return (
                     f"- 文件: {filename}\n"
-                    f"  虚拟路径: {virtual_path}\n"
-                    f"  (暂无可预览文本，请使用工具读取原始文件)"
+                    f"  沙箱路径: user-data/uploads/{stored_name or filename}\n"
+                    f"  (暂无可预览文本，请使用 Read/Bash/Glob 读取该文件)"
                 )
 
         # 调用方传的原始文件名与落盘文件名不一致（源平台把文档导出为
@@ -234,15 +235,17 @@ class UploadsMiddleware(MiddlewareBase):
         ):
             name_note = (
                 f"\n  (原始文件名: {record.original_name}；会话内实际文件为 "
-                f"{record.stored_name}，读取请使用实际文件名)"
+                f"user-data/uploads/{record.stored_name}，读取请使用实际文件名)"
             )
 
         if record and record.is_image:
             # 图片：上传时已固化为 base64（view_image_tool 从元数据直读），
-            # 正文不可内联预览，提示 Agent 调用图片解析工具。
+            # 正文不可内联预览，提示 Agent 调用图片解析工具。图片不落沙箱
+            # 可读文件，故只给 view_image_tool 的参数 virtual_path（协议
+            # 路径，仅该工具可用，勿传给 Read/Bash/Glob）。
             return (
                 f"- 文件: {filename} [图片]\n"
-                f"  虚拟路径: {virtual_path}\n"
+                f"  view_image_tool 参数 virtual_path: {virtual_path}\n"
                 f"  (图片内容不可内联预览；如需解析图片，请调用 "
                 f"view_image_tool 并传入上述 virtual_path 与用户的问题)"
                 f"{name_note}"
@@ -253,16 +256,16 @@ class UploadsMiddleware(MiddlewareBase):
             if outline:
                 return (
                     f"- 文件: {filename}\n"
-                    f"  虚拟路径: {virtual_path}\n"
+                    f"  沙箱路径: user-data/uploads/{stored_name}\n"
                     f"  大纲/预览:\n{outline}\n"
-                    f"  (如需全文，请使用 Read/Bash 工具读取 user-data/uploads/ 下的原始文件或同名 .md)"
+                    f"  (如需全文，请用 Read/Bash 读取沙箱路径下的原始文件或同名 .md)"
                     f"{name_note}"
                 )
-        # 无 .md 时仅给文件名 + 路径引用
+        # 无 .md 时仅给文件名 + 沙箱相对路径引用
         return (
             f"- 文件: {filename}\n"
-            f"  虚拟路径: {virtual_path}\n"
-            f"  (暂无可预览文本，请使用工具读取原始文件)"
+            f"  沙箱路径: user-data/uploads/{stored_name}\n"
+            f"  (暂无可预览文本，请使用 Read/Bash/Glob 读取该文件)"
             f"{name_note}"
         )
 
