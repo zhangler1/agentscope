@@ -2,19 +2,24 @@
 """UploadsMiddleware —— 将上传文件以「大纲 + 虚拟路径引用」注入 human 消息。
 
 对应 deer-flow 的 UploadsMiddleware（基于 HumanInputMiddleware）。
-本框架使用 AgentScope 的 ``MiddlewareBase.on_reply`` 洋葱钩子，
-通过覆写 ``on_reply`` 在消息进入 LLM 前改写 ``input_kwargs["messages"]``。
+本框架使用 AgentScope 的 ``MiddlewareBase.on_model_call`` 钩子：框架三个
+洋葱钩子中只有 ``on_model_call`` 的 ``input_kwargs`` 携带 ``messages``
+（on_reply 传 ``inputs``、on_reasoning 传 ``tool_choice``），注入因此挂在
+on_model_call——真实模型调用前的最后一环改写 ``input_kwargs["messages"]``，
+且注入只作用于本次调用快照、不污染 ``agent.state.context``。
 
 注入策略（对照 Plan 第 4 节，已修正为 outline + 引用，而非内联全文）：
-- 从 ``message.additional_kwargs["files"]`` 取出文件列表；
-- 优先用转换后的同名 ``.md`` 生成 outline（file_outline.create_outline）；
+- 从最后一条 human 消息的 ``metadata.files``（或旧版 additional_kwargs）
+  取出文件列表；
+- 优先用 uploads DB 固化的 markdown 生成 outline
+  （file_outline.create_outline_text）；
 - 用 ``<context name="files">`` 包裹大纲 + 虚拟路径引用；
 - 无 ``.md`` 时仅注入文件名 + 虚拟路径引用（Agent 用工具读原始文件）。
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 try:
     from bocomadp.middleware.agent_middleware import MiddlewareBase
@@ -25,6 +30,9 @@ except Exception:  # pragma: no cover - agentscope 不可用时降级（如纯�
         async def on_reply(self, agent, input_kwargs, next_handler):
             async for event in next_handler():
                 yield event
+
+        async def on_model_call(self, agent, input_kwargs, next_handler):
+            return await next_handler()
 
 from bocomadp.uploads.db import get_uploads_db
 try:
@@ -41,23 +49,50 @@ logger = logging.getLogger(__name__)
 class UploadsMiddleware(MiddlewareBase):
     """人类输入中间件：把上传文件作为上下文注入。"""
 
-    async def on_reply(
+    async def on_model_call(
         self,
         agent: Any,
         input_kwargs: dict,
-        next_handler: AsyncGenerator,
-    ) -> AsyncGenerator:
-        messages = input_kwargs.get("messages")
-        if not messages:
-            async for event in next_handler():
-                yield event
-            return
+        next_handler: Callable[..., Awaitable[Any]],
+    ) -> Any:
+        """``on_model_call`` 钩子：注入文件上下文 + 透传模型调用。
 
-        # 取最后一条 human 消息中的 files 元数据
-        files = self._extract_files(messages)
+        注意：本钩子是 **async 函数**（**不能 yield**），框架用
+        ``await mw.on_model_call(...)`` 接收返回值——对齐
+        EventLogMiddleware 的实现形态；流式模型返回 AsyncGenerator，
+        需内嵌 wrapper 透传。
+        """
+        messages = input_kwargs.get("messages")
+        if messages:
+            self._inject_files_context(agent, messages)
+
+        result = await next_handler()
+        if hasattr(result, "__aiter__"):
+
+            async def _wrapped() -> AsyncGenerator[Any, None]:
+                async for chunk in result:
+                    yield chunk
+
+            return _wrapped()
+        return result
+
+    # ------------------------------------------------------------------
+    # 内部辅助
+    # ------------------------------------------------------------------
+    def _inject_files_context(self, agent: Any, messages: list) -> None:
+        """从最后一条 human 消息提取 files 元数据并注入 ``<context name="files">``。
+
+        注入在消息副本上进行（messages 是 ``_prepare_model_input`` 组装的
+        本次调用快照），替换 messages 列表中的引用；随后消费原消息的 files
+        元数据保证幂等（同一 run 内多轮工具循环的后续 model call 不会重复
+        注入同一批文件）。
+        """
+        found = self._find_last_human(messages)
+        if found is None:
+            return
+        _, human_msg = found
+        files = self._files_from_msg(human_msg)
         if not files:
-            async for event in next_handler():
-                yield event
             return
 
         # 优先从 agent.state 取当前会话上下文（方案 A 下虚拟路径不再编码
@@ -77,42 +112,72 @@ class UploadsMiddleware(MiddlewareBase):
             if block:
                 blocks.append(block)
 
-        if blocks:
-            usage_hint = (
-                "\n\n提示：上传文件位于 user-data/uploads/ 目录下。"
-                "可用 Bash(ls user-data/uploads/) 列出文件，"
-                "用 Read 工具读取文本文件或同名 .md（转换后的文档）；"
-                "图片文件请调用 "
-                "view_image_tool(virtual_path=..., question=用户的问题)。"
-            )
-            injection = (
-                "<context name=\"files\">\n"
-                + "\n\n".join(blocks)
-                + usage_hint
-                + "\n</context>"
-            )
-            self._append_to_last_human(messages, injection)
-            logger.info("UploadsMiddleware injected %d file block(s)", len(blocks))
+        if not blocks:
+            return
+        usage_hint = (
+            "\n\n提示：上传文件位于 user-data/uploads/ 目录下。"
+            "可用 Bash(ls user-data/uploads/) 列出文件，"
+            "用 Read 工具读取文本文件或同名 .md（转换后的文档）；"
+            "图片文件请调用 "
+            "view_image_tool(virtual_path=..., question=用户的问题)。"
+        )
+        injection = (
+            "<context name=\"files\">\n"
+            + "\n\n".join(blocks)
+            + usage_hint
+            + "\n</context>"
+        )
+        # 幂等：先消费原消息的 files 元数据，同 run 后续 model call 不再
+        # 注入（须在副本化之前：Msg 深拷贝会连带复制 metadata，副本若仍
+        # 携带 files，下一轮 model call 会重复注入）。
+        self._consume_files(human_msg)
+        # 副本注入（替换 messages 引用，不污染 state.context）
+        self._append_to_last_human(messages, injection)
+        logger.info("UploadsMiddleware injected %d file block(s)", len(blocks))
 
-        async for event in next_handler():
-            yield event
-
-    # ------------------------------------------------------------------
-    # 内部辅助
-    # ------------------------------------------------------------------
     @staticmethod
-    def _extract_files(messages: list) -> list[dict]:
-        for msg in reversed(messages):
-            # 兼容对象消息与 dict 消息两种形态；新版 Msg 用 metadata 取代
-            # 旧版 additional_kwargs 承载自定义字段。
-            f = getattr(msg, "additional_kwargs", None)
-            if f is None and isinstance(msg, dict):
-                f = msg.get("additional_kwargs")
-            if f is None:
-                f = getattr(msg, "metadata", None)
-            if isinstance(f, dict) and f.get("files"):
-                return f["files"]
+    def _find_last_human(messages: list) -> tuple[int, Any] | None:
+        """倒序找最后一条 user/human 消息，返回 ``(索引, 消息)``。"""
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if isinstance(msg, dict):
+                role = msg.get("role") or msg.get("name")
+            else:
+                role = getattr(msg, "role", None) or getattr(msg, "name", None)
+            if role in ("user", "human"):
+                return idx, msg
+        return None
+
+    @staticmethod
+    def _files_from_msg(msg: Any) -> list[dict]:
+        """兼容对象消息与 dict 消息两种形态；新版 Msg 用 metadata 取代
+        旧版 additional_kwargs 承载自定义字段。"""
+        f = getattr(msg, "additional_kwargs", None)
+        if f is None and isinstance(msg, dict):
+            f = msg.get("additional_kwargs")
+        if f is None:
+            f = getattr(msg, "metadata", None)
+        if isinstance(f, dict) and f.get("files"):
+            return f["files"]
         return []
+
+    @staticmethod
+    def _consume_files(msg: Any) -> None:
+        """清空消息的 files 元数据（只删 files 键，保留其余字段）。
+
+        ``on_model_call`` 每轮模型调用都触发（工具循环内多轮）；注入后
+        消费 files 元数据，后续 model call 提取不到 files 即不会重复注入。
+        """
+        if isinstance(msg, dict):
+            for key in ("additional_kwargs", "metadata"):
+                holder = msg.get(key)
+                if isinstance(holder, dict) and "files" in holder:
+                    holder.pop("files")
+            return
+        for holder_name in ("additional_kwargs", "metadata"):
+            holder = getattr(msg, holder_name, None)
+            if isinstance(holder, dict) and "files" in holder:
+                holder.pop("files")
 
     @staticmethod
     def _render_file_block(
@@ -203,33 +268,43 @@ class UploadsMiddleware(MiddlewareBase):
 
     @staticmethod
     def _append_to_last_human(messages: list, text: str) -> None:
-        for msg in reversed(messages):
-            role = None
-            if isinstance(msg, dict):
-                role = msg.get("role") or msg.get("name")
-            else:
-                role = getattr(msg, "role", None) or getattr(msg, "name", None)
-            if role in ("user", "human"):
-                if isinstance(msg, dict):
-                    content = msg.get("content")
-                    if isinstance(content, str):
-                        msg["content"] = f"{content}\n\n{text}"
-                    elif isinstance(content, list):
-                        content.append({"type": "text", "text": text})
-                else:
-                    content = getattr(msg, "content", None)
-                    if isinstance(content, str):
-                        msg.content = f"{content}\n\n{text}"
-                    elif isinstance(content, list):
-                        # Msg 对象：content 为 ContentBlock 对象列表（新版），
-                        # 也可能混入 dict（旧版序列化形态），统一追加文本块。
-                        block = (
-                            TextBlock(text=text)
-                            if TextBlock is not None
-                            else {"type": "text", "text": text}
-                        )
-                        content.append(block)
-                return
+        """在最后一条 human 消息的副本上追加文本并替换列表引用。
+
+        messages 是 ``_prepare_model_input`` 组装的本次调用快照（列表
+        新建，元素引用 ``state.context`` 的消息对象）；在副本上追加、
+        替换引用，保证注入不写回 ``agent.state.context``（不持久化）。
+        """
+        found = UploadsMiddleware._find_last_human(messages)
+        if found is None:
+            return
+        idx, msg = found
+        if isinstance(msg, dict):
+            copied = dict(msg)
+            content = copied.get("content")
+            if isinstance(content, str):
+                copied["content"] = f"{content}\n\n{text}"
+            elif isinstance(content, list):
+                copied["content"] = list(content) + [
+                    {"type": "text", "text": text},
+                ]
+        else:
+            try:
+                copied = msg.model_copy(deep=True)
+            except Exception:  # noqa: BLE001 —— 非 pydantic 兜底（原地追加）
+                copied = msg
+            content = getattr(copied, "content", None)
+            if isinstance(content, str):
+                copied.content = f"{content}\n\n{text}"
+            elif isinstance(content, list):
+                # Msg 对象：content 为 ContentBlock 对象列表（新版），
+                # 也可能混入 dict（旧版序列化形态），统一追加文本块。
+                block = (
+                    TextBlock(text=text)
+                    if TextBlock is not None
+                    else {"type": "text", "text": text}
+                )
+                copied.content = list(content) + [block]
+        messages[idx] = copied
 
 
 # 模块级实例：MiddlewareRegistry.load_builtin() 会自动扫描并注册，
