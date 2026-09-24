@@ -29,6 +29,7 @@ from bocomadp.routers._schema.agent import (
     ListAgentsResponse,
     ListOwnedAgentsResponse,
     OwnedAgentView,
+    PublishInfoView,
     CreateAgentRequest,
     CreateAgentResponse,
     CopyAgentRequest,
@@ -161,6 +162,99 @@ async def get_agent_schema_v2() -> AgentSchemaV2Response:
     return AgentSchemaV2Response(schema=schema)
 
 
+async def _attach_publish_status(
+    storage: StorageBase,
+    items: list[TeamAgentView],
+) -> None:
+    """批量给视图附上发布/审批状态（in-place）。
+
+    与 ``GET /agent/owned`` 的 ``publish_status`` 同口径（两步小查询，
+    不逐条查）：
+
+    - 已在市场（``agent_market`` 有行，含平台内置手动上架）→ approved；
+    - 有审批记录 → pending / rejected（审批结论走同项的 ``review_reason``）；
+    - 都没有 → 保持默认 not_submitted（未发布/待发布）。
+
+    同时回显**发布档案四件套**（department / system_name / tag /
+    description）：用户点发布时填的表单原值，前端在"已驳回重新发布"
+    时直接回填弹窗，省得重填。口径：**有档案就带**
+    ——approved 取市场行（上架即定格），pending/rejected 取审批记录，
+    not_submitted 保持空串。数据来源都是本函数已有的两次批量查询，
+    **不新增查询次数**。
+
+    同时附带**审批明细**（review_reason / reviewer / reviewed_at）：
+    前端不用再单查发布状态接口，一次列表请求即可渲染状态角标、驳回
+    理由与"谁在什么时候审的"。口径同"有档案就带"：审批记录存在就带，
+    下架后记录已清除则回落空值。数据同样来自已有的两次批量查询，
+    **不新增查询次数**。
+
+    调用方：``GET /agent/``（分页后的当前页批量附带）与
+    ``_to_team_view``（PATCH 单条返回附带）。
+    """
+    if not items:
+        return
+    from bocomadp.market_review_store import STATUS_APPROVED, STATUS_REJECTED
+    from bocomadp.market_review_store import review_status_map
+    from bocomadp.market_store import list_market_entries
+
+    ids = [item.id for item in items]
+    status_map = await review_status_map(storage, ids)
+    market_map = {
+        e.agent_id: e
+        for e in await list_market_entries(storage)
+        if e.agent_id in set(ids)
+    }
+    for item in items:
+        review = status_map.get(item.id)
+        entry = market_map.get(item.id)
+        if entry is not None:
+            item.publish_status = STATUS_APPROVED
+            _fill_publish_archive(
+                item,
+                entry.department,
+                entry.system_name,
+                entry.tag,
+                entry.description,
+            )
+        elif review is None:
+            continue  # 默认 not_submitted（schema 默认值）
+        else:
+            item.publish_status = review.status
+            _fill_publish_archive(
+                item,
+                review.department,
+                review.system_name,
+                review.tag,
+                review.description,
+            )
+        if review is None:
+            continue
+        if review.status in (STATUS_APPROVED, STATUS_REJECTED):
+            item.review_reason = review.reason
+        item.reviewer = review.reviewer
+        item.reviewed_at = review.reviewed_at
+
+
+def _fill_publish_archive(
+    item: TeamAgentView | OwnedAgentView,
+    department: str,
+    system_name: str,
+    tag: str,
+    description: str,
+) -> None:
+    """把发布档案四件套写进 ``item.publish_info``（空值兜底空串，回显用）。
+
+    包在 ``publish_info`` 对象里而不是摊平到顶层：``data.description``
+    是"智能体简介"，这里的 ``description`` 是"发布说明"，同名不同义。
+    """
+    item.publish_info = PublishInfoView(
+        department=department or "",
+        system_name=system_name or "",
+        tag=tag or "",
+        description=description or "",
+    )
+
+
 @agent_router.get(
     "/",
     response_model=ListAgentsResponse,
@@ -277,6 +371,8 @@ async def list_agents(
     # （多出 is_team / parent_agent_id / is_self_built 三个专家团字段），
     # 显式转换以通过 Pydantic 校验。
     views = [TeamAgentView(**e.model_dump()) for e in page_entries]
+    # 发布/审批状态批量附带（当前页，与 /agent/owned 同口径）
+    await _attach_publish_status(storage, views)
     return ListAgentsResponse(agents=views, total=total)
 
 
@@ -334,9 +430,11 @@ async def list_owned_agents(
         m for t in teams for m in t.member_ids  # noqa: C416
     }
     items: list[OwnedAgentView] = []
+    owned_ids: list[str] = []
     for record in sorted(records, key=lambda r: r.updated_at, reverse=True):
         if record.id in member_ids:
             continue
+        owned_ids.append(record.id)
         items.append(
             OwnedAgentView(
                 id=record.id,
@@ -350,6 +448,47 @@ async def list_owned_agents(
                 updated_at=record.updated_at,
             ),
         )
+    # 发布/审批状态批量附带（"我的智能体"页渲染状态标签用）：
+    # 两步小查询——审批表一次 id IN + 市场名单一次全量（表小，内存过滤），
+    # 不逐条查询。已在市场（含平台内置手动上架）恒为 approved。
+    from bocomadp.market_review_store import STATUS_APPROVED, STATUS_REJECTED
+    from bocomadp.market_review_store import review_status_map
+    from bocomadp.market_store import list_market_entries
+
+    status_map = await review_status_map(storage, owned_ids)
+    market_map = {
+        e.agent_id: e
+        for e in await list_market_entries(storage)
+        if e.agent_id in set(owned_ids)
+    }
+    for item in items:
+        review = status_map.get(item.id)
+        entry = market_map.get(item.id)
+        if entry is not None:
+            item.publish_status = STATUS_APPROVED
+            _fill_publish_archive(
+                item,
+                entry.department,
+                entry.system_name,
+                entry.tag,
+                entry.description,
+            )
+        elif review is None:
+            continue  # 默认 not_submitted（schema 默认值）
+        else:
+            item.publish_status = review.status
+            _fill_publish_archive(
+                item,
+                review.department,
+                review.system_name,
+                review.tag,
+                review.description,
+            )
+        if review is not None:
+            if review.status in (STATUS_APPROVED, STATUS_REJECTED):
+                item.review_reason = review.reason
+            item.reviewer = review.reviewer
+            item.reviewed_at = review.reviewed_at
     total = len(items)
     start = (page_num - 1) * page_size
     return ListOwnedAgentsResponse(
@@ -759,6 +898,16 @@ async def delete_agent(
             target=agent_id,
             detail="删除智能体级联清理市场档案",
         )
+    # 发布审批记录级联清理（防幽灵待办条目）
+    from bocomadp.market_review_store import delete_review_record
+
+    if await delete_review_record(storage, agent_id):
+        log_audit(
+            user_id,
+            "delete_agent_review",
+            target=agent_id,
+            detail="删除智能体级联清理发布审批记录",
+        )
 
 
 # ======================================================================
@@ -871,6 +1020,8 @@ async def _to_team_view(
         if team.is_self_built(record.id):
             view.parent_agent_id = team.leader_agent_id
             view.is_self_built = True
+    # 发布/审批状态附带（单条，与列表接口同口径）
+    await _attach_publish_status(storage, [view])
     return view
 
 
