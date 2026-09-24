@@ -69,19 +69,12 @@ class CreateAgentResponse(BaseModel):
 
 
 class CopyAgentRequest(BaseModel):
-    """Request body for copying an agent (payload + 已安装技能)。"""
+    """Request body for copying an agent（只复制本体，不搬技能）。"""
 
     name: str | None = Field(
         default=None,
         description=(
             "新智能体名；缺省为 '<源名> 副本'。允许与已有智能体重名。"
-        ),
-    )
-    copy_skills: bool = Field(
-        default=True,
-        description=(
-            "是否同时复制该智能体已安装的技能。仅在 K8s 沙箱部署下生效；"
-            "本地模式技能按会话存储，会跳过并在 warnings 中说明。"
         ),
     )
 
@@ -216,19 +209,34 @@ class CopyAgentResponse(TeamAgentView):
     ``parent_agent_id`` / ``is_self_built`` —— 前端可以把它直接当成一个
     智能体对象插进列表，不需要再调一次 ``GET``。
 
-    不返回复制过程信息（已复制技能名、告警等）：那些只进服务端日志，
-    "复制成功"由 HTTP 201 表达。
+    只复制本体、不搬技能（技能按会话存储在 workspace 里，不属于智能体
+    配置），因此也没有任何"复制过程信息"需要返回："复制成功"由 HTTP 201
+    表达。
 
     - ``editable`` 恒为 ``True``（复制品归属调用者，与 ``PATCH`` 的响应
       口径一致——那两处都是在权限校验之后构造的视图）；
     - 新建的复制品 ``is_team=False`` / ``parent_agent_id=None`` /
-      ``is_self_built=None``（团队关系不复制）。
+      ``is_self_built=None``（团队关系不复制）；
+    - ``skills`` 是**源智能体所属模板行**声明的技能清单
+      （``agent_template.skills``），只透出、不安装。
     """
 
     agent_id: str = Field(
         description=(
             "新智能体 id；与 :attr:`id` 同值，保留以兼容“只取 agent_id”"
             "的旧调用方。"
+        ),
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description=(
+            "**源**智能体在 ``agent_template`` 名单里声明的 ``skills``"
+            "（期望安装的技能清单，元素形如 ``namespace:name``，如 "
+            "``global:rollback-check-sql``）。"
+            "取值与 ``GET /agent/template/agents`` 的模板行同源；"
+            "源不在模板名单内（或存储层不可用）时为空列表。"
+            "本端点只**返回清单**，不代为安装（技能仍由调用方按清单"
+            "逐个调 ``POST /workspace/skill/download/{namespace}:{name}``）。"
         ),
     )
 

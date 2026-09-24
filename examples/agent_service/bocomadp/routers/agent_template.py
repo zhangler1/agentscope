@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agentscope.app._service import ResourceAccessService
 from agentscope.app.access import ResourceKind
@@ -44,6 +44,7 @@ from bocomadp.agent_template_store import (
     get_template_entry,
     list_template_categories,
     list_template_entries,
+    normalize_skills,
     update_template_entry,
 )
 from bocomadp.team_store import list_teams
@@ -54,6 +55,40 @@ agent_template_router = APIRouter(
     prefix="/agent/template",
     tags=["agent-template"],
 )
+
+#: ``skills`` 元素必须是 ``namespace:name`` 形式（与 ``skill_router`` 的
+#: full name 口径一致，如 ``global:rollback-check-sql``）——这样复制时可以直接
+#: 拿去 hub 下载安装，不用再猜 namespace。
+_SKILL_SEP = ":"
+#: 单个技能名长度上限（与 ``agent_template.skills`` 里存的字符串惯例一致）。
+_SKILL_NAME_MAX_LEN = 128
+#: 单个模板最多登记多少个技能。
+_SKILLS_MAX_COUNT = 50
+
+
+def _clean_skills(values: list[str] | None) -> list[str]:
+    """校验并规范化技能清单（元素必须为 ``namespace:name``）。
+
+    规范化（strip / 去空 / 去重保序）在 store 里也会做一遍，这里做是为了
+    **尽早报 422**（前端能拿到具体哪个元素不合法），而不是静默存脏数据。
+    """
+    cleaned = normalize_skills(values)
+    if len(cleaned) > _SKILLS_MAX_COUNT:
+        raise ValueError(
+            f"skills 最多 {_SKILLS_MAX_COUNT} 项，当前 {len(cleaned)} 项。",
+        )
+    for name in cleaned:
+        if len(name) > _SKILL_NAME_MAX_LEN:
+            raise ValueError(
+                f"技能名最长 {_SKILL_NAME_MAX_LEN} 字符：{name!r}。",
+            )
+        namespace, sep, skill = name.partition(_SKILL_SEP)
+        if not sep or not namespace or not skill:
+            raise ValueError(
+                f"技能名必须是 'namespace:name' 形式（如 "
+                f"'global:rollback-check-sql'），收到 {name!r}。",
+            )
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +103,8 @@ class AgentTemplateCreateRequest(BaseModel):
     owner_user_id: str | None = Field(
         default=None,
         description=(
-            "智能体归属用户（模板通常归属 ``default``）；缺省时由后端"
-            "跨 owner 探测，探测不到视为智能体不存在。"
+            "智能体归属用户，**原样存储，不做任何校验**（可任意填写，也"
+            "可以是不存在的用户）；缺省（``null`` / 空串）存空串。"
         ),
     )
     title: str = Field(
@@ -78,23 +113,49 @@ class AgentTemplateCreateRequest(BaseModel):
     )
     description: str = Field(default="", description="模板说明（一句话）。")
     category: str = Field(default="", description="分类，前端按类目分组。")
+    skills: list[str] = Field(
+        default_factory=list,
+        description=(
+            "期望安装的技能清单，元素为 ``namespace:name``（如 "
+            "``global:rollback-check-sql``）；缺省空数组 = 不带技能。"
+            f"最多 {_SKILLS_MAX_COUNT} 项，自动去重（保序）。"
+        ),
+    )
     sort_order: int = Field(default=0, description="展示顺序，小者在前。")
     enabled: bool = Field(default=True, description="是否允许被复制。")
+
+    @field_validator("skills")
+    @classmethod
+    def _validate_skills(cls, value: list[str]) -> list[str]:
+        return _clean_skills(value)
 
 
 class AgentTemplateUpdateRequest(BaseModel):
     """``PUT /agent/template/{agent_id}`` 请求体。
 
     PATCH 语义：**只有显式传入的字段会被修改**；显式传 ``null`` 等同
-    不改（避免把列写成 NULL），清空请传空串。
+    不改（避免把列写成 NULL），清空请传空串。``skills`` 例外：
+    ``null`` = 不改，**清空要传 ``[]``**。
     """
 
     owner_user_id: str | None = None
     title: str | None = None
     description: str | None = None
     category: str | None = None
+    skills: list[str] | None = Field(
+        default=None,
+        description=(
+            "整体替换技能清单（元素 ``namespace:name``）；传 ``[]`` 清空，"
+            "不传 / 传 ``null`` 保持不变。"
+        ),
+    )
     sort_order: int | None = None
     enabled: bool | None = None
+
+    @field_validator("skills")
+    @classmethod
+    def _validate_skills(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else _clean_skills(value)
 
 
 class AgentTemplateListResponse(BaseModel):
@@ -117,6 +178,7 @@ class TemplateAgentItem(BaseModel):
     在智能体本体与归属信息之外，额外带上：
 
     - ``category``：模板表（``agent_template``）上的分类，前端按类目分组；
+    - ``skills``：模板表上的技能清单（元素 ``namespace:name``）；
     - ``editable`` / ``is_team`` / ``parent_agent_id`` / ``is_self_built``：
       与 ``GET /api/agent/`` 的 :class:`TeamAgentView` 字段对齐，且**取值
       同源**（都是现查表/权限算出来的，不是常量）：
@@ -140,6 +202,13 @@ class TemplateAgentItem(BaseModel):
         description=(
             "模板分类（``agent_template.category``）；仅作展示分组，"
             "与 ``GET /agent/template`` 的过滤参数同名。"
+        ),
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description=(
+            "模板登记的技能清单（``agent_template.skills``，元素 "
+            "``namespace:name``）；供前端展示该模板会带哪些技能。"
         ),
     )
     editable: bool = Field(
@@ -196,24 +265,6 @@ class AgentTemplateCategoriesResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # 内部工具
 # ---------------------------------------------------------------------------
-
-
-async def _detect_owner(storage: Any, agent_id: str) -> str:
-    """跨 owner 探测智能体归属（SQL 主存储）；探测不到返回空串。
-
-    列表/查询接口走 ``storage`` 的 owner 作用域，而模板通常归属
-    ``default``、调用方不是 owner，因此加入名单时按 id 全局查一次
-    ``agents`` 表拿真实 owner（复用开放访问模块的现成实现）。
-    """
-    try:
-        from bocomadp.open_agent_access import get_agent_global
-    except Exception:  # noqa: BLE001 —— 探测能力不可用时由调用方回退 404
-        logger.warning("owner detection unavailable", exc_info=True)
-        return ""
-    record = await get_agent_global(storage, agent_id)
-    if record is None:
-        return ""
-    return str(getattr(record, "user_id", "") or "")
 
 
 def _team_markers(
@@ -286,6 +337,42 @@ async def _teams_of_owner(
     if owner_id not in cache:
         cache[owner_id] = await list_teams(storage, owner_id)
     return cache[owner_id]
+
+
+async def _resolve_agent_record(
+    storage: Any,
+    agent_id: str,
+) -> Any | None:
+    """**只按 ``agent_id`` 查智能体记录**（跨 owner 全局查）。
+
+    模板行上的 ``owner_user_id`` 不参与定位、也不做校验（可空 / 可任意填，
+    它只是登记信息），所以这里直接用 :func:`bocomadp.open_agent_access.
+    get_agent_global` 按 id 查：
+
+    - **仅 SQL 主存储**支持跨 owner 查询（``storage._session()``）；Redis 等
+      按 user 分片的主存储没有全局索引 → 返回 ``None``，该模板行按
+      "智能体不存在"跳过；
+    - 查不到 = 智能体真的不存在（不是"owner 填错"）。
+
+    Args:
+        storage (`Any`):
+            框架 storage。
+        agent_id (`str`):
+            智能体 id（``agents`` 表主键，全局唯一）。
+
+    Returns:
+        `Any | None`:
+        :class:`AgentRecord`；不存在或主存储不支持跨 owner 查询时为 ``None``。
+    """
+    try:
+        from bocomadp.open_agent_access import get_agent_global
+    except Exception:  # noqa: BLE001 —— 查询能力不可用时按"不存在"处理
+        logger.warning(
+            "agent_template: global agent lookup unavailable",
+            exc_info=True,
+        )
+        return None
+    return await get_agent_global(storage, agent_id)
 
 
 # ---------------------------------------------------------------------------
@@ -373,26 +460,28 @@ async def list_template_agents(
     """按 ``agent_template`` 名单批量返回对应智能体的完整信息。
 
     流程：先取模板名单（含已下架，除非按 ``enabled`` 过滤），按模板表顺序
-    ``sort_order ASC, created_at DESC, agent_id ASC`` 分页，再逐个用模板行的
-    ``owner_user_id`` 以 owner-scoped 方式读 ``agents`` 表，返回
-    ``{id, user_id, source, data, created_at, updated_at, category,
+    ``sort_order ASC, created_at DESC, agent_id ASC`` 分页，再逐个取智能体
+    记录，返回     ``{id, user_id, source, data, created_at, updated_at, category, skills,
     editable, is_team, parent_agent_id, is_self_built}``：
 
+    - **定位智能体记录只看 ``agent_id``**（跨 owner 全局查，详见
+      :func:`_resolve_agent_record`）：模板行上的 ``owner_user_id`` 不参与
+      定位、也不校验，留空 / 乱填都能正常返回明细（它只是登记信息）；
     - ``data`` 经 :class:`~agentscope.app.storage.AgentData` 序列化，
       库里老行 payload 缺键（如 ``description``）会自动补模型默认值，
       与 ``GET /api/agent/`` 的 ``data`` 形状保持一致；
-    - ``category`` 取自模板行（``agent_template.category``），供前端按类目
-      分组；其余模板字段（``title`` / ``sort_order`` / ``enabled``）仍只用于
-      过滤与排序，不返回；
+    - ``category`` / ``skills`` 取自模板行（``agent_template``），供前端
+      按类目分组、展示该模板会带哪些技能；其余模板字段（``title`` /
+      ``sort_order`` / ``enabled``）仍只用于过滤与排序，不返回；
     - ``editable`` / ``is_team`` / ``parent_agent_id`` / ``is_self_built``
       **与 ``GET /api/agent/`` 同源、按调用者现算**，不是常量：
       ``editable`` 取访问层 ``list_resource``（顶层）给出的 viewer-relative
       布尔值（同一次请求复用同一份映射）；团队三项由 ``expert_team_relations``
-      表按 ``owner_user_id`` 推导，判定逻辑与 ``routers/agent.py::_to_team_view``
-      一致。调用者列表里看不到的智能体（平台模板归属 ``default``）→
-      ``editable=False``；
-    - 模板行是孤儿（``agents`` 表已无该 id）时跳过该条并打 warning，
-      ``total`` 仍按模板表计数（因此 ``len(agents)`` 可能小于 ``pageSize``）。
+      表按**智能体真实归属**（``record.user_id``）推导，判定逻辑与
+      ``routers/agent.py::_to_team_view`` 一致。调用者列表里看不到的智能体
+      （平台模板归属 ``default``）→ ``editable=False``；
+    - 模板行指向的智能体**真的不存在**时跳过该条并打 warning，``total``
+      仍按模板表计数（因此 ``len(agents)`` 可能小于 ``pageSize``）。
 
     Args:
         category (`str | None`):
@@ -431,19 +520,21 @@ async def list_template_agents(
 
     agents: list[TemplateAgentItem] = []
     for entry in page:
-        record = await storage.get_agent(
-            entry.owner_user_id,
-            entry.agent_id,
-        )
+        # 只按 agent_id 查（跨 owner）：模板行上的 owner_user_id 不参与定位、
+        # 也不做校验，留空 / 乱填都能正常返回明细。
+        record = await _resolve_agent_record(storage, entry.agent_id)
         if record is None:
             logger.warning(
-                "agent_template: orphan row skipped: agent_id=%s owner=%s",
+                "agent_template: template row points to a missing agent: "
+                "agent_id=%s owner=%s",
                 entry.agent_id,
                 entry.owner_user_id,
             )
             continue
+        # 团队档案按**智能体真实归属**（record.user_id）查，而不是模板行上
+        # 登记的 owner —— 后者可能空/错，用它查会漏掉团长/成员标记。
         is_team, parent_agent_id, is_self_built = _team_markers(
-            await _teams_of_owner(storage, entry.owner_user_id, teams_cache),
+            await _teams_of_owner(storage, record.user_id, teams_cache),
             record.id,
         )
         agents.append(
@@ -455,6 +546,7 @@ async def list_template_agents(
                 created_at=record.created_at,
                 updated_at=record.updated_at,
                 category=entry.category,
+                skills=list(entry.skills or []),
                 editable=editable_map.get(record.id, False),
                 is_team=is_team,
                 parent_agent_id=parent_agent_id,
@@ -539,8 +631,20 @@ async def create_agent_template(
 ) -> AgentTemplateEntry:
     """把一个智能体加入模板名单。
 
-    校验顺序：``owner_user_id`` 缺省时先跨 owner 探测（探测不到 →
-    **404** 智能体不存在）→ 已在名单内 → **409**。
+    **不做任何校验**：``agent_id`` 不要求出现在 ``agents`` 表里，
+    ``owner_user_id`` 原样存储（可任意填写、可以是空串 / 不存在的用户）
+    —— 便于先占位登记、再由运营补真实归属。唯一校验是"已在名单内 →
+    **409**"。
+
+    ``skills`` 会做**格式校验**（元素必须是 ``namespace:name``，如
+    ``global:rollback-check-sql``；最多 50 项、单名 ≤128 字符），不合法
+    直接 422；合法值会被规范化（strip / 去空 / 去重保序）后入库，但
+    **不校验技能是否真实存在**（技能在外部 hub，允许先登记后安装）。
+
+    ``owner_user_id`` 只是**登记信息**，不参与任何查询：明细端点
+    ``GET /agent/template/agents`` 只按 ``agent_id`` 跨 owner 取记录
+    （详见 :func:`_resolve_agent_record`），所以它填什么都不会影响该模板
+    能否被查出来。
 
     Args:
         body (`AgentTemplateCreateRequest`):
@@ -555,16 +659,9 @@ async def create_agent_template(
             落库后的条目（含 ``created_at`` / ``updated_at``）。
 
     Raises:
-        `HTTPException`: 404 智能体不存在；409 已在名单内。
+        `HTTPException`: 409 已在名单内。
     """
     owner = (body.owner_user_id or "").strip()
-    if not owner:
-        owner = await _detect_owner(storage, body.agent_id)
-        if not owner:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Agent {body.agent_id!r} not found.",
-            )
 
     entry = AgentTemplateEntry(
         agent_id=body.agent_id,
@@ -572,6 +669,7 @@ async def create_agent_template(
         title=body.title,
         description=body.description,
         category=body.category,
+        skills=body.skills,
         sort_order=body.sort_order,
         enabled=body.enabled,
     )
@@ -612,7 +710,11 @@ async def update_agent_template(
     """部分更新模板记录（PATCH 语义）；不在名单内 → 404。
 
     常用场景：``{"enabled": false}`` 临时下架、``{"sort_order": 5}`` 置顶、
-    ``{"title": "..."}`` 改展示名。
+    ``{"title": "..."}`` 改展示名、
+    ``{"skills": ["global:rollback-check-sql"]}`` 整体替换技能清单。
+
+    ``skills`` 语义：传值 = **整体替换**（同样校验 ``namespace:name``）；
+    传 ``[]`` = 清空；不传 / 传 ``null`` = 保持不变。
     """
     patch = body.model_dump(exclude_unset=True)
     updated = await update_template_entry(storage, agent_id, patch)
