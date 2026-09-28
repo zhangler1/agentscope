@@ -340,7 +340,18 @@ async def view_image_tool(
             question=question or "请详细描述这张图片的内容",
         )
         try:
-            response = await vision_model.client.chat.completions.create(
+            # 经统一入口调用（而非直连 client）：补齐 _call_api 的两个
+            # 关键行为——fresh key（set_api_key 注入的 override）作为
+            # Authorization 发送、401 invalid_api_key 强制刷新 key 并
+            # 重试一次。直连 client 时二者均不生效，key 一到期即报
+            # "API KEY不存在或已过期"。
+            call = getattr(vision_model, "call_completions", None)
+            if call is None:
+                return (
+                    "多模态模型调用失败: 模型缺少统一调用入口"
+                    "（call_completions）。"
+                )
+            response = await call(
                 model=vision_model.model,
                 messages=[
                     {
@@ -350,7 +361,10 @@ async def view_image_tool(
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:{rec.mime_type};base64,{rec.base64}",
+                                    "url": (
+                                        f"data:{rec.mime_type};"
+                                        f"base64,{rec.base64}"
+                                    ),
                                 },
                             },
                         ],
