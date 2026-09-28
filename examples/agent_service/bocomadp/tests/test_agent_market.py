@@ -15,8 +15,9 @@
 3. GET /agent/market/featured —— 精选推荐（实时聚合 sessions）：
    - 按会话数倒序取前 N；0 热度是合法状态，不过滤；
 4. POST /agent/market/{agent_id}/publish|unpublish —— 发布走审批流：
-   - publish = 写审批表 pending（幂等，**不再直接上架**）；审批人
-     approve 后才插名单行；unpublish = 删市场行 + 清审批记录，幂等；
+   - publish = 写审批表 pending（**不再直接上架**）：已上架智能体重复
+     发布会先下架再进 pending（变更重审）；审批人 approve 后才插名单行；
+     unpublish = 删市场行 + 清审批记录，幂等；
    - 仅智能体 owner（X-User-ID = agents.user_id）可发布/撤回，
      智能体不存在 404；
 5. PUT/DELETE /agent/market/{agent_id} —— 标签管理（全开放无权限
@@ -693,7 +694,7 @@ def test_publish_owner_only(client, market_ids):
 
 
 def test_publish_guard_rules(client, market_ids):
-    """不存在 404，发布仍非 owner 403，已在市场的智能体重复发布幂等；
+    """不存在 404，发布仍非 owner 403，已上架智能体重复发布先下架再进 pending（变更重审）；
     **下架人人可操作**：非 owner 下架已上架的智能体 204。
     """
     platform_user, _, _ = market_ids
@@ -703,14 +704,18 @@ def test_publish_guard_rules(client, market_ids):
         f"/agent/market/{platform_user}/publish", json=_PUB_BODY, headers=HDR_ALICE,
     ).status_code == 403
 
-    # owner 重复发布幂等：已在市场 → 直接返回 approved，不重复审批
+    # owner 重新发布已上架智能体 → 先下架（删市场行）+ 进 pending（重审）
     resp = client.post(
         f"/agent/market/{platform_user}/publish", json=_PUB_BODY, headers=HDR_ADMIN,
     )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "approved"
-    # 名单里没有产生重复行
-    assert client.get("/agent/market").json()["total"] == 2
+    assert resp.json()["status"] == "pending"
+    # 市场行已被删：平台智能体从市场消失（total 由 2 变 1）
+    assert client.get("/agent/market").json()["total"] == 1
+    review = _run(market_review_store.get_review_record(
+        client.app.state.storage, platform_user,
+    ))
+    assert review is not None and review.status == "pending"
 
     # 不存在：404
     assert client.post(
@@ -728,6 +733,55 @@ def test_publish_guard_rules(client, market_ids):
         f"/agent/market/{platform_user}/unpublish", headers=HDR_ALICE,
     ).status_code == 204
     assert platform_user not in {
+        a["id"] for a in client.get("/agent/market").json()["agents"]
+    }
+
+
+def test_republish_approved_agent_takes_down_then_pending(client, market_ids):
+    """已上架智能体重新发布 = 先下架（删市场行）+ 进 pending（重审）。
+
+    变更重审语义：owner 改了任何配置（本体 / 技能 / 工具等）后再次
+    提交发布，未审核的新配置不会继续在市场展示，审过才重新上架。
+    """
+    platform_user, _, _ = market_ids
+    storage = client.app.state.storage
+
+    # 正常审批通过、上架
+    assert client.post(
+        f"/agent/market/{platform_user}/publish", json=_PUB_BODY, headers=HDR_ADMIN,
+    ).status_code == 200
+    assert client.post(
+        f"/agent/market/reviews/{platform_user}/approve", headers=HDR_REVIEWER,
+    ).status_code == 200
+    assert platform_user in {
+        a["id"] for a in client.get("/agent/market").json()["agents"]
+    }
+
+    # owner 改了配置后重新发布（例如换了技能 / 工具）
+    resp = client.post(
+        f"/agent/market/{platform_user}/publish", json=_PUB_BODY, headers=HDR_ADMIN,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["applicant"] == "default"
+
+    # 市场行已被删：平台智能体从市场消失
+    assert platform_user not in {
+        a["id"] for a in client.get("/agent/market").json()["agents"]
+    }
+    # 审批记录回到 pending，旧结论（reason / reviewer）清空
+    review = _run(market_review_store.get_review_record(storage, platform_user))
+    assert review is not None
+    assert review.status == "pending"
+    assert review.reason == ""
+    assert review.reviewer == ""
+
+    # 重新审批通过 → 再次上架
+    assert client.post(
+        f"/agent/market/reviews/{platform_user}/approve", headers=HDR_REVIEWER,
+    ).status_code == 200
+    assert platform_user in {
         a["id"] for a in client.get("/agent/market").json()["agents"]
     }
 
