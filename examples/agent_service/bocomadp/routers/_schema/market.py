@@ -41,10 +41,6 @@ class MarketAgentView(BaseModel):
         default="",
         description="所属系统（发布时填写）。",
     )
-    description: str = Field(
-        default="",
-        description="说明（发布时填写的智能体用途介绍）。",
-    )
     heat: int = Field(
         default=0,
         description=(

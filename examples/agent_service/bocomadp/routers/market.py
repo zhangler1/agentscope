@@ -641,8 +641,9 @@ async def publish_market_agent(
     **不再直接上架**——审批人通过（approve）后才插 ``agent_market``
     名单行。幂等口径：
 
-    - 已在市场（审批通过上架 / 平台内置手动上架）→ 幂等返回 approved，
-      不重复审批（上架后内容锁定，无"变更重审"概念）；
+    - 已在市场（审批通过上架 / 平台内置手动上架）→ 先下架（删市场行）
+      再进 pending：任何配置变更（本体 / 技能 / 工具等）重新发布都走
+      重审，未审核的新配置不继续在市场展示，审过才重新上架；
     - 已 pending → 幂等返回当前申请（前端连点不报错、不建重复记录），
       **表单字段照常覆盖**（改完弹窗再点发布，存的信息要最新）；
     - rejected → 重置回 pending 并清空旧结论（reason/reviewer 作废）；
@@ -660,18 +661,14 @@ async def publish_market_agent(
 
     existing = await get_market_entry(storage, agent_id)
     if existing is not None:
+        # 已在市场：重新发布 = 先下架（市场行移除），再进审批 pending，
+        # 避免未审核的新配置（含技能 / 工具等）继续在市场展示，审过才重新上架。
+        await delete_market_entry(storage, agent_id)
         log_audit(
             user_id,
-            "publish_agent_market",
+            "unpublish_agent_market",
             target=agent_id,
-            detail="重复发布（已在市场，幂等返回 approved）",
-        )
-        return MarketPublishStatusView(
-            agent_id=agent_id,
-            status=STATUS_APPROVED,
-            applicant=record.user_id,
-            created_at=existing.created_at,
-            updated_at=existing.updated_at,
+            detail="重新发布：先下架等待重新审批",
         )
 
     review = await upsert_pending_review(
