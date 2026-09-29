@@ -36,12 +36,18 @@ RUN curl -LsSf https://astral.sh/uv/install.sh \
 # Keep in sync with agentscope.workspace._k8s._k8s_bootstrap.GATEWAY_HOME
 ENV GATEWAY_HOME=/root/.agentscope
 
-# Gateway venv + base runtime requirements
-# (mirrors ``_GATEWAY_BASE_REQUIREMENTS`` in _sandboxed_base.py)
+# Gateway venv + base runtime requirements.
+# First 4 items mirror ``_GATEWAY_BASE_REQUIREMENTS``; the trailing 6
+# back the ``agentscope.tool`` tree imported by ``MCPClient.get_tool()``
+# on every tool call. agentscope installs with ``--no-deps`` and this
+# prebaked image hits the fast-path (bootstrap skipped), so they must
+# be listed explicitly here.
 RUN mkdir -p "${GATEWAY_HOME}" \
  && uv venv "${GATEWAY_HOME}/.venv" \
  && uv pip install --python "${GATEWAY_HOME}/.venv/bin/python" \
-        'mcp<2.0.0' uvicorn fastapi httpx
+        'mcp<2.0.0' uvicorn fastapi httpx \
+        docstring_parser aiofiles jinja2 python-frontmatter \
+        tree_sitter tree_sitter_bash
 
 # Install agentscope itself from the local checkout.
 # Build context is repo root, so pyproject.toml + src/ are visible at /src.
