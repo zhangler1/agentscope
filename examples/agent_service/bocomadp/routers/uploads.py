@@ -371,52 +371,63 @@ async def list_uploads(
 
 
 # ---------------------------------------------------------------------------
-# POST /files/upload — 上传单个文件（沙箱 / 本地 统一走 backend）
+# POST /files/upload — 批量上传（同一字段名 file 可携带多个文件；沙箱 / 本地 统一走 backend）
 # ---------------------------------------------------------------------------
-@uploads_router.post("/upload", response_model=UploadedFile)
+@uploads_router.post("/upload", response_model=list[UploadedFile])
 async def upload_file(
     agent_id: str = Form(...),
     session_id: str = Form(...),
-    file: UploadFile = File(...),
+    # 字段名保持 ``file`` 不变：前端（uploads.ts 的 fd.append('file', ...)）
+    # 与历史 curl 均以此名发多值，FastAPI 按参数名绑定表单字段，
+    # 同名多值自动收成列表，前端零改动即可批量上传。
+    file: list[UploadFile] = File(...),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
-) -> UploadedFile:
+) -> list[UploadedFile]:
     cfg = get_upload_config()
     if not cfg.enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="upload disabled")
+    if not file:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="no file provided")
 
-    # 限制：单文件大小
-    data = await file.read()
-    if len(data) > cfg.max_file_size_bytes:
-        raise FileSizeExceeded(
-            f"file {len(data)//1024//1024}MB exceeds limit "
-            f"{cfg.max_file_size_mb}MB",
-        )
-
-    # 限制：单会话文件数
+    # 限制：单会话文件数（按"已有数 + 本次批量数"一次性校验，避免逐个插时超量）
     db = get_uploads_db()
-    if db.count_by_session(user_id, agent_id, session_id) >= cfg.max_files_per_session:
-        raise TooManyFiles(
-            f"session {session_id!r} exceeds {cfg.max_files_per_session} files",
-        )
+    existing = db.count_by_session(user_id, agent_id, session_id)
 
-    # 落盘 + 转换 + DB 记录（与 context.custom_params.additional_urls 下载共用
-    # _persist_uploaded_bytes，保证两条路径行为一致）
-    try:
-        return await _persist_uploaded_bytes(
-            user_id=user_id,
-            agent_id=agent_id,
-            session_id=session_id,
-            storage=storage,
-            workspace_manager=workspace_manager,
-            original_name=file.filename or "file",
-            data=data,
-            content_type=file.content_type,
-        )
-    except UploadError as e:
-        _raise_upload_error(e)
-        raise  # pragma: no cover —— _raise_upload_error 必然抛 HTTPException
+    results: list[UploadedFile] = []
+    for upload in file:
+        # 限制：单文件大小
+        data = await upload.read()
+        if len(data) > cfg.max_file_size_bytes:
+            raise FileSizeExceeded(
+                f"file {upload.filename!r} {len(data)//1024//1024}MB exceeds "
+                f"limit {cfg.max_file_size_mb}MB",
+            )
+        if existing + len(results) >= cfg.max_files_per_session:
+            raise TooManyFiles(
+                f"session {session_id!r} exceeds {cfg.max_files_per_session} files",
+            )
+
+        # 落盘 + 转换 + DB 记录（与 context.custom_params.additional_urls 下载共用
+        # _persist_uploaded_bytes，保证两条路径行为一致）
+        try:
+            record = await _persist_uploaded_bytes(
+                user_id=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                storage=storage,
+                workspace_manager=workspace_manager,
+                original_name=upload.filename or "file",
+                data=data,
+                content_type=upload.content_type,
+            )
+        except UploadError as e:
+            _raise_upload_error(e)
+            raise  # pragma: no cover —— _raise_upload_error 必然抛 HTTPException
+        results.append(record)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
