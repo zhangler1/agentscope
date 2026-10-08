@@ -674,7 +674,7 @@ async def publish_market_agent(
     review = await upsert_pending_review(
         storage,
         agent_id,
-        user_id,
+        body.user_name,
         meta={
             "department": body.department.strip(),
             "system_name": body.system_name.strip(),
@@ -769,8 +769,9 @@ async def list_market_reviews(
     keyword: str | None = Query(
         default=None,
         description=(
-            "模糊搜索（单字段双列 OR）：智能体名称 **或** 提交人 "
-            "（applicant user_id）任一包含即命中，大小写不敏感。"
+            "模糊搜索（单字段双列 OR）：智能体名称 **或** 申请人姓名 "
+            "（applicant）任一包含即命中，大小写不敏感；只按姓名匹配，"
+            "不按 user_id 匹配。"
         ),
     ),
     page_num: int = Query(
@@ -794,10 +795,10 @@ async def list_market_reviews(
     - ``status``：不传/传 all = 全部三种状态（按**提交时间倒序**，
       最近的申请在前）；pending = 待办（先到先审，申请时间正序）；
       approved/rejected = 已办（按审批时间倒序，最近处理在前）。
-    - ``keyword``：名称/提交人二选一模糊匹配（SQL 语义
+    - ``keyword``：名称/申请人姓名二选一模糊匹配（SQL 语义
       ``name LIKE %kw% OR applicant LIKE %kw%``）——实现沿用本模块
-      "两步小查询"风格：审批表按提交人过滤 + agents 名称内存过滤，
-      不写 SQL JOIN/OR。
+      "两步小查询"风格：审批表按申请人姓名过滤 + agents 名称内存过滤，
+      不写 SQL JOIN/OR；只按姓名匹配，不按 user_id 匹配。
     - ``status_counts``：各状态全量计数（不随筛选变化），顶部统计卡
       一次拿全，前端不用再调四次。
     """
@@ -845,7 +846,7 @@ async def list_market_reviews(
             else {}
         )
         name = str(data.get("name", ""))
-        # 模糊搜索：名称 OR 提交人任一包含即命中（单字段双列 OR）
+        # 模糊搜索：智能体名称 OR 申请人姓名任一包含即命中（单字段双列 OR）
         if kw and kw not in name.lower() and kw not in e.applicant.lower():
             continue
         items.append(
