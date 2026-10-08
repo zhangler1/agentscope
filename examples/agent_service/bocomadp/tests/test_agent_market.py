@@ -63,13 +63,14 @@ HDR_ALICE = {"X-User-ID": "alice"}         # 另一个普通用户
 HDR_ADMIN = {"X-User-ID": "default"}       # 平台运营（config 默认白名单内）
 HDR_REVIEWER = {"X-User-ID": "reviewer-1"}  # 市场审批人（fixture 种入名单）
 
-# 发布弹窗表单（publish 必带：部门/系统/业务条线/说明；业务条线即
-# 市场标签 tag）
+# 发布弹窗表单（publish 必带：部门/系统/业务条线/说明/user_name；
+# 业务条线即市场标签 tag；user_name 为申请人姓名）
 _PUB_BODY = {
     "department": "网络金融部",
     "system_name": "智能体平台",
     "tag": "智能研发",
     "description": "用于测试的智能体说明",
+    "user_name": "张三",
 }
 
 
@@ -613,7 +614,7 @@ def test_publish_unpublish_flow(client, market_ids):
     body = resp.json()
     assert body["agent_id"] == other_id
     assert body["status"] == "pending"
-    assert body["applicant"] == "alice"
+    assert body["applicant"] == "张三"
 
     # 待审批期间市场不可见
     resp = client.get("/agent/market")
@@ -764,7 +765,7 @@ def test_republish_approved_agent_takes_down_then_pending(client, market_ids):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "pending"
-    assert body["applicant"] == "default"
+    assert body["applicant"] == "张三"
 
     # 市场行已被删：平台智能体从市场消失
     assert platform_user not in {
@@ -1037,20 +1038,27 @@ def test_reviews_list_all_and_status_counts(client):
     assert [r["agent_id"] for r in resp.json()["reviews"]] == [a_ok]
 
 
-def test_reviews_keyword_fuzzy_matches_name_or_applicant(client):
-    """keyword 单字段模糊：名称 OR 提交人任一包含即命中（大小写不敏感）。"""
+def test_reviews_keyword_fuzzy_matches_by_name(client):
+    """keyword 模糊：智能体名称 OR 申请人姓名 任一包含即命中（大小写不敏感）。
+
+    方案A 后 applicant 存的是姓名（不再是 user_id），因此按 user_id
+    搜不到——本用例同时验证"只按姓名搜索"这一口径。
+    """
     hit1 = _create(client, HDR_ALICE, name="授信报告智能生成")
     hit2 = _create(client, HDR_USER, name="公文写作助手")
     miss = _create(client, HDR_ALICE, name="客服话术推荐")
-    # 各自的 owner 发布（publish 仍锁 owner）
+    # 各自的 owner 发布（publish 仍锁 owner），提交人姓名覆盖为不同值
     assert client.post(
-        f"/agent/market/{hit1}/publish", json=_PUB_BODY, headers=HDR_ALICE,
+        f"/agent/market/{hit1}/publish",
+        json={**_PUB_BODY, "user_name": "ZhangSan"}, headers=HDR_ALICE,
     ).status_code == 200
     assert client.post(
-        f"/agent/market/{hit2}/publish", json=_PUB_BODY, headers=HDR_USER,
+        f"/agent/market/{hit2}/publish",
+        json={**_PUB_BODY, "user_name": "LiSi"}, headers=HDR_USER,
     ).status_code == 200
     assert client.post(
-        f"/agent/market/{miss}/publish", json=_PUB_BODY, headers=HDR_ALICE,
+        f"/agent/market/{miss}/publish",
+        json={**_PUB_BODY, "user_name": "ZhangSan"}, headers=HDR_ALICE,
     ).status_code == 200
 
     def _ids(kw: str) -> set[str]:
@@ -1062,13 +1070,16 @@ def test_reviews_keyword_fuzzy_matches_name_or_applicant(client):
         assert resp.status_code == 200
         return {r["agent_id"] for r in resp.json()["reviews"]}
 
-    # 名称模糊命中
+    # 按智能体名称命中
     assert _ids("授信") == {hit1}
-    # 提交人模糊命中（alice 的两个申请，名称各不相同）
-    assert _ids("alice") == {hit1, miss}
+    # 按申请人姓名命中（ZhangSan 的两个申请）
+    assert _ids("ZhangSan") == {hit1, miss}
+    assert _ids("LiSi") == {hit2}
     # 大小写不敏感
-    assert _ids("ALICE") == {hit1, miss}
-    # 名称 OR 提交人：谁都不含 → 空
+    assert _ids("zhangsan") == {hit1, miss}
+    # 不再按 user_id 匹配（alice 是 user_id，不是姓名）
+    assert _ids("alice") == set()
+    # 名称 OR 姓名：谁都不含 → 空
     assert _ids("不存在的关键词") == set()
     # 与 status 组合：只搜待审核里的命中
     resp = client.get(
@@ -1095,7 +1106,7 @@ def test_review_detail_endpoint(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "智文管理系统"
-    assert body["applicant"] == "alice"
+    assert body["applicant"] == "张三"
     assert body["department"] == _PUB_BODY["department"]
     assert body["system_name"] == _PUB_BODY["system_name"]
     assert body["tag"] == _PUB_BODY["tag"]

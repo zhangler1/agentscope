@@ -126,6 +126,14 @@ class MarketPublishRequest(BaseModel):
         max_length=500,
         description="说明（必填，≤500 字符）：智能体用途介绍。",
     )
+    user_name: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "申请人姓名（必填，≤64 字符）：发布人的真实姓名，作为审核"
+            "列表的 applicant 展示——替代原 user_id，让审批人直接看到人名。"
+        ),
+    )
 
 
 class MarketPublishStatusView(BaseModel):
@@ -148,7 +156,7 @@ class MarketPublishStatusView(BaseModel):
     )
     applicant: str = Field(
         default="",
-        description="申请人（owner user_id）；not_submitted 时为空串。",
+        description="申请人姓名（发布表单传入的 user_name）；not_submitted 时为空串。",
     )
     reason: str = Field(
         default="",
@@ -205,7 +213,7 @@ class MarketReviewItemView(BaseModel):
         default="",
         description="智能体提示词（agents.payload 实时取）。",
     )
-    applicant: str = Field(description="申请人（owner user_id）。")
+    applicant: str = Field(description="申请人姓名（发布时传入的 user_name）。")
     status: str = Field(description="审批状态：pending/approved/rejected。")
     reason: str = Field(
         default="",

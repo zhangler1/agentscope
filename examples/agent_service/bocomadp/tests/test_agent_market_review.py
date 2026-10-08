@@ -124,6 +124,7 @@ _PUB_BODY = {
     "system_name": "智能体平台",
     "tag": "智能研发",
     "description": "用于测试的智能体说明",
+    "user_name": "张三",
 }
 
 
@@ -421,6 +422,14 @@ def test_publish_form_profile_lifecycle(client):
     )
     assert resp.status_code == 422
 
+    # user_name（申请人姓名）必填：不传 → 422
+    resp = client.post(
+        f"/agent/market/{agent_id}/publish",
+        json={k: v for k, v in _PUB_BODY.items() if k != "user_name"},
+        headers=HDR_ALICE,
+    )
+    assert resp.status_code == 422
+
     # tag（业务条线）必填：不传 / 空串 / 纯空白 → 422
     resp = client.post(
         f"/agent/market/{agent_id}/publish",
@@ -526,7 +535,7 @@ def test_reviews_list_filters_and_content(client):
     assert {r["agent_id"] for r in body["reviews"]} == {a1, a2}
     first = next(r for r in body["reviews"] if r["agent_id"] == a1)
     assert first["name"] == "智能体一"
-    assert first["applicant"] == "alice"
+    assert first["applicant"] == "张三"
     assert first["status"] == "pending"
     assert first["reviewer"] == ""
 
