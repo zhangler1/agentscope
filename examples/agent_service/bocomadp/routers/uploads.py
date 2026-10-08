@@ -115,6 +115,45 @@ def _upload_abs(backend, workdir: str, name: str) -> str:
     return backend.join_path(workdir, to_upload_rel_path(name))
 
 
+async def _dedupe_session_filename(
+    *,
+    backend,
+    workdir: str,
+    user_id: str,
+    session_id: str,
+    stored_name: str,
+) -> str:
+    """同会话同名文件自动改名（``A.docx`` → ``A(1).docx`` → ``A(2).docx``）。
+
+    同会话内重传同名文件时若直接覆盖磁盘并复用路径，先前轮次消息引用的
+    ``virtual_path`` 会静默指向新内容（元数据旧记录与磁盘真身脱节）。
+    改名让每次上传获得独立路径：物理文件分开，元数据不再出现同三键的
+    多条记录，逐轮历史还原精确到当轮版本。跨会话同名由 workdir 物理
+    隔离，无需去重。占用判定同时看元数据库与磁盘，防止单边残留。
+
+    Raises:
+        `UploadError`: 序号耗尽（极端情况，防御死循环）。
+    """
+    db = get_uploads_db()
+
+    async def _taken(name: str) -> bool:
+        if db.get_by_session_file(user_id, session_id, name):
+            return True
+        return await backend.file_exists(_upload_abs(backend, workdir, name))
+
+    if not await _taken(stored_name):
+        return stored_name
+
+    stem, ext = os.path.splitext(stored_name)
+    for seq in range(1, 1000):
+        candidate = f"{stem}({seq}){ext}"
+        if not await _taken(candidate):
+            return candidate
+    raise UploadError(
+        f"too many same-name uploads for {stored_name!r} in session {session_id!r}",
+    )
+
+
 async def _persist_uploaded_bytes(
     *,
     user_id: str,
@@ -139,7 +178,6 @@ async def _persist_uploaded_bytes(
     # 安全文件名
     stored_name = normalize_filename(original_name or "file")
     validate_path_traversal(stored_name)
-    virtual_path = to_virtual_path(stored_name)
 
     # 解析工作区与 backend（沙箱 / 本地统一）
     workspace = await _resolve_workspace(
@@ -147,6 +185,17 @@ async def _persist_uploaded_bytes(
     )
     backend = workspace.get_backend()
     workdir = workspace.workdir
+
+    # 同会话同名自动改名（A.docx → A(1).docx）：每次上传独立路径，
+    # 先前轮次消息引用的 virtual_path 不被后续重传覆盖。
+    stored_name = await _dedupe_session_filename(
+        backend=backend,
+        workdir=workdir,
+        user_id=user_id,
+        session_id=session_id,
+        stored_name=stored_name,
+    )
+    virtual_path = to_virtual_path(stored_name)
 
     # 上传目录由来宾工作区的 _ensure_workspace_layout() 保证存在
     #（user-data/uploads）；backend.write_file 也会自动创建父目录，
@@ -201,7 +250,7 @@ async def _persist_uploaded_bytes(
             agent_id=agent_id,
             session_id=session_id,
             workspace_id=getattr(workspace, "workspace_id", None),
-            original_name=original_name or stored_name,
+            original_name=stored_name,
             stored_name=stored_name,
             virtual_path=virtual_path,
             size_bytes=len(data),
@@ -254,8 +303,8 @@ async def download_urls_to_session(
     下游链路立即可见。
 
     Args:
-        urls: 待下载的 OSS / HTTP(S) 地址列表（同名文件会被
-            ``normalize_filename`` 归一化；重复文件名直接覆盖）。
+        urls: 待下载的 OSS / HTTP(S) 地址列表（同名文件经
+            ``_dedupe_session_filename`` 自动改名，互不覆盖）。
 
     Returns:
         `list[UploadedFile]`: 成功保存的上传记录（按 URL 顺序）。

@@ -74,6 +74,7 @@ from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.tool_call_repair import ToolCallRepairMiddleware
 from bocomadp.middleware.request_log import AccessLogMiddleware
+from bocomadp.middleware.chat_upload_inject import ChatUploadInjectMiddleware
 from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
@@ -759,6 +760,13 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
         # 最内层：捕获 guwpToken 到 ContextVar，随请求上下文透传给
         # 框架 chat-run 后台任务（agent-creator 工厂工具使用）。
         Middleware(TokenCaptureMiddleware),
+        # 前端在 /chat/ 请求体 input.metadata.files 里显式携带本轮上传的
+        # 文件引用（POST /files/upload 响应数组原样回传，最少 virtual_path），
+        # 本中间件逐个到 uploaded_files 元数据表核对归属（user/session 一致），
+        # 规范化为 {filename, filetype, virtual_path}：供 UploadsMiddleware
+        # 注入 <context name="files">，也让 human 消息落库携带「它那一轮」
+        # 的文件记录，历史接口逐轮还原。
+        Middleware(ChatUploadInjectMiddleware),
         # 解析用户消息中的 /skill_name 前缀（存入 ContextVar，供提示词注入）
         Middleware(ActiveSkillMiddleware),
         Middleware(TraceMiddleware, enabled=trace_enabled),
