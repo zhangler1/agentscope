@@ -74,6 +74,7 @@ from bocomadp.middleware.factory import build_enterprise_middlewares
 from bocomadp.middleware.registry import MiddlewareRegistry
 from bocomadp.middleware.tool_call_repair import ToolCallRepairMiddleware
 from bocomadp.middleware.request_log import AccessLogMiddleware
+from bocomadp.middleware.chat_upload_inject import ChatUploadInjectMiddleware
 from bocomadp.deerflow import BusBridge, RunManager
 from bocomadp.deerflow.credentials import ensure_default_credentials
 from bocomadp.deerflow.routers.auth_stub import auth_stub_router
@@ -110,6 +111,10 @@ from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 from bocomadp.tool_catalog import AGENT_CREATOR_ID
 from bocomadp.deerflow.model_patch import patch_get_model
+# 会话默认权限模式：给原生 POST /sessions/ 前插包裹路由（一处配置生效）
+from bocomadp.session_default_mode import (
+    install_create_session_default_mode,
+)
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
     agent_router as _framework_agent_router,
@@ -755,6 +760,13 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
         # 最内层：捕获 guwpToken 到 ContextVar，随请求上下文透传给
         # 框架 chat-run 后台任务（agent-creator 工厂工具使用）。
         Middleware(TokenCaptureMiddleware),
+        # 前端在 /chat/ 请求体 input.metadata.files 里显式携带本轮上传的
+        # 文件引用（POST /files/upload 响应数组原样回传，最少 virtual_path），
+        # 本中间件逐个到 uploaded_files 元数据表核对归属（user/session 一致），
+        # 规范化为 {filename, filetype, virtual_path}：供 UploadsMiddleware
+        # 注入 <context name="files">，也让 human 消息落库携带「它那一轮」
+        # 的文件记录，历史接口逐轮还原。
+        Middleware(ChatUploadInjectMiddleware),
         # 解析用户消息中的 /skill_name 前缀（存入 ContextVar，供提示词注入）
         Middleware(ActiveSkillMiddleware),
         Middleware(TraceMiddleware, enabled=trace_enabled),
@@ -948,6 +960,12 @@ async def _lifespan_with_builtin_agents(app):
     async with _original_lifespan(app):
         # 恢复持久化的工具白名单（内存存储重启会丢）
         load_tool_whitelists()
+        # 市场审批人白名单（JSON 文件持久化 + 接口管理，末位保护：
+        # 名单不可清空）——文件缺失时用 SEED_REVIEWERS 种子名单首次
+        # 播种，之后文件即唯一真相源。
+        from bocomadp import market_reviewers
+
+        market_reviewers.load_whitelist()
         # 专家团关系表（expert_team_relations）——团队档案从 AgentData
         # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
         # 必须早于下面所有读团队档案的补丁挂载。
@@ -959,6 +977,25 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import market_store
 
         await market_store.ensure_market_tables(storage)
+        # 发布审批表（agent_market_review）——发布走审批流，approve 后
+        # 才插 agent_market 名单行（一智能体一记录，upsert 覆盖）。
+        from bocomadp import market_review_store
+
+        await market_review_store.ensure_review_tables(storage)
+        # 智能体模板名单表（agent_template）——"可复制模板"白名单：
+        # 只有名单内且 enabled=true 的智能体允许被 POST /agent/{id}/copy。
+        # 与市场表同一套自建表模式：启动幂等建表（create_all），无迁移。
+        from bocomadp import agent_template_store
+
+        await agent_template_store.ensure_agent_template_tables(storage)
+        # 智能体扩展表（agents_extend）——一智能体一行，payload 存该
+        # 智能体的扩展数据（当前装已安装技能清单）。存起来是为了让
+        # "查已装技能"不必进沙箱（原先必须解析 workspace → 路由 Pod →
+        # exec 列举，Pod 被回收/容器重启时该查询就失败）。
+        # 与上表同一套自建表模式：启动幂等建表（create_all）+ 列级迁移。
+        from bocomadp import agents_extend_store
+
+        await agents_extend_store.ensure_agents_extend_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -1082,6 +1119,25 @@ app.include_router(agent_router)
 # （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
 # _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
 memory_module.install_memory(app)
+# 会话默认权限模式（create_app 之后、/api 子应用挂载之前）：
+# 原生 POST /sessions/ 与 bocomadp POST /sessions/create 统一取
+# config.yaml 的 default_permission_mode（显式传入时以显式值为准），
+# 见 bocomadp/session_default_mode.py。
+install_create_session_default_mode(app)
+# 已装技能查询（create_app 之后、/api 子应用挂载之前）：
+# GET /workspace/skill 前插为"先查 agents_extend，无记录才回源沙箱并写回"，
+# 使该查询在 Pod 不可用时也能命中缓存；见 bocomadp/routers/skill_router.py
+# 的 install_skill_list_from_table。
+from bocomadp.routers.skill_router import install_skill_list_from_table
+
+install_skill_list_from_table(app)
+# 技能上传 / 卸载写穿（同样在 /api 挂载之前）：
+# 框架的 POST /workspace/skill/upload 与 DELETE /workspace/skill/{name} 只动
+# 沙箱，这里前插同路径包装，成功后再更新 agents_extend（used 标记的数据源）；
+# 状态码 / 响应体 / 异常与框架实现逐字一致，见 bocomadp/skill_write_through.py。
+from bocomadp.skill_write_through import install_skill_write_through
+
+install_skill_write_through(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
@@ -1103,7 +1159,7 @@ app.include_router(agent_concurrency_router)
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）
 app.include_router(oss_download_router)
-# 按凭证查询模型（含单模型绑定过滤）
+# 按 (X-User-ID, credential_id) 查询凭证 payload（+ ELLM 凭证部分更新）
 app.include_router(credential_model_router)
 # 系统提示词管理（全局默认 + 按智能体自定义）
 from bocomadp.routers.system_prompt import system_prompt_router
@@ -1120,6 +1176,9 @@ app.include_router(agent_credential_router)
 # 智能体市场（平台应用列表 / 精选推荐 / 默认标签打标，全开放）
 from bocomadp.routers.market import market_router
 app.include_router(market_router)
+# 智能体模板名单（可复制白名单的 CRUD：/agent/template）
+from bocomadp.routers.agent_template import agent_template_router
+app.include_router(agent_template_router)
 
 
 # ---------------------------------------------------------------------------

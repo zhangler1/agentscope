@@ -27,7 +27,10 @@ Endpoint
       ``model`` / ``parameters``，``type`` 与 ``credential_id`` 由后端补齐
       （``credential_id`` 取自 ``agent_credential`` 表按 ``agent_id`` 的绑定，
       ``type`` 固定为 ``bocom_ellm_credential``），最终落库结构与原生接口
-      完全一致。
+      完全一致。另支持可选 ``permission_mode``：显式传入时写入会话 state，
+      省略时取配置项 ``default_permission_mode``（见
+      :mod:`bocomadp.session_default_mode`）——不再落到框架默认的
+      ``default``（那是"每个工具调用都弹确认"）。
     - update：更新已有会话的模型配置，同样**自动注入该智能体绑定的
       ELLM 凭证**。语义与原生 ``PATCH /api/sessions/{session_id}`` 一致
       （省略字段 = 不改，显式传 ``null`` = 清空），差异同样只在
@@ -65,8 +68,13 @@ from agentscope.app.storage import (
     TTSModelConfig,
 )
 from agentscope.app.workspace_manager import WorkspaceManagerBase
+from agentscope.permission import PermissionMode
 
 from bocomadp.routers.agent_credential import get_agent_credential_id
+from bocomadp.session_default_mode import (
+    resolve_default_mode,
+    session_state_with_mode,
+)
 
 logger = logging.getLogger("bocomadp.session_usage")
 
@@ -790,9 +798,14 @@ class SessionChatModelInput(BaseModel):
 class CreateSessionWithCredentialRequest(BaseModel):
     """``POST /sessions/create`` 请求体。
 
-    字段与原生 ``CreateSessionRequest`` 一致，唯一差异是
-    ``chat_model_config`` 为精简形态（无 ``type`` / ``credential_id``）。
-    其余模型配置仍按原生形态传入。
+    字段与原生 ``CreateSessionRequest`` 一致，差异是：
+
+    - ``chat_model_config`` 为精简形态（无 ``type`` / ``credential_id``）；
+    - 额外支持 ``permission_mode``（原生创建接口没有该字段）：显式传入时
+      写入新会话的 ``state.permission_context.mode``；**省略时取配置项**
+      ``default_permission_mode``（``config.yaml`` /
+      ``BOCOMADP_DEFAULT_PERMISSION_MODE``），而不是框架默认的
+      ``default``（每个工具调用都弹确认卡）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -823,6 +836,16 @@ class CreateSessionWithCredentialRequest(BaseModel):
     knowledge_config: SessionKnowledgeConfig | None = Field(
         default=None,
         description="会话知识库挂载配置（原生形态）；省略则不挂载。",
+    )
+    permission_mode: PermissionMode | None = Field(
+        default=None,
+        description=(
+            "会话权限模式：``default``（每次工具调用弹确认）/ "
+            "``accept_edits``（工作区内文件编辑免确认）/ ``explore``"
+            "（只读）/ ``bypass``（跳过权限检查）/ ``dont_ask``"
+            "（不弹确认、需确认的操作直接拒绝）。"
+            "省略时取配置项 ``default_permission_mode``。"
+        ),
     )
 
 
@@ -1014,8 +1037,11 @@ async def create_session_with_credential(
        ``bocom_ellm_credential``（否则 → 400）——见
        :func:`_build_bound_chat_model_config`
     3. 校验知识库可见性；解析 ``workspace_id``（显式传入优先）
-    4. ``storage.upsert_session(...)`` 落库 —— 结构与原生接口完全一致
-       （同一 ``(user_id, agent_id, workspace_id)`` 三元组为 upsert）
+    4. 解析权限模式：``body.permission_mode`` 优先，省略时取配置项
+       ``default_permission_mode``（见 :mod:`bocomadp.session_default_mode`）
+    5. ``storage.upsert_session(..., state=...)`` 落库 —— 除 state 里带上了
+       权限模式外，结构与原生接口完全一致（同一
+       ``(user_id, agent_id, workspace_id)`` 三元组为 upsert）
 
     Args:
         body (`CreateSessionWithCredentialRequest`): 请求体，见该模型。
@@ -1060,7 +1086,10 @@ async def create_session_with_credential(
         )
     )
 
-    # 4) 落库：与原生 create_session 相同的调用与字段
+    # 4) 落库：与原生 create_session 相同的调用与字段，额外带上 state ——
+    #    权限模式 = 显式传入优先，省略时取配置项 default_permission_mode
+    #    （框架默认是 default，即每次工具调用都弹确认卡）。
+    permission_mode = resolve_default_mode(body.permission_mode)
     session_record = await storage.upsert_session(
         user_id=user_id,
         agent_id=body.agent_id,
@@ -1072,14 +1101,16 @@ async def create_session_with_credential(
             knowledge_config=body.knowledge_config,
             **({"name": body.name} if body.name is not None else {}),
         ),
+        state=session_state_with_mode(permission_mode),
     )
     logger.info(
         "session create with credential: user=%s agent=%s credential=%s "
-        "session=%s",
+        "session=%s permission_mode=%s",
         user_id,
         body.agent_id,
         credential_id,
         session_record.id,
+        permission_mode.value,
     )
     return CreateSessionResponse(session_id=session_record.id)
 

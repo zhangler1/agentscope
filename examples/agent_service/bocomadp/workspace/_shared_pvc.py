@@ -852,6 +852,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
     # 120s + 三条 exec（各 60s）+ 健康轮询 15s，最坏累计数百秒，
     # 600s 兑底不误杀正常路径；超时抛异常走失败路径而非永久挂起
     POD_ROUTE_TIMEOUT_SECS = 600.0
+    # 兜底重建前的复核次数：每次实时 list 一遍池再判定，间隔 1s。
+    # 兜底删除是破坏性动作（同名 Pod 可能正被别人用），宁可多复核几轮。
+    REBUILD_RECHECK_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -933,6 +936,9 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         self._k8s_api_client: Any = None
         self._k8s_v1: Any = None
         self._k8s_lock = asyncio.Lock()
+        # 池 Pod 重建锁（按 agent_hash）：同名 Pod 的重建在本进程内串行，
+        # 避免多个请求同时删同一个 Pod（删谁的都是破坏性动作）。
+        self._rebuild_locks: dict[str, asyncio.Lock] = {}
 
     # ── 覆盖 get_workspace ──────────────────────────────────────
 
@@ -1451,6 +1457,110 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
         )
         return int.from_bytes(digest.digest(), "big") % pool_size
 
+    # ── 池 Pod 状态判定（复核用，全部纯函数） ──────────────────
+
+    @staticmethod
+    def _pod_terminating(pod: Any) -> bool:
+        """Pod 是否正在删除（``metadata.deletion_timestamp`` 非空）。
+
+        K8s 在 DELETE 被接受后立即写上该字段，但 ``status.phase`` 在
+        优雅期内**仍是 ``Running``**——所以判"可用"必须同时看这两者。
+        """
+        meta = getattr(pod, "metadata", None)
+        return getattr(meta, "deletion_timestamp", None) is not None
+
+    @staticmethod
+    def _pod_usable(pod: Any) -> bool:
+        """Pod 能否当沙箱用：``Running`` 且未在删除中。
+
+        只看 ``phase == "Running"`` 不够：正在删除的 Pod 也是 Running，
+        对它 exec 会被 apiserver 拒（HTTP 500 → 客户端报
+        ``Invalid response status``，命令根本没跑）。
+        """
+        if pod is None or pod.status is None:
+            return False
+        if pod.status.phase != "Running":
+            return False
+        return not SharedPvcK8sWorkspaceManager._pod_terminating(pod)
+
+    @staticmethod
+    def _pod_phase_label(pod: Any) -> str | None:
+        """给日志用的 phase 标签：``None`` = Pod 不存在，``Running(deleting)`` = 在删。"""
+        if pod is None or pod.status is None:
+            return None
+        if SharedPvcK8sWorkspaceManager._pod_terminating(pod):
+            return f"{pod.status.phase}(deleting)"
+        return str(pod.status.phase)
+
+    @classmethod
+    def _pool_snapshot(
+        cls,
+        pods: dict[str, Any],
+        agent_hash: str,
+        pool_size: int,
+    ) -> dict[str, str | None]:
+        """池内每个索引的 phase 标签（诊断用）。
+
+        打在"no running pool pod"那条 warning 上，下次复现就能一眼看出
+        到底是"快照里没有这个 Pod"（``null``）还是"phase 不对"。
+        """
+        return {
+            f"-{i}": cls._pod_phase_label(
+                pods.get(f"as-ws-{agent_hash}-{i}"),
+            )
+            for i in range(pool_size)
+        }
+
+    @classmethod
+    def _first_usable_pod(
+        cls,
+        pods: dict[str, Any],
+        agent_hash: str,
+        start: int,
+        pool_size: int,
+    ) -> str | None:
+        """从 ``start`` 起顺延，返回池里第一个可用 Pod 名（无则 ``None``）。"""
+        for k in range(pool_size):
+            name = f"as-ws-{agent_hash}-{(start + k) % pool_size}"
+            if cls._pod_usable(pods.get(name)):
+                return name
+        return None
+
+    async def _list_pool_pods(self, agent_hash: str) -> dict[str, Any]:
+        """**实时**列举该 agent 的池 Pod（name → Pod）；失败返回空 dict。
+
+        与 ``_ensure_pool`` 的 list 快照的区别：本方法不创建、不删除、
+        不改任何状态，纯读；K8s 抖动时返回空 dict 让调用方走保守分支。
+        """
+        from kubernetes_asyncio.client.rest import ApiException
+
+        try:
+            pods = await self._k8s_v1.list_namespaced_pod(
+                namespace=self._namespace,
+                label_selector=f"{self.POOL_LABEL_AGENT}={agent_hash}",
+            )
+        except ApiException as e:
+            logger.warning(
+                "SharedPvcK8sWorkspaceManager: recheck list pool pods for "
+                "agent_hash %r failed: %s",
+                agent_hash,
+                e,
+            )
+            return {}
+        return {
+            p.metadata.name: p
+            for p in (pods.items or [])
+            if p.metadata is not None
+        }
+
+    def _rebuild_lock(self, agent_hash: str) -> asyncio.Lock:
+        """取该 agent 池的"重建锁"：同名 Pod 的重建在本进程内串行。
+
+        ``dict.setdefault`` 在 CPython 里是原子的，竞态最多多造一个
+        立刻被丢弃的空锁，无副作用。
+        """
+        return self._rebuild_locks.setdefault(agent_hash, asyncio.Lock())
+
     async def _route_pod(
         self,
         agent_hash: str,
@@ -1466,10 +1576,24 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
 
         先经 :meth:`_ensure_pool` 补全池（primary=hash 目标，同步
         预热），再从 hash 目标起顺延找第一个 Running Pod 并刷新
-        last-active annotation。全池无 Running Pod 时删除重建
-        hash 目标 Pod 并等待就绪，兜底保证 run 有可用沙箱。
-        周期性的不可用检测与重建主要由 sweeper 负责，这里是
-        访问路径上的兜底。
+        last-active annotation。周期性的不可用检测与重建主要由
+        sweeper 负责，这里是访问路径上的兜底。
+
+        **兜底删除有闸门**：``_ensure_pool`` 返回的是 list 快照，可能
+        陈旧（并发请求刚建好的 Pod 还不在里面、或那份对象的 phase
+        已过期）。照旧直接 ``delete_namespaced_pod`` 会把**别的请求
+        正在用的同名 Pod** 删掉（Pod 名确定，同 agent 共用），表现为
+        对方下一条 exec 报 ``500 Invalid response status``。因此删除前：
+
+        1. **实时复核**（最多 :data:`REBUILD_RECHECK_ATTEMPTS` 轮，
+           每轮重新 list 一遍池）：只要发现有可用 Pod 就用它，不删；
+        2. **在用的不删**：本进程 ``_pool_busy`` 为真说明有请求正在这个
+           池里干活（那个 Pod 就是"活着"的最好证据）→ 直接复用它；
+        3. 两轮都拦不住时，若池在忙但目标 Pod 已消失，则**抛
+           ``RuntimeError`` 让本次请求快速失败**（重试即可），而不是
+           做破坏性重建；只有"池空闲且确实没有可用 Pod"才真正重建；
+        4. 整个复核+重建过程持 :meth:`_rebuild_lock`，同名 Pod 的重建
+           在本进程内串行，避免多个请求同时删同一个 Pod。
         """
         from kubernetes_asyncio.client.rest import ApiException
 
@@ -1494,51 +1618,113 @@ class SharedPvcK8sWorkspaceManager(K8sWorkspaceManager):
                 await self._touch_last_active(name)
                 return name
 
-        # ── 全池无 Running Pod：重建 hash 目标 Pod 兜底 ──
+        # ── 兜底：快照里没有 Running Pod。重建是**破坏性**动作（Pod 名
+        # 确定、同 agent 共用，删掉的可能是别人正在用的那个），先复核 ──
         name = f"as-ws-{agent_hash}-{start}"
         logger.warning(
             "SharedPvcK8sWorkspaceManager: no running pool pod for "
-            "agent %r; rebuilding %r",
+            "agent %r; rechecking before rebuild %r (snapshot=%s)",
             agent_id,
             name,
+            self._pool_snapshot(existing, agent_hash, pool_size),
         )
-        try:
-            await self._k8s_v1.delete_namespaced_pod(name, self._namespace)
-        except ApiException as e:
-            if e.status != 404:
-                logger.warning(
-                    "SharedPvcK8sWorkspaceManager: delete bad pool pod "
-                    "%r failed: %s",
-                    name,
-                    e,
+
+        async with self._rebuild_lock(agent_hash):
+            may_rebuild = False
+            for attempt in range(1, self.REBUILD_RECHECK_ATTEMPTS + 1):
+                # 闸 1：实时复核 —— 不信 list 快照。同名 Pod 可能刚被并发
+                # 请求建好（快照里还没有它），或快照里那份对象的 phase 已
+                # 过期；两种都会让上面的判定误以为"全池无可用 Pod"。
+                fresh = await self._list_pool_pods(agent_hash)
+                candidate = self._first_usable_pod(
+                    fresh,
+                    agent_hash,
+                    start,
+                    pool_size,
                 )
-        # 等 Pod 真正消失，避免重建撞 409
-        deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline:
-            try:
-                await self._k8s_v1.read_namespaced_pod(
-                    name,
-                    self._namespace,
-                )
-            except ApiException as e:
-                if e.status == 404:
+                if candidate is not None:
+                    logger.info(
+                        "SharedPvcK8sWorkspaceManager: pool pod %r is "
+                        "usable on recheck; reuse it instead of rebuilding",
+                        candidate,
+                    )
+                    await self._touch_last_active(candidate)
+                    return candidate
+
+                # 闸 2：本进程有请求正在用这个池 → 那个 Pod 就是"活着"的
+                # 最好证据；删它会打断对方正在执行的 exec（报
+                # `500 Invalid response status`），所以绝不删。
+                if not await self._pool_busy(agent_hash):
+                    may_rebuild = True
                     break
-                raise
-            await asyncio.sleep(1.0)
-        await self._create_pool_pod(
-            name,
-            agent_hash,
-            agent_id,
-            agent_shared_pvc_name,
-            shared_read_only,
-            user_pvc_name,
-        )
-        await self._preheat_pod_gateway(
-            name,
-            shared_read_only=shared_read_only,
-        )
-        await self._touch_last_active(name)
-        return name
+                target = fresh.get(name)
+                if target is not None and not self._pod_terminating(target):
+                    logger.warning(
+                        "SharedPvcK8sWorkspaceManager: pool for agent %r "
+                        "is in use in this process; reuse %r instead of "
+                        "rebuilding it",
+                        agent_id,
+                        name,
+                    )
+                    await self._touch_last_active(name)
+                    return name
+                logger.warning(
+                    "SharedPvcK8sWorkspaceManager: pool for agent %r is in "
+                    "use but %r is unavailable; recheck %d/%d",
+                    agent_id,
+                    name,
+                    attempt,
+                    self.REBUILD_RECHECK_ATTEMPTS,
+                )
+                await asyncio.sleep(1.0)
+
+            if not may_rebuild:
+                # 池在忙、目标 Pod 又不可用：不做破坏性重建，让本次请求
+                # 快速失败（重试即可），而不是删掉可能在用的 Pod。
+                raise RuntimeError(
+                    f"Pool for agent {agent_id!r} is in use by an in-flight "
+                    f"request while {name!r} is unavailable; refusing to "
+                    "rebuild a pod that may be in use — retry later.",
+                )
+
+            # 池确实空闲且没有可用 Pod → 原逻辑：删掉重建
+            try:
+                await self._k8s_v1.delete_namespaced_pod(name, self._namespace)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(
+                        "SharedPvcK8sWorkspaceManager: delete bad pool pod "
+                        "%r failed: %s",
+                        name,
+                        e,
+                    )
+            # 等 Pod 真正消失，避免重建撞 409
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                try:
+                    await self._k8s_v1.read_namespaced_pod(
+                        name,
+                        self._namespace,
+                    )
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+                    raise
+                await asyncio.sleep(1.0)
+            await self._create_pool_pod(
+                name,
+                agent_hash,
+                agent_id,
+                agent_shared_pvc_name,
+                shared_read_only,
+                user_pvc_name,
+            )
+            await self._preheat_pod_gateway(
+                name,
+                shared_read_only=shared_read_only,
+            )
+            await self._touch_last_active(name)
+            return name
 
     async def _touch_last_active(self, pod_name: str) -> None:
         """刷新池 Pod 的 last-active annotation（unix 秒）。

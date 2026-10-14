@@ -51,6 +51,14 @@ class AgentMarketRow(_MarketBase):
 
     agent_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     tag: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # 发布弹窗档案：publish 时随申请填写，approve 上架时从审批行复制
+    # 过来，市场列表/精选直接展示。业务条线不单独设列——
+    # 就是本表的 tag（打标/撕标接口直接复用）。列名统一 system_name
+    # （比 system 更达意：存的是"系统名"，且避免与泛指"系统"混淆），
+    # 与接口字段同名免转换。
+    department: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    system_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    description: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
@@ -67,6 +75,9 @@ class AgentMarketEntry(BaseModel):
 
     agent_id: str
     tag: str = ""
+    department: str = ""
+    system_name: str = ""
+    description: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -85,8 +96,48 @@ def _session_factory(storage: Any) -> Any:
     return getattr(storage, "_session_factory", None)
 
 
+#: 列级迁移清单：表名 → {列名: DDL}。老库已建过表，``create_all``
+#: 只按表名跳过不会补新列，ORM 查询全列 SELECT 会报 Unknown column，
+#: 故启动时逐列检查、缺列补 ``ALTER TABLE ADD COLUMN``。
+_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
+    "agent_market": {
+        "department": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "system_name": "VARCHAR(64) NOT NULL DEFAULT ''",
+        "description": "VARCHAR(500) NOT NULL DEFAULT ''",
+    },
+}
+
+
+async def ensure_columns(engine: Any, migrations: dict[str, dict[str, str]]) -> None:
+    """列级幂等迁移（MySQL / SQLite 通用）：缺列才 ALTER，已有列不动。
+
+    ``market_review_store.ensure_review_tables`` 也复用本函数（审批表
+    同批新增的 4 列），放这里避免两个 store 各抄一份。
+    """
+    from sqlalchemy import inspect
+
+    async with engine.begin() as conn:
+
+        def _existing(sync_conn: Any) -> dict[str, set[str]]:
+            insp = inspect(sync_conn)
+            return {
+                t: {c["name"] for c in insp.get_columns(t)}
+                for t in migrations
+            }
+
+        tables = await conn.run_sync(_existing)
+        for table, cols in migrations.items():
+            for name, ddl in cols.items():
+                if name in tables.get(table, set()):
+                    continue
+                await conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {ddl}",
+                )
+                logger.info("added column %s to %s", name, table)
+
+
 async def ensure_market_tables(storage: Any) -> None:
-    """启动时建表（幂等，已存在则跳过）+ 孤儿名单清理。
+    """启动时建表（幂等，已存在则跳过）+ 列级迁移 + 孤儿名单清理。
 
     生产部署时 ``agent_market`` 按新结构新建，无存量迁移；本地老库
     残留的旧口径列不影响运行，需要清理走手工 SQL（见运营手册）。
@@ -99,6 +150,7 @@ async def ensure_market_tables(storage: Any) -> None:
         return
     async with engine.begin() as conn:
         await conn.run_sync(_MarketBase.metadata.create_all)
+    await ensure_columns(engine, _COLUMN_MIGRATIONS)
     logger.info("ensured table agent_market")
 
     # 孤儿名单兜底清理（智能体已被删但市场行残留的死数据）
@@ -111,16 +163,22 @@ async def insert_market_entry(
     storage: Any,
     agent_id: str,
     tag: str = "",
+    meta: dict[str, str] | None = None,
 ) -> bool:
     """把一个智能体放进市场名单（publish 专用）。
 
     不存在则插行（``tag`` 默认空串 = 未打标），返回 True；
     已在名单内则**不动已有行**（幂等，不覆盖已配置的标签），返回 False。
+
+    ``meta`` 是发布档案（approve 上架时从审批行复制过来）：
+    ``{"department", "system_name", "description"}``，缺键兜底空串；
+    业务条线不进 meta——走 ``tag`` 参数（业务条线即 tag）。
     """
     factory = _session_factory(storage)
     if factory is None:
         return False
     now = _now()
+    meta = meta or {}
     async with factory() as session:
         if await session.get(AgentMarketRow, agent_id) is not None:
             return False
@@ -128,6 +186,9 @@ async def insert_market_entry(
             AgentMarketRow(
                 agent_id=agent_id,
                 tag=tag,
+                department=meta.get("department", ""),
+                system_name=meta.get("system_name", ""),
+                description=meta.get("description", ""),
                 created_at=now,
                 updated_at=now,
             ),
@@ -170,6 +231,9 @@ async def get_market_entry(
         return AgentMarketEntry(
             agent_id=row.agent_id,
             tag=row.tag,
+            department=row.department,
+            system_name=row.system_name,
+            description=row.description,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -188,6 +252,9 @@ async def list_market_entries(storage: Any) -> list[AgentMarketEntry]:
             AgentMarketEntry(
                 agent_id=r.agent_id,
                 tag=r.tag,
+                department=r.department,
+                system_name=r.system_name,
+                description=r.description,
                 created_at=r.created_at,
                 updated_at=r.updated_at,
             )

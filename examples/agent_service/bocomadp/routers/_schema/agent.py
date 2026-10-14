@@ -14,6 +14,13 @@ class CreateAgentRequest(BaseModel):
     """Request body for creating a new agent."""
 
     name: str = Field(description="Display name of the agent.")
+    description: str = Field(
+        default="",
+        description=(
+            "智能体简介（一句话说明它能做什么）。随 AgentData 存进 "
+            "``agents.payload``；不传则空串。"
+        ),
+    )
     system_prompt: str = Field(
         default="你是一个乐于助人的AI助手。",
         description="Base system prompt fed to the agent.",
@@ -61,6 +68,17 @@ class CreateAgentResponse(BaseModel):
     agent_id: str = Field(description="Server-assigned agent identifier.")
 
 
+class CopyAgentRequest(BaseModel):
+    """Request body for copying an agent（只复制本体，不搬技能）。"""
+
+    name: str | None = Field(
+        default=None,
+        description=(
+            "新智能体名；缺省为 '<源名> 副本'。允许与已有智能体重名。"
+        ),
+    )
+
+
 class UpdateAgentRequest(BaseModel):
     """Request body for partially updating an agent.
 
@@ -68,6 +86,13 @@ class UpdateAgentRequest(BaseModel):
     """
 
     name: str | None = Field(default=None, description="New display name.")
+    description: str | None = Field(
+        default=None,
+        description=(
+            "New description. Omit to keep the current value; pass an "
+            "empty string to clear it."
+        ),
+    )
     system_prompt: str | None = Field(
         default=None,
         description="New system prompt.",
@@ -90,6 +115,33 @@ class UpdateAgentRequest(BaseModel):
     )
 
 
+class PublishInfoView(BaseModel):
+    """发布档案（用户点发布时填的表单原值）。
+
+    挂在 ``TeamAgentView.publish_info`` 下，**包成对象**而不是摊平成
+    顶层字段：``data.description`` 是"智能体简介"（智能体本体的
+    AgentData 字段），本模型的 ``description`` 是"发布说明"（发布弹窗
+    填的那栏）——两者同名不同义，放进各自的容器里就不会撞车。
+    """
+
+    department: str = Field(
+        default="",
+        description="所属部门（发布弹窗填写的原值；未发布过为空串）。",
+    )
+    system_name: str = Field(
+        default="",
+        description="所属系统（发布弹窗填写的原值；未发布过为空串）。",
+    )
+    tag: str = Field(
+        default="",
+        description="业务条线（发布时选择，即市场标签；未发布过为空串）。",
+    )
+    description: str = Field(
+        default="",
+        description="发布说明（发布弹窗填写的用途介绍）；未发布过为空串。",
+    )
+
+
 class TeamAgentView(AgentView):
     """Agent view re-deriving the expert-team fields.
 
@@ -105,6 +157,88 @@ class TeamAgentView(AgentView):
     # list was queried with ``parent_agent_id`` — mirrors the historical
     # framework ``AgentView`` contract.
     is_self_built: bool | None = None
+    # 发布/审批状态（列表接口批量附带，与 GET /agent/owned 的
+    # OwnedAgentView.publish_status 同口径）。
+    publish_status: str = Field(
+        default="not_submitted",
+        description=(
+            "发布/审批状态：not_submitted（未发布/待发布）/ pending"
+            "（待审核）/ approved（已通过，= 已在市场）/ rejected"
+            "（已驳回）。已在市场的智能体（含平台内置手动上架）恒为"
+            " approved。"
+        ),
+    )
+    publish_info: PublishInfoView = Field(
+        default_factory=PublishInfoView,
+        description=(
+            "发布档案（用户点发布时填的表单原值）：department / "
+            "system_name / tag / description，供前端回显发布弹窗"
+            "（已驳回重新发布时省得重填）。无档案（not_submitted）时"
+            "四项皆为空串。**包成对象**是为了和 data.description"
+            "（智能体简介）区分开，两者同名的 description 含义不同。"
+        ),
+    )
+    review_reason: str | None = Field(
+        default=None,
+        description=(
+            "审批结论（审批人写的那段话，已办结就有值）：publish_status"
+            "=rejected 时是**驳回理由**、=approved 时是**审批意见**"
+            "（通过时没写意见则为空串）；pending / not_submitted 为 "
+            "null。**前端按 publish_status 决定这栏显示什么文案**。"
+        ),
+    )
+    reviewer: str = Field(
+        default="",
+        description=(
+            "审批人 user_id。未提交过发布（not_submitted）或审批记录"
+            "已随下架清除时为空串。"
+        ),
+    )
+    reviewed_at: datetime | None = Field(
+        default=None,
+        description="审批时间（ISO 8601）；未审批为 null。",
+    )
+
+
+class CopyAgentResponse(TeamAgentView):
+    """Response body for ``POST /agent/{agent_id}/copy``.
+
+    与 ``GET /agent/`` 的列表元素、``PATCH /agent/{id}`` 的响应**同构**
+    （都是 :class:`TeamAgentView`）：``id`` / ``created_at`` / ``updated_at``
+    / ``user_id`` / ``source`` / ``data`` / ``editable`` / ``is_team`` /
+    ``parent_agent_id`` / ``is_self_built`` —— 前端可以把它直接当成一个
+    智能体对象插进列表，不需要再调一次 ``GET``。
+
+    只复制本体、不搬技能（技能按会话存储在 workspace 里，不属于智能体
+    配置），因此也没有任何"复制过程信息"需要返回："复制成功"由 HTTP 201
+    表达。
+
+    - ``editable`` 恒为 ``True``（复制品归属调用者，与 ``PATCH`` 的响应
+      口径一致——那两处都是在权限校验之后构造的视图）；
+    - 新建的复制品 ``is_team=False`` / ``parent_agent_id=None`` /
+      ``is_self_built=None``（团队关系不复制）；
+    - ``skills`` 是**源智能体所属模板行**声明的技能清单
+      （``agent_template.skills``），只透出、不安装。
+    """
+
+    agent_id: str = Field(
+        description=(
+            "新智能体 id；与 :attr:`id` 同值，保留以兼容“只取 agent_id”"
+            "的旧调用方。"
+        ),
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description=(
+            "**源**智能体在 ``agent_template`` 名单里声明的 ``skills``"
+            "（期望安装的技能清单，元素形如 ``namespace:name``，如 "
+            "``global:rollback-check-sql``）。"
+            "取值与 ``GET /agent/template/agents`` 的模板行同源；"
+            "源不在模板名单内（或存储层不可用）时为空列表。"
+            "本端点只**返回清单**，不代为安装（技能仍由调用方按清单"
+            "逐个调 ``POST /workspace/skill/download/{namespace}:{name}``）。"
+        ),
+    )
 
 
 class ListAgentsResponse(BaseModel):
@@ -126,6 +260,12 @@ class OwnedAgentView(BaseModel):
 
     id: str = Field(description="智能体 id。")
     name: str = Field(description="智能体名称。")
+    description: str = Field(
+        default="",
+        description=(
+            "智能体简介（AgentData.description）；历史脏数据缺字段时兜底空串。"
+        ),
+    )
     system_prompt: str = Field(
         default="",
         description=(
@@ -144,6 +284,43 @@ class OwnedAgentView(BaseModel):
     )
     created_at: datetime | None = Field(default=None, description="创建时间。")
     updated_at: datetime | None = Field(default=None, description="最后更新时间。")
+    publish_status: str = Field(
+        default="not_submitted",
+        description=(
+            "发布/审批状态：not_submitted（从未提交）/ pending（审核中）"
+            "/ approved（已上架市场）/ rejected（已拒绝）。已在市场的"
+            "智能体（含平台内置手动上架）恒为 approved。"
+        ),
+    )
+    publish_info: PublishInfoView = Field(
+        default_factory=PublishInfoView,
+        description=(
+            "发布档案（用户点发布时填的表单原值）：department / "
+            "system_name / tag / description，供前端回显发布弹窗"
+            "（已驳回重新发布时省得重填）。无档案（not_submitted）时"
+            "四项皆为空串。与 GET /agent/ 的同名字段同口径。"
+        ),
+    )
+    reviewer: str = Field(
+        default="",
+        description=(
+            "审批人 user_id；未提交过发布、或审批记录已随下架清除时为"
+            "空串。与 GET /agent/ 的同名字段同口径。"
+        ),
+    )
+    reviewed_at: datetime | None = Field(
+        default=None,
+        description="审批时间（ISO 8601）；未审批为 null。",
+    )
+    review_reason: str | None = Field(
+        default=None,
+        description=(
+            "审批结论（审批人写的那段话，已办结就有值）：publish_status"
+            "=rejected 时是**驳回理由**、=approved 时是**审批意见**"
+            "（通过时没写意见则为空串）；pending / not_submitted 为 "
+            "null。**前端按 publish_status 决定这栏显示什么文案**。"
+        ),
+    )
 
 
 class ListOwnedAgentsResponse(BaseModel):

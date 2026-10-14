@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import io
+from typing import Any
 
 from .manager import UploadError
 
@@ -133,23 +134,72 @@ def _convert_pdf(src: bytes) -> str:
     return "\n\n".join(parts)
 
 
+def _docx_cell_text(cell: Any) -> str:
+    """docx 单元格 → 单行文本（多段落用空格连接，转义 GFM 的 ``|``）。"""
+    parts = [p.text.strip() for p in cell.paragraphs if p.text.strip()]
+    return " ".join(parts).replace("|", "\\|")
+
+
+def _docx_table_to_md(table: Any) -> str:
+    """docx 表格 → GFM 管道表（首行作表头；单元格内多段落合并成一行）。
+
+    回退通道此前只遍历 ``doc.paragraphs``，**表格整块丢失**（表格内容不在
+    paragraphs 里，而在 ``doc.tables``）——这是"上传 docx 后 md 缺表格"的
+    直接原因。
+
+    首行全空时（python-docx / 部分导出器不写 ``w:tblHeader``）会把首个非空行
+    提为表头，避免输出一个空表头行。
+    """
+    rows: list[list[str]] = []
+    for row in table.rows:
+        rows.append([_docx_cell_text(cell) for cell in row.cells])
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+
+    header = rows[0]
+    body_rows = rows[1:]
+    if all(not c.strip() for c in header) and body_rows:
+        header = body_rows[0]
+        body_rows = body_rows[1:]
+
+    out = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    out.extend("| " + " | ".join(r) + " |" for r in body_rows)
+    return "\n".join(out)
+
+
 def _convert_docx(src: bytes) -> str:
     try:
         from docx import Document  # type: ignore
+        from docx.table import Table  # type: ignore
+        from docx.text.paragraph import Paragraph  # type: ignore
     except ImportError as e:
         raise UnsupportedFileType("python-docx not installed") from e
     doc = Document(io.BytesIO(src))
     lines: list[str] = []
-    for para in doc.paragraphs:
-        style = (para.style.name or "") if para.style else ""
-        text = para.text.strip()
-        if not text:
-            continue
-        if style.startswith("Heading"):
-            level = "".join(filter(str.isdigit, style)) or "1"
-            lines.append(f"{'#' * min(int(level), 6)} {text}")
-        else:
-            lines.append(text)
+    # 按**文档顺序**遍历 body 的子元素（w:p 段落 / w:tbl 表格），否则表格
+    # 与其前后段落的相对顺序会丢失（表格混在段落末尾）。
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            para = Paragraph(child, doc)
+            style = (para.style.name or "") if para.style else ""
+            text = para.text.strip()
+            if not text:
+                continue
+            if style.startswith("Heading"):
+                level = "".join(filter(str.isdigit, style)) or "1"
+                lines.append(f"{'#' * min(int(level), 6)} {text}")
+            else:
+                lines.append(text)
+        elif tag == "tbl":
+            md_table = _docx_table_to_md(Table(child, doc))
+            if md_table:
+                lines.append(md_table)
     return "\n\n".join(lines)
 
 

@@ -83,6 +83,17 @@ class AgentData(BaseModel):
         title="Name",
     )
 
+    description: str = Field(
+        default="",
+        description=(
+            "面向使用者的智能体简介（一句话说明它能做什么），随本模型"
+            "序列化进 ``agents.payload`` 的 ``data`` 下。默认空串以保证"
+            "存量记录（payload 中无该键）仍可正常读取。"
+        ),
+        title="Description",
+        json_schema_extra={"format": "textarea"},
+    )
+
     system_prompt: str = Field(
         default="你是一个乐于助人的AI助手。",
         description="The system prompt for the agent.",

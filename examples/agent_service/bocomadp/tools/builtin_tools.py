@@ -104,6 +104,21 @@ def list_uploaded_files(
     """
     from bocomadp.uploads.db import get_uploads_db
 
+    # 当前会话上下文自动注入：ContextVar 由 build_agent_tools 在每次
+    # chat run 组装工具时 set（工具在 run 任务内执行，可直接读取）；
+    # 显式传入的参数优先。
+    if not user_id or not session_id:
+        try:
+            from bocomadp.tools.agent_factory_tools import (
+                _current_session_id,
+                _current_user_id,
+            )
+
+            user_id = user_id or _current_user_id.get()
+            session_id = session_id or _current_session_id.get()
+        except Exception:  # noqa: BLE001
+            pass
+
     if not user_id or not session_id:
         return (
             "缺少 user_id / session_id。请直接传入当前会话的这两个值"
@@ -169,6 +184,21 @@ def read_uploaded_file(
     """
     from bocomadp.uploads.db import get_uploads_db
     from bocomadp.uploads.manager import resolve_upload_parts
+
+    # 当前会话上下文自动注入：ContextVar 由 build_agent_tools 在每次
+    # chat run 组装工具时 set（工具在 run 任务内执行，可直接读取）；
+    # 显式传入的参数优先。
+    if not user_id or not session_id:
+        try:
+            from bocomadp.tools.agent_factory_tools import (
+                _current_session_id,
+                _current_user_id,
+            )
+
+            user_id = user_id or _current_user_id.get()
+            session_id = session_id or _current_session_id.get()
+        except Exception:  # noqa: BLE001
+            pass
 
     if not user_id or not session_id:
         return (

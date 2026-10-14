@@ -209,6 +209,29 @@ class UploadsDB:
         ).fetchone()
         return UploadedFile(**dict(row)) if row else None  # type: ignore[arg-type]
 
+    def get_by_session_virtual_path(
+        self,
+        user_id: str,
+        session_id: str,
+        virtual_path: str,
+    ) -> UploadedFile | None:
+        """按 ``(user_id, session_id, virtual_path)`` 三键定位单条记录。
+
+        虚拟路径不编码 session（方案 A），不同会话上传同名文件会产生多条
+        相同 ``virtual_path`` 的记录，仅按 virtual_path 查询无法确定归属；
+        带上 user/session 三键后命中即代表归属校验通过，也杜绝了
+        ``LIMIT 1`` 误命中其他会话旧记录的问题。
+        """
+        row = self._conn.execute(
+            """
+            SELECT * FROM uploaded_files
+            WHERE user_id = ? AND session_id = ? AND virtual_path = ?
+            LIMIT 1
+            """,
+            (user_id, session_id, virtual_path),
+        ).fetchone()
+        return UploadedFile(**dict(row)) if row else None  # type: ignore[arg-type]
+
     def get_by_session_file(
         self,
         user_id: str,

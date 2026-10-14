@@ -6,6 +6,7 @@ that framework sources stay untouched: the framework router is detached
 in ``main.py`` and this router (including the 8 ``/team/*`` endpoints
 and the CRUD expert-team behavior) is registered instead.
 """
+import logging
 from datetime import datetime
 from typing import Literal
 
@@ -13,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, ValidationError
 
 from agentscope.agent import ContextConfig, ReActConfig
-from agentscope._utils._common import _flatten_json_schema
+from agentscope._utils._common import _flatten_json_schema, _generate_id
 from agentscope.app.access import ResourceKind
 from agentscope.app.deps import (
     get_current_user_id,
@@ -27,8 +28,11 @@ from bocomadp.routers._schema.agent import (
     ListAgentsResponse,
     ListOwnedAgentsResponse,
     OwnedAgentView,
+    PublishInfoView,
     CreateAgentRequest,
     CreateAgentResponse,
+    CopyAgentRequest,
+    CopyAgentResponse,
     UpdateAgentRequest,
     TeamAgentView,
 )
@@ -38,6 +42,11 @@ from agentscope.app.storage import (
     AgentData,
     AgentRecord,
     InviteConfig,
+)
+from bocomadp.agent_template_store import get_template_entry
+from bocomadp.agents_extend_store import (
+    delete_agent_extend,
+    ensure_agent_extend_row,
 )
 from bocomadp.team_store import (
     ExpertTeamRelation,
@@ -52,6 +61,8 @@ agent_router = APIRouter(
     tags=["agent"],
     responses={404: {"description": "Not found"}},
 )
+
+logger = logging.getLogger("bocomadp.agent")
 
 
 @agent_router.get(
@@ -83,7 +94,7 @@ async def get_agent_schema() -> AgentSchemaResponse:
     # a dict by hand) keeps Pydantic as the single source of truth for
     # defaults, titles, descriptions, and the ``format: textarea`` hint.
     agent_schema = AgentData.model_json_schema()
-    identity_keys = ("name", "system_prompt")
+    identity_keys = ("name", "description", "system_prompt")
     identity = {
         "type": "object",
         "title": "Identity",
@@ -152,6 +163,99 @@ async def get_agent_schema_v2() -> AgentSchemaV2Response:
     context_config = schema.get("properties", {}).get("context_config", {})
     context_config.get("properties", {}).pop("summary_schema", None)
     return AgentSchemaV2Response(schema=schema)
+
+
+async def _attach_publish_status(
+    storage: StorageBase,
+    items: list[TeamAgentView],
+) -> None:
+    """批量给视图附上发布/审批状态（in-place）。
+
+    与 ``GET /agent/owned`` 的 ``publish_status`` 同口径（两步小查询，
+    不逐条查）：
+
+    - 已在市场（``agent_market`` 有行，含平台内置手动上架）→ approved；
+    - 有审批记录 → pending / rejected（审批结论走同项的 ``review_reason``）；
+    - 都没有 → 保持默认 not_submitted（未发布/待发布）。
+
+    同时回显**发布档案四件套**（department / system_name / tag /
+    description）：用户点发布时填的表单原值，前端在"已驳回重新发布"
+    时直接回填弹窗，省得重填。口径：**有档案就带**
+    ——approved 取市场行（上架即定格），pending/rejected 取审批记录，
+    not_submitted 保持空串。数据来源都是本函数已有的两次批量查询，
+    **不新增查询次数**。
+
+    同时附带**审批明细**（review_reason / reviewer / reviewed_at）：
+    前端不用再单查发布状态接口，一次列表请求即可渲染状态角标、驳回
+    理由与"谁在什么时候审的"。口径同"有档案就带"：审批记录存在就带，
+    下架后记录已清除则回落空值。数据同样来自已有的两次批量查询，
+    **不新增查询次数**。
+
+    调用方：``GET /agent/``（分页后的当前页批量附带）与
+    ``_to_team_view``（PATCH 单条返回附带）。
+    """
+    if not items:
+        return
+    from bocomadp.market_review_store import STATUS_APPROVED, STATUS_REJECTED
+    from bocomadp.market_review_store import review_status_map
+    from bocomadp.market_store import list_market_entries
+
+    ids = [item.id for item in items]
+    status_map = await review_status_map(storage, ids)
+    market_map = {
+        e.agent_id: e
+        for e in await list_market_entries(storage)
+        if e.agent_id in set(ids)
+    }
+    for item in items:
+        review = status_map.get(item.id)
+        entry = market_map.get(item.id)
+        if entry is not None:
+            item.publish_status = STATUS_APPROVED
+            _fill_publish_archive(
+                item,
+                entry.department,
+                entry.system_name,
+                entry.tag,
+                entry.description,
+            )
+        elif review is None:
+            continue  # 默认 not_submitted（schema 默认值）
+        else:
+            item.publish_status = review.status
+            _fill_publish_archive(
+                item,
+                review.department,
+                review.system_name,
+                review.tag,
+                review.description,
+            )
+        if review is None:
+            continue
+        if review.status in (STATUS_APPROVED, STATUS_REJECTED):
+            item.review_reason = review.reason
+        item.reviewer = review.reviewer
+        item.reviewed_at = review.reviewed_at
+
+
+def _fill_publish_archive(
+    item: TeamAgentView | OwnedAgentView,
+    department: str,
+    system_name: str,
+    tag: str,
+    description: str,
+) -> None:
+    """把发布档案四件套写进 ``item.publish_info``（空值兜底空串，回显用）。
+
+    包在 ``publish_info`` 对象里而不是摊平到顶层：``data.description``
+    是"智能体简介"，这里的 ``description`` 是"发布说明"，同名不同义。
+    """
+    item.publish_info = PublishInfoView(
+        department=department or "",
+        system_name=system_name or "",
+        tag=tag or "",
+        description=description or "",
+    )
 
 
 @agent_router.get(
@@ -270,6 +374,8 @@ async def list_agents(
     # （多出 is_team / parent_agent_id / is_self_built 三个专家团字段），
     # 显式转换以通过 Pydantic 校验。
     views = [TeamAgentView(**e.model_dump()) for e in page_entries]
+    # 发布/审批状态批量附带（当前页，与 /agent/owned 同口径）
+    await _attach_publish_status(storage, views)
     return ListAgentsResponse(agents=views, total=total)
 
 
@@ -327,13 +433,16 @@ async def list_owned_agents(
         m for t in teams for m in t.member_ids  # noqa: C416
     }
     items: list[OwnedAgentView] = []
+    owned_ids: list[str] = []
     for record in sorted(records, key=lambda r: r.updated_at, reverse=True):
         if record.id in member_ids:
             continue
+        owned_ids.append(record.id)
         items.append(
             OwnedAgentView(
                 id=record.id,
                 name=record.data.name,
+                description=record.data.description,
                 system_prompt=record.data.system_prompt,
                 is_team=any(t.leader_agent_id == record.id for t in teams),
                 parent_agent_id=None,
@@ -342,6 +451,47 @@ async def list_owned_agents(
                 updated_at=record.updated_at,
             ),
         )
+    # 发布/审批状态批量附带（"我的智能体"页渲染状态标签用）：
+    # 两步小查询——审批表一次 id IN + 市场名单一次全量（表小，内存过滤），
+    # 不逐条查询。已在市场（含平台内置手动上架）恒为 approved。
+    from bocomadp.market_review_store import STATUS_APPROVED, STATUS_REJECTED
+    from bocomadp.market_review_store import review_status_map
+    from bocomadp.market_store import list_market_entries
+
+    status_map = await review_status_map(storage, owned_ids)
+    market_map = {
+        e.agent_id: e
+        for e in await list_market_entries(storage)
+        if e.agent_id in set(owned_ids)
+    }
+    for item in items:
+        review = status_map.get(item.id)
+        entry = market_map.get(item.id)
+        if entry is not None:
+            item.publish_status = STATUS_APPROVED
+            _fill_publish_archive(
+                item,
+                entry.department,
+                entry.system_name,
+                entry.tag,
+                entry.description,
+            )
+        elif review is None:
+            continue  # 默认 not_submitted（schema 默认值）
+        else:
+            item.publish_status = review.status
+            _fill_publish_archive(
+                item,
+                review.department,
+                review.system_name,
+                review.tag,
+                review.description,
+            )
+        if review is not None:
+            if review.status in (STATUS_APPROVED, STATUS_REJECTED):
+                item.review_reason = review.reason
+            item.reviewer = review.reviewer
+            item.reviewed_at = review.reviewed_at
     total = len(items)
     start = (page_num - 1) * page_size
     return ListOwnedAgentsResponse(
@@ -363,6 +513,11 @@ async def create_agent(
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> CreateAgentResponse:
     """Create and persist a new agent configuration.
+
+    创建成功后**在 ``agents_extend`` 里预置一行**（``payload = {"skills": []}``）：
+    新智能体必定没有已装技能，先落空记录可让 ``GET /workspace/skill`` 直接
+    命中表、不必回源沙箱；该写入是尽力而为（失败只打 warning，读侧会回源
+    并写回），不影响创建结果。
 
     When ``body.parent_agent_id`` is set, the new agent is created as a
     member of that leader's expert team: its ``data.parent_agent_id`` is
@@ -434,6 +589,7 @@ async def create_agent(
     try:
         data = AgentData(
             name=body.name,
+            description=body.description,
             system_prompt=body.system_prompt,
             context_config=body.context_config,
             react_config=body.react_config,
@@ -446,6 +602,20 @@ async def create_agent(
         ) from exc
     record = AgentRecord(user_id=user_id, data=data)
     agent_id = await storage.upsert_agent(user_id, record)
+
+    # 预置一行 agents_extend（payload.skills = []）：新智能体没有任何已装
+    # 技能，先落一条空记录，让 GET /workspace/skill 直接命中表，不必解析
+    # 会话 → 路由 Pod → exec 列举（Pod 不可用时那条路径会失败）。
+    # **尽力而为**：写失败只打 warning —— 读侧找不到记录会自动回源沙箱并
+    # 写回（等同于旧行为），不能为一条缓存把已建好的智能体变成 500。
+    try:
+        await ensure_agent_extend_row(storage, agent_id, source="agent-create")
+    except Exception:  # noqa: BLE001 —— 缓存预置失败不影响创建主流程
+        logger.warning(
+            "create_agent: failed to preset agents_extend row for %s",
+            agent_id,
+            exc_info=True,
+        )
 
     if body.is_team and parent_id is None:
         # Create an empty team "shell" so the agent is already classified
@@ -464,6 +634,137 @@ async def create_agent(
     # 进名单；个人智能体由 owner 调 POST /agent/market/{id}/publish 上架。
 
     return CreateAgentResponse(agent_id=agent_id)
+
+
+@agent_router.post(
+    "/{agent_id}/copy",
+    response_model=CopyAgentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Copy an agent (payload only)",
+)
+async def copy_agent(
+    agent_id: str,
+    body: CopyAgentRequest,
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+    access: ResourceAccessService = Depends(get_resource_access_service),
+) -> CopyAgentResponse:
+    """复制智能体**本体**（``AgentData``）。
+
+    复制范围：
+
+    - **复制**：``name`` / ``description`` / ``system_prompt`` /
+      ``context_config`` / ``react_config`` / ``invite_config``
+      （``invite_config`` **原样**复制——``invitable`` 与
+      ``invite_description`` 都保留）；
+    - **不复制**：已安装技能（技能按会话存在 workspace 里，不属于智能体
+      配置）、工具/MCP 启停白名单、知识库配置、专家团（成员 / 团队档案 /
+      handoff）、市场名单、记忆配置、沙箱并发配置、凭证绑定。
+
+    响应里的 ``skills`` 取自**源**智能体在 ``agent_template`` 名单里的
+    那一行（``agent_template.skills``，元素形如 ``namespace:name``），
+    即"该模板期望安装的技能清单"：本端点只**返回清单**，不代为安装。
+    源不在模板名单内（或存储层不可用）时为空列表——注意这**不是**权限
+    判断，复制本身仍是"可读即可复制"。
+
+    因此复制品的默认状态是：``is_team=False``、``parent_agent_id=None``、
+    无技能、工具与 MCP 全部启用（新 id 在白名单里没有条目）、无知识库
+    配置 / 无记忆、并发走默认值、模型凭证走运行时兜底解析。
+
+    复制成功后会像 ``POST /agent/`` 一样**在 ``agents_extend`` 里预置一行**
+    （``payload = {"skills": []}``）：复制品此刻确实没有已装技能，预置空行可
+    让 ``/skills/*`` 查询与 ``GET /workspace/skill`` 不必回源沙箱；随后前端
+    调 ``/skill/ensure`` 装的技能会逐条写穿到这一行。该写入是尽力而为（失败
+    只打 warning，读侧会回源沙箱），不影响复制结果。
+
+    权限：可读即可复制（:meth:`ResourceAccessService.resolve_agent`），
+    不可见 → 404。命名：``body.name`` 缺省为 ``"<源名> 副本"``，允许与
+    已有智能体重名。
+
+    Args:
+        agent_id (`str`):
+            源智能体 id。
+        body (`CopyAgentRequest`):
+            复制参数（新名字）。
+        user_id (`str`):
+            Injected authenticated user ID（复制品归属该用户）。
+        storage (`StorageBase`):
+            Injected storage backend.
+        access (`ResourceAccessService`):
+            Injected resource access service（可见性校验 + 取源记录）。
+
+    Returns:
+        `CopyAgentResponse`:
+            新智能体的完整视图——与 ``GET /agent/`` 列表元素、``PATCH``
+            响应**同构**的 :class:`TeamAgentView`，可直接插进前端列表；
+            额外带 ``agent_id``（与 ``id`` 同值）与 ``skills``（源模板行
+            声明的技能清单）。
+
+    Raises:
+        `HTTPException`:
+            404 if the source agent is not visible to the caller.
+    """
+    src = await access.resolve_agent(user_id, agent_id)
+
+    # 两个 id 必须同时更换：``agents.id``（行主键）与 ``payload.data.id``
+    # 在框架里是各自独立生成的（存量行实测即不相等），只换主键会在 payload
+    # 里残留**源**的 data.id。
+    new_id = _generate_id()
+    payload = {**src.data.model_dump(exclude={"id"}), "id": new_id}
+    new_name = (body.name or "").strip()
+    payload["name"] = new_name or f"{src.data.name} 副本"
+
+    await storage.upsert_agent(
+        user_id,
+        AgentRecord(id=new_id, user_id=user_id, data=AgentData(**payload)),
+    )
+
+    # 预置一行 agents_extend（payload.skills = []），与 POST /agent/ 完全一致：
+    # 复制品当前**没有任何已装技能**（响应里的 ``skills`` 只是源模板声明的
+    # 清单，由前端随后调 /skill/ensure 安装；装成后 ensure 会逐条写穿本表，
+    # 见 skill_router._record_installed_skill）。不预置的话，复制品属于
+    # "无记录"，两个 /skills/* 查询每次都要回源沙箱（申请 Pod）。
+    # 尽力而为：写失败只打 warning —— 读侧找不到记录时仍会回源沙箱。
+    try:
+        await ensure_agent_extend_row(storage, new_id, source="agent-copy")
+    except Exception:  # noqa: BLE001 —— 缓存预置失败不影响复制主流程
+        logger.warning(
+            "copy_agent: failed to preset agents_extend row for %s",
+            new_id,
+            exc_info=True,
+        )
+
+    logger.info(
+        "copy_agent: %s → %s (by=%s, name=%r)",
+        agent_id,
+        new_id,
+        user_id,
+        payload["name"],
+    )
+
+    # 响应 = 新智能体的完整视图（与 GET /agent/ 列表元素、PATCH 响应同构），
+    # 前端可直接把它当成一个智能体对象插进列表，省一次 GET。
+    # ``_to_team_view`` 就是 PATCH 用的那个构造函数（复制品归属调用者，
+    # 所以 editable 恒 True；团队关系不复制 → is_team=False）。
+    stored = await storage.get_agent(user_id, new_id)
+    if stored is None:  # 理论不可达：刚 upsert 的行读不到
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Copied agent was not persisted.",
+        )
+    view = await _to_team_view(storage, user_id, stored)
+
+    # 模板声明的技能清单：``agent_template`` 里**源**智能体那一行的
+    # ``skills``（"该模板期望安装的技能"，元素 namespace:name）。只透出
+    # 清单、不代为安装；不在名单内 / 存储层不可用 → 空列表。
+    template = await get_template_entry(storage, agent_id)
+    template_skills = list(template.skills) if template is not None else []
+
+    return CopyAgentResponse(
+        **view.model_dump(),
+        agent_id=new_id,
+        skills=template_skills,
+    )
 
 
 @agent_router.patch(
@@ -582,6 +883,10 @@ async def delete_agent(
     不清理会留下孤儿档案（指向已删智能体的死数据）。团队成员级联删除
     等绕过本接口的路径，由启动时 ``prune_orphan_market_entries`` 兜底。
 
+    同时**级联清理扩展表记录**（``agents_extend`` 行，见
+    :func:`bocomadp.agents_extend_store.delete_agent_extend`），与创建接口
+    预置空记录成对，不留孤儿行；该清理失败只打 warning，不影响删除结果。
+
     Args:
         agent_id (`str`): The agent to delete.
         user_id (`str`): Injected authenticated user ID.
@@ -590,7 +895,7 @@ async def delete_agent(
             to resolve the owning user and enforce the edit permission
             when a shared editor deletes the agent.
         storage (`StorageBase`): Injected storage — used to cascade the
-            agent-market entry.
+            agent-market entry and the ``agents_extend`` row.
 
     Raises:
         `HTTPException`: 404 if the agent is not visible to the caller;
@@ -617,6 +922,27 @@ async def delete_agent(
             "delete_agent_market",
             target=agent_id,
             detail="删除智能体级联清理市场档案",
+        )
+    # 发布审批记录级联清理（防幽灵待办条目）
+    from bocomadp.market_review_store import delete_review_record
+
+    if await delete_review_record(storage, agent_id):
+        log_audit(
+            user_id,
+            "delete_agent_review",
+            target=agent_id,
+            detail="删除智能体级联清理发布审批记录",
+        )
+    # 扩展表（agents_extend）级联清理：不留指向已删智能体的孤儿行
+    # （读侧只在活智能体上查询，孤儿行无害但会一直占着；同步清理比
+    # 依赖启动扫描更及时）。失败同样不影响删除主流程。
+    try:
+        await delete_agent_extend(storage, agent_id)
+    except Exception:  # noqa: BLE001 —— 缓存清理失败不影响删除结果
+        logger.warning(
+            "delete_agent: failed to drop agents_extend row for %s",
+            agent_id,
+            exc_info=True,
         )
 
 
@@ -730,6 +1056,8 @@ async def _to_team_view(
         if team.is_self_built(record.id):
             view.parent_agent_id = team.leader_agent_id
             view.is_self_built = True
+    # 发布/审批状态附带（单条，与列表接口同口径）
+    await _attach_publish_status(storage, [view])
     return view
 
 

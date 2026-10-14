@@ -75,6 +75,26 @@ class UploadConfig(BaseModel):
         return int(self.streaming_threshold_mb * 1024 * 1024)
 
 
+def get_workspace_dir() -> Path:
+    """工作区根目录（与 main.py 的 ``LocalWorkspaceManager`` basedir 同源）。
+
+    单一真相源是 ``AppConfig.workspace_dir``（config.yaml ``workspace_dir``
+    节点，``BOCOMADP_WORKSPACE_DIR`` 环境变量可覆盖，默认
+    ``BASE_DIR/workspaces``）。读取失败时兜底 ``BASE_DIR/workspaces``，
+    与默认值一致。
+
+    用途：``agent_tools.py`` 工具白名单 / ``market_reviewers.py`` 审批人
+    白名单等**运行时持久化数据**的落盘根——放在 workspace 卷里，
+    容器重建（compose down/up）不丢。
+    """
+    try:
+        from bocomadp.config import get_app_config
+
+        return get_app_config().workspace_dir
+    except Exception:  # noqa: BLE001
+        return BASE_DIR / "workspaces"
+
+
 def get_upload_config() -> UploadConfig:
     """从 config.yaml 的 uploads 段读取（缺失则用默认值）。
 
