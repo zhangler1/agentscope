@@ -267,6 +267,10 @@ class DownloadSkillRequest(BaseModel):
         default=None,
         description="技能版本；不传取上游默认（最新）。",
     )
+    isCheck: bool | None = Field(
+        default=None,
+        description="透传给上游的 isCheck 标志；不传则不下发该字段。",
+    )
 
 
 @jiaoxin_skillhub_router.post(
@@ -320,6 +324,7 @@ async def download_jiaoxin_skill(
                 namespace_slug=body.namespace_slug,
                 channel=body.channel,
                 version=body.version,
+                isCheck=body.isCheck,
             )
             await _install_archive(workspace, archive, body.name)
         except HubError as e:
