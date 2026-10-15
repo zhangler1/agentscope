@@ -63,10 +63,10 @@ except ImportError:
         format: str  # "zip" | "tar" | "tar.gz"
         stream: AsyncIterator[bytes]
 
-DEFAULT_BASE_URL = "http://eaip-2.bocomm.com"
-DEFAULT_DOWNLOAD_PATH = "/EAGP.EAGP-AGENT.V-1.0/bocomExportSkill.upload"
-DEFAULT_LIST_PATH = "/EAGP.EAGP-AGENT.V-1.0/bocomListSkill.do"
-DEFAULT_CONTENT_PATH = "/EAGP.EAGP-AGENT.V-1.0/bocomParseSkillPackageContent.do"
+DEFAULT_BASE_URL = "http://eaip-2.bocomm.com/EAGP.EAGP-AGENT.V-1.0"
+DEFAULT_DOWNLOAD_PATH = "/bocomExportSkill.upload"
+DEFAULT_LIST_PATH = "/bocomListSkill.do"
+DEFAULT_CONTENT_PATH = "/bocomParseSkillPackageContent.do"
 
 # 默认流式分块大小（64 KiB），与 ClawSkillHub 的 DEFAULT_CHUNK_SIZE 一致。
 DEFAULT_CHUNK_SIZE = 64 * 1024
@@ -137,13 +137,14 @@ class JiaoXinSkillHub(HubBase):
                 The user-facing hub description.
             icon_url (`str | None`, optional):
                 An image identifying the hub in the picker.
-            base_url (`str`, defaults to `"http://eaip-2.bocomm.com"`):
-                The base URL of the EAGP gateway.
+            base_url (`str`, defaults to
+                `"http://eaip-2.bocomm.com/EAGP.EAGP-AGENT.V-1.0"`):
+                The base URL of the EAGP gateway, including the service
+                path prefix (``EAGP.EAGP-AGENT.V-1.0``).
             download_path (`str`, defaults to
-                `"/EAGP.EAGP-AGENT.V-1.0/bocomExportSkill.upload"`):
+                `"/bocomExportSkill.upload"`):
                 The export endpoint path under ``base_url``.
-            list_path (`str`, defaults to
-                `"/EAGP.EAGP-AGENT.V-1.0/bocomListSkill.do"`):
+            list_path (`str`, defaults to `"/bocomListSkill.do"`):
                 The skill listing endpoint path under ``base_url``.
             token (`str | None`, optional):
                 The ``guwp-token`` header value. Should come from
@@ -212,6 +213,7 @@ class JiaoXinSkillHub(HubBase):
         namespace_slug: str,
         channel: str,
         version: str | None = None,
+        isCheck: bool | None = None,
     ) -> dict[str, str]:
         """Build the form body the JiaoXin endpoint expects.
 
@@ -225,6 +227,8 @@ class JiaoXinSkillHub(HubBase):
             version (`str | None`, optional):
                 A specific skill version. ``None`` lets the upstream
                 serve its default (latest).
+            isCheck (`bool | None`, optional):
+                The upstream ``isCheck`` flag, passed through as-is.
 
         Returns:
             `dict[str, str]`:
@@ -238,6 +242,8 @@ class JiaoXinSkillHub(HubBase):
         }
         if version is not None:
             param["version"] = version
+        if isCheck is not None:
+            param["isCheck"] = isCheck
         req_message = {
             "REQ_HEAD": {"TRAN_PROCESS": "", "TRAN_ID": ""},
             "REQ_BODY": {"param": param},
@@ -306,6 +312,7 @@ class JiaoXinSkillHub(HubBase):
         namespace_slug: str = "Global",
         channel: str = "aioffice",
         version: str | None = None,
+        isCheck: bool | None = None,
     ) -> SkillArchive:
         """Stream a skill archive from the JiaoXin export endpoint.
 
@@ -324,6 +331,9 @@ class JiaoXinSkillHub(HubBase):
             version (`str | None`, optional):
                 A specific skill version. ``None`` lets the upstream
                 serve its default (latest).
+            isCheck (`bool | None`, optional):
+                The upstream ``isCheck`` flag, passed through as-is;
+                ``None`` omits the field.
 
         Returns:
             `SkillArchive`:
@@ -346,7 +356,7 @@ class JiaoXinSkillHub(HubBase):
                     "POST",
                     url,
                     data=self._build_req_message(
-                        name, namespace_slug, channel, version,
+                        name, namespace_slug, channel, version, isCheck,
                     ),
                     headers=self._headers(),
                 ),
