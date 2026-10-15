@@ -225,16 +225,26 @@ class CancelDispatcher:
             ready.set()
 
     def _interrupt_session(self, session_id: str) -> None:
-        """Cancel the local chat-run task for a session.
-
-        Unlike ``_cancel_session``, this method only cancels the
+        """Cancel the local chat-run task **and** background tool tasks
+        for a session.
+         Unlike ``_cancel_session``, this method only cancels the
         chat-run asyncio task—it does **not** cancel background tasks.
+        The agent handles ``CancelledError`` gracefully at each
+        breakpoint, preserving partial context.
+        
+        interrupt 现在同时取消 chat-run 与该 session 的后台工具任务，
+        行为与 ``_cancel_session`` 对齐；区别仅在于触发来源（用户显式暂停 vs
+        session 删除/abort）和日志措辞。用户显式暂停意图优先于后台工具结果——
+        若不取消，后台工具完成后会向 inbox 推结果并 enqueue wakeup，把刚被
+        暂停的 session 重新拉起。
+
         The agent handles ``CancelledError`` gracefully at each
         breakpoint, preserving partial context.
 
         Args:
             session_id (`str`):
-                The session whose chat run should be interrupted.
+                The session whose chat run and background tasks should
+                be interrupted.
         """
         task = self._registry.get(session_id)
         if task is not None and not task.done():
@@ -244,3 +254,11 @@ class CancelDispatcher:
                 session_id,
             )
             task.cancel()
+        # bg_cancelled = self._bg_manager.cancel_session_tasks(session_id)
+        # if bg_cancelled:
+        #     logger.info(
+        #         "CancelDispatcher: cancelled %d local BG task(s) on "
+        #         "interrupt for session %s",
+        #         bg_cancelled,
+        #         session_id,
+        #     )

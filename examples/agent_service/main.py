@@ -125,7 +125,9 @@ from bocomadp.skills.bocom_skill_hub import BocomSkillHub
 from bocomadp.tools import ToolRegistry, build_enterprise_tools, init_factory_tools
 from bocomadp.uploads.manager import cleanup_stale_upload_staging_files
 
-# K8s 沙箱工作区（纯配置驱动，零框架侵入）
+from bocomadp.middleware.interrupt_guard import interrupt_guard_state
+
+# K8s 沙箱工作区（纯配置驱动，零框架侵入）s
 from bocomadp.workspace import (
     build_k8s_workspace_manager,
     is_k8s_enabled,
@@ -862,8 +864,9 @@ app = create_app(
     title="BocomADP",
     extra_middlewares=build_asgi_middlewares(trace_enabled),
 )
-
-
+############监听中断信号，取消后台任务
+interrupt_guard_state.configure(app)
+##############
 def _configurable_tool_names() -> list[str]:
     """Return the full set of tool/MCP names for the agent-creator whitelist.
 

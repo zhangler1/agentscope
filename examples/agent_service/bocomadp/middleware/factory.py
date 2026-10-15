@@ -14,6 +14,7 @@ import os
 from agentscope.middleware import MiddlewareBase
 
 from .custom_prompt import CustomPromptMiddleware
+from .interrupt_guard import InterruptGuardMiddleware
 from .slot_release import SlotReleaseMiddleware
 from .tool_call_repair import ToolCallRepairMiddleware
 from .tool_result_budget import ToolResultBudgetMiddleware
@@ -51,7 +52,9 @@ async def build_enterprise_middlewares(
     # runtime_configs 表 tool_result 段,enabled=false 时纯透传。
     middlewares.append(ToolResultPersistenceMiddleware())
     middlewares.append(ToolResultBudgetMiddleware())
-
+    #####
+    middlewares.append(InterruptGuardMiddleware())
+    ####
     if os.getenv("ADP_K8S_SLOT_RELEASE_ON_RUN_END", "1") == "1":
         middlewares.append(
             SlotReleaseMiddleware(session_id=session_id),

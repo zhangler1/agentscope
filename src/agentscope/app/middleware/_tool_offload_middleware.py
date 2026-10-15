@@ -280,6 +280,21 @@ class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
                 None,
             )
 
+            # 工具因 interrupt 被取消时跳过投递与唤醒，防止暂停后 session 被后台结果复活（配套 _interrupt_session 取消后台任务的修复）
+            # 仅检测 toolkit 吞掉 CancelledError 后产出 INTERRUPTED 响应的形态；
+            # drain_task.cancelled() 分支不可达（取消时 await 已抛 CancelledError 并在上方 return）
+            # if (
+            #     response is not None
+            #     and response.state == ToolResultState.INTERRUPTED
+            # ):
+            #     logger.info(
+            #         "Background tool '%s' was interrupted, skipping "
+            #         "delivery: session_id=%s",
+            #         tool_name,
+            #         session_id,
+            #     )
+            #     return
+##########################################################
             tool_call_id = tool_call.id
 
             hint_source = json.dumps(
