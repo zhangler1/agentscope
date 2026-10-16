@@ -28,8 +28,8 @@ from agentscope.app.deps import (
 from agentscope.app.storage import StorageBase
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 
-from ._jiaoxin_hub import DEFAULT_BASE_URL  # 兼容层见 _jiaoxin_hub.py
-from ._jiaoxin_hub import HubError, JiaoXinSkillHub, SkillArchive
+from .jiaoxin_hub import DEFAULT_BASE_URL  # 兼容层见 _jiaoxin_hub.py
+from .jiaoxin_hub import HubError, JiaoXinSkillHub, SkillArchive
 
 jiaoxin_skillhub_router = APIRouter(
     prefix="/skill/jiaoxin",
@@ -44,8 +44,13 @@ async def _install_archive(workspace: Any, archive: SkillArchive, name: str) -> 
       服务端零缓冲；
     - 官方 2.0.5 ``LocalWorkspace``（只有 ``add_skill``）：先落服务端
       临时目录并解压，再按目录复制安装（临时目录用完即清）。
+
+    .. note:: Windows 上不走流式分支：SDK 的 ``add_skill_archive``
+        内部硬编码 ``python3`` 起解压子进程，而 Windows 的 ``python3``
+        默认是 Microsoft Store 占位 stub（非真实解释器），会
+        ``RuntimeError``。故 Windows 一律走本地解压分支。
     """
-    if hasattr(workspace, "add_skill_archive"):
+    if hasattr(workspace, "add_skill_archive") and os.name != "nt":
         await workspace.add_skill_archive(archive.stream, archive.format, name)
         return
 
