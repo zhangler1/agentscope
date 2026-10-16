@@ -10,7 +10,7 @@
 - :data:`jiaoxin_skillhub_router`: HTTP 路由
   （``POST /skill/jiaoxin/list|content|download``）。
 """
-from ._jiaoxin_hub import JiaoXinSkillHub
+from .jiaoxin_hub import JiaoXinSkillHub
 from .routers import jiaoxin_skillhub_router
 
 __all__ = [
