@@ -33,6 +33,9 @@ from ...workspace import WorkspaceBase
 from ..access import ResourceKind
 from ._access import ResourceAccessService
 
+import logging as _logging
+_log = _logging.getLogger(__name__)
+
 
 async def get_toolkit(
     *,

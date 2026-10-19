@@ -154,9 +154,23 @@ async def _connect_initial(
     state: _State,
     server_cfgs: list[dict[str, Any]],
 ) -> None:
-    """Connect every server listed in the config file."""
+    """Connect every server listed in the config file.
+
+    A single MCP connection failure is logged but does not prevent
+    the remaining servers from being connected — one broken MCP
+    (e.g. missing ``npx`` for a stdio server) must not brick the
+    entire gateway.
+    """
     for cfg in server_cfgs:
-        client = await _build_client(cfg)
+        try:
+            client = await _build_client(cfg)
+        except Exception as exc:  # noqa: BLE001
+            name = cfg.get("name", "<unknown>")
+            print(
+                f"[gateway] FAILED to connect {name!r}: {exc}",
+                flush=True,
+            )
+            continue
         if client.name in state.clients:
             if client.is_stateful and client.is_connected:
                 await client.close()

@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""toolkit_whitelist 每智能体白名单过滤（无请求级收窄）。
-
-``subagent_enabled`` / ``is_plan_mode`` 在请求级被静默接受但不使用——
-toolkit 过滤仅由每智能体白名单 ``_tool_whitelists`` 驱动。
-"""
+"""toolkit_whitelist 每智能体白名单过滤（反向判断：仅限制企业/MCP工具）。"""
 import asyncio
 
 from agentscope.app._service._toolkit import Toolkit
@@ -12,13 +8,10 @@ import bocomadp.toolkit_whitelist as tw
 
 
 def _tool(name: str):
-    """鸭子类型工具：过滤层只读 ``getattr(tool, 'name', '')``。"""
     return type("T", (), {"name": name})()
 
 
 def _toolkit(names: list[str]) -> Toolkit:
-    # 注意：Toolkit 构造不允许 tool_groups 含 "basic"（ValueError），
-    # tools= 参数自动生成 basic group；过滤层遍历 toolkit.tool_groups。
     return Toolkit(tools=[_tool(n) for n in names])
 
 
@@ -30,8 +23,10 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_empty_whitelist_no_filter(monkeypatch):
-    tk = _toolkit(["bash", "TeamCreate", "TaskCreate"])
+def test_non_restricted_tools_always_allowed(monkeypatch):
+    """非受限工具（内置/框架/项目/中间件）始终放行，不受白名单影响。"""
+    monkeypatch.setattr(tw, "_restricted_tool_names", {"通讯录查询", "browser-use"})
+    tk = _toolkit(["Bash", "TeamCreate", "echo", "view_image_tool", "通讯录查询"])
 
     async def fake_orig(*args, **kwargs):
         return tk
@@ -42,11 +37,18 @@ def test_empty_whitelist_no_filter(monkeypatch):
         {},
     )
     out = _run(tw._whitelisted_get_toolkit(agent_record=type("A", (), {"id": "ag1"})()))
-    assert _seen_names(out) == {"bash", "TeamCreate", "TaskCreate"}
+    seen = _seen_names(out)
+    assert "Bash" in seen
+    assert "TeamCreate" in seen
+    assert "echo" in seen
+    assert "view_image_tool" in seen
+    assert "通讯录查询" not in seen
 
 
-def test_whitelist_only_keeps_allowed(monkeypatch):
-    tk = _toolkit(["bash", "read", "TeamCreate", "TaskCreate"])
+def test_restricted_tool_allowed_when_whitelisted(monkeypatch):
+    """受限工具在白名单中才放行。"""
+    monkeypatch.setattr(tw, "_restricted_tool_names", {"通讯录查询", "browser-use"})
+    tk = _toolkit(["Bash", "echo", "通讯录查询"])
 
     async def fake_orig(*args, **kwargs):
         return tk
@@ -54,72 +56,29 @@ def test_whitelist_only_keeps_allowed(monkeypatch):
     monkeypatch.setattr(tw, "_original_get_toolkit", fake_orig)
     monkeypatch.setattr(
         "bocomadp.routers.agent_tools._tool_whitelists",
-        {"ag1": ["bash", "TeamCreate"]},
+        {"ag1": ["通讯录查询"]},
     )
     out = _run(tw._whitelisted_get_toolkit(agent_record=type("A", (), {"id": "ag1"})()))
-    assert _seen_names(out) == {"bash", "TeamCreate"}
+    seen = _seen_names(out)
+    assert "Bash" in seen
+    assert "echo" in seen
+    assert "通讯录查询" in seen
 
 
-def test_whitelist_exempts_usable_enterprise_tools(monkeypatch):
-    """usableTools 名单内的企业工具豁免 per-agent 白名单（请求级优先）。"""
-    from bocomadp.tools._naming import tool_name
-
-    vector_cn = tool_name("行内搜索", "vector_search")
-    cross_cn = tool_name("跨知识搜索", "cross_search")
-    tk = _toolkit(["bash", "TeamCreate", vector_cn, cross_cn])
-
-    async def fake_orig(*args, **kwargs):
-        return tk
-
-    async def run():
-        from bocomadp.deerflow.custom_params import (
-            reset_custom_params,
-            set_custom_params,
-        )
-
-        token = set_custom_params({"usableTools": [vector_cn]})
-        try:
-            return await tw._whitelisted_get_toolkit(
-                agent_record=type("A", (), {"id": "ag1"})(),
-            )
-        finally:
-            reset_custom_params(token)
-
-    monkeypatch.setattr(tw, "_original_get_toolkit", fake_orig)
-    monkeypatch.setattr(
-        "bocomadp.routers.agent_tools._tool_whitelists",
-        {"ag1": ["bash", "TeamCreate"]},
-    )
-    out = _run(run())
-    # 名单内的 vector 豁免白名单；名单外的 cross 仍被白名单滤掉
-    assert _seen_names(out) == {"bash", "TeamCreate", vector_cn}
-
-
-def test_whitelist_exemption_never_covers_non_enterprise(monkeypatch):
-    """名单里写 builtins 名不豁免——豁免范围钉死在企业工具层。"""
-    tk = _toolkit(["bash", "read", "TeamCreate"])
+def test_restricted_tool_blocked_when_not_whitelisted(monkeypatch):
+    """受限工具不在白名单中被过滤。"""
+    monkeypatch.setattr(tw, "_restricted_tool_names", {"通讯录查询"})
+    tk = _toolkit(["Bash", "通讯录查询"])
 
     async def fake_orig(*args, **kwargs):
         return tk
 
-    async def run():
-        from bocomadp.deerflow.custom_params import (
-            reset_custom_params,
-            set_custom_params,
-        )
-
-        token = set_custom_params({"usableTools": ["read"]})
-        try:
-            return await tw._whitelisted_get_toolkit(
-                agent_record=type("A", (), {"id": "ag1"})(),
-            )
-        finally:
-            reset_custom_params(token)
-
     monkeypatch.setattr(tw, "_original_get_toolkit", fake_orig)
     monkeypatch.setattr(
         "bocomadp.routers.agent_tools._tool_whitelists",
-        {"ag1": ["bash", "TeamCreate"]},
+        {"ag1": []},
     )
-    out = _run(run())
-    assert _seen_names(out) == {"bash", "TeamCreate"}
+    out = _run(tw._whitelisted_get_toolkit(agent_record=type("A", (), {"id": "ag1"})()))
+    seen = _seen_names(out)
+    assert "Bash" in seen
+    assert "通讯录查询" not in seen

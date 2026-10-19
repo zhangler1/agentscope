@@ -169,7 +169,7 @@ async def _persist_uploaded_bytes(
 
     ``POST /files/upload`` 端点与 ``context.custom_params.additional_urls`` 下载
     共用本函数，保证两条路径的文件元数据与落盘格式完全一致（下游
-    ``list_uploaded_files`` / ``view_image_tool`` / ``<context name="files">``
+    ``view_image_tool`` / ``<context name="files">``
     均以 uploads DB 记录为感知通道）。
 
     Raises:
@@ -286,11 +286,44 @@ def _filename_from_url(url: str) -> str:
     return name if name and name not in {".", ".."} else "downloaded"
 
 
+# ---------------------------------------------------------------------------
+# 工具层依赖注入（run 任务内无 FastAPI Depends，工具须经本入口复用
+# download_urls_to_session 下载文件到会话 uploads 目录）
+# ---------------------------------------------------------------------------
+_upload_deps_storage: StorageBase | None = None
+_upload_deps_workspace_manager: WorkspaceManagerBase | None = None
+
+
+def set_upload_dependencies(
+    storage: StorageBase,
+    workspace_manager: WorkspaceManagerBase,
+) -> None:
+    """注册全局 storage / workspace_manager（main.py 启动时调用一次）。"""
+    global _upload_deps_storage, _upload_deps_workspace_manager
+    _upload_deps_storage = storage
+    _upload_deps_workspace_manager = workspace_manager
+
+
+def get_upload_dependencies() -> tuple[StorageBase, WorkspaceManagerBase]:
+    """读取已注册的 ``(storage, workspace_manager)``。
+
+    Raises:
+        RuntimeError: 尚未注册（main.py 启动序列未执行 / 测试环境未注入）。
+    """
+    if _upload_deps_storage is None or _upload_deps_workspace_manager is None:
+        raise RuntimeError(
+            "upload dependencies not registered; call "
+            "set_upload_dependencies(storage, workspace_manager) "
+            "at startup (main.py)"
+        )
+    return _upload_deps_storage, _upload_deps_workspace_manager
+
+
 async def download_urls_to_session(
     user_id: str,
     agent_id: str,
     session_id: str,
-    urls: list[str],
+    items: list[str | tuple[str, str]],
     storage: StorageBase,
     workspace_manager: WorkspaceManagerBase,
 ) -> list[UploadedFile]:
@@ -303,14 +336,19 @@ async def download_urls_to_session(
     下游链路立即可见。
 
     Args:
-        urls: 待下载的 OSS / HTTP(S) 地址列表（同名文件经
-            ``_dedupe_session_filename`` 自动改名，互不覆盖）。
+        items: 待下载的 OSS / HTTP(S) 地址列表。元素可为：
+
+            - 裸 URL 字符串（``"http://oss/a.png"``），文件名从 URL 推断；
+            - ``(url, original_name)`` 元组，``original_name`` 为空时回退
+              到 URL 推断（保留前端传入的 ``file_name``）。
+
+            同名文件会被 ``normalize_filename`` 归一化；重复文件名直接覆盖。
 
     Returns:
         `list[UploadedFile]`: 成功保存的上传记录（按 URL 顺序）。
     """
     cfg = get_upload_config()
-    if not cfg.enabled or not urls:
+    if not cfg.enabled or not items:
         return []
     db = get_uploads_db()
     saved: list[UploadedFile] = []
@@ -318,7 +356,11 @@ async def download_urls_to_session(
         timeout=_URL_DOWNLOAD_TIMEOUT,
         follow_redirects=True,
     ) as client:
-        for url in urls:
+        for entry in items:
+            if isinstance(entry, tuple):
+                url, original_name = entry
+            else:
+                url, original_name = entry, ""
             try:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -363,7 +405,7 @@ async def download_urls_to_session(
                     session_id=session_id,
                     storage=storage,
                     workspace_manager=workspace_manager,
-                    original_name=_filename_from_url(url),
+                    original_name=original_name or _filename_from_url(url),
                     data=content,
                     content_type=resp.headers.get("content-type"),
                 )

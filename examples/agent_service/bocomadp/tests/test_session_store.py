@@ -26,7 +26,7 @@ def _run(coro):
 
 
 def test_save_and_load_params_roundtrip():
-    params = {"vector_search_switch": True, "space_code_list": ["SP1"]}
+    params = {"vector_search_switch": True, "custom_prompt": "test"}
     _run(save_session("sid-1", params=params))
     assert _run(load_params("sid-1")) == params
 

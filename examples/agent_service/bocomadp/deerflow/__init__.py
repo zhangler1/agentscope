@@ -24,7 +24,6 @@ from .protocol import (
     END_SENTINEL,
     HEARTBEAT_SENTINEL,
     EVENT_CUSTOM,
-    EVENT_END,
     EVENT_ERROR,
     EVENT_MESSAGES,
     EVENT_METADATA,
@@ -45,7 +44,6 @@ __all__ = [
     "EVENT_MESSAGES",
     "EVENT_CUSTOM",
     "EVENT_ERROR",
-    "EVENT_END",
     "HEARTBEAT_SENTINEL",
     "END_SENTINEL",
 ]

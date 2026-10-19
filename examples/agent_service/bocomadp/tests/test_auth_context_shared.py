@@ -11,10 +11,12 @@ from bocomadp.deerflow import _session_store
 from bocomadp.deerflow.auth_context import (
     ResolvedAuth,
     attach_muwp_user,
+    attach_user_identity,
     build_auth_headers,
     get_resolved_auth,
     load_auth,
     reset_resolved_auth,
+    resolve_auth_params,
     save_auth,
     set_resolved_auth,
 )
@@ -88,3 +90,73 @@ def test_attach_muwp_user_only_in_muwp_mode():
         assert "muwpUser" not in body["REQ_BODY"]
     finally:
         reset_resolved_auth(token)
+
+
+def test_build_auth_headers_guip_token():
+    token = set_resolved_auth(
+        ResolvedAuth(auth_mode="guip-token", guip_token="gp")
+    )
+    try:
+        headers = build_auth_headers({})
+        assert headers["guip-token"] == "gp"
+        assert "guwp-token" not in headers
+    finally:
+        reset_resolved_auth(token)
+
+
+def test_attach_user_identity_guip_user_mode():
+    token = set_resolved_auth(
+        ResolvedAuth(auth_mode="guip-user", guip_user={"userId": "gu1"})
+    )
+    try:
+        body = attach_user_identity({"REQ_BODY": {"param": {}}})
+        assert body["REQ_BODY"]["guipUser"] == {"userId": "gu1"}
+        assert "muwpUser" not in body["REQ_BODY"]
+    finally:
+        reset_resolved_auth(token)
+
+
+def test_attach_muwp_user_alias_covers_guip_user():
+    # attach_muwp_user 委托 attach_user_identity，guip-user 模式也应注入 guipUser
+    token = set_resolved_auth(
+        ResolvedAuth(auth_mode="guip-user", guip_user={"userId": "gu2"})
+    )
+    try:
+        body = attach_muwp_user({"REQ_BODY": {"param": {}}})
+        assert body["REQ_BODY"]["guipUser"] == {"userId": "gu2"}
+    finally:
+        reset_resolved_auth(token)
+
+
+def test_resolve_auth_params_priority_guip_token_before_muwp_user():
+    # guip-token 优先级高于 muwp-user
+    auth = resolve_auth_params(
+        {"guip_token": "gt", "muwp_user": {"userId": "u"}}
+    )
+    assert auth.auth_mode == "guip-token"
+    assert auth.guip_token == "gt"
+
+
+def test_resolve_auth_params_guip_user_last():
+    # guip-user 优先级最低（仅高于 none）
+    auth = resolve_auth_params({"guip_user": {"userId": "gu"}})
+    assert auth.auth_mode == "guip-user"
+    assert auth.guip_user == {"userId": "gu"}
+
+
+def test_resolve_auth_params_guip_user_below_muwp_user():
+    auth = resolve_auth_params(
+        {"muwp_user": {"userId": "m"}, "guip_user": {"userId": "g"}}
+    )
+    assert auth.auth_mode == "muwp-user"
+
+
+def test_save_and_load_auth_guip_roundtrip():
+    auth = ResolvedAuth(
+        auth_mode="guip-user", guip_user={"userId": "gu-rt"}
+    )
+    _run(save_auth("sid-guip", auth))
+    loaded = _run(load_auth("sid-guip"))
+    assert loaded is not None
+    assert loaded.auth_mode == "guip-user"
+    assert loaded.guip_user == {"userId": "gu-rt"}

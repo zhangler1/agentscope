@@ -91,7 +91,11 @@ def _make_app(
 
 
 def test_join_finished_record_ends_immediately() -> None:
-    """记账落定终态的 run：回放无 end 也立即返回 event: end。"""
+    """记账落定终态的 run：回放无 end 也立即收尾（空流关闭）。
+
+    本层不下发 end 帧（协议决策，见 protocol.py）：断言点改为"空流
+    立即结束"——若回归为 live 空等心跳，响应会挂起到超时。
+    """
     mgr = RunManager()
     rec = mgr.create_or_reject("default", "t1", "a1")
     mgr.mark_finished(rec.run_id, RunStatus.SUCCESS)
@@ -104,7 +108,7 @@ def test_join_finished_record_ends_immediately() -> None:
         )
 
     assert response.status_code == 200
-    assert "event: end" in response.text
+    assert response.text == ""
 
 
 def test_join_unknown_run_without_active_task_ends() -> None:
@@ -120,7 +124,8 @@ def test_join_unknown_run_without_active_task_ends() -> None:
         )
 
     assert response.status_code == 200
-    assert "event: end" in response.text
+    # 已结束 run 空流立即收尾（本层不下发 end 帧，流结束由连接关闭传递）
+    assert response.text == ""
 
 
 def test_join_unknown_run_with_active_task_still_waits() -> None:
@@ -166,7 +171,9 @@ def test_join_unknown_run_with_active_task_still_waits() -> None:
             task.cancel()
 
     body = asyncio.run(scenario())
-    assert "event: end" in body
+    # run 结束广播后流自然关闭；本层不下发 end 帧，body 应为空
+    # （REPLY_END 翻译为内部 end 哨兵，live 阶段直接收尾）。
+    assert body == ""
 
 
 def test_bridge_run_finished_after_empty_replay() -> None:

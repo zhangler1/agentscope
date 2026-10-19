@@ -23,13 +23,14 @@ from agentscope.permission import (
 from agentscope.state import AgentState
 from agentscope.tool import ToolBase, ToolChunk
 
+from ._naming import tool_name
 from ..tool_result_store import get_tool_result, get_tool_result_config
 
 
 class ReadToolResultTool(ToolBase):  # pylint: disable=abstract-method
     """只读读回被持久化的工具输出;需要会话状态注入。"""
 
-    name: str = "read_tool_result"
+    name: str = tool_name("读取工具结果", "read_tool_result")
     description: str = (
         "读取被持久化保存的超长工具输出完整内容。当工具结果被替换为 "
         "<persisted-output> 预览时,通过此工具按 tool_call_id 取回完整内容,"

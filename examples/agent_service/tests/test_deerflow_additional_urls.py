@@ -158,13 +158,13 @@ def deps(monkeypatch: pytest.MonkeyPatch) -> dict:
     }
 
 
-def _download_sync(deps: dict, urls: list[str]) -> list:
+def _download_sync(deps: dict, items: list) -> list:
     return asyncio.run(
         download_urls_to_session(
             deps["user_id"],
             deps["agent_id"],
             deps["session_id"],
-            urls,
+            items,
             deps["storage"],
             deps["wm"],
         ),
@@ -297,8 +297,8 @@ def test_download_additional_urls_downloads_cleaned_urls(
 
     seen: dict = {}
 
-    async def fake_download(user_id, agent_id, session_id, urls, storage, wm):
-        seen["urls"] = urls
+    async def fake_download(user_id, agent_id, session_id, items, storage, wm):
+        seen["items"] = items
         return []
 
     monkeypatch.setattr(chat_mod, "download_urls_to_session", fake_download)
@@ -321,10 +321,94 @@ def test_download_additional_urls_downloads_cleaned_urls(
         ),
     )
 
-    # URL 清洗：去空白、过滤非字符串；仅执行下载副作用，返回 None
+    # 裸字符串 URL：去空白、过滤非字符串/空串；仅执行下载副作用，返回 None
     # （context.custom_params 含 additional_urls 整体由 _resolve_custom_params 落盘）
-    assert seen["urls"] == ["http://oss/a.png", "http://oss/b.txt"]
+    assert seen["items"] == [
+        ("http://oss/a.png", ""),
+        ("http://oss/b.txt", ""),
+    ]
     assert result is None
+
+
+def test_download_additional_urls_parses_dict_and_json_string(
+    deps: dict,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """对齐 deer-flow thread_runs.py：dict / JSON 字符串 / 裸 URL 三种格式 + https→http。"""
+    from bocomadp.deerflow.routers import deerflow_chat as chat_mod
+
+    seen: dict = {}
+
+    async def fake_download(user_id, agent_id, session_id, items, storage, wm):
+        seen["items"] = items
+        return []
+
+    monkeypatch.setattr(chat_mod, "download_urls_to_session", fake_download)
+    body = CreateRunRequest(
+        agent_id="a1",
+        session_id="s1",
+        context={
+            "custom_params": {
+                "additional_urls": [
+                    # dict 格式
+                    {"file_url": "https://oss/report.pdf", "file_name": "季报.pdf"},
+                    # JSON 字符串格式
+                    '{"file_url": "https://oss/note.txt", "file_name": "笔记.txt"}',
+                    # 裸 URL（https 应替换为 http）
+                    "https://oss/image.png",
+                    # 无效 JSON 字符串 → 当裸 URL
+                    "https://oss/plain",
+                    # dict 缺 file_url → 丢弃
+                    {"file_name": "no_url.doc"},
+                    # 非字符串非 dict → 丢弃
+                    456,
+                ],
+                "lang": "zh",
+            },
+        },
+    )
+
+    asyncio.run(
+        _download_additional_urls(
+            body,
+            "u1", "a1", "s1",
+            deps["storage"], deps["wm"],
+        ),
+    )
+
+    assert seen["items"] == [
+        ("http://oss/report.pdf", "季报.pdf"),
+        ("http://oss/note.txt", "笔记.txt"),
+        ("http://oss/image.png", ""),
+        ("http://oss/plain", ""),
+    ]
+
+
+def test_download_urls_to_session_keeps_original_name(
+    deps: dict,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """download_urls_to_session 接受 (url, original_name) 元组，保留前端文件名。"""
+    client = FakeAsyncClient(
+        {
+            "http://oss/x": FakeResponse(b"data", "application/octet-stream"),
+            "http://oss/y": FakeResponse(b"data2", "application/octet-stream"),
+        },
+    )
+    _patch_client(deps, client, monkeypatch)
+
+    saved = _download_sync(
+        deps,
+        [
+            ("http://oss/x", "自定义名.bin"),
+            "http://oss/y",  # 裸字符串回退到 URL 推断
+        ],
+    )
+
+    assert len(saved) == 2
+    assert saved[0].original_name == "自定义名.bin"
+    # 裸字符串：URL 末段 y 无扩展名 → 回退文件名
+    assert saved[1].original_name == "y"
 
 
 def test_download_additional_urls_skips_without_key(

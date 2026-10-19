@@ -542,10 +542,18 @@ class Toolkit:
                         tool.name,
                         group.name,
                     )
-                available_tools[tool.name] = RegisteredTool(
-                    tool=tool,
-                    group=group.name,
-                )
+                try:
+                    available_tools[tool.name] = RegisteredTool(
+                        tool=tool,
+                        group=group.name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "_get_available_tools: RegisteredTool() FAILED "
+                        "for tool name=%r group=%s — SKIPPED",
+                        tool.name,
+                        group.name,
+                    )
 
         return available_tools
 

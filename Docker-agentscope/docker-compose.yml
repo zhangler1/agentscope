@@ -1,26 +1,10 @@
 services:
   redis:
     image: redis:7-bookworm
-    ports: ["6379:6379"]
+    ports: ["6389:6379"]
     volumes:
       - redis-data:/data
 
-  postgres:
-    image: postgres:16-alpine
-    ports: ["5432:5432"]
-    environment:
-      # 与 config.yaml db.url 中的凭据保持一致
-      - POSTGRES_USER=agentscope
-      - POSTGRES_PASSWORD=agentscope
-      - POSTGRES_DB=agentscope
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-    healthcheck:
-      # 就绪探测：agentscope-service 等待其 healthy 后再启动
-      test: ["CMD-SHELL", "pg_isready -U agentscope -d agentscope"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
 
   mysql:
     # mysql:8.0：与 OceanBase 的 MySQL 兼容模式（以 8.0 为基准）最贴近，
@@ -52,12 +36,15 @@ services:
     # build:
     #   context: ..
     #   dockerfile: examples/agent_service/Dockerfile
-    image: agentscope-service:latest
+    # image: agentscope-service:latest
+    image: agentscope-service:mysql
     command: ["python", "main.py"]
-    ports: ["8001:8000"]
+    ports: ["8000:8000"]
     # 相对本文件目录（Docker-agentscope/.env），含 DEEPSEEK_API_KEY 等密钥
     env_file: .env
     environment:
+      - AGENTSCOPE_OSS_KEY=6lHgmYV7R36Bk5AyHFgyz4f9a0SL30TbaeHDJTPOS5M=
+      - TZ=Asia/Shanghai
       # 注意：AppConfig 只识别 BOCOMADP_ 前缀（嵌套字段用 __ 分隔），
       # 裸 REDIS_HOST 不会生效，会导致容器内连 localhost:6379 失败
       - BOCOMADP_REDIS__HOST=redis
@@ -66,13 +53,11 @@ services:
       - BOCOMADP_DB__URL=mysql+aiomysql://agentscope:agentscope@mysql:3306/agentscope
       # K8s 沙箱：kubeconfig 挂载自宿主机 .kube/config（容器内路径）
       - ADP_K8S_KUBECONFIG=/app/kubeconfig/config
-      - ADP_K8S_ENABLED=false
-      - BOCOMADP_TOOL_ASCII_NAMES=1
+      - ADP_K8S_ENABLED=true
+      - BOCOMADP_TOOL_ASCII_NAMES=0
     depends_on:
       redis:
         condition: service_started
-      postgres:
-        condition: service_healthy
       mysql:
         condition: service_healthy
     volumes:
@@ -92,61 +77,19 @@ services:
       # Docker Socket（支持 Docker 工作区沙箱）
       - /var/run/docker.sock:/var/run/docker.sock
       # K8s kubeconfig（K8s 沙箱模式必需）
-      - .kube/config:/app/kubeconfig/config:ro
+      - ./config:/app/kubeconfig/config:ro
       # AgentScope ``as`` logger 文件输出（与 main.py 中默认路径一致）
       - ./logs:/app/logs
-
-  webui-backend:
-    image: webui-backend:dev
-    # build:
-    #   context: ../examples/web_ui/backend
-    #   dockerfile: Dockerfile
-    #   # dev：容器内跑 nodemon 热更新开发服务器；prod：删除本行（默认构建到最后的 prod 阶段）
-    #   target: dev
-    # 仅容器网络内可访问，统一由 nginx 网关代理
-    expose: ["3000"]
-    environment:
-      - AGENTSCOPE_API_URL=http://agentscope-service:8000
-    depends_on: [agentscope-service]
-    volumes:
-      # 挂载源码
-      - ../examples/web_ui/backend/src:/app/src
-      - ../examples/web_ui/backend/package.json:/app/package.json
-      - ../examples/web_ui/backend/tsconfig.json:/app/tsconfig.json
-
-  webui-frontend:
-    image: webui-frontend:dev
-    # build:
-    #   context: ../examples/web_ui/frontend
-    #   dockerfile: Dockerfile
-    #   # dev：容器内跑 vite dev server（HMR）；prod：删除本行，并将 nginx 的
-    #   # FRONTEND_UPSTREAM 改为 webui-frontend:80
-    #   target: dev
-    #   args:
-    #     # 构建期注入 API 路径前缀（仅 prod 静态构建使用）
-    #     VITE_API_PREFIX: /api
-    # # 仅容器网络内可访问，统一由 nginx 网关代理
-    environment:
-      - VITE_API_BASE_URL=http://agentscope-service:8000
-    expose: ["5173"]
-    depends_on: [webui-backend]
-    volumes:
-      # 挂载源码实现改码即热更；匿名卷保留镜像内 node_modules 不被遮蔽
-      - ../examples/web_ui/frontend:/app
-      - /app/node_modules
 
   # 反向代理网关：统一入口（http://localhost:80）
   # /api/* → webui-backend:3000，其余 → 前端（dev:5173 / prod:80）
   nginx:
     image: nginx:alpine
     ports: ["80:80"]
-    environment:
-      # envsubst 模板变量：dev 指向 vite dev server；prod 改为 webui-frontend:80
-      - FRONTEND_UPSTREAM=webui-frontend:5173
     volumes:
       # 以模板方式挂载，启动时经 envsubst 渲染为实际配置
       - ./nginx/nginx.conf:/etc/nginx/templates/default.conf.template:ro
-    depends_on: [webui-frontend, webui-backend]
+    depends_on: [agentscope-service]
 
 volumes:
   redis-data:

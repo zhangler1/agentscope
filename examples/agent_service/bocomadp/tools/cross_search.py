@@ -11,13 +11,19 @@
       （从 ``config.yaml`` 的 ``cross_search`` 节点提取，字符串值支持
       ``$VAR`` 环境变量引用展开），本模块仅负责使用配置，不再自解析环境变量；
     - 用 ``httpx`` 替代 ``requests``：``httpx`` 是本项目已有依赖，且支持
-      multipart ``files`` 上传，接口基本对齐。
+      multipart ``files`` 上传，接口基本对齐；
+    - 安全敏感参数（空间码、用户编码等）为智能体级配置，通过
+      ``PUT /agents/{id}/cross-search-config`` 接口设置，存储在 PG
+      ``agent_cross_search_configs`` 表，运行时由工具从智能体配置读取，
+      不暴露给 LLM。
 
 接入真实环境时，只需配置 ``config.yaml`` 的 ``cross_search.api_url``、
-``caller`` / ``user_code``（见 ``config.yaml.example`` 与 ``.env.example``）。
+``caller`` / ``user_code``（见 ``config.yaml.example`` 与 ``.env.example``），
+或通过智能体配置接口按智能体覆盖。
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 from typing import Any
@@ -29,136 +35,126 @@ try:
 except ImportError:
     FunctionTool = ToolMiddlewareBase = None
 
+from ..agent_cross_search_config import (
+    AgentCrossSearchConfig,
+    cross_search_config_get,
+)
 from ..config.cross_search_config import CrossSearchConfig, get_cross_search_config
 from ..deerflow.custom_params import get_custom_params
 from ._naming import tool_name
 
 logger = logging.getLogger(__name__)
 
-# 请求级 custom_params 中允许强制覆盖本工具参数的 key 集合
-# （与工具函数签名参数同名，下划线形式）。
-_OVERRIDE_KEYS = (
-    "space_code_list",
-    "team_space_code_list",
-    "psnl_space_code_id",
-    "user_code",
-    "search_type",
-    "customized_tag_list",
-    "psnl_category_id_list",
+_current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cross_search_user_id",
+    default="",
+)
+
+_current_agent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cross_search_agent_id",
+    default="",
 )
 
 
-class _SpacecodeOverrideMiddleware(ToolMiddlewareBase):
-    """空间码参数强制覆盖中间件（对齐 deer-flow SpacecodeOverrideMiddleware）。
+async def _get_agent_cross_search_config() -> AgentCrossSearchConfig | None:
+    """从 PG 读取当前智能体的跨知识搜索配置。
 
-    每次工具调用时读取请求级 custom_params（ContextVar，由 deerflow
-    路由层在 spawn run 前注入），对 :data:`_OVERRIDE_KEYS` 中的参数
-    直接赋值覆盖——即使模型传错值也会被纠正为请求方指定的空间码。
-
-    ``personal_search_switch`` 显式 ``False`` 时，在覆盖之后清空
-    ``psnl_space_code_id`` / ``psnl_category_id_list``（对齐 deer-flow：
-    该开关为 False 时不挂个人知识库搜索工具；bocomadp 无独立个人
-    搜索工具，等价于禁用 cross_search 的个人检索维度）。config 中
-    对应默认值为空，参数置 ``None`` 后不会回填。
+    优先级：智能体级配置（PG）> config.yaml 全局默认。
+    智能体配置由管理接口 ``PUT /agents/{id}/cross-search-config`` 写入，
+    与对话请求无关，属于智能体级别（所有会话共享）。
     """
-
-    async def on_tool_call(self, tool, input_kwargs, next_handler):
-        params = get_custom_params()
-        for key in _OVERRIDE_KEYS:
-            value = params.get(key)
-            if value is not None:
-                previous = input_kwargs.get(key)
-                input_kwargs[key] = value  # 强制覆盖，模型传错的也纠正
-                logger.info(
-                    "SpacecodeOverride: %s %r -> %r",
-                    key,
-                    previous,
-                    value,
-                )
-        # 个人检索显式关闭优先于空间码覆盖（关闭开关后置处理）
-        if params.get("personal_search_switch") is False:
-            for key in ("psnl_space_code_id", "psnl_category_id_list"):
-                previous = input_kwargs.get(key)
-                if previous:
-                    input_kwargs[key] = None
-                    logger.info(
-                        "SpacecodeOverride: personal_search_switch=false, "
-                        "%s %r -> None",
-                        key,
-                        previous,
-                    )
-        async for chunk in next_handler(**input_kwargs):
-            yield chunk
-
+    user_id = _current_user_id.get()
+    agent_id = _current_agent_id.get()
+    if not user_id or not agent_id:
+        return None
+    try:
+        return await cross_search_config_get(user_id, agent_id)
+    except Exception as exc:
+        logger.warning(
+            "CrossSearchParams: failed to read agent config for %s/%s: %s",
+            user_id,
+            agent_id,
+            exc,
+        )
+        return None
 
 
 def _build_req_message(
     keyword: str,
     config: CrossSearchConfig,
     *,
-    search_type: str | None = None,
-    user_code: str | None = None,
-    space_code_list: list[str] | None = None,
-    team_space_code_list: list[str] | None = None,
-    psnl_space_code_id: str | None = None,
-    customized_tag_list: list[str] | None = None,
-    psnl_category_id_list: list[str] | None = None,
-    text_top_n: int | None = None,
-    vector_top_n: int | None = None,
+    agent_config: AgentCrossSearchConfig | None = None,
 ) -> str:
-    effective_user_code = user_code or config.user_code
+    if agent_config is not None:
+        effective_user_code = agent_config.user_code or config.user_code
+        effective_search_type = agent_config.search_type or config.search_type
+        effective_space_code_list = (
+            agent_config.space_code_list
+            if agent_config.space_code_list
+            else config.space_code_list
+        )
+        # effective_team_space_code_list = (
+        #     agent_config.team_space_code_list
+        #     if agent_config.team_space_code_list
+        #     else config.team_space_code_list
+        # )
+        # effective_psnl_space_code_id = (
+        #     agent_config.psnl_space_code_id or config.psnl_space_code_id
+        # )
+        effective_customized_tag_list = (
+            agent_config.customized_tag_list
+            if agent_config.customized_tag_list
+            else config.customized_tag_list
+        )
+        # effective_psnl_category_id_list = (
+        #     agent_config.psnl_category_id_list
+        #     if agent_config.psnl_category_id_list
+        #     else config.psnl_category_id_list
+        # )
+        effective_text_top_n = (
+            agent_config.text_top_n
+            if agent_config.text_top_n is not None
+            else config.text_top_n
+        )
+        effective_vector_top_n = (
+            agent_config.vector_top_n
+            if agent_config.vector_top_n is not None
+            else config.vector_top_n
+        )
+    else:
+        effective_user_code = config.user_code
+        effective_search_type = config.search_type
+        effective_space_code_list = config.space_code_list
+        # effective_team_space_code_list = config.team_space_code_list
+        # effective_psnl_space_code_id = config.psnl_space_code_id
+        effective_customized_tag_list = config.customized_tag_list
+        # effective_psnl_category_id_list = config.psnl_category_id_list
+        effective_text_top_n = config.text_top_n
+        effective_vector_top_n = config.vector_top_n
+
     if not effective_user_code:
         raise ValueError(
-            "userCode is required. 请在 config.yaml 的 cross_search.user_code 中配置。",
+            "userCode is required. 请通过智能体配置接口或在 config.yaml 的 cross_search.user_code 中配置。",
         )
 
-    effective_search_type = search_type or config.search_type
-    effective_space_code_list = (
-        space_code_list
-        if space_code_list is not None
-        else config.space_code_list
-    )
-    effective_team_space_code_list = (
-        team_space_code_list
-        if team_space_code_list is not None
-        else config.team_space_code_list
-    )
-    effective_psnl_space_code_id = (
-        psnl_space_code_id or config.psnl_space_code_id
-    )
-    effective_customized_tag_list = (
-        customized_tag_list
-        if customized_tag_list is not None
-        else config.customized_tag_list
-    )
-    effective_psnl_category_id_list = (
-        psnl_category_id_list
-        if psnl_category_id_list is not None
-        else config.psnl_category_id_list
-    )
-
-    has_space = bool(
-        effective_space_code_list
-        or effective_team_space_code_list
-        or effective_psnl_space_code_id
-    )
-    if not has_space:
-        raise ValueError(
-            "至少需要提供 spaceCodeList、teamSpaceCodeList 或 "
-            "psnlSpaceCodeId 中的一个。",
-        )
+    # has_space = bool(
+    #     effective_space_code_list
+    #     or effective_team_space_code_list
+    #     or effective_psnl_space_code_id
+    # )
+    # if not has_space:
+    #     raise ValueError(
+    #         "至少需要提供 spaceCodeList、teamSpaceCodeList 或 "
+    #         "psnlSpaceCodeId 中的一个。请通过智能体配置接口设置。",
+    #     )
 
     param: dict[str, Any] = {
         "keyword": keyword,
         "userCode": effective_user_code,
         "userRole": config.user_role,
         "searchType": effective_search_type,
-        "textTopN": (
-            text_top_n if text_top_n is not None else config.text_top_n
-        ),
-        "vectorTopN": (
-            vector_top_n if vector_top_n is not None else config.vector_top_n
-        ),
+        "textTopN": effective_text_top_n,
+        "vectorTopN": effective_vector_top_n,
         "attachFlag": config.attach_flag,
         "caller": config.caller,
         "rerankFlag": config.rerank_flag,
@@ -175,13 +171,13 @@ def _build_req_message(
 
     if effective_space_code_list:
         param["spaceCodeList"] = effective_space_code_list
-    if effective_team_space_code_list:
-        param["teamSpaceCodeList"] = effective_team_space_code_list
-    if effective_psnl_space_code_id:
-        param["psnlSpaceCodeId"] = effective_psnl_space_code_id
-    if effective_psnl_category_id_list:
-        param["psnlCategoryIdList"] = effective_psnl_category_id_list
-    if effective_customized_tag_list:
+    # if effective_team_space_code_list:
+    #     param["teamSpaceCodeList"] = effective_team_space_code_list
+    # if effective_psnl_space_code_id:
+    #     param["psnlSpaceCodeId"] = effective_psnl_space_code_id
+    # if effective_psnl_category_id_list:
+    #     param["psnlCategoryIdList"] = effective_psnl_category_id_list
+    # if effective_customized_tag_list:
         param["customizedTagList"] = effective_customized_tag_list
     if config.source_org_id_list:
         param["sourceOrgIdList"] = config.source_org_id_list
@@ -196,7 +192,7 @@ def _build_req_message(
 
     req_message = {
         "REQ_HEAD": {
-            "TRANS_PROCESS": "searchKnowledgeCross",
+            "TRANS_PROCESS": "searchKnowledgeStandard",
             "TRAN_ID": "",
         },
         "REQ_BODY": {
@@ -310,15 +306,7 @@ def _extract_results(
 async def search_cross_backend(
     keyword: str,
     *,
-    search_type: str | None = None,
-    user_code: str | None = None,
-    space_code_list: list[str] | None = None,
-    team_space_code_list: list[str] | None = None,
-    psnl_space_code_id: str | None = None,
-    customized_tag_list: list[str] | None = None,
-    psnl_category_id_list: list[str] | None = None,
-    text_top_n: int | None = None,
-    vector_top_n: int | None = None,
+    agent_config: AgentCrossSearchConfig | None = None,
 ) -> str:
     config = get_cross_search_config()
     if not config.api_url:
@@ -333,15 +321,7 @@ async def search_cross_backend(
     req_message = _build_req_message(
         keyword,
         config,
-        search_type=search_type,
-        user_code=user_code,
-        space_code_list=space_code_list,
-        team_space_code_list=team_space_code_list,
-        psnl_space_code_id=psnl_space_code_id,
-        customized_tag_list=customized_tag_list,
-        psnl_category_id_list=psnl_category_id_list,
-        text_top_n=text_top_n,
-        vector_top_n=vector_top_n,
+        agent_config=agent_config,
     )
 
     headers = dict(config.headers)
@@ -376,18 +356,7 @@ async def search_cross_backend(
     return json.dumps(results, indent=2, ensure_ascii=False)
 
 
-async def _cross_search_tool_impl(
-    keyword: str,
-    search_type: str | None = None,
-    user_code: str | None = None,
-    space_code_list: list[str] | None = None,
-    team_space_code_list: list[str] | None = None,
-    psnl_space_code_id: str | None = None,
-    customized_tag_list: list[str] | None = None,
-    psnl_category_id_list: list[str] | None = None,
-    text_top_n: int | None = None,
-    vector_top_n: int | None = None,
-) -> str:
+async def _cross_search_tool_impl(keyword: str) -> str:
     """跨知识搜索
 
     跨场景、团队、个人知识库进行混合召回搜索，支持全文检索和向量检索。
@@ -399,40 +368,27 @@ async def _cross_search_tool_impl(
     构造搜索关键词时，应贴近用户原始措辞，提取核心主题词，不要自动添加
     泛化限定词，除非用户明确提及或确实需要消歧。
 
-    关于 spacecode 参数的强制规则：
-    - 如果系统提示词中指定了 spacecode，你必须原样传入该值，
-      禁止省略、修改或替换
-    - 至少需要提供 space_code_list、team_space_code_list 或
-      psnl_space_code_id 中的一个
+    空间码、用户编码、检索类型、返回条数等参数由系统自动注入，无需手动传入。
 
     Args:
         keyword: 用户的完整查询语句。禁止提取关键词或修改用户输入、
             必须严格使用用户提供的完整语句。
-        search_type: 搜索类型。0=混合检索(默认)，1=全文检索，2=向量检索。
-            不传则使用配置默认值。
-        user_code: 用户编码。通常由系统自动填充，无需手动传入。
-        space_code_list: 场景知识空间代码列表，例如 ["SP0000001",
-            "SP0000002"]。不传则使用配置默认值。
-        team_space_code_list: 团队知识空间代码列表。不传则使用配置默认值。
-        psnl_space_code_id: 个人知识空间代码ID。通常由系统自动填充，
-            无需手动传入。
-        customized_tag_list: 自定义标签列表，用于过滤搜索结果。
-        psnl_category_id_list: 个人知识分类ID列表。
-        text_top_n: 全文检索返回条数。不传则使用配置默认值。
-        vector_top_n: 向量检索返回条数。不传则使用配置默认值。
     """
+    agent_config = await _get_agent_cross_search_config()
+
+    if agent_config is not None:
+        logger.info(
+            "CrossSearchParams: agent_config loaded for agent=%s, "
+            "user_code=%s, space_codes=%s",
+            _current_agent_id.get(),
+            agent_config.user_code,
+            agent_config.space_code_list,
+        )
+
     try:
         return await search_cross_backend(
             keyword,
-            search_type=search_type,
-            user_code=user_code,
-            space_code_list=space_code_list,
-            team_space_code_list=team_space_code_list,
-            psnl_space_code_id=psnl_space_code_id,
-            customized_tag_list=customized_tag_list,
-            psnl_category_id_list=psnl_category_id_list,
-            text_top_n=text_top_n,
-            vector_top_n=vector_top_n,
+            agent_config=agent_config,
         )
     except httpx.TimeoutException:
         logger.error("Cross search request timed out.", exc_info=True)
@@ -460,11 +416,14 @@ if FunctionTool is not None and ToolMiddlewareBase is not None:
         # ^[a-zA-Z0-9_-]+$，设置 BOCOMADP_TOOL_ASCII_NAMES=1 切 ASCII。
         name=tool_name("跨知识搜索", "cross_search"),
         is_read_only=True,
-        middlewares=[_SpacecodeOverrideMiddleware()],
     )
 else:
-    # agentscope 不可用时的降级：保持裸函数（与项目 registry.py 风格一致）
     cross_search_tool = _cross_search_tool_impl
 
 
-__all__ = ["cross_search_tool", "search_cross_backend"]
+__all__ = [
+    "cross_search_tool",
+    "search_cross_backend",
+    "_current_user_id",
+    "_current_agent_id",
+]

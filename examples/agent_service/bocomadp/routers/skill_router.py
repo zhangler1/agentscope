@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -1343,16 +1344,35 @@ async def enable_agent_skill(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Skill '{skill_name}' not found on the remote skillhub.",
         ) from None
+    import time as _time
+
+    _t0 = _time.monotonic()
+    logger.info("[skill-dl] install start for %s (workspace=%s)", skill_name, getattr(workspace, "workdir", "?"))
     try:
-        # 安装期间置"使用中"：否则 sweeper 可能把正在写的池 Pod 当空闲
-        # 回收，下一条 exec 被 apiserver 拒 → 500 Invalid response status。
-        async with _pool_activity_guard(workspace):
-            await workspace.add_skill_archive(
-                archive.stream,
-                archive.format,
-                skill_name,
-            )
+        await workspace.add_skill_archive(
+            archive.stream,
+            archive.format,
+            skill_name,
+        )
+        logger.info(
+            "[skill-dl] add_skill_archive OK in %.2fs",
+            _time.monotonic() - _t0,
+        )
+    except asyncio.CancelledError:
+        logger.error(
+            "[skill-dl] INSTALL CANCELLED mid-flight for %s after %.2fs "
+            "(workspace teardown / request cancel?)",
+            skill_name,
+            _time.monotonic() - _t0,
+        )
+        raise
     except Exception as e:  # noqa: BLE001
+        logger.error(
+            "[skill-dl] add_skill_archive FAILED for %s after %.2fs: %r",
+            skill_name,
+            _time.monotonic() - _t0,
+            e,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Failed to install skill '{skill_name}': {e}",
@@ -1370,26 +1390,19 @@ async def enable_agent_skill(
             ),
         )
 
-    # 该 agent 当前的完整清单（frontmatter 名），**排除本次装的这一个**：
-    # `new_names` 就是本次下载新出现的技能（frontmatter 名）——无论沙箱把
-    # 解压目录命名成 hub slug 还是 frontmatter 名，都能准确排除，免得建行时
-    # 同一个技能既记成 uploaded/unknown 又记成 skillhub（读侧会当成两个）。
-    skip = {skill_name} | new_names
-    listed_others = [s.name for s in refreshed if s.name and s.name not in skip]
-
-    # 写穿 agents_extend：/skills/external、/skills/uploaded 的 used 标记
-    # 以该表为准（不申请 Pod）；表里没有记录时用上面这份清单建行，本次技能
-    # 标 type=skillhub，见 helper 说明。
-    await _record_installed_skill(
-        storage,
+    logger.info(
+        "Enabled skill '%s' for agent '%s'",
+        skill_full_name,
         agent_id,
-        category,
-        skill_name,
-        source="skill-download",
-        listed_names=listed_others,
     )
-
-    logger.info("Enabled skill '%s' for agent '%s'", skill_full_name, agent_id)
+    # 打印落盘的具体路径（宿主视角：workspace 目录 + skill 实际解压目录）
+    logger.info(
+        "Skill '%s' downloaded -> workspace host_workdir=%s, "
+        "landed dirs=%s",
+        skill_full_name,
+        getattr(workspace, "host_workdir", "?"),
+        sorted(s.dir for s in refreshed if s.name in new_names),
+    )
     return SkillActionResponse(
         success=True,
         action="enabled",

@@ -18,6 +18,7 @@ from .contact_search import contact_search_tool
 from .cross_search import cross_search_tool
 from .exchange_rate import exchange_rate_tool
 from .interest_rate import interest_rate_tool
+from .personal_knowledge_request import personal_knowledge_request_tool
 from .personal_search import personal_search_tool
 from .physical_contact_search import physical_contact_search_tool
 from .raw_request import raw_request_tool
@@ -27,8 +28,7 @@ from .vector_search import vector_search_tool
 logger = logging.getLogger("bocomadp.enterprise_catalog")
 
 #: 纳入可配置集合的企业工具实例（顺序即展示顺序）。
-#: 联网搜索（online_search）与两个占位（query_internal_doc /
-#: submit_it_ticket）按要求暂不纳入，故此处不引用。
+#: 联网搜索（online_search）按要求暂不纳入，故此处不引用。
 _ENTERPRISE_TOOLS: tuple = (
     contact_search_tool,
     physical_contact_search_tool,
@@ -39,6 +39,7 @@ _ENTERPRISE_TOOLS: tuple = (
     cross_search_tool,
     vector_search_tool,
     personal_search_tool,
+    personal_knowledge_request_tool,
 )
 
 
@@ -63,7 +64,7 @@ def enterprise_tools_meta() -> list[dict[str, str]]:
 
 
 def enterprise_tool_names() -> list[str]:
-    """企业工具中纳入可配置集合的名字（已排除联网搜索与占位）。"""
+    """企业工具中纳入可配置集合的名字（已排除联网搜索）。"""
     return [m["name"] for m in enterprise_tools_meta()]
 
 

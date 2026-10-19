@@ -281,8 +281,8 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             "——但禁止安装新包。"
             "\n- 用户上传的图片（.png/.jpg/.jpeg/.webp）不会转换为 .md，上传时已"
             "固化为 base64 存于上传元数据。解析图片**必须**调用 "
-            "view_image_tool(virtual_path=..., question=...)：先调用 "
-            "list_uploaded_files 获取图片的 virtual_path 再传给该工具。"
+            "view_image_tool(virtual_path=..., question=...)："
+            "从 <context name=\"files\"> 中获取图片的 virtual_path 再传给该工具。"
             "\n- 禁止用 Read/bash/Python 直接读取二进制图片文件（会得到乱码），"
             "也不要尝试用编程方式解析图片（环境可能没有图像处理库）。"
             "\n\n### 项目目录"
@@ -299,6 +299,7 @@ class SharedPvcK8sWorkspace(K8sWorkspace):
             "\n\n### Python 环境"
             "\n- 沙箱预置了Python虚拟环境`/root/.agentscope/.venv`。"
             "\n- 执行Python脚本前，先激活该环境：`source /root/.agentscope/.venv/bin/activate`"
+            "\n- 安装包如：uv pip / pip install docstring_parser --index-url=http://afty.bocomm.tst/repo/api/pypi/pypi-public/simple --trusted-host=afty.bocomm.tst"
             "\n</workspace>"
         ).format(
             backend="Kubernetes-based (shared-PVC)",

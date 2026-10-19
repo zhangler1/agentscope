@@ -126,12 +126,17 @@ class ToolRegistry:
 
         当 agentscope 未安装（fallback 模式）时，保持原样返回，
         以便至少能完成模块导入与语法检查。
+
+        若裸函数带有 ``_tool_display_name`` 属性（由
+        ``builtin_tools.py`` 等设置），则以此作为工具名传入
+        ``FunctionTool(name=...)``，实现展示名与函数名解耦。
         """
-        # 已经是 ToolBase 实例，无需包装
         if ToolBase is not None and isinstance(tool, ToolBase):
             return tool
-        # 裸 Python 函数 -> FunctionTool
         if FunctionTool is not None and callable(tool):
+            display = getattr(tool, "_tool_display_name", None)
+            if display:
+                return FunctionTool(tool, name=display)
             return FunctionTool(tool)
         return tool
 

@@ -4,7 +4,8 @@
 通过 ContextVar 在 deerflow 路由层与工具后端之间传递解析后的认证信息，
 避免在每个 tool call 中重复解析 custom_params。解析入口为
 :func:`resolve_auth_params`（对齐 deer-flow ``_resolve_auth_params``），
-优先级：guwp-token > jrt-auth-code > okic-token > muwp-user > none。
+优先级：guwp-token > jrt-auth-code > okic-token > guip-token > muwp-user
+> guip-user > none。
 
 ContextVar 随 ``asyncio.create_task`` 复制到后台 run 任务，工具中间件 /
 后端在 run 任务内经 :func:`get_resolved_auth` 读取；路由层 spawn 后
@@ -25,21 +26,26 @@ class ResolvedAuth:
     """解析后的认证信息。
 
     ``auth_mode`` 表示最终选用的认证方式，优先级：
-    guwp-token > jrt-auth-code > okic-token > muwp-user > none。
+    guwp-token > jrt-auth-code > okic-token > guip-token > muwp-user >
+    guip-user > none。
     """
 
     auth_mode: Literal[
         "guwp-token",
         "jrt-auth-code",
         "okic-token",
+        "guip-token",
         "muwp-user",
+        "guip-user",
         "none",
     ]
     guwp_token: str = ""
     jrt_auth_code: str = ""
     okic_token: str = ""
     okic_type: str = ""
+    guip_token: str = ""
     muwp_user: dict[str, Any] = field(default_factory=dict)
+    guip_user: dict[str, Any] = field(default_factory=dict)
 
 
 _auth_ctx: ContextVar[ResolvedAuth] = ContextVar(
@@ -68,7 +74,8 @@ def resolve_auth_params(
 ) -> ResolvedAuth:
     """从 custom_params 解析认证方案（对齐 deer-flow ``_resolve_auth_params``）。
 
-    优先级：guwp-token > jrt-auth-code > okic-token > muwp-user > none。
+    优先级：guwp-token > jrt-auth-code > okic-token > guip-token >
+    muwp-user > guip-user > none。
     任一方案的凭据为空串 / 缺失则跳过，全部缺失时返回 ``none``。
     """
     if not custom_params:
@@ -78,9 +85,13 @@ def resolve_auth_params(
     jrt_auth_code = str(custom_params.get("jrt_auth_code") or "")
     okic_token = str(custom_params.get("okic_token") or "")
     okic_type = str(custom_params.get("okic_type") or "")
+    guip_token = str(custom_params.get("guip_token") or "")
     muwp_user = custom_params.get("muwp_user") or {}
     if not isinstance(muwp_user, dict):
         muwp_user = {}
+    guip_user = custom_params.get("guip_user") or {}
+    if not isinstance(guip_user, dict):
+        guip_user = {}
 
     if guwp_token:
         return ResolvedAuth(auth_mode="guwp-token", guwp_token=guwp_token)
@@ -95,8 +106,12 @@ def resolve_auth_params(
             okic_token=okic_token,
             okic_type=okic_type,
         )
+    if guip_token:
+        return ResolvedAuth(auth_mode="guip-token", guip_token=guip_token)
     if muwp_user:
         return ResolvedAuth(auth_mode="muwp-user", muwp_user=muwp_user)
+    if guip_user:
+        return ResolvedAuth(auth_mode="guip-user", guip_user=guip_user)
     return ResolvedAuth(auth_mode="none")
 
 
@@ -118,7 +133,7 @@ def build_auth_headers(headers: dict[str, str]) -> dict[str, str]:
     """按当前上下文的 ResolvedAuth 注入认证请求头（三工具共享）。
 
     对齐源项目三工具各自重复实现的同一逻辑，此处收敛为单点：
-    guwp-token > jrt-auth-code > okic-token(+okic-type)。
+    guwp-token > jrt-auth-code > okic-token(+okic-type) > guip-token。
     """
     auth = get_resolved_auth()
     if auth.auth_mode == "guwp-token" and auth.guwp_token:
@@ -128,18 +143,38 @@ def build_auth_headers(headers: dict[str, str]) -> dict[str, str]:
     elif auth.auth_mode == "okic-token" and auth.okic_token:
         headers["okic-token"] = auth.okic_token
         headers["okic-type"] = auth.okic_type
+    elif auth.auth_mode == "guip-token" and auth.guip_token:
+        headers["guip-token"] = auth.guip_token
     return headers
 
 
-def attach_muwp_user(body: dict[str, Any]) -> dict[str, Any]:
-    """auth_mode 为 muwp-user 且 muwp_user 非空时附加 REQ_BODY.muwpUser。
+def attach_user_identity(body: dict[str, Any]) -> dict[str, Any]:
+    """按当前 auth_mode 注入用户标识到 REQ_BODY。
+
+    - muwp-user 模式 → ``REQ_BODY.muwpUser``
+    - guip-user 模式 → ``REQ_BODY.guipUser``
 
     返回传入的 ``body``（原地修改），便于链式调用。
     """
     auth = get_resolved_auth()
     if auth.auth_mode == "muwp-user" and auth.muwp_user:
         body.setdefault("REQ_BODY", {})["muwpUser"] = auth.muwp_user
+    elif auth.auth_mode == "guip-user" and auth.guip_user:
+        body.setdefault("REQ_BODY", {})["guipUser"] = auth.guip_user
     return body
+
+
+def attach_muwp_user(body: dict[str, Any]) -> dict[str, Any]:
+    """auth_mode 为 muwp-user 且 muwp_user 非空时附加 REQ_BODY.muwpUser。
+
+    .. deprecated::
+        保留以兼容现有调用点；新逻辑请用 :func:`attach_user_identity`
+        （覆盖 muwp-user 与 guip-user 两种模式）。本函数内部已委托给
+        :func:`attach_user_identity`，保证旧调用点同时获得 guip-user 支持。
+
+    返回传入的 ``body``（原地修改），便于链式调用。
+    """
+    return attach_user_identity(body)
 
 
 __all__ = [
@@ -151,5 +186,6 @@ __all__ = [
     "save_auth",
     "load_auth",
     "build_auth_headers",
+    "attach_user_identity",
     "attach_muwp_user",
 ]

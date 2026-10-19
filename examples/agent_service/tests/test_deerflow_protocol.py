@@ -3,7 +3,7 @@
 对齐 deer-flow 2.0 ``format_sse`` 协议事实：
 - field 顺序 event → data → id（可选）→ 空行
 - 心跳 ``: heartbeat\\n\\n``（纯注释帧）
-- 结束 ``event: end\\ndata: null\\n\\n``
+- 本适配层不下发 ``event: end`` 帧（END_SENTINEL 仅作内部收尾信号）
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 from bocomadp.deerflow.protocol import (
     END_SENTINEL,
     EVENT_CUSTOM,
-    EVENT_END,
     EVENT_MESSAGES,
     EVENT_METADATA,
     EVENT_VALUES,
@@ -58,13 +57,8 @@ def test_heartbeat_sentinel() -> None:
     assert format_sse(HEARTBEAT_SENTINEL) == ": heartbeat\n\n"
 
 
-def test_end_sentinel() -> None:
-    """结束帧带 data: null（对齐 deer-flow format_sse("end", None)）。"""
-    assert format_sse(END_SENTINEL) == "event: end\ndata: null\n\n"
-
-
 def test_end_sentinel_constant() -> None:
-    """END_SENTINEL 的协议事件名为 end（供路由层识别）。"""
+    """END_SENTINEL 是内部收尾信号（协议事件名 __end__，不序列化下发）。"""
     assert END_SENTINEL.event == "__end__"
 
 
