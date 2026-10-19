@@ -71,6 +71,7 @@ from bocomadp.open_agent_access import get_agent_global
 from bocomadp.workspace._shared_pvc import NON_ADP_WORKSPACE_PREFIX
 from bocomadp.routers.agent_credential import get_agent_credential_id
 from bocomadp.routers.uploads import download_urls_to_session
+from bocomadp.uploads.db import UploadedFile
 
 from ..bridge import BusBridge
 from ..credentials import (
@@ -243,6 +244,39 @@ def _attach_files_metadata(input_msg: Any, files: list | None) -> None:
     for m in msgs:
         if isinstance(m, Msg):
             m.metadata["files"] = files
+
+
+def _merge_files_metadata(input_msg: Any, files: list | None) -> None:
+    """把 additional_urls 下载记录回填到 human 消息的 ``metadata.files``。
+
+    ``context.custom_params.additional_urls`` 只负责下载落库（不提示模型）；
+    这里把下载记录转成的 fmeta 与调用方显式传的 ``files`` 合并（按
+    virtual_path 去重），复用 UploadsMiddleware 的 ``<context name="files">``
+    渲染链路让模型感知本轮新下载的文件。事件类输入（确认卡片等）非
+    Msg，自动跳过。
+    """
+    if not files:
+        return
+    msgs = input_msg if isinstance(input_msg, list) else [input_msg]
+    for m in msgs:
+        if not isinstance(m, Msg):
+            continue
+        existing = m.metadata.get("files") or []
+        seen = {
+            f.get("virtual_path")
+            for f in existing
+            if isinstance(f, dict) and f.get("virtual_path")
+        }
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            vp = f.get("virtual_path")
+            if vp and vp in seen:
+                continue
+            existing.append(f)
+            if vp:
+                seen.add(vp)
+        m.metadata["files"] = existing
 
 
 def _msg_to_human_chunk(msg: Msg) -> dict[str, Any]:
@@ -1061,6 +1095,36 @@ async def _resolve_custom_params(
     return loaded or {}
 
 
+#: 固定注入 ``custom_params.usableTools`` 名单的工具（名单条目写中文名
+#: 即可，两层过滤会经 ``usable_enterprise_tool_names`` 归一为运行时形态
+#: 名，与 BOCOMADP_TOOL_ASCII_NAMES 开关无关）。
+_FIXED_USABLE_TOOLS: tuple[str, ...] = ("读取工具结果",)
+
+
+def _inject_fixed_usable_tools(params: dict[str, Any]) -> None:
+    """把固定工具追加进 ``custom_params.usableTools`` 名单（原地修改）。
+
+    ``read_tool_result``（持久化读回工具）固定启用，与调用方是否携带
+    ``usableTools``、是否配置 per-agent 白名单无关：两层过滤
+    （main.py ``build_agent_tools`` / ``toolkit_whitelist``）只放行名单内
+    工具，这里在解析后、ContextVar 注入前固定补上该条目。
+
+    usableTools 名单语义只收缩不扩张：缺失 / 非 list 时归一为空名单后
+    追加，其余专用企业工具的收缩行为不受影响（名单内只有固定工具时
+    专用工具仍全部不挂载）。名单内可能出现中/英文重复条目（调用方传
+    "read_tool_result" 时），归一为 set 后自然去重，无副作用。
+    """
+    usable = params.get("usableTools")
+    if not isinstance(usable, list):
+        usable = []
+    else:
+        usable = list(usable)
+    for name in _FIXED_USABLE_TOOLS:
+        if name not in usable:
+            usable.append(name)
+    params["usableTools"] = usable
+
+
 async def _resolve_run_context(
     session_id: str,
     requested: dict[str, Any] | None,
@@ -1125,8 +1189,8 @@ async def _download_additional_urls(
     session_id: str,
     storage: StorageBase,
     workspace_manager: WorkspaceManagerBase,
-) -> None:
-    """下载 context.custom_params.additional_urls 到会话 uploads 目录（仅副作用）。
+) -> list[UploadedFile]:
+    """下载 context.custom_params.additional_urls 到会话 uploads 目录。
 
     ``context.custom_params: {additional_urls: [...]}`` 中的地址是 OSS /
     HTTP(S) 直链（或 ``{file_url, file_name}`` dict / JSON 字符串），需在
@@ -1135,18 +1199,20 @@ async def _download_additional_urls(
     ``<context name="files">`` 立即可见）。前端传入的 ``file_name`` 作为
     原始文件名保留，空则从 URL 推断。
 
-    本函数不改变任何参数：context.custom_params（含 additional_urls）
-    由调用方原样交给 ``_resolve_custom_params`` 整体落盘，便于事后查看
-    历史传参。下载仅在请求显式携带 additional_urls 时触发一次；回退
-    加载路径（请求未携带时从落盘文件恢复）不会再次触发下载，故
-    持久化不会导致重复下载。
+    返回成功下载的上传记录（调用方将其转成 fmeta 回填 human 消息
+    metadata.files，复用 UploadsMiddleware 渲染链路提示模型——
+    additional_urls 本身只落库、不注入）。本函数不改变任何请求参数：
+    context.custom_params（含 additional_urls）由调用方原样交给
+    ``_resolve_custom_params`` 整体落盘，便于事后查看历史传参。下载仅在
+    请求显式携带 additional_urls 时触发一次；回退加载路径（请求未携带
+    时从落盘文件恢复）不会再次触发下载，故持久化不会导致重复下载。
     """
     custom = _nested_custom_params(body.context)
     if not custom or not custom.get("additional_urls"):
-        return
+        return []
     raw = custom.get("additional_urls")
     if not isinstance(raw, list):
-        return
+        return []
     items: list[tuple[str, str]] = []
     for entry in raw:
         url, name = _parse_additional_url_item(entry)
@@ -1167,7 +1233,28 @@ async def _download_additional_urls(
                 len(downloaded),
                 session_id,
             )
+        return downloaded
+    return []
 
+
+def _uploaded_to_file_meta(rec: UploadedFile) -> dict[str, Any]:
+    """把下载记录转为 UploadsMiddleware 认识的 fmeta 形态。
+
+    与 ``context.custom_params.files`` 条目同构（filename / virtual_path /
+    stored_name / user_id / session_id / agent_id），中间件据此定位
+    uploads DB 记录渲染 ``<context name="files">`` 大纲/图片提示。
+    """
+    return {
+        # filename 展示实际落盘文件名（stored_name）；调用方传入的原始
+        # 文件名（original_name）与落盘名不一致时，由 UploadsMiddleware
+        # 按 uploads DB 记录在提示词中说明对应关系。
+        "filename": rec.stored_name or rec.original_name,
+        "virtual_path": rec.virtual_path,
+        "stored_name": rec.stored_name,
+        "user_id": rec.user_id,
+        "session_id": rec.session_id,
+        "agent_id": rec.agent_id,
+    }
 
 async def _set_run_auth_contexts(
     session_id: str,
@@ -1311,11 +1398,15 @@ async def _interrupt_active_run(
     """打断 session 当前活跃 run 并等待其结束（新请求优先语义）。
 
     旧 run 记账先落定 INTERRUPTED（与 cancel 端点同款，done 回调不
-    覆盖），随后原生 interrupt（幂等：运行中 → 广播取消旧 task；已
-    结束 → LookupError 吞掉）。最后等待本进程可见的旧 task 完成——
-    其清理释放 session 分布式锁后新 run 才能接管；跨进程场景旧 task
-    不在本进程，由新 run 内部 ``acquire_lock`` 阻塞排队兜底。旧 run
-    的 join 流收到 REPLY_END(INTERRUPTED) 翻译的 end 哨兵后自行断开。
+    覆盖），然后**直接取消本进程可见的旧 task**——不依赖
+    ``chat_service.interrupt`` 的 is_locked 判断：旧 run 处于组装
+    阶段（尚未 acquire session 锁）或 HITL parked（锁已释放）时
+    is_locked 为 False，interrupt 走 enqueue resume 分支、不会取消
+    旧 task，等待超时后重试仍撞活跃 run（30s 后 409）。
+    ``task.cancel()`` 后 ``done()`` 立即为 True，重试
+    ``create_or_reject`` 即可放行；旧 task 的 CancelledError 清理在
+    事件循环中异步完成，新 run 的 ``acquire_lock`` 会等待其释放
+    session 锁。interrupt 广播保留作跨进程兜底（幂等）。
     """
     old_run_id = run_manager.active_run_id(session_id)
     old_record = run_manager.get(old_run_id) if old_run_id else None
@@ -1327,6 +1418,24 @@ async def _interrupt_active_run(
             old_run_id,
             session_id,
         )
+
+    # 直接取消本进程旧 task（核心路径）：无论旧 run 是否持有 session
+    # 锁，本进程 registry 中的 task 都能立即取消；cancel 后 done()
+    # 立即为 True，后续 create_or_reject 重试与 spawn 均放行。
+    old_task = chat_run_registry.get(session_id)
+    if old_task is not None and not old_task.done():
+        logger.info(
+            "deerflow: cancelling active local run task directly "
+            "(run=%s, session=%s).",
+            old_run_id,
+            session_id,
+        )
+        old_task.cancel()
+
+    # interrupt 广播兜底：跨进程场景（旧 run 在其它 worker）由
+    # CancelDispatcher 按 session 定位并取消；本进程 task 已被直接
+    # 取消，重复广播幂等无害。未持锁时走 enqueue resume，由框架
+    # skip 逻辑与新 run 的活跃检查去重。
     try:
         await chat_service.interrupt(
             user_id,
@@ -1336,7 +1445,6 @@ async def _interrupt_active_run(
     except LookupError:
         # run 已完成、session 已清理时的正常情形，不必告警
         pass
-    old_task = chat_run_registry.get(session_id)
     if old_task is not None and not old_task.done():
         done, _ = await asyncio.wait(
             {old_task},
@@ -1598,22 +1706,32 @@ def _sse_generator(
             # 本层暂不下发 end 帧：流结束由连接关闭传递
         finally:
             if on_disconnect == "cancel" and not hitl_parked:
-                try:
-                    await chat_service.interrupt(
-                        user_id,
-                        session_id,
-                        agent_id,
-                    )
-                except LookupError:
-                    # run 已完成、session 已清理时的正常情形，不必告警
-                    pass
-                except Exception:  # noqa: BLE001 —— 兜底中断失败仅记日志
-                    logger.exception(
-                        "deerflow: interrupt on disconnect failed for "
-                        "session %s run %s",
-                        session_id,
-                        run_id,
-                    )
+                # 断线时 uvicorn 已取消本生成器 task：此处直接 await 会在
+                # 首个 await 点被二次 CancelledError 打断（interrupt 内
+                # DB 查询的 SQLAlchemy terminate 清理路径泄漏 traceback，
+                # 且断线取消实际未生效）。改为后台 task 执行：不继承外层
+                # 取消，可完整跑完 get_session → publish 广播链。异常仅
+                # 记日志（interrupt 幂等，遗漏由新请求的"直接 cancel 旧
+                # task"兜底）。
+                async def _interrupt_cleanup() -> None:
+                    try:
+                        await chat_service.interrupt(
+                            user_id,
+                            session_id,
+                            agent_id,
+                        )
+                    except LookupError:
+                        # run 已完成、session 已清理时的正常情形，不必告警
+                        pass
+                    except Exception:  # noqa: BLE001 —— 兜底中断失败仅记日志
+                        logger.exception(
+                            "deerflow: interrupt on disconnect failed for "
+                            "session %s run %s",
+                            session_id,
+                            run_id,
+                        )
+
+                asyncio.create_task(_interrupt_cleanup())
 
     return _gen()
 
@@ -1850,7 +1968,7 @@ async def create_run_stream(
     # uploads 目录；随后 context 按通道拆分（平铺层根路径 5 键 →
     # run_context，嵌套 custom_params → custom_params）分别落盘/回退
     # 加载，reset 不影响已创建的后台 run 任务。
-    await _download_additional_urls(
+    downloaded = await _download_additional_urls(
         body,
         user_id,
         agent_id,
@@ -1858,6 +1976,14 @@ async def create_run_stream(
         storage,
         workspace_manager,
     )
+    # 下载记录回填 human 消息 metadata.files（与显式 files 合并去重），
+    # 复用 UploadsMiddleware 渲染 <context name="files"> 提示模型——
+    # 调用方只传 additional_urls 时模型同样能感知本轮新文件。
+    if downloaded:
+        _merge_files_metadata(
+            input_msg,
+            [_uploaded_to_file_meta(rec) for rec in downloaded],
+        )
     custom_params_part, run_context = _split_request_context(body.context)
     resolved_params = await _resolve_custom_params(
         session_id,
@@ -1868,6 +1994,9 @@ async def create_run_stream(
     # custom_params 读取 thread_id 注入联机请求体做链路追踪。
     if resolved_params:
         resolved_params["thread_id"] = session_id
+    # 固定工具名单注入：read_tool_result（读取工具结果）始终启用，
+    # 不依赖调用方携带 usableTools 或 per-agent 白名单。
+    _inject_fixed_usable_tools(resolved_params)
     ctx_token = set_custom_params(resolved_params)
     # 请求级 run 配置（context 平铺层根路径 5 键）：经 ContextVar 注入
     # 后台 run 任务；spawn 后 reset（create_task 已复制上下文快照，
@@ -1970,7 +2099,7 @@ async def create_run_wait(
     # run_context，嵌套 custom_params → custom_params）分别落盘/回退
     # 加载，reset 不影响已创建的后台 run 任务（create_task 复制
     # ContextVar 上下文）。
-    await _download_additional_urls(
+    downloaded = await _download_additional_urls(
         body,
         user_id,
         agent_id,
@@ -1978,6 +2107,13 @@ async def create_run_wait(
         storage,
         workspace_manager,
     )
+    # 同 create_run_stream：下载记录回填 human 消息 metadata.files，
+    # 复用 UploadsMiddleware 渲染 <context name="files"> 提示模型。
+    if downloaded:
+        _merge_files_metadata(
+            input_msg,
+            [_uploaded_to_file_meta(rec) for rec in downloaded],
+        )
     custom_params_part, run_context = _split_request_context(body.context)
     resolved_params = await _resolve_custom_params(
         session_id,
@@ -1988,6 +2124,9 @@ async def create_run_wait(
     # custom_params 读取 thread_id 注入联机请求体做链路追踪。
     if resolved_params:
         resolved_params["thread_id"] = session_id
+    # 固定工具名单注入：read_tool_result（读取工具结果）始终启用，
+    # 不依赖调用方携带 usableTools 或 per-agent 白名单。
+    _inject_fixed_usable_tools(resolved_params)
     ctx_token = set_custom_params(resolved_params)
     if "mode" in run_context:
         logger.debug(

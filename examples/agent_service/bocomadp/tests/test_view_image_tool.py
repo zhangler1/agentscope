@@ -41,7 +41,9 @@ class _FakeVisionModel(_FakeEllmChatModel):
 
     def __init__(self) -> None:
         self.api_key: str | None = None
+        self.model = "Qwen3-VL-30B-A3B-Instruct"
         self.closed = False
+        self.completion_kwargs: dict | None = None
 
     def set_api_key(self, key: str) -> None:
         self.api_key = key
@@ -52,12 +54,26 @@ class _FakeVisionModel(_FakeEllmChatModel):
     def set_auth_invalidate_callback(self, cb) -> None:  # noqa: ANN001
         self.invalidate_cb = cb
 
+    async def call_completions(self, **kwargs):  # noqa: ANN001, ANN201
+        """统一调用入口桩：记录参数并返回固定假响应。"""
+        self.completion_kwargs = kwargs
+        response = MagicMock()
+        response.choices[0].message.content = "图片中有一张桌子。"
+        return response
+
     async def aclose(self) -> None:
         self.closed = True
 
 
 class _NoCloseModel:
     """无 aclose 方法的模型（回退路径可能返回非 EllmChatModel）。"""
+
+    model = "Qwen3-VL-30B-A3B-Instruct"
+
+    async def call_completions(self, **kwargs):  # noqa: ANN001, ANN201
+        response = MagicMock()
+        response.choices[0].message.content = "图片中有一张桌子。"
+        return response
 
 
 def _make_record(is_image: bool = True) -> MagicMock:

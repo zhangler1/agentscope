@@ -336,6 +336,37 @@ class EllmChatModel(ChatModelBase):
         """
         self._refresh_key_callback = callback
 
+    async def call_completions(self, **kwargs: Any) -> Any:
+        """Directly call the OpenAI-compatible ``chat.completions`` API.
+
+        For callers that bypass :meth:`_call_api` (e.g. the view-image
+        tool, which sends its own OpenAI-format ``messages`` dict with a
+        ``data:image`` payload), this restores the two behaviors
+        ``_call_api`` provides and a bare
+        ``client.chat.completions.create`` loses:
+
+        - the fresh key injected via :meth:`set_api_key`
+          (``_api_key_override``) is sent as
+          ``Authorization: Bearer <key>``;
+        - a 401 ``invalid_api_key`` goes through
+          :meth:`_request_with_retry_on_auth`: force-refresh the key and
+          retry once, marking the credential expired when the refresh
+          fails.
+
+        Args:
+            **kwargs: Forwarded verbatim to
+                ``client.chat.completions.create`` (``model``,
+                ``messages``, ``stream``, ...).
+
+        Returns:
+            The OpenAI-compatible completion response.
+        """
+        if self._api_key_override:
+            headers = dict(kwargs.pop("extra_headers", None) or {})
+            headers["Authorization"] = f"Bearer {self._api_key_override}"
+            kwargs["extra_headers"] = headers
+        return await self._request_with_retry_on_auth(kwargs)
+
     async def aclose(self) -> None:
         """Close the underlying openai client and release its connection pool.
 

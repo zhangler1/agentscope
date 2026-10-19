@@ -1,0 +1,21 @@
+# local 启动覆盖文件：Windows 本机开发环境专用。
+# 用法（叠加在基础文件之上，未列出的服务/配置沿用 docker-compose.yml）：
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# 与基础文件的差异：
+#   - k8s 沙箱 kubeconfig 挂载源改为 Windows 宿主机实际路径
+#     （基础文件为 ./config 相对路径；本机 kubectl 配置通常在家目录，
+#     如需使用项目内 .kube/config 改为：
+#       D:/agentscope/Docker-agentscope/.kube/config:/app/kubeconfig/config:ro）
+#   - 沙箱镜像改为本机预构建镜像（跳过 bootstrap，加速沙箱启动；
+#     Docker Desktop K8s 与 docker 共享镜像仓库，直接用本地 tag；
+#     如需推送到私有仓库后使用改为对应仓库地址）
+#   - 工具名切 ASCII：DeepSeek 等 API 强校验工具名 ^[a-zA-Z0-9_-]+$，
+#     中文原名会 400；内网 ELLM 无此限制可保持中文（0）
+services:
+  agentscope-service:
+    environment:
+      - ADP_K8S_IMAGE=agentscope-k8s-workspace:latest
+      - BOCOMADP_TOOL_ASCII_NAMES=1
+    volumes:
+      - C:/Users/86199/.kube/config:/app/kubeconfig/config:ro
