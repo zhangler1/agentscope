@@ -100,6 +100,89 @@ async def _allowed_handoff_targets(
     return team, team_role, allowed
 
 
+_ROUTING_TOOL_NAMES = {
+    "TeamCreate",
+    "AgentCreate",
+    "AgentInvite",
+    "TeamSay",
+    "TeamDelete",
+}
+
+
+async def _apply_orchestrated_toolkit(
+    toolkit: Any,
+    *,
+    storage: Any,
+    user_id: str,
+    agent_record: Any,
+    session_record: Any,
+    team: Any,
+    team_role: str | None,
+) -> bool:
+    """Replace the generic team toolset with workflow control tools.
+
+    Returns ``True`` when the session belongs to an orchestrated team and
+    the caller should skip the legacy TeamSay/AgentInvite handling.
+    """
+    if team is None:
+        return False
+    leader_session = await storage.get_session(user_id, "", team.session_id)
+    if leader_session is None:
+        return False
+    from bocomadp import team_store
+
+    rel = await team_store.get_team(storage, user_id, leader_session.agent_id)
+    if rel is None or rel.collaboration_mode != "workflow":
+        return False
+
+    from bocomadp.team.state import get_state
+    from bocomadp.team.tools import ResumeWorkflow, SubmitHandoffs
+
+    state = await get_state(storage, team.id)
+    if state is None:
+        return False
+
+    groups = getattr(toolkit, "tool_groups", None) or []
+    for group in groups:
+        group.tools = [
+            tool
+            for tool in getattr(group, "tools", None) or []
+            if getattr(tool, "name", "") not in _ROUTING_TOOL_NAMES
+        ]
+
+    common = {
+        "storage": storage,
+        "user_id": user_id,
+        "session_id": session_record.id,
+        "agent_id": agent_record.id,
+        "team_id": team.id,
+    }
+    if team_role == "leader":
+        if state.leader.phase == "first" and not state.leader.dispatched:
+            await toolkit.add_tool(
+                SubmitHandoffs(**common, is_leader=True),
+                group_name="basic",
+            )
+        if state.leader.phase == "first" and state.status in ("running", "failed"):
+            await toolkit.add_tool(
+                ResumeWorkflow(**common),
+                group_name="basic",
+            )
+    else:
+        node = state.nodes.get(agent_record.id)
+        if node is not None and node.status in (
+            "active",
+            "interrupted",
+            "pending",
+            "failed",
+        ):
+            await toolkit.add_tool(
+                SubmitHandoffs(**common, is_leader=False),
+                group_name="basic",
+            )
+    return True
+
+
 async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
     """Assemble the toolkit, then inject the expert-team behaviours."""
     toolkit = await _original_get_toolkit(*args, **kwargs)
@@ -120,12 +203,23 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
 
     from agentscope.app._tool import AgentInvite, TeamSay
 
-    _, team_role, allowed = await _allowed_handoff_targets(
+    team, team_role, allowed = await _allowed_handoff_targets(
         storage,
         user_id,
         agent_record,
         session_record,
     )
+
+    if await _apply_orchestrated_toolkit(
+        toolkit,
+        storage=storage,
+        user_id=user_id,
+        agent_record=agent_record,
+        session_record=session_record,
+        team=team,
+        team_role=team_role,
+    ):
+        return toolkit
 
     groups = getattr(toolkit, "tool_groups", None) or []
     has_invite = False
@@ -177,6 +271,37 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
     return toolkit
 
 
+_TEAM_CREATE_CLEANUP_HINT = (
+    "\n\n## 任务完成后的团队清理\n"
+    "当所有成员已完成任务、你已收齐结果并准备给出最终答复后，"
+    "建议调用 `TeamDelete` 解散团队。\n"
+    "- 会删除：运行时团队记录、团队成员会话；由 AgentCreate 自建的"
+    "成员 agent 也会被删除；AgentInvite 邀请的成员 agent 保留；\n"
+    "- 会保留：leader 会话、共享工作区/PVC、已写入的文件；\n"
+    "- 如果成员仍在执行，或你还需要继续派活、追问成员，不要删除；\n"
+    "- 删除不可逆，删除后团队工具不可用；需要继续协作时必须重新建团。\n"
+)
+
+
+def install_team_create_cleanup_hint() -> None:
+    """Append the post-task cleanup guidance to TeamCreate's tool prompt.
+
+    The hint lives on the tool description rather than a specific leader
+    briefing so it reaches plain agents that create a team dynamically as
+    well as configured free_handoff leaders. Workflow mode removes
+    ``TeamCreate`` entirely, so orchestrated sessions are unaffected.
+    """
+    from agentscope.app._tool import TeamCreate
+
+    marker = "## 任务完成后的团队清理"
+    if marker in TeamCreate.description:
+        return
+    TeamCreate.description = (
+        TeamCreate.description.rstrip() + _TEAM_CREATE_CLEANUP_HINT
+    )
+    logger.info("installed TeamCreate post-task cleanup hint")
+
+
 def patch_team_toolkit() -> None:
     """Replace the chat service's ``get_toolkit`` binding (idempotent).
 
@@ -186,6 +311,8 @@ def patch_team_toolkit() -> None:
     global _original_get_toolkit
     if _original_get_toolkit is not None:
         return
+
+    install_team_create_cleanup_hint()
 
     from bocomadp._team_tool_patch import install_team_tool_patches
 

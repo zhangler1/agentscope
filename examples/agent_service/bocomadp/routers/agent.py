@@ -8,7 +8,7 @@ and the CRUD expert-team behavior) is registered instead.
 """
 import logging
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, ValidationError
@@ -17,6 +17,7 @@ from agentscope.agent import ContextConfig, ReActConfig
 from agentscope._utils._common import _flatten_json_schema, _generate_id
 from agentscope.app.access import ResourceKind
 from agentscope.app.deps import (
+    get_chat_service,
     get_current_user_id,
     get_resource_access_service,
     get_session_service,
@@ -37,7 +38,11 @@ from bocomadp.routers._schema.agent import (
     UpdateAgentRequest,
     TeamAgentView,
 )
-from agentscope.app._service import ResourceAccessService, SessionService
+from agentscope.app._service import (
+    ChatService,
+    ResourceAccessService,
+    SessionService,
+)
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 from agentscope.app.storage import (
     StorageBase,
@@ -51,6 +56,13 @@ from bocomadp.team_store import (
     get_team,
     list_teams,
     upsert_team,
+)
+from bocomadp.team.plan import PlanError, build_plan
+from bocomadp.team.hooks import get_orchestrator
+from bocomadp.team.state import (
+    delete_state,
+    get_state,
+    list_states,
 )
 
 agent_router = APIRouter(
@@ -983,6 +995,45 @@ class CollaborationModeResponse(BaseModel):
     collaboration_mode: Literal["free_handoff", "workflow"]
 
 
+class WorkflowNodeView(BaseModel):
+    status: str
+    attempts: int
+    resume_count: int
+    session_id: str | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class WorkflowStateResponse(BaseModel):
+    team_id: str
+    status: str
+    stage_index: int
+    stage_count: int
+    stage_members: list[str]
+    nodes: dict[str, WorkflowNodeView]
+    leader_phase: str
+    leader_attempts: int
+    last_error: str | None = None
+
+
+class WorkflowCancelResponse(BaseModel):
+    status: str
+    team_id: str | None = None
+
+
+def _validate_workflow_plan(rel: ExpertTeamRelation) -> None:
+    """Raise 422 when workflow mode cannot form a valid plan."""
+    if rel.collaboration_mode != "workflow":
+        return
+    try:
+        build_plan(rel, rel.leader_agent_id)
+    except PlanError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid workflow plan: {exc}",
+        ) from exc
+
+
 # Force-rebuild the request model so Pydantic's TypeAdapter used by FastAPI
 # can fully resolve ``Literal`` and the cross-module ``HandoffRelation``
 # reference at module-import time. Without this, FastAPI raises
@@ -1092,6 +1143,7 @@ async def set_team_config(
     user_id: str = Depends(get_current_user_id),
     access: ResourceAccessService = Depends(get_resource_access_service),
     storage: StorageBase = Depends(get_storage),
+    session_service: SessionService = Depends(get_session_service),
 ) -> TeamConfigResponse:
     """Replace the leader's team configuration.
 
@@ -1115,7 +1167,13 @@ async def set_team_config(
     rel.collaboration_mode = body.collaboration_mode
     rel.max_members = body.max_members
     rel.handoff_relations = list(body.handoff_relations)
+    _validate_workflow_plan(rel)
     await upsert_team(storage, rel)
+    if body.collaboration_mode == "free_handoff":
+        for state in await list_states(storage, owner_id):
+            if state.plan.leader_agent_id == agent_id:
+                await session_service.delete_team(owner_id, state.team_id)
+                await delete_state(storage, state.team_id)
     return await get_team_config(agent_id, user_id, access, storage)
 
 
@@ -1159,6 +1217,7 @@ async def set_collaboration_mode(
     user_id: str = Depends(get_current_user_id),
     access: ResourceAccessService = Depends(get_resource_access_service),
     storage: StorageBase = Depends(get_storage),
+    session_service: SessionService = Depends(get_session_service),
 ) -> CollaborationModeResponse:
     """Toggle between soft guidance (``free_handoff``) and hard ordering
     (``workflow``) without touching members or handoff edges. A missing
@@ -1174,7 +1233,15 @@ async def set_collaboration_mode(
     if rel is None:
         rel = ExpertTeamRelation(user_id=owner_id, leader_agent_id=agent_id)
     rel.collaboration_mode = body.collaboration_mode
+    _validate_workflow_plan(rel)
     await upsert_team(storage, rel)
+    if body.collaboration_mode == "free_handoff":
+        # Drop any running orchestration so the next run uses the legacy
+        # free-handoff toolset.
+        for state in await list_states(storage, owner_id):
+            if state.plan.leader_agent_id == agent_id:
+                await session_service.delete_team(owner_id, state.team_id)
+                await delete_state(storage, state.team_id)
     return CollaborationModeResponse(collaboration_mode=rel.collaboration_mode)
 
 
@@ -1347,5 +1414,110 @@ async def set_handoff(
                 ),
             )
     rel.handoff_relations = list(body.handoff_relations)
+    _validate_workflow_plan(rel)
     await upsert_team(storage, rel)
     return HandoffRelationResponse(handoff_relations=rel.handoff_relations)
+
+
+async def _find_workflow_state(
+    storage: StorageBase,
+    user_id: str,
+    leader_agent_id: str,
+):
+    for state in await list_states(storage, user_id):
+        if state.plan.leader_agent_id == leader_agent_id:
+            return state
+    return None
+
+
+@agent_router.get(
+    "/{agent_id}/team/workflow",
+    response_model=WorkflowStateResponse,
+    summary="Get the current orchestrated-workflow state",
+)
+async def get_workflow_state(
+    agent_id: str,
+    user_id: str = Depends(get_current_user_id),
+    access: ResourceAccessService = Depends(get_resource_access_service),
+    storage: StorageBase = Depends(get_storage),
+) -> WorkflowStateResponse:
+    """Return the current stage/node state for a leader's workflow."""
+    owner_id, agent = await access.resolve_for_edit(
+        user_id,
+        ResourceKind.AGENT,
+        agent_id,
+    )
+    _require_leader(agent)
+    state = await _find_workflow_state(storage, owner_id, agent_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active workflow for this leader.",
+        )
+    return WorkflowStateResponse(
+        team_id=state.team_id,
+        status=state.status,
+        stage_index=state.stage_index,
+        stage_count=state.plan.stage_count,
+        stage_members=state.stage_members,
+        nodes={
+            member: WorkflowNodeView(
+                status=node.status,
+                attempts=node.attempts,
+                resume_count=node.resume_count,
+                session_id=node.session_id,
+                result=(
+                    node.result.model_dump()
+                    if node.result is not None
+                    else None
+                ),
+                error=node.error,
+            )
+            for member, node in state.nodes.items()
+        },
+        leader_phase=state.leader.phase,
+        leader_attempts=state.leader.attempts,
+        last_error=state.last_error,
+    )
+
+
+@agent_router.post(
+    "/{agent_id}/team/workflow/cancel",
+    response_model=WorkflowCancelResponse,
+    summary="Cancel the current orchestrated workflow",
+)
+async def cancel_workflow(
+    agent_id: str,
+    user_id: str = Depends(get_current_user_id),
+    access: ResourceAccessService = Depends(get_resource_access_service),
+    storage: StorageBase = Depends(get_storage),
+    session_service: SessionService = Depends(get_session_service),
+    chat_service: ChatService = Depends(get_chat_service),
+) -> WorkflowCancelResponse:
+    """Cancel active runs, dissolve the runtime team, and drop the state."""
+    owner_id, agent = await access.resolve_for_edit(
+        user_id,
+        ResourceKind.AGENT,
+        agent_id,
+    )
+    _require_leader(agent)
+    state = await _find_workflow_state(storage, owner_id, agent_id)
+    if state is None:
+        return WorkflowCancelResponse(status="no_workflow")
+    team = await storage.get_team(owner_id, state.team_id)
+    if team is not None:
+        try:
+            await chat_service.interrupt(
+                owner_id,
+                team.session_id,
+                agent_id,
+            )
+        except LookupError:
+            pass
+    orchestrator = get_orchestrator()
+    if orchestrator is not None:
+        await orchestrator.cancel(owner_id, state.team_id)
+    else:
+        await session_service.delete_team(owner_id, state.team_id)
+        await delete_state(storage, state.team_id)
+    return WorkflowCancelResponse(status="cancelled", team_id=state.team_id)

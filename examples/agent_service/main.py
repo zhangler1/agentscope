@@ -706,6 +706,11 @@ _concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
 # 传入 mcp_registry 使白名单中新启用的 MCP 能自动注册到 workspace。
 workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
+# 团队模式：所有 team worker 共享 leader 当前 session 的 workspace
+# （同 PVC、同 workdir）；不再区分 free_handoff / workflow。
+from bocomadp.team.workspace import TeamWorkspaceManager
+
+workspace_manager = TeamWorkspaceManager(workspace_manager, storage)
 
 # 注册上传依赖（storage / workspace_manager 模块级单例）：run 任务内的
 # personal_knowledge_request 等工具无 FastAPI Depends，经此入口获取依赖后
@@ -974,6 +979,10 @@ async def _lifespan_with_builtin_agents(app):
         # 必须早于下面所有读团队档案的补丁挂载。
         from bocomadp import team_store
 
+        # 导入 workflow 状态模型，使其注册到同一 _TeamBase metadata，
+        # 随后 ensure_team_tables 会一并创建 team_workflow_states。
+        from bocomadp.team import state as _team_workflow_state  # noqa: F401
+
         await team_store.ensure_team_tables(storage)
         # 智能体市场扩展表（agent_market）——平台智能体的领域分类档案，
         # 与专家团关系表同一套 bocomadp 自建表模式（热度不落库，实时聚合）。
@@ -1070,6 +1079,24 @@ async def _lifespan_with_builtin_agents(app):
             chat_service._projectors.append(
                 WorkerFailureNotifier(app.state.storage)
             )
+        # 编排模式：系统编排器 + ChatService.run 钩子 + 内部工具事件过滤。
+        from bocomadp.team.hooks import (
+            patch_chat_service_run,
+            patch_legacy_team_tools,
+            set_orchestrator,
+        )
+        from bocomadp.team.orchestrator import WorkflowOrchestrator
+
+        set_orchestrator(
+            WorkflowOrchestrator(
+                storage=storage,
+                message_bus=message_bus,
+                session_service=app.state.session_service,
+                chat_service=chat_service,
+            ),
+        )
+        patch_chat_service_run()
+        patch_legacy_team_tools()
         yield
 
 

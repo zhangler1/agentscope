@@ -49,6 +49,18 @@ async def _delete_agent_with_cascade(
             if leader_team.is_self_built(mid):
                 await self.delete_agent(user_id, mid)
         await team_store.delete_team(self._storage, user_id, agent_id)
+        # Drop the orchestrated-workflow state row (if any) as well.
+        try:
+            from bocomadp.team.state import delete_state, list_states
+
+            for state in await list_states(self._storage, user_id):
+                if state.plan.leader_agent_id == agent_id:
+                    await delete_state(self._storage, state.team_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "failed to clean workflow state for leader %s",
+                agent_id,
+            )
 
     # Unbind this agent from any team roster that references it. Under
     # scheme B a member is always self-built and belongs to exactly one
