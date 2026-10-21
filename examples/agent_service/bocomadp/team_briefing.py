@@ -163,6 +163,11 @@ async def _build_leader_system_prompt(
                 "- If you plan to delegate, do not end your turn until "
                 "the real ``AgentInvite`` / ``TeamSay`` call has been "
                 "sent.\n"
+                "- Immediately after the ``AgentInvite`` / ``TeamSay`` "
+                "call succeeds, END this turn. Do NOT poll workspace "
+                "files or repeatedly check for member output; the member "
+                "will report back via ``TeamSay``. A missing file does "
+                "not mean the member failed.\n"
                 "- Never skip a step: only delegate to the next member "
                 "after the current member has reported back.\n"
                 "- A member MAY be delegated to MORE THAN ONCE. The "
@@ -230,6 +235,16 @@ async def _build_orchestrated_prompt(
             "完成拆解后调用 `SubmitHandoffs`："
             "`result` 写你的简短汇报（≤500 字），"
             "`handoffs` 为每个当前成员提供一个 target（只能是上面列出的人）。",
+        )
+        lines.append(
+            "提交成功后本轮必须立即结束：不要调用 Bash/Read/Write 检查"
+            "工作区，不要等待或轮询成员结果。系统会在所有成员完成后"
+            "自动唤醒你。",
+        )
+        lines.append(
+            "以上是内部执行规则，不要向用户复述，也不要在回复中解释"
+            "工作区检查、轮询或唤醒机制。提交后只用一句简短进度说明"
+            "（例如“已派发”），不要输出规则原文。",
         )
         lines.append(
             "提交后系统会自动派发，不要自己调用工具发送任务，"

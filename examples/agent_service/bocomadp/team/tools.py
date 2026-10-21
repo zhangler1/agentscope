@@ -74,6 +74,10 @@ class _ResumeParams(ParamsBase):
     )
 
 
+class _GetStatusParams(ParamsBase):
+    """GetWorkflowStatus takes no parameters."""
+
+
 class _WorkflowToolBase(ToolBase):
     """Base class for internal workflow tools (always allowed)."""
 
@@ -92,12 +96,14 @@ class _WorkflowToolBase(ToolBase):
         session_id: str,
         agent_id: str,
         team_id: str,
+        session_service: Any | None = None,
     ) -> None:
         self._storage = storage
         self._user_id = user_id
         self._session_id = session_id
         self._agent_id = agent_id
         self._team_id = team_id
+        self._session_service = session_service
 
     async def check_permissions(
         self,
@@ -186,7 +192,12 @@ class SubmitHandoffs(_WorkflowToolBase):
             stage_note = "leader 首节点"
         else:
             node = state.nodes.get(self._agent_id)
-            if node is None or node.status not in ("active", "interrupted", "failed"):
+            if node is None or node.status not in (
+                "active",
+                "waiting",
+                "interrupted",
+                "failed",
+            ):
                 return _error(
                     "SubmitHandoffs: 当前节点不是活动节点，或已经提交过。",
                 )
@@ -257,7 +268,7 @@ class SubmitHandoffs(_WorkflowToolBase):
                 if (
                     fresh_node is None
                     or fresh_node.status
-                    not in ("active", "interrupted", "failed")
+                    not in ("active", "waiting", "interrupted", "failed")
                 ):
                     return _error(
                         "SubmitHandoffs: 节点状态已变化，请刷新后重试。",
@@ -308,6 +319,147 @@ class ResumeWorkflow(_WorkflowToolBase):
         return _error("ResumeWorkflow: 状态写入冲突，请重试。")
 
 
+class GetWorkflowStatus(_WorkflowToolBase):
+    """Read-only view of the current team's workflow status."""
+
+    name = "GetWorkflowStatus"
+    description = (
+        "查询当前团队和成员的真实执行状态。只读，不会触发成员运行。"
+        "返回 active / waiting / completed / failed 等状态。"
+        "如果返回 active 或 waiting，说明成员仍在执行或等待，不能判断失败，"
+        "也不要连续调用本工具轮询；本轮应结束，等待系统唤醒。"
+    )
+    input_schema = _GetStatusParams.model_json_schema()
+    is_read_only = True
+    is_concurrency_safe = True
+
+    async def _session_status(
+        self,
+        agent_id: str,
+        session_id: str | None,
+    ) -> str | None:
+        if self._session_service is None or not session_id:
+            return None
+        try:
+            status = await self._session_service.get_session_status(
+                self._user_id,
+                agent_id,
+                session_id,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "GetWorkflowStatus failed to read session %s",
+                session_id,
+            )
+            return "unknown"
+        return getattr(status, "value", str(status))
+
+    async def _name(self, agent_id: str) -> str:
+        try:
+            record = await self._storage.get_agent(self._user_id, agent_id)
+        except Exception:  # pylint: disable=broad-except
+            record = None
+        if record is None:
+            return agent_id
+        return record.data.name
+
+    async def _render_workflow(self, state: WorkflowState) -> str:
+        lines = [
+            f"团队状态：{state.status}",
+            "模式：workflow",
+            f"阶段：{state.stage_index + 1}/{state.plan.stage_count}",
+            f"leader 阶段：{state.leader.phase}",
+            "成员：",
+        ]
+        counts = {
+            "completed": 0,
+            "active": 0,
+            "waiting": 0,
+            "failed": 0,
+            "pending": 0,
+        }
+        for agent_id, node in state.nodes.items():
+            name = await self._name(agent_id)
+            detail = f"- {name} ({agent_id})：{node.status}"
+            if node.waiting_reason:
+                detail += f" [{node.waiting_reason}]"
+            detail += f"，attempts={node.attempts}"
+            if node.result and node.result.summary:
+                detail += f"，result={node.result.summary[:120]}"
+            lines.append(detail)
+            counts[node.status] = counts.get(node.status, 0) + 1
+
+        lines.append(
+            "汇总："
+            f"completed={counts['completed']}，"
+            f"active={counts['active']}，"
+            f"waiting={counts['waiting']}，"
+            f"failed={counts['failed']}，"
+            f"pending={counts['pending']}",
+        )
+        if state.status == "completed":
+            lines.append("结论：流程已完成。")
+        elif state.status == "failed":
+            errors = [
+                f"{await self._name(agent_id)}：{node.error or '未知错误'}"
+                for agent_id, node in state.nodes.items()
+                if node.status == "failed"
+            ]
+            lines.append("结论：流程已失败。" + "；".join(errors))
+        elif counts["active"] or counts["waiting"]:
+            lines.append("结论：成员仍在执行或等待，尚未完成。")
+        else:
+            lines.append("结论：流程仍在进行，但当前没有活跃成员。")
+        return "\n".join(lines)
+
+    async def _render_free_handoff(self, team: Any) -> str:
+        lines = ["团队状态：running", "模式：free_handoff"]
+        leader_session = await self._storage.get_session(
+            self._user_id,
+            "",
+            team.session_id,
+        )
+        if leader_session is not None:
+            status = await self._session_status(
+                leader_session.agent_id,
+                leader_session.id,
+            )
+            lines.append(
+                f"- leader {await self._name(leader_session.agent_id)}"
+                f"：{status or 'unknown'}",
+            )
+        for member in getattr(team.data, "members", []) or []:
+            status = await self._session_status(
+                member.agent_id,
+                getattr(member, "session_id", None),
+            )
+            lines.append(
+                f"- {await self._name(member.agent_id)}"
+                f" ({member.agent_id})：{status or 'unknown'}",
+            )
+        lines.append(
+            "结论：free_handoff 没有阶段状态，成员当前状态如上。",
+        )
+        return "\n".join(lines)
+
+    async def __call__(self) -> ToolChunk:
+        state = await self._load_state()
+        if state is not None:
+            text = await self._render_workflow(state)
+        else:
+            team = await self._storage.get_team(self._user_id, self._team_id)
+            if team is None:
+                return ToolChunk(
+                    content=[TextBlock(text="GetWorkflowStatus: 当前没有活动团队。")],
+                    state=ToolResultState.SUCCESS,
+                )
+            text = await self._render_free_handoff(team)
+        return ToolChunk(
+            content=[TextBlock(text=text)],
+            state=ToolResultState.SUCCESS,
+        )
+
+
 def _error(message: str) -> ToolChunk:
     return ToolChunk(
         content=[TextBlock(text=message)],
@@ -315,4 +467,4 @@ def _error(message: str) -> ToolChunk:
     )
 
 
-__all__ = ["ResumeWorkflow", "SubmitHandoffs"]
+__all__ = ["GetWorkflowStatus", "ResumeWorkflow", "SubmitHandoffs"]

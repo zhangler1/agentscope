@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from agentscope.app._bus_ops import enqueue_run_trigger
@@ -47,6 +48,10 @@ from .state import (
 logger = logging.getLogger("bocomadp.team.orchestrator")
 
 MAX_ATTEMPTS = 3
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @dataclass
@@ -111,6 +116,13 @@ class WorkflowOrchestrator:
                 )
             if state is None:
                 return None
+            if role == "worker":
+                node = state.nodes.get(agent_id)
+                if node is not None and node.status == "waiting":
+                    node.status = "active"
+                    node.waiting_reason = None
+                    node.last_heartbeat = _now()
+                    await save_state(self._storage, state)
             return RunContext(
                 user_id=user_id,
                 session_id=session_id,
@@ -209,7 +221,38 @@ class WorkflowOrchestrator:
             return
         if node.status == "failed":
             return
+        if node.status == "waiting":
+            session_status = await self._worker_session_status(ctx)
+            if session_status in (
+                "running",
+                "awaiting_permission",
+                "awaiting_external_result",
+            ):
+                node.last_heartbeat = _now()
+                await save_state(self._storage, state)
+                return
+            if session_status is None:
+                # No status service: do not turn an indeterminate wait into
+                # a failure.
+                return
+            # The resumed run ended and is no longer parked; let the normal
+            # idle/no-handoffs path decide whether this is a retry/failure.
+            node.status = "active"
         if node.status != "active":
+            return
+
+        session_status = await self._worker_session_status(ctx)
+        if session_status in (
+            "running",
+            "awaiting_permission",
+            "awaiting_external_result",
+        ):
+            node.status = "waiting"
+            node.waiting_reason = session_status
+            node.waiting_since = node.waiting_since or _now()
+            node.last_heartbeat = _now()
+            node.error = None
+            await save_state(self._storage, state)
             return
 
         node.error = "节点 run 结束但未调用 SubmitHandoffs"
@@ -452,6 +495,28 @@ class WorkflowOrchestrator:
             parts.append(f"## 来自上游的任务\n{ref.task or ref.summary}")
             inputs.extend(ref.inputs)
         return "\n\n".join(parts), inputs
+
+    async def _worker_session_status(self, ctx: RunContext) -> str | None:
+        """Return the worker session's liveness/parking status.
+
+        ``running`` and ``awaiting_*`` mean the worker is not finished; only
+        ``idle`` is a safe signal that a run ended without SubmitHandoffs.
+        """
+        if self._session_service is None:
+            return None
+        try:
+            status = await self._session_service.get_session_status(
+                ctx.user_id,
+                ctx.agent_id,
+                ctx.session_id,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "failed to read worker session status for %s",
+                ctx.session_id,
+            )
+            return None
+        return getattr(status, "value", str(status))
 
     # ------------------------------------------------------------------
     # Stage completion / final summary
