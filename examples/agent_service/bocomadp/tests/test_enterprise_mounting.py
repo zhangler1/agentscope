@@ -19,6 +19,7 @@ _CROSS = tool_name("跨知识搜索", "cross_search")
 _VECTOR = tool_name("行内搜索", "vector_search")
 _ONLINE = tool_name("联网搜索", "online_search")
 _PERSONAL = tool_name("个人知识库搜索", "personal_search")
+_PK_REQUEST = tool_name("个人知识库全文检索", "personal_knowledge_request")
 
 
 def _mount(params: dict | None) -> set[str]:
@@ -45,6 +46,7 @@ _ALL_ENTERPRISE_NAMES: list[str] = [
     tool_name("跨知识搜索", "cross_search"),
     tool_name("行内搜索", "vector_search"),
     tool_name("个人知识库搜索", "personal_search"),
+    tool_name("个人知识库全文检索", "personal_knowledge_request"),
     tool_name("联网搜索", "online_search"),
 ]
 
@@ -62,6 +64,7 @@ def test_default_mounts_cross_and_vector():
     assert _VECTOR in names         # 默认挂载
     assert _ONLINE not in names     # 默认不挂
     assert _PERSONAL not in names   # 默认不挂
+    assert _PK_REQUEST in names     # 无条件挂载（可用性由 usableTools 控制）
 
 
 def test_vector_switch_false_removes_vector_only():
@@ -93,6 +96,71 @@ def test_personal_switch_true_with_space_params_mounted():
         }
     )
     assert _PERSONAL in names
+    assert _PK_REQUEST in names  # 分类列表齐备 → 全文检索同步挂载
+
+
+def test_personal_knowledge_request_mounts_unconditionally():
+    # 无条件构建：custom_params 完全为空也挂载（可用性由 usableTools 控制，
+    # 分类参数缺失时工具调用返回明确错误，不在此测）。
+    names = _mount_usable({})
+    assert _PK_REQUEST in names
+    # personal_search 仍受 personal_search_switch + 空间参数控制
+    assert _PERSONAL not in names
+
+
+def test_pk_request_params_lookup_survives_missing_structure():
+    # 无条件挂载的配套防御：custom_params 结构残缺时取值链不崩。
+    from bocomadp.tools.personal_knowledge_request import _get_knowledge_params
+
+    for params in (None, {}, {"tools_param": {}}):
+        token = set_custom_params(params)
+        try:
+            user_code, category_id = _get_knowledge_params()
+            assert user_code is None
+            assert category_id is None
+        finally:
+            reset_custom_params(token)
+
+
+def test_knowledge_tool_returns_error_when_required_params_missing():
+    # 前置校验：custom_params 关键参数缺失时直接返回明确错误，不发请求
+    # （无条件挂载后，参数完整性由调用时校验保证）。
+    import asyncio
+
+    from bocomadp.tools.personal_knowledge_request import (
+        _personal_knowledge_request_tool_impl as run_tool,
+    )
+
+    # custom_params 为空：user_code 先拦，两个 intent 都不发请求。
+    for intent in ("knowledge_query", "knowledge_file_link"):
+        token = set_custom_params(None)
+        try:
+            result = asyncio.run(run_tool(intent, file_id="f1"))
+            assert "用户编码缺失" in result
+        finally:
+            reset_custom_params(token)
+
+    # user_code 有、分类缺：仅 knowledge_query 拦截。
+    token = set_custom_params({"userCode": "u1"})
+    try:
+        result = asyncio.run(run_tool("knowledge_query"))
+        assert "分类参数缺失" in result
+    finally:
+        reset_custom_params(token)
+
+
+def test_personal_knowledge_request_mounts_without_personal_search_switch():
+    # 与 personal_search_switch 解耦：分类列表齐备即挂载，即使开关未开
+    # （personal_search 因开关未开 / psnlSpaceCodeId 缺失仍不挂）。
+    names = _mount_usable(
+        {
+            "tools_param": {
+                "personalKnowledgeSearch": {"psnlCategoryIdList": ["C1"]},
+            },
+        }
+    )
+    assert _PK_REQUEST in names
+    assert _PERSONAL not in names
 
 
 def test_basic_enterprise_tools_always_present():

@@ -9,6 +9,10 @@ apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落�
 每轮携带）> 模型库 ``model_registry``（按模型名）> 默认
 False。不换类、不重建 client，模型调用链保持不变。
 
+另外实现 ``on_compress_context``：上下文压缩直接调用 ``agent.model``，
+不经过 ``on_model_call`` 链，因此在压缩前补一次惰性刷新，避免长时间
+空闲后 key 已过期时压缩请求 401。
+
 挂载方式（bocomadp main.py）::
 
     from bocomadp.middleware.ellm_refresh import build_ellm_refresh_middleware
@@ -104,6 +108,40 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
             refresh_ahead_secs=refresh_ahead_secs,
         )
 
+    @staticmethod
+    def _credential_id(model: EllmChatModel) -> str | None:
+        """模型绑定的凭证 id；缺失时返回 ``None``。"""
+        return getattr(getattr(model, "credential", None), "id", None)
+
+    async def _refresh_and_inject_key(
+        self,
+        model: EllmChatModel,
+        credential_id: str,
+    ) -> None:
+        """惰性刷新 key 并写入模型的请求级 override。
+
+        与 ``on_model_call`` 一致：刷新失败会向上抛出，由调用方决定
+        是否吞掉（压缩路径吞掉，常规调用路径不吞）。
+        """
+        key, _ = await self._refresher.ensure_fresh_key(credential_id)
+        model.set_api_key(key)
+
+    def _install_auth_callbacks(
+        self,
+        model: EllmChatModel,
+        credential_id: str,
+    ) -> None:
+        """安装 401 双回调（强制换新重试 / 刷新失败置过期）。
+
+        两个闭包都绑定本次 ``credential_id``，避免并发串号。
+        """
+        model.set_refresh_key_callback(
+            lambda: self._refresher.force_refresh_key(credential_id),
+        )
+        model.set_auth_invalidate_callback(
+            lambda: self._refresher.invalidate_key(credential_id),
+        )
+
     async def on_model_call(
         self,
         agent: Any,
@@ -113,16 +151,12 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
         current_model = input_kwargs.get("current_model")
 
         if isinstance(current_model, EllmChatModel):
-            credential_id = getattr(
-                getattr(current_model, "credential", None),
-                "id",
-                None,
-            )
+            credential_id = self._credential_id(current_model)
             if credential_id:
-                key, _ = await self._refresher.ensure_fresh_key(
+                await self._refresh_and_inject_key(
+                    current_model,
                     credential_id,
                 )
-                current_model.set_api_key(key)
                 # inject_think_tag 优先级：
                 #   1) 请求体 custom_params.add_think（deerflow run/stream
                 #      每轮携带，第一优先级）；
@@ -141,20 +175,7 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                     current_model.inject_think_tag = (
                         bool(meta["think_tag"]) if meta else False
                     )
-                # 401 时的行为：
-                #   1) 强制刷新 key（force_refresh_key，锁保护）并用新 key
-                #      重试当前调用一次；
-                #   2) 若强制刷新失败（未拿到新 key），回调把该凭证的 key
-                #      置为过期（下一次使用该凭证的调用走惰性刷新）。
-                # 两个回调闭包都绑定本次 credential_id，避免并发串号。
-                current_model.set_refresh_key_callback(
-                    lambda: self._refresher.force_refresh_key(
-                        credential_id,
-                    ),
-                )
-                current_model.set_auth_invalidate_callback(
-                    lambda: self._refresher.invalidate_key(credential_id),
-                )
+                self._install_auth_callbacks(current_model, credential_id)
                 logger.debug(
                     "injected refreshed ELLM key (user=%s, credential=%s)",
                     self._refresher.user_id,
@@ -162,6 +183,45 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 )
 
         return await next_handler(**input_kwargs)
+
+    async def on_compress_context(
+        self,
+        agent: Any,
+        input_kwargs: dict,
+        next_handler: Any,
+    ) -> Any:
+        """压缩前刷新 ELLM key（压缩调用不走 ``on_model_call`` 链）。
+
+        框架压缩在每轮 reasoning 前执行，直接调用 ``agent.model``；
+        不在这里补刷新的话，长时间空闲后 key 过期时压缩请求会 401。
+
+        刷新是 best-effort：失败只记 warning，不阻断压缩本身。
+        401 回调先于刷新安装，因此即便主动刷新失败，真正遇到 401 时
+        仍能强制换新并重试一次。
+        """
+        # input_kwargs 只含 context_config / instructions，这里用不到。
+        del input_kwargs
+
+        current_model = getattr(agent, "model", None)
+        if isinstance(current_model, EllmChatModel):
+            credential_id = self._credential_id(current_model)
+            if credential_id:
+                self._install_auth_callbacks(current_model, credential_id)
+                try:
+                    await self._refresh_and_inject_key(
+                        current_model,
+                        credential_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 —— 刷新失败不阻断压缩
+                    logger.warning(
+                        "compress: pre-compression ELLM key refresh failed "
+                        "(user=%s, credential=%s, error=%s)",
+                        self._refresher.user_id,
+                        credential_id,
+                        exc,
+                    )
+
+        return await next_handler()
 
 
 def build_ellm_refresh_middleware(

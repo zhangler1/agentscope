@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -38,6 +39,7 @@ from bocomadp.middleware.ellm_refresh import (
     _parse_add_think,
 )
 from bocomadp.providers.ellm_chat_model import EllmChatModel
+from bocomadp.providers.ellm_key import EllmKeyRefresher
 
 _KEY_URL = "http://ellm.example/createSceneApiKey.do"
 
@@ -302,3 +304,102 @@ class TestEndToEnd:
         assert storage.upsert_calls == 1
         # The agent's model is the SAME instance — never swapped.
         assert agent.model is base
+
+
+class TestCompressContextHook:
+    """``on_compress_context``：原生压缩前的 key 刷新。"""
+
+    def test_compress_refreshes_expired_key(self) -> None:
+        """过期凭证在压缩前被刷新并注入，401 回调已安装。"""
+        storage = _FakeStorage(_record("old-key", time.time() - 1800))
+        mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
+        model = _base_model()
+        next_handler = mock.AsyncMock(return_value=None)
+
+        with mock.patch(
+            "bocomadp.providers.ellm_key.fetch_ellm_key",
+            return_value=("new-key-abc", 1_500_000),
+        ) as fetch:
+            asyncio.run(
+                mw.on_compress_context(
+                    SimpleNamespace(model=model),
+                    {},
+                    next_handler,
+                ),
+            )
+
+        fetch.assert_called_once()
+        next_handler.assert_awaited_once_with()
+        assert model._api_key_override == "new-key-abc"
+        assert model._refresh_key_callback is not None
+        assert model._auth_invalidate_callback is not None
+        # 压缩不应改动 think-tag 开关（保持构造默认值）。
+        assert model.inject_think_tag is False
+        assert storage.upsert_calls == 1
+
+    def test_compress_reuses_fresh_key_without_gateway(self) -> None:
+        """key 未过期时复用存储中的 key，不访问网关。"""
+        storage = _FakeStorage(_record("fresh-key", time.time() + 3600))
+        mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
+        model = _base_model()
+        next_handler = mock.AsyncMock(return_value=None)
+
+        with mock.patch(
+            "bocomadp.providers.ellm_key.fetch_ellm_key",
+        ) as fetch:
+            asyncio.run(
+                mw.on_compress_context(
+                    SimpleNamespace(model=model),
+                    {},
+                    next_handler,
+                ),
+            )
+
+        fetch.assert_not_called()
+        next_handler.assert_awaited_once_with()
+        assert model._api_key_override == "fresh-key"
+
+    def test_compress_refresh_failure_is_non_fatal(self) -> None:
+        """主动刷新失败只告警：压缩继续，401 回调仍在。"""
+        storage = _FakeStorage(_record("old-key", time.time() - 1800))
+        mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
+        model = _base_model()
+        next_handler = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(
+            EllmKeyRefresher,
+            "ensure_fresh_key",
+            new=mock.AsyncMock(side_effect=RuntimeError("gateway down")),
+        ):
+            asyncio.run(
+                mw.on_compress_context(
+                    SimpleNamespace(model=model),
+                    {},
+                    next_handler,
+                ),
+            )
+
+        next_handler.assert_awaited_once_with()
+        assert model._api_key_override is None
+        # 主动刷新失败不影响 401 兜底能力。
+        assert model._refresh_key_callback is not None
+        assert model._auth_invalidate_callback is not None
+
+    def test_compress_non_ellm_passthrough(self) -> None:
+        """非 EllmChatModel 不做任何处理，直接进入压缩。"""
+        mw = EllmKeyRefreshMiddleware(
+            _FakeStorage(_record("k", time.time() + 3600)),
+            InMemoryMessageBus(),
+            "user-1",
+        )
+        next_handler = mock.AsyncMock(return_value=None)
+
+        asyncio.run(
+            mw.on_compress_context(
+                SimpleNamespace(model="not-a-model"),
+                {},
+                next_handler,
+            ),
+        )
+
+        next_handler.assert_awaited_once_with()
