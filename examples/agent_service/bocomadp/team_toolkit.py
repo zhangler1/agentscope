@@ -118,6 +118,7 @@ async def _apply_orchestrated_toolkit(
     session_record: Any,
     team: Any,
     team_role: str | None,
+    session_service: Any | None = None,
 ) -> bool:
     """Replace the generic team toolset with workflow control tools.
 
@@ -136,7 +137,11 @@ async def _apply_orchestrated_toolkit(
         return False
 
     from bocomadp.team.state import get_state
-    from bocomadp.team.tools import ResumeWorkflow, SubmitHandoffs
+    from bocomadp.team.tools import (
+        GetWorkflowStatus,
+        ResumeWorkflow,
+        SubmitHandoffs,
+    )
 
     state = await get_state(storage, team.id)
     if state is None:
@@ -156,8 +161,13 @@ async def _apply_orchestrated_toolkit(
         "session_id": session_record.id,
         "agent_id": agent_record.id,
         "team_id": team.id,
+        "session_service": session_service,
     }
     if team_role == "leader":
+        await toolkit.add_tool(
+            GetWorkflowStatus(**common),
+            group_name="basic",
+        )
         if state.leader.phase == "first" and not state.leader.dispatched:
             await toolkit.add_tool(
                 SubmitHandoffs(**common, is_leader=True),
@@ -172,6 +182,7 @@ async def _apply_orchestrated_toolkit(
         node = state.nodes.get(agent_record.id)
         if node is not None and node.status in (
             "active",
+            "waiting",
             "interrupted",
             "pending",
             "failed",
@@ -218,6 +229,7 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
         session_record=session_record,
         team=team,
         team_role=team_role,
+        session_service=kwargs.get("session_service"),
     ):
         return toolkit
 
@@ -229,6 +241,21 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
                 tool._allowed_handoff_targets = allowed
             elif isinstance(tool, AgentInvite):
                 has_invite = True
+
+    if team is not None and team_role != "worker":
+        from bocomadp.team.tools import GetWorkflowStatus
+
+        await toolkit.add_tool(
+            GetWorkflowStatus(
+                storage=storage,
+                user_id=user_id,
+                session_id=session_record.id,
+                agent_id=agent_record.id,
+                team_id=team.id,
+                session_service=kwargs.get("session_service"),
+            ),
+            group_name="basic",
+        )
 
     # Leader-side backfill: if the framework attached no AgentInvite
     # (top-level invitable pool empty because team members are hidden by

@@ -25,7 +25,7 @@ from bocomadp.team.state import (
     save_state,
     upsert_state,
 )
-from bocomadp.team.tools import SubmitHandoffs
+from bocomadp.team.tools import GetWorkflowStatus, SubmitHandoffs
 from bocomadp.team.workspace import TeamWorkspaceManager
 from bocomadp.team_store import ExpertTeamMember, ExpertTeamRelation, HandoffRelation
 
@@ -332,6 +332,87 @@ def test_submit_handoffs_rejects_long_result(workflow_storage):
         ),
     )
     assert chunk.state.value == "error"
+
+
+def test_get_workflow_status_reports_waiting(workflow_storage):
+    _run(team_store.ensure_team_tables(workflow_storage))
+    _seed_state(workflow_storage, [("leader-1", "a")], stage_members=("a",))
+    state = _run(get_state(workflow_storage, "t1"))
+    state.nodes["a"].status = "waiting"
+    state.nodes["a"].waiting_reason = "awaiting_permission"
+    state.nodes["a"].attempts = 1
+    _run(save_state(workflow_storage, state))
+
+    tool = GetWorkflowStatus(
+        storage=workflow_storage,
+        user_id="u1",
+        session_id="leader-session",
+        agent_id="leader-1",
+        team_id="t1",
+    )
+    chunk = _run(tool())
+    text = chunk.content[0].text
+    assert "waiting" in text
+    assert "awaiting_permission" in text
+    assert "尚未完成" in text
+
+
+def test_worker_awaiting_permission_becomes_waiting(workflow_storage):
+    from bocomadp.team.orchestrator import RunContext, WorkflowOrchestrator
+
+    class _StatusService:
+        async def get_session_status(self, user_id, agent_id, session_id):
+            return "awaiting_permission"
+
+    _run(team_store.ensure_team_tables(workflow_storage))
+    _seed_state(workflow_storage, [("leader-1", "a")], stage_members=("a",))
+    state = _run(get_state(workflow_storage, "t1"))
+    state.nodes["a"].status = "active"
+    state.nodes["a"].session_id = "worker-a"
+    state.nodes["a"].attempts = 1
+    _run(save_state(workflow_storage, state))
+
+    orchestrator = WorkflowOrchestrator(
+        storage=workflow_storage,
+        message_bus=SimpleNamespace(),
+        session_service=_StatusService(),
+    )
+    ctx = RunContext(
+        user_id="u1",
+        session_id="worker-a",
+        agent_id="a",
+        team_id="t1",
+        role="worker",
+        phase="",
+    )
+    _run(orchestrator._after_run_locked(ctx))
+
+    state = _run(get_state(workflow_storage, "t1"))
+    node = state.nodes["a"]
+    assert node.status == "waiting"
+    assert node.waiting_reason == "awaiting_permission"
+    assert node.attempts == 1
+
+
+def test_waiting_worker_can_submit_handoffs(workflow_storage):
+    _run(team_store.ensure_team_tables(workflow_storage))
+    _seed_state(workflow_storage, [("leader-1", "a")], stage_members=("a",))
+    state = _run(get_state(workflow_storage, "t1"))
+    state.nodes["a"].status = "waiting"
+    _run(save_state(workflow_storage, state))
+
+    tool = SubmitHandoffs(
+        storage=workflow_storage,
+        user_id="u1",
+        session_id="worker-a",
+        agent_id="a",
+        team_id="t1",
+        is_leader=False,
+    )
+    chunk = _run(tool(result="A 完成", handoffs=[]))
+    assert chunk.state.value == "success"
+    state = _run(get_state(workflow_storage, "t1"))
+    assert state.nodes["a"].status == "completed"
 
 
 # ---------------------------------------------------------------------------

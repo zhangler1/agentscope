@@ -24,6 +24,7 @@ logger = logging.getLogger("bocomadp.team.state")
 NodeStatus = Literal[
     "pending",
     "active",
+    "waiting",
     "submitted",
     "completed",
     "interrupted",
@@ -64,6 +65,9 @@ class WorkflowNodeState(BaseModel):
     error: str | None = None
     submitted_at: datetime | None = None
     completed_at: datetime | None = None
+    waiting_reason: str | None = None
+    waiting_since: datetime | None = None
+    last_heartbeat: datetime | None = None
 
 
 class WorkflowLeaderState(BaseModel):
