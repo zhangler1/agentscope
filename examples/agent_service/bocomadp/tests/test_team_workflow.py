@@ -357,6 +357,51 @@ def test_get_workflow_status_reports_waiting(workflow_storage):
     assert "尚未完成" in text
 
 
+def test_get_workflow_status_resolves_team_from_session(workflow_storage):
+    _run(team_store.ensure_team_tables(workflow_storage))
+    _seed_state(workflow_storage, [("leader-1", "a")], stage_members=("a",))
+    workflow_storage.sessions["leader-session"] = SimpleNamespace(
+        id="leader-session",
+        agent_id="leader-1",
+        team_id="t1",
+    )
+    tool = GetWorkflowStatus(
+        storage=workflow_storage,
+        user_id="u1",
+        session_id="leader-session",
+        agent_id="leader-1",
+        team_id=None,
+    )
+    text = _run(tool()).content[0].text
+    assert "模式：workflow" in text
+    assert "leader 阶段" in text
+
+
+def test_ensure_status_tool_is_deduplicated(workflow_storage):
+    from bocomadp.team_toolkit import _ensure_status_tool
+
+    class _Toolkit:
+        def __init__(self):
+            self.tool_groups = [
+                SimpleNamespace(name="basic", tools=[]),
+            ]
+
+        async def add_tool(self, tool, group_name="basic"):
+            self.tool_groups[0].tools.append(tool)
+
+    toolkit = _Toolkit()
+    args = dict(
+        storage=workflow_storage,
+        user_id="u1",
+        agent_record=SimpleNamespace(id="leader-1"),
+        session_record=SimpleNamespace(id="leader-session"),
+    )
+    _run(_ensure_status_tool(toolkit, **args))
+    _run(_ensure_status_tool(toolkit, **args))
+    names = [tool.name for tool in toolkit.tool_groups[0].tools]
+    assert names == ["GetWorkflowStatus"]
+
+
 def test_worker_awaiting_permission_becomes_waiting(workflow_storage):
     from bocomadp.team.orchestrator import RunContext, WorkflowOrchestrator
 

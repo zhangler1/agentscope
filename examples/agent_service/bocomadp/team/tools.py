@@ -95,8 +95,9 @@ class _WorkflowToolBase(ToolBase):
         user_id: str,
         session_id: str,
         agent_id: str,
-        team_id: str,
+        team_id: str | None = None,
         session_service: Any | None = None,
+        message_bus: Any | None = None,
     ) -> None:
         self._storage = storage
         self._user_id = user_id
@@ -104,6 +105,14 @@ class _WorkflowToolBase(ToolBase):
         self._agent_id = agent_id
         self._team_id = team_id
         self._session_service = session_service
+        if self._session_service is None and message_bus is not None:
+            from agentscope.app._service import SessionService
+
+            self._session_service = SessionService(
+                self._storage,
+                message_bus,
+            )
+        self._message_bus = message_bus
 
     async def check_permissions(
         self,
@@ -116,14 +125,20 @@ class _WorkflowToolBase(ToolBase):
         )
 
     async def _load_state(self) -> WorkflowState | None:
-        return await get_state(self._storage, self._team_id)
+        team_id = self._team_id
+        if not team_id:
+            return None
+        return await get_state(self._storage, team_id)
 
     async def _save_state(self, state: WorkflowState) -> bool:
         """Save with a small optimistic-lock retry loop."""
+        team_id = self._team_id
+        if not team_id:
+            return False
         for _ in range(3):
             if await save_state(self._storage, state):
                 return True
-            fresh = await get_state(self._storage, self._team_id)
+            fresh = await get_state(self._storage, team_id)
             if fresh is None:
                 return False
             state.version = fresh.version
@@ -250,10 +265,13 @@ class SubmitHandoffs(_WorkflowToolBase):
         )
 
         completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        team_id = self._team_id
+        if not team_id:
+            return _error("SubmitHandoffs: 当前团队状态不存在。")
         # Merge-on-conflict: fan-in nodes submit concurrently, so a stale
         # whole-row write would drop another node's result.
         for _ in range(3):
-            fresh = await get_state(self._storage, self._team_id)
+            fresh = await get_state(self._storage, team_id)
             if fresh is None:
                 return _error("SubmitHandoffs: 状态已消失。")
             if self._is_leader:
@@ -303,8 +321,11 @@ class ResumeWorkflow(_WorkflowToolBase):
             return _error(
                 f"ResumeWorkflow: 流程状态为 {state.status}，无法恢复。",
             )
+        team_id = self._team_id
+        if not team_id:
+            return _error("ResumeWorkflow: 当前团队状态不存在。")
         for _ in range(3):
-            fresh = await get_state(self._storage, self._team_id)
+            fresh = await get_state(self._storage, team_id)
             if fresh is None:
                 return _error("ResumeWorkflow: 状态已消失。")
             fresh.leader.resume_requested = True
@@ -332,6 +353,23 @@ class GetWorkflowStatus(_WorkflowToolBase):
     input_schema = _GetStatusParams.model_json_schema()
     is_read_only = True
     is_concurrency_safe = True
+
+    async def _resolve_team_id(self) -> str | None:
+        if self._team_id:
+            return self._team_id
+        try:
+            session = await self._storage.get_session(
+                self._user_id,
+                self._agent_id,
+                self._session_id,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "GetWorkflowStatus failed to resolve session %s",
+                self._session_id,
+            )
+            return None
+        return session.team_id if session is not None else None
 
     async def _session_status(
         self,
@@ -443,11 +481,17 @@ class GetWorkflowStatus(_WorkflowToolBase):
         return "\n".join(lines)
 
     async def __call__(self) -> ToolChunk:
-        state = await self._load_state()
+        team_id = await self._resolve_team_id()
+        if not team_id:
+            return ToolChunk(
+                content=[TextBlock(text="GetWorkflowStatus: 当前没有活动团队。")],
+                state=ToolResultState.SUCCESS,
+            )
+        state = await get_state(self._storage, team_id)
         if state is not None:
             text = await self._render_workflow(state)
         else:
-            team = await self._storage.get_team(self._user_id, self._team_id)
+            team = await self._storage.get_team(self._user_id, team_id)
             if team is None:
                 return ToolChunk(
                     content=[TextBlock(text="GetWorkflowStatus: 当前没有活动团队。")],
