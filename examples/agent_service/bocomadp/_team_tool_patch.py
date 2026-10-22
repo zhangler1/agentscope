@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING
 
 from agentscope._utils._common import _generate_id
 from agentscope.app._bus_ops import enqueue_run_trigger
-from agentscope.app._tool import AgentInvite, TeamSay
+from agentscope.app._tool import AgentInvite, TeamCreate, TeamSay
 from agentscope.app._tool._agent_invite import (
     _display_handle,
     _display_name,
@@ -574,19 +574,58 @@ async def patched_agent_invite_call(
         )
 
 
+_TEAM_CREATE_RUN_MARKER = "## 动态团队运行规则"
+_TEAM_CREATE_RUN_RULES = (
+    f"\n\n{_TEAM_CREATE_RUN_MARKER}\n"
+    "1. 用 AgentCreate 添加成员，用 TeamSay 派任务；\n"
+    "2. AgentCreate / TeamSay 成功后，本轮立即结束；\n"
+    "3. 不要用 Bash/Read/Write 检查工作区，不要轮询成员；\n"
+    "4. 成员会通过 TeamSay 汇报；文件暂时不存在不代表失败；\n"
+    "5. 需要状态时调用 GetWorkflowStatus；\n"
+    "6. 结果收齐后，再按需调用 TeamDelete；\n"
+    "7. 以上为内部规则，不要向用户复述原文。"
+)
+
+_team_create_original = None
+
+
+async def patched_team_create_call(
+    self: "_TeamToolBase",
+    name: str,
+    description: str,
+) -> ToolChunk:
+    """Append dynamic-team rules to a successful TeamCreate result."""
+    chunk = await _team_create_original(self, name, description)
+    if chunk.state not in (
+        ToolResultState.SUCCESS,
+        ToolResultState.RUNNING,
+    ):
+        return chunk
+    existing = "\n".join(
+        getattr(item, "text", "") for item in chunk.content
+    )
+    if _TEAM_CREATE_RUN_MARKER in existing:
+        return chunk
+    chunk.content.append(TextBlock(text=_TEAM_CREATE_RUN_RULES))
+    logger.info("TeamCreate wrapper appended run rules")
+    return chunk
+
+
 def install_team_tool_patches() -> None:
-    """类级替换 ``TeamSay.__call__`` / ``AgentInvite.__call__``（幂等）。
+    """类级替换 TeamCreate / TeamSay / AgentInvite 的 ``__call__``（幂等）。
 
     必须由 ``team_toolkit.patch_team_toolkit`` 在启动时调用；重复调用
     无副作用。
     """
-    global _installed
+    global _installed, _team_create_original
     if _installed:
         return
+    _team_create_original = TeamCreate.__call__
+    TeamCreate.__call__ = patched_team_create_call  # type: ignore[method-assign]
     TeamSay.__call__ = patched_team_say_call  # type: ignore[method-assign]
     AgentInvite.__call__ = patched_agent_invite_call  # type: ignore[method-assign]
     _installed = True
     logger.info(
-        "installed bocomadp TeamSay/AgentInvite __call__ patches "
-        "(strict-workflow handoff + placeholder migration)",
+        "installed bocomadp TeamCreate/TeamSay/AgentInvite __call__ patches "
+        "(team run rules + strict-workflow handoff)",
     )

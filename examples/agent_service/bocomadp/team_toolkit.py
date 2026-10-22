@@ -109,6 +109,43 @@ _ROUTING_TOOL_NAMES = {
 }
 
 
+def _toolkit_has_tool(toolkit: Any, name: str) -> bool:
+    for group in getattr(toolkit, "tool_groups", None) or []:
+        for tool in getattr(group, "tools", None) or []:
+            if getattr(tool, "name", "") == name:
+                return True
+    return False
+
+
+async def _ensure_status_tool(
+    toolkit: Any,
+    *,
+    storage: Any,
+    user_id: str,
+    agent_record: Any,
+    session_record: Any,
+    session_service: Any | None = None,
+    message_bus: Any | None = None,
+) -> None:
+    """Attach the read-only status tool once, without requiring a team."""
+    if _toolkit_has_tool(toolkit, "GetWorkflowStatus"):
+        return
+    from bocomadp.team.tools import GetWorkflowStatus
+
+    await toolkit.add_tool(
+        GetWorkflowStatus(
+            storage=storage,
+            user_id=user_id,
+            session_id=session_record.id,
+            agent_id=agent_record.id,
+            team_id=None,
+            session_service=session_service,
+            message_bus=message_bus,
+        ),
+        group_name="basic",
+    )
+
+
 async def _apply_orchestrated_toolkit(
     toolkit: Any,
     *,
@@ -137,11 +174,7 @@ async def _apply_orchestrated_toolkit(
         return False
 
     from bocomadp.team.state import get_state
-    from bocomadp.team.tools import (
-        GetWorkflowStatus,
-        ResumeWorkflow,
-        SubmitHandoffs,
-    )
+    from bocomadp.team.tools import ResumeWorkflow, SubmitHandoffs
 
     state = await get_state(storage, team.id)
     if state is None:
@@ -164,10 +197,6 @@ async def _apply_orchestrated_toolkit(
         "session_service": session_service,
     }
     if team_role == "leader":
-        await toolkit.add_tool(
-            GetWorkflowStatus(**common),
-            group_name="basic",
-        )
         if state.leader.phase == "first" and not state.leader.dispatched:
             await toolkit.add_tool(
                 SubmitHandoffs(**common, is_leader=True),
@@ -214,6 +243,16 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
 
     from agentscope.app._tool import AgentInvite, TeamSay
 
+    await _ensure_status_tool(
+        toolkit,
+        storage=storage,
+        user_id=user_id,
+        agent_record=agent_record,
+        session_record=session_record,
+        session_service=kwargs.get("session_service"),
+        message_bus=kwargs.get("message_bus"),
+    )
+
     team, team_role, allowed = await _allowed_handoff_targets(
         storage,
         user_id,
@@ -241,21 +280,6 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
                 tool._allowed_handoff_targets = allowed
             elif isinstance(tool, AgentInvite):
                 has_invite = True
-
-    if team is not None and team_role != "worker":
-        from bocomadp.team.tools import GetWorkflowStatus
-
-        await toolkit.add_tool(
-            GetWorkflowStatus(
-                storage=storage,
-                user_id=user_id,
-                session_id=session_record.id,
-                agent_id=agent_record.id,
-                team_id=team.id,
-                session_service=kwargs.get("session_service"),
-            ),
-            group_name="basic",
-        )
 
     # Leader-side backfill: if the framework attached no AgentInvite
     # (top-level invitable pool empty because team members are hidden by
@@ -299,13 +323,22 @@ async def _get_toolkit_with_team(*args: Any, **kwargs: Any):
 
 
 _TEAM_CREATE_CLEANUP_HINT = (
-    "\n\n## 任务完成后的团队清理\n"
-    "当所有成员已完成任务、你已收齐结果并准备给出最终答复后，"
-    "建议调用 `TeamDelete` 解散团队。\n"
-    "- 会删除：运行时团队记录、团队成员会话；由 AgentCreate 自建的"
-    "成员 agent 也会被删除；AgentInvite 邀请的成员 agent 保留；\n"
+    "\n\n## 团队运行与清理规则\n"
+    "创建团队后：\n"
+    "- 用 `AgentCreate` 添加成员，用 `TeamSay` 派任务；\n"
+    "- 调用 `AgentCreate` / `TeamSay` 成功后立即结束本轮；\n"
+    "- 不要用 `Bash` / `Read` / `Write` 检查工作区，不要轮询成员；\n"
+    "- 成员会通过 `TeamSay` 回报；文件暂时不存在不代表失败；\n"
+    "- 需要查看成员状态时调用 `GetWorkflowStatus`。\n"
+    "\n## 任务完成后的团队清理\n"
+    "当所有成员已完成、结果已收齐，并且你准备结束本轮或给出最终答复时，"
+    "建议调用 `TeamDelete` 解散团队，释放成员会话和运行时团队资源。\n"
+    "- 推荐顺序：收集全部结果 -> `TeamDelete` -> 输出最终答复；\n"
+    "- 删除前确认：没有成员仍在执行，且你不再需要追问成员；\n"
+    "- 会删除：运行时团队记录、成员会话；由 `AgentCreate` 自建的"
+    "成员 agent 也会被删除；`AgentInvite` 邀请的成员 agent 保留；\n"
     "- 会保留：leader 会话、共享工作区/PVC、已写入的文件；\n"
-    "- 如果成员仍在执行，或你还需要继续派活、追问成员，不要删除；\n"
+    "- 如果用户可能继续追问，或成员仍在执行，不要删除；\n"
     "- 删除不可逆，删除后团队工具不可用；需要继续协作时必须重新建团。\n"
 )
 
