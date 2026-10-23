@@ -573,13 +573,10 @@ class _BuiltinAgentStorageProxy:
         ``/agents`` router is unused by the product.
 
         Memory cleanup (best-effort, never blocks the delete result):
-        - DB ``agent_memory_configs`` row: ``memory_store.memory_delete``;
-        - Redis per-session state (``active_sessions`` member / ``turns`` /
-          extract lock): scanned from ``active_sessions`` by agent dimension
-          inside ``cleanup_agent_memory`` — no pre-delete session snapshot
-          needed (the compound key embeds user_id, so cleanup resolves it
-          from the active set instead).
-          Platform-side delete remains a placeholder (local delete only).
+        - ``memory_agent_configs`` row（agent 级配置）；
+        - 该 agent 的全部 ``memory_session_states``（turns / cursor / 心跳）。
+          ``cleanup_agent_memory`` 先删配置（立即停止新装配）、后清状态；
+          平台侧删除仍为占位（仅本地清理）。
         """
         ok = await self._inner.delete_agent(user_id, agent_id)
         if ok:
@@ -824,12 +821,26 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
-# 会话记忆运行时依赖：redis client（供心跳/计数/锁）与 storage（取消息）。
-# InMemory 本地模式 _get_redis_client() 返回 None → 记忆中间件仅检索注入，
-# 计数/提取降级关闭；Redis 模式全量生效。
-memory_module.configure_memory_runtime(
-    redis_client_fn=_get_redis_client,
+# 会话记忆能力装配（bocom SDK 版记忆包）：
+# - 平台连接走 euvd_memory_pysdk（环境由 config.memory.environment 指定）；
+# - 记忆两表（memory_agent_configs / memory_session_states）与框架共用
+#   config.db.url，由 SQLMemoryStorage.ensure_ready 幂等建表；全局参数走
+#   目标项目通用 runtime_configs 表（config_key='memory'）；
+# - storage 传入的是 _BuiltinAgentStorageProxy（带 default 回退），类型判定
+#   无法识别，因此显式注入 memory_storage；
+# - 提取锁走 message_bus（InMemory / Redis 两种总线均支持）。
+memory_module.setup_memory(
+    settings=memory_module.MemorySettings(
+        environment=config.memory.environment,
+        connect_timeout_seconds=config.memory.connect_timeout_seconds,
+        read_timeout_seconds=config.memory.read_timeout_seconds,
+        pool_connections=config.memory.pool_connections,
+        pool_maxsize=config.memory.pool_maxsize,
+        db_url=config.db.url,
+    ),
     storage=storage,
+    message_bus=message_bus,
+    memory_storage=memory_module.SQLMemoryStorage(db_url=config.db.url),
 )
 
 
@@ -841,7 +852,7 @@ async def _build_agent_middlewares_with_ellm(
     mws = await build_agent_middlewares(user_id, agent_id, session_id)
     mws.extend(await _ellm_refresh_mw_factory(user_id, agent_id, session_id))
     mws.append(_summarization_mw)
-    # 会话记忆中间件：memory_enabled 才装配（检索注入 + 轮数/静默触发）
+    # 会话记忆中间件：injection_enabled / extraction_enabled 任一开启才装配
     mws.extend(
         await memory_module.build_memory_middlewares(
             user_id,
@@ -1142,15 +1153,12 @@ app.router.routes[:] = [
     r for r in app.router.routes if not _is_framework_agent_route(r)
 ]
 app.include_router(agent_router)
-# 智能体记忆字段包裹路由（必须后于 include bocomadp agent_router）：
-# 按路径移除 bocomadp agent_router 中被覆盖的 /agent/ 4 条 CRUD 路由
-# （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
-# 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
-# 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
-# 会话记忆能力装配：/memory/config 路由 + lifespan 启动静默扫描器
-# （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
-# _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
-memory_module.install_memory(app)
+# 会话记忆能力装配：/memory/config 路由 + lifespan 启停（SDK client /
+# ensure_ready 建表 / 静默扫描器）。删除 agent 后的记忆清理已由
+# _BuiltinAgentStorageProxy.delete_agent 统一调用 cleanup_agent_memory，
+# 故关闭 install_memory 自带的 DELETE 中间件，避免重复清理。
+# 顺序要求：create_app 之后、bocomadp agent_router 之后、lifespan 包装赋值之后。
+memory_module.install_memory(app, cleanup_on_agent_delete=False)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)

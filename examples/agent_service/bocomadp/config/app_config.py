@@ -38,7 +38,7 @@ from .base import (
 # 由独立读取器消费（models → load_model_entries；
 # cross_search → get_cross_search_config）。
 # 新增此类业务节点时，必须加入本集合，否则启动校验会 fail-fast。
-# （memory 已由 AppConfig.memory: MemoryEndpointConfig 声明消费，
+# （memory 已由 AppConfig.memory: MemoryConfig 声明消费，
 #   保留在白名单内以免遗留/拼写校验误报，两者不冲突。）
 _BUSINESS_KEYS: frozenset[str] = frozenset(
     {
@@ -321,30 +321,39 @@ class ImageParseConfig(BaseModel):
         return self
 
 
-class MemoryEndpointConfig(BaseModel):
-    """会话记忆平台 HTTP 端点配置（config.yaml ``memory:`` 节点）。
+class MemoryConfig(BaseModel):
+    """会话记忆配置（config.yaml ``memory:`` 节点）。
 
-    完整 URL 不拼接：注册 / 检索 / 录入接口的绝对地址直接给到对应字段
-    （路径如 ``/registerAgent.do`` 等已含在 URL 中）。空值表示未配置，
-    平台客户端（``bocomadp/memory/platform.py``）按需读取并抛错。
+    平台连接走 ``euvd_memory_pysdk``：``environment`` 决定 SDK 的 base_url
+    （sit / uat / uat2 / prd），凭证留空时回退 SDK 的 ``EUVD_MEMORIES_*``
+    环境变量优先级链。记忆存储复用 ``db.url``，另见
+    ``bocomadp/memory/settings.py``。
     """
 
-    register_url: str = Field(
-        default="",
-        description="平台注册接口完整 URL（registerAgent.do）。",
+    environment: str = Field(
+        default="uat",
+        min_length=1,
+        description="SDK 环境：sit / uat / uat2 / prd（非法值由 SDK fail-fast）。",
     )
-    retrieve_url: str = Field(
-        default="",
-        description="平台检索接口完整 URL（searchMemory.do）。",
-    )
-    extract_url: str = Field(
-        default="",
-        description="平台录入接口完整 URL（saveMemoriesStandard.do）。",
-    )
-    request_timeout_seconds: float = Field(
-        default=30.0,
+    connect_timeout_seconds: float = Field(
+        default=3.0,
         gt=0,
-        description="平台 HTTP 请求超时（秒）。",
+        description="SDK 连接超时（秒）。",
+    )
+    read_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="SDK 读取超时（秒）。",
+    )
+    pool_connections: int = Field(
+        default=10,
+        ge=1,
+        description="SDK 连接池连接数。",
+    )
+    pool_maxsize: int = Field(
+        default=20,
+        ge=1,
+        description="SDK 连接池最大连接数。",
     )
 
 
@@ -632,9 +641,9 @@ class AppConfig(BaseSettings):
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     db: DbConfig = Field(default_factory=DbConfig)
-    memory: MemoryEndpointConfig = Field(
-        default_factory=MemoryEndpointConfig,
-        description="会话记忆平台端点（register/retrieve/extract URL）。",
+    memory: MemoryConfig = Field(
+        default_factory=MemoryConfig,
+        description="会话记忆配置（SDK 环境 / 凭证 / 连接池）。",
     )
     ellm_key_refresh: EllmKeyRefreshConfig = Field(
         default_factory=EllmKeyRefreshConfig,

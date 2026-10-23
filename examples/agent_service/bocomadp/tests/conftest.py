@@ -35,8 +35,8 @@ class FakeRedis:
 
     Supports only the commands ConcurrencyGuard uses:
     incr / decr / hset / hdel / hgetall / exists / get / set / eval / pipeline
-    — plus the sorted-set / delete primitives used by bocomadp.memory.state
-    (zadd / zscore / zrem / zrangebyscore / delete) and ``set`` NX/EX flags.
+    — plus the sorted-set / delete primitives（zadd / zscore / zrem /
+    zrangebyscore / delete）and ``set`` NX/EX flags.
     """
 
     def __init__(self) -> None:
@@ -238,3 +238,122 @@ class FakeRedis:
 @pytest.fixture
 def fake_redis() -> FakeRedis:
     return FakeRedis()
+
+
+# ---------------------------------------------------------------------------
+# SDK 版记忆包测试 fixtures（自 bocom 测试迁移）
+#
+# SQL 后端使用真实 MySQL：建表 DDL 为 MySQL 规范（DATETIME(6) /
+# CURRENT_TIMESTAMP(6) / ON UPDATE），SQLite 建不出该结构；Redis 后端用
+# fakeredis。未提供可达的 MySQL 时，SQL 相关用例自动 skip。
+# ---------------------------------------------------------------------------
+import os as _os
+import socket as _socket
+from urllib.parse import urlparse as _urlparse
+
+from sqlalchemy import text as _sa_text
+from sqlalchemy.ext.asyncio import create_async_engine as _create_async_engine
+from sqlalchemy.pool import NullPool as _NullPool
+
+from bocomadp.memory.storage._sql_memory import SQLMemoryStorage
+
+SQL_DB_URL = _os.getenv(
+    "MEMORY_TEST_DB_URL",
+    "mysql+aiomysql://agentscope:agentscope@127.0.0.1:3306/agentscope",
+)
+
+_TABLE_NAMES = (
+    "memory_session_states",
+    "memory_agent_configs",
+)
+
+
+def _mysql_reachable() -> bool:
+    parsed = _urlparse(SQL_DB_URL.replace("mysql+aiomysql://", "mysql://"))
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 3306
+    try:
+        with _socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _require_mysql() -> None:
+    if not _mysql_reachable():
+        pytest.skip(f"MySQL not reachable: {SQL_DB_URL}")
+
+
+class _IsolatedSQLStorage(SQLMemoryStorage):
+    """测试专用 SQL 后端：建表前先 DROP 记忆三表，保证用例互不干扰。"""
+
+    async def ensure_ready(self) -> None:
+        async with self._engine.begin() as conn:
+            for name in _TABLE_NAMES:
+                await conn.execute(_sa_text(f"DROP TABLE IF EXISTS {name}"))
+        await super().ensure_ready()
+
+
+def _make_sql_storage() -> SQLMemoryStorage:
+    _require_mysql()
+    return _IsolatedSQLStorage(
+        engine=_create_async_engine(SQL_DB_URL, poolclass=_NullPool)
+    )
+
+
+@pytest.fixture
+def sql_db_url() -> str:
+    return SQL_DB_URL
+
+
+@pytest.fixture
+def make_sql_storage():
+    def _make():
+        return _make_sql_storage()
+
+    return _make
+
+
+@pytest.fixture
+def session_ids():
+    async def _list(storage) -> list[str]:
+        if hasattr(storage, "_redis"):
+            members = await storage._redis.zrange(
+                "agentscope:memory:sessions", 0, -1
+            )
+            return sorted(
+                (m.decode() if isinstance(m, bytes) else m).split(":", 2)[2]
+                for m in members
+            )
+        from sqlalchemy import select
+
+        from bocomadp.memory.storage._sql_memory import _SessionStateRow
+
+        async with storage._engine.connect() as conn:
+            rows = (
+                await conn.execute(select(_SessionStateRow.session_id))
+            ).scalars().all()
+        return sorted(rows)
+
+    return _list
+
+
+@pytest.fixture(params=["sql", "redis"])
+def make_storage(request):
+    if request.param == "sql":
+
+        def _make():
+            return _make_sql_storage()
+
+    else:
+        from fakeredis import aioredis as fakeredis_aio
+
+        from bocomadp.memory.storage._redis_memory import RedisMemoryStorage
+
+        def _make():
+            return RedisMemoryStorage(
+                fakeredis_aio.FakeRedis(), state_ttl_secs=86400 * 30
+            )
+
+    _make.backend = request.param  # type: ignore[attr-defined]
+    return _make

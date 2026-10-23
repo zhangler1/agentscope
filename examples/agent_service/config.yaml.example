@@ -31,6 +31,14 @@ redis:
   host: localhost
   port: 6379
 
+# ---------- 会话记忆（EUVD 记忆平台 SDK） ----------
+memory:
+  environment: "uat"       # sit / uat / uat2 / prd（决定 SDK base_url）
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 10
+  pool_connections: 10
+  pool_maxsize: 20
+
 # ---------- 组件注册表 ----------
 tools:
   enabled: true
