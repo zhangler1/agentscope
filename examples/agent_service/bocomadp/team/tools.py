@@ -193,18 +193,25 @@ class SubmitHandoffs(_WorkflowToolBase):
                 f"SubmitHandoffs: 流程状态为 {state.status}，不能提交。",
             )
 
+        is_redispatch = state.leader.phase == "worker_failed"
         if self._is_leader:
-            if state.leader.dispatched:
-                return _error(
-                    "SubmitHandoffs: 当前流程已经派发，不能重新拆解；"
-                    "如需新任务请先取消当前流程。",
-                )
-            if state.leader.handoffs:
-                return _error(
-                    "SubmitHandoffs: 本轮已经提交过 handoffs，不能重复提交。",
-                )
-            allowed = state.plan.members_of(0)
-            stage_note = "leader 首节点"
+            if is_redispatch:
+                allowed = state.plan.members_of(state.stage_index)
+                stage_note = f"workflow 第 {state.stage_index + 1} 阶段"
+                require_all = False
+            else:
+                if state.leader.dispatched:
+                    return _error(
+                        "SubmitHandoffs: 当前流程已经派发，不能重新拆解；"
+                        "如需新任务请先取消当前流程。",
+                    )
+                if state.leader.handoffs:
+                    return _error(
+                        "SubmitHandoffs: 本轮已经提交过 handoffs，不能重复提交。",
+                    )
+                allowed = state.plan.members_of(0)
+                stage_note = "leader 首节点"
+                require_all = True
         else:
             node = state.nodes.get(self._agent_id)
             if node is None or node.status not in (
@@ -222,10 +229,18 @@ class SubmitHandoffs(_WorkflowToolBase):
                 )
             allowed = state.plan.members_of(state.stage_index + 1)
             stage_note = f"阶段 {state.stage_index + 1}"
+            require_all = True
 
         targets = [str(item.get("target") or "") for item in (handoffs or [])]
-        if allowed:
-            missing = [target for target in allowed if target not in targets]
+        if is_redispatch and not targets:
+            # Empty handoffs is the explicit "abort this workflow" signal.
+            pass
+        elif allowed:
+            missing = (
+                [target for target in allowed if target not in targets]
+                if require_all
+                else []
+            )
             unknown = [target for target in targets if target not in allowed]
             if missing or unknown:
                 details = []
@@ -239,6 +254,18 @@ class SubmitHandoffs(_WorkflowToolBase):
                     + f"）。{stage_note} 允许的目标：{allowed}。"
                     "请修正后重新提交。",
                 )
+            if is_redispatch:
+                for target in targets:
+                    target_node = state.nodes.get(target)
+                    if target_node is None or target_node.status not in (
+                        "failed",
+                        "pending",
+                    ):
+                        return _error(
+                            "SubmitHandoffs: 重新派发只允许 failed/pending "
+                            f"节点，target={target} 当前状态是 "
+                            f"{getattr(target_node, 'status', 'missing')}。",
+                        )
         elif targets:
             return _error(
                 "SubmitHandoffs: 当前是最后一步，handoffs 必须为空。",
@@ -275,12 +302,34 @@ class SubmitHandoffs(_WorkflowToolBase):
             if fresh is None:
                 return _error("SubmitHandoffs: 状态已消失。")
             if self._is_leader:
-                if fresh.leader.dispatched or fresh.leader.handoffs:
-                    return _error(
-                        "SubmitHandoffs: handoffs 已经提交或流程已派发。",
-                    )
-                fresh.leader.last_result = result_ref
-                fresh.leader.handoffs = refs
+                if fresh.leader.phase == "worker_failed":
+                    if refs:
+                        for ref in refs:
+                            target_node = fresh.nodes.get(ref.target)
+                            if target_node is None or target_node.status not in (
+                                "failed",
+                                "pending",
+                            ):
+                                return _error(
+                                    "SubmitHandoffs: 重新派发目标状态已变化，"
+                                    "请刷新后重试。",
+                                )
+                        for ref in refs:
+                            target_node = fresh.node(ref.target)
+                            target_node.status = "pending"
+                            target_node.error = None
+                            target_node.waiting_reason = None
+                            target_node.task_summary = ref.task[:200]
+                    fresh.leader.last_result = result_ref
+                    fresh.leader.handoffs = refs
+                    fresh.leader.dispatched = False
+                else:
+                    if fresh.leader.dispatched or fresh.leader.handoffs:
+                        return _error(
+                            "SubmitHandoffs: handoffs 已经提交或流程已派发。",
+                        )
+                    fresh.leader.last_result = result_ref
+                    fresh.leader.handoffs = refs
             else:
                 fresh_node = fresh.nodes.get(self._agent_id)
                 if (

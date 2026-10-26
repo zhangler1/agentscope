@@ -175,6 +175,17 @@ class WorkflowOrchestrator:
             if state.leader.resume_requested:
                 await self.resume(state)
                 return
+            if state.leader.phase == "worker_failed":
+                if state.leader.handoffs:
+                    state.leader.dispatched = True
+                    await save_state(self._storage, state)
+                    await self._dispatch_failed_nodes(
+                        state,
+                        [ref.target for ref in state.leader.handoffs],
+                    )
+                else:
+                    await self._trigger_failed_summary(state)
+                return
             if state.leader.dispatched:
                 # Already running: user messages during this period are not
                 # new dispatch requests.
@@ -256,14 +267,7 @@ class WorkflowOrchestrator:
             return
 
         node.error = "节点 run 结束但未调用 SubmitHandoffs"
-        if node.attempts >= MAX_ATTEMPTS:
-            node.status = "failed"
-            await save_state(self._storage, state)
-            await self._trigger_failed_summary(state)
-            return
-        node.status = "pending"
-        await save_state(self._storage, state)
-        await self.dispatch_stage(state, state.stage_index)
+        await self._trigger_worker_failed(state, ctx.agent_id, node)
 
     # ------------------------------------------------------------------
     # Plan / state initialization
@@ -464,12 +468,13 @@ class WorkflowOrchestrator:
         agent_id: str,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Collect task text + inputs from the previous stage's handoffs."""
+        # Re-dispatched tasks live on the leader; check them first. For a
+        # normal later stage they simply do not match the current member.
+        refs = list(state.leader.handoffs)
         if state.stage_index == 0:
-            refs = list(state.leader.handoffs)
             previous_members: list[str] = []
         else:
             previous_members = state.plan.members_of(state.stage_index - 1)
-            refs = []
             for member in previous_members:
                 refs.extend(state.node(member).handoffs)
 
@@ -495,6 +500,116 @@ class WorkflowOrchestrator:
             parts.append(f"## 来自上游的任务\n{ref.task or ref.summary}")
             inputs.extend(ref.inputs)
         return "\n\n".join(parts), inputs
+
+    async def _trigger_worker_failed(
+        self,
+        state: WorkflowState,
+        agent_id: str,
+        node: WorkflowNodeState,
+    ) -> None:
+        """Mark one node failed and ask the leader to re-dispatch it.
+
+        No automatic retry happens here. The workflow stays running and the
+        leader gets a decision run; an empty SubmitHandoffs aborts it.
+        """
+        fresh = await get_state(self._storage, state.team_id)
+        if fresh is None or fresh.leader.phase in ("final", "failed_summary"):
+            return
+        team = await self._storage.get_team(fresh.user_id, fresh.team_id)
+        if team is None:
+            return
+        leader_session = await self._storage.get_session(
+            fresh.user_id,
+            fresh.plan.leader_agent_id,
+            team.session_id,
+        )
+        if leader_session is None:
+            return
+
+        failed_node = fresh.node(agent_id)
+        failed_node.status = "failed"
+        failed_node.error = node.error or "worker run failed"
+        fresh.status = "running"
+        fresh.leader.phase = "worker_failed"
+        fresh.leader.dispatched = False
+        fresh.leader.handoffs = []
+        fresh.leader.failed_stage_index = fresh.stage_index
+        if agent_id not in fresh.leader.failed_nodes:
+            fresh.leader.failed_nodes.append(agent_id)
+        fresh.leader.failed_errors[agent_id] = failed_node.error
+        if not await save_state(self._storage, fresh):
+            return
+
+        await self._push_and_wake(
+            fresh.user_id,
+            leader_session.id,
+            fresh.plan.leader_agent_id,
+            self._build_worker_failed_prompt(fresh, agent_id),
+        )
+
+    def _build_worker_failed_prompt(
+        self,
+        state: WorkflowState,
+        agent_id: str,
+    ) -> str:
+        node = state.node(agent_id)
+        members = state.plan.members_of(state.stage_index)
+        lines = [
+            "工作流中有 worker 本轮失败。",
+            f"- 阶段：{state.stage_index + 1}/{state.plan.stage_count}",
+            f"- 失败成员：{agent_id}",
+            f"- 错误：{node.error or '未知错误'}",
+            "本轮不会自动重试。",
+            "如果你要重新派发，请调用 SubmitHandoffs：",
+            f"- target 必须属于当前阶段：{members}",
+            "- 只提交需要重跑的失败节点，已完成节点不会重跑。",
+            "如果放弃当前流程，请调用 SubmitHandoffs 且 handoffs 为空。",
+        ]
+        return "\n".join(lines)
+
+    async def _dispatch_failed_nodes(
+        self,
+        state: WorkflowState,
+        targets: list[str],
+    ) -> None:
+        """Dispatch only explicitly re-submitted failed nodes."""
+        allowed = set(state.plan.members_of(state.stage_index))
+        deliveries: list[tuple[str, str, str]] = []
+        for agent_id in targets:
+            if agent_id not in allowed:
+                continue
+            node = state.node(agent_id)
+            if node.status not in ("failed", "pending"):
+                continue
+            session_id = await self._ensure_member_session(state, agent_id)
+            if session_id is None:
+                node.status = "failed"
+                node.error = "无法创建成员会话"
+                continue
+            task, inputs = self._collect_task(state, agent_id)
+            node.status = "active"
+            node.session_id = session_id
+            node.attempts += 1
+            node.error = None
+            node.waiting_reason = None
+            node.task_summary = task[:200]
+            prompt = build_task_prompt(
+                task,
+                inputs,
+                stage_note=(
+                    f"当前是第 {state.stage_index + 1}/"
+                    f"{state.plan.stage_count} 阶段"
+                ),
+            )
+            deliveries.append((session_id, agent_id, prompt))
+        await save_state(self._storage, state)
+        for session_id, agent_id, prompt in deliveries:
+            await self._push_and_wake(
+                state.user_id,
+                session_id,
+                agent_id,
+                prompt,
+            )
 
     async def _worker_session_status(self, ctx: RunContext) -> str | None:
         """Return the worker session's liveness/parking status.
@@ -548,16 +663,9 @@ class WorkflowOrchestrator:
             await self.dispatch_stage(state, next_index)
             return
 
-        failed = [
-            member
-            for member in state.stage_members
-            if state.node(member).status == "failed"
-        ]
-        if failed and all(
-            state.node(member).attempts >= MAX_ATTEMPTS
-            for member in failed
-        ):
-            await self._trigger_failed_summary(state)
+        # A failed node blocks the stage until the leader either re-dispatches
+        # it or explicitly aborts with empty handoffs.
+        return
 
     async def _trigger_leader_final(self, state: WorkflowState) -> bool:
         # Re-read under the team lock so an older caller cannot enqueue a

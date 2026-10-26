@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bocomadp import team_store
-from bocomadp.team.plan import PlanError, build_plan
+from bocomadp.team.plan import PlanError, WorkflowPlan, WorkflowStage, build_plan
 from bocomadp.team.protocol import (
     RESULT_MAX_CHARS,
     build_task_prompt,
@@ -355,6 +355,156 @@ def test_get_workflow_status_reports_waiting(workflow_storage):
     assert "waiting" in text
     assert "awaiting_permission" in text
     assert "尚未完成" in text
+
+
+def test_worker_failure_enters_worker_failed_without_retry(
+    workflow_storage,
+    monkeypatch,
+):
+    from contextlib import asynccontextmanager
+
+    from bocomadp.team import orchestrator as orchestrator_mod
+    from bocomadp.team.orchestrator import RunContext, WorkflowOrchestrator
+
+    class _Status:
+        async def get_session_status(self, user_id, agent_id, session_id):
+            return "idle"
+
+    class _Bus:
+        def __init__(self):
+            self.pushes = []
+
+        async def queue_push(self, key, payload):
+            self.pushes.append((key, payload))
+
+        @asynccontextmanager
+        async def acquire_lock(self, key, ttl_secs=300):
+            yield
+
+    _run(team_store.ensure_team_tables(workflow_storage))
+    _seed_state(workflow_storage, [("leader-1", "a")], stage_members=("a",))
+    state = _run(get_state(workflow_storage, "t1"))
+    state.leader.dispatched = True
+    state.stage_members = ["a"]
+    state.nodes["a"].status = "active"
+    state.nodes["a"].attempts = 1
+    state.nodes["a"].session_id = "worker-a"
+    _run(save_state(workflow_storage, state))
+
+    async def get_team(user_id, team_id):
+        return SimpleNamespace(id="t1", session_id="leader-session")
+
+    async def get_session(user_id, agent_id, session_id):
+        return SimpleNamespace(
+            id=session_id,
+            agent_id="leader-1" if session_id == "leader-session" else "a",
+        )
+
+    workflow_storage.get_team = get_team
+    workflow_storage.get_session = get_session
+    bus = _Bus()
+    wakes = []
+
+    async def fake_enqueue(bus_obj, **kwargs):
+        wakes.append(kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_mod,
+        "enqueue_run_trigger",
+        fake_enqueue,
+    )
+    orchestrator = WorkflowOrchestrator(
+        storage=workflow_storage,
+        message_bus=bus,
+        session_service=_Status(),
+    )
+    ctx = RunContext(
+        user_id="u1",
+        session_id="worker-a",
+        agent_id="a",
+        team_id="t1",
+        role="worker",
+        phase="",
+    )
+    _run(orchestrator._after_run_locked(ctx))
+
+    state = _run(get_state(workflow_storage, "t1"))
+    assert state.leader.phase == "worker_failed"
+    assert state.nodes["a"].status == "failed"
+    assert state.leader.failed_nodes == ["a"]
+    assert len(wakes) == 1
+    assert wakes[0]["session_id"] == "leader-session"
+    assert wakes[0]["agent_id"] == "leader-1"
+
+
+def test_worker_failed_prompt_uses_current_node_status():
+    from bocomadp.team_briefing import _build_orchestrated_prompt
+
+    async def get_agent(owner_id, agent_id):
+        return None
+
+    state = WorkflowState(
+        team_id="t1",
+        user_id="u1",
+        plan=WorkflowPlan(
+            leader_agent_id="leader-1",
+            stages=[WorkflowStage(stage=0, members=["a", "b"])],
+            nodes=["a", "b"],
+        ),
+        stage_members=["a", "b"],
+        nodes={
+            "a": WorkflowNodeState(status="completed"),
+            "b": WorkflowNodeState(status="failed", error="boom"),
+        },
+        leader=WorkflowLeaderState(
+            phase="worker_failed",
+            failed_nodes=["a", "b"],
+        ),
+    )
+    prompt = _run(
+        _build_orchestrated_prompt(
+            state,
+            SimpleNamespace(get_agent=get_agent),
+            "u1",
+        ),
+    )
+    assert "- a：completed" in prompt
+    assert "- a：failed" not in prompt
+    assert "- b：failed，错误：boom" in prompt
+
+
+def test_worker_failed_leader_can_redispatch_with_submit_handoffs(
+    workflow_storage,
+):
+    _run(team_store.ensure_team_tables(workflow_storage))
+    _seed_state(workflow_storage, [("leader-1", "a")], stage_members=("a",))
+    state = _run(get_state(workflow_storage, "t1"))
+    state.leader.phase = "worker_failed"
+    state.leader.dispatched = False
+    state.leader.handoffs = []
+    state.nodes["a"].status = "failed"
+    state.nodes["a"].error = "model error"
+    _run(save_state(workflow_storage, state))
+
+    tool = SubmitHandoffs(
+        storage=workflow_storage,
+        user_id="u1",
+        session_id="leader-session",
+        agent_id="leader-1",
+        team_id="t1",
+        is_leader=True,
+    )
+    chunk = _run(
+        tool(
+            result="重新派发 A",
+            handoffs=[{"target": "a", "task": "重新执行 A"}],
+        ),
+    )
+    assert chunk.state.value == "success"
+    state = _run(get_state(workflow_storage, "t1"))
+    assert state.leader.handoffs[0].target == "a"
+    assert state.nodes["a"].status == "pending"
+    assert state.leader.phase == "worker_failed"
 
 
 def test_get_workflow_status_resolves_team_from_session(workflow_storage):

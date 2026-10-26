@@ -197,7 +197,13 @@ async def _apply_orchestrated_toolkit(
         "session_service": session_service,
     }
     if team_role == "leader":
-        if state.leader.phase == "first" and not state.leader.dispatched:
+        if (
+            state.leader.phase == "worker_failed"
+            or (
+                state.leader.phase == "first"
+                and not state.leader.dispatched
+            )
+        ):
             await toolkit.add_tool(
                 SubmitHandoffs(**common, is_leader=True),
                 group_name="basic",

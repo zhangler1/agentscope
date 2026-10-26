@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING
 
 from agentscope._utils._common import _generate_id
 from agentscope.app._bus_ops import enqueue_run_trigger
-from agentscope.app._tool import AgentInvite, TeamCreate, TeamSay
+from agentscope.app._tool import AgentCreate, AgentInvite, TeamCreate, TeamSay
 from agentscope.app._tool._agent_invite import (
     _display_handle,
     _display_name,
@@ -300,6 +300,19 @@ async def patched_team_say_call(
                 session_id=sid,
                 agent_id=aid,
             )
+        try:
+            from bocomadp.team.watcher import (
+                ensure_team_watcher_for_sessions,
+            )
+
+            await ensure_team_watcher_for_sessions(
+                self._storage,
+                self._message_bus,
+                user_id=self._user_id,
+                session_ids=[sid for sid, _ in recipients],
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("failed to start team watcher after TeamSay")
 
         count = len(recipients)
         target = "broadcast" if to is None else f"member {to!r}"
@@ -556,6 +569,19 @@ async def patched_agent_invite_call(
             session_id=borrowed.id,
             agent_id=invited.id,
         )
+        try:
+            from bocomadp.team.watcher import (
+                ensure_team_watcher_for_sessions,
+            )
+
+            await ensure_team_watcher_for_sessions(
+                self._storage,
+                self._message_bus,
+                user_id=self._user_id,
+                session_ids=[borrowed.id],
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("failed to start team watcher after AgentInvite")
 
         return ToolChunk(
             content=[
@@ -587,6 +613,63 @@ _TEAM_CREATE_RUN_RULES = (
 )
 
 _team_create_original = None
+_agent_create_original = None
+
+
+async def _member_session_ids(tool: Any) -> set[str]:
+    try:
+        session = await tool._storage.get_session(
+            tool._user_id,
+            tool._agent_id,
+            tool._session_id,
+        )
+        if session is None or not session.team_id:
+            return set()
+        team = await tool._storage.get_team(tool._user_id, session.team_id)
+        if team is None:
+            return set()
+        return {
+            member.session_id
+            for member in getattr(team.data, "members", []) or []
+            if getattr(member, "session_id", None)
+            and member.session_id != team.session_id
+        }
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("failed to inspect team members for watcher")
+        return set()
+
+
+async def patched_agent_create_call(
+    self: "_TeamToolBase",
+    *args: Any,
+    **kwargs: Any,
+) -> ToolChunk:
+    """Start the team watcher for the newly created worker session."""
+    before = await _member_session_ids(self)
+    chunk = await _agent_create_original(self, *args, **kwargs)
+    if chunk.state not in (
+        ToolResultState.SUCCESS,
+        ToolResultState.RUNNING,
+    ):
+        return chunk
+    after = await _member_session_ids(self)
+    for session_id in after - before:
+        try:
+            from bocomadp.team.watcher import (
+                ensure_team_watcher_for_sessions,
+            )
+
+            await ensure_team_watcher_for_sessions(
+                self._storage,
+                self._message_bus,
+                user_id=self._user_id,
+                session_ids=[session_id],
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "failed to start team watcher after AgentCreate",
+            )
+    return chunk
 
 
 async def patched_team_create_call(
@@ -617,15 +700,17 @@ def install_team_tool_patches() -> None:
     必须由 ``team_toolkit.patch_team_toolkit`` 在启动时调用；重复调用
     无副作用。
     """
-    global _installed, _team_create_original
+    global _installed, _team_create_original, _agent_create_original
     if _installed:
         return
     _team_create_original = TeamCreate.__call__
     TeamCreate.__call__ = patched_team_create_call  # type: ignore[method-assign]
+    _agent_create_original = AgentCreate.__call__
+    AgentCreate.__call__ = patched_agent_create_call  # type: ignore[method-assign]
     TeamSay.__call__ = patched_team_say_call  # type: ignore[method-assign]
     AgentInvite.__call__ = patched_agent_invite_call  # type: ignore[method-assign]
     _installed = True
     logger.info(
-        "installed bocomadp TeamCreate/TeamSay/AgentInvite __call__ patches "
-        "(team run rules + strict-workflow handoff)",
+        "installed bocomadp TeamCreate/AgentCreate/TeamSay/AgentInvite "
+        "__call__ patches (team run rules + watcher)",
     )

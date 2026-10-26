@@ -256,6 +256,28 @@ async def _build_orchestrated_prompt(
             )
         return "\n".join(lines)
 
+    if state.leader.phase == "worker_failed":
+        members = list(state.stage_members)
+        lines.append(
+            f"当前阶段 {state.stage_index + 1}/{state.plan.stage_count} "
+            "有 worker 执行失败。本轮不会自动重试。",
+        )
+        for member in members:
+            node = state.node(member)
+            if node.status == "failed":
+                lines.append(
+                    f"- {member}：failed，错误：{node.error or '未知错误'}",
+                )
+            else:
+                lines.append(f"- {member}：{node.status}")
+        lines.append(
+            "请调用 `SubmitHandoffs` 重新派发当前阶段的失败节点；"
+            f"允许的 target：{members}。"
+            "只提交 failed/pending 节点，已完成节点不会重跑。"
+            "如果决定放弃，请调用 `SubmitHandoffs` 且 handoffs 为空。",
+        )
+        return "\n".join(lines)
+
     if state.leader.phase == "final":
         lines.append(
             "流程已结束。系统已收集各节点的简短汇报，"
