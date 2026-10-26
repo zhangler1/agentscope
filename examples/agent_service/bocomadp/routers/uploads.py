@@ -115,6 +115,45 @@ def _upload_abs(backend, workdir: str, name: str) -> str:
     return backend.join_path(workdir, to_upload_rel_path(name))
 
 
+async def _dedupe_session_filename(
+    *,
+    backend,
+    workdir: str,
+    user_id: str,
+    session_id: str,
+    stored_name: str,
+) -> str:
+    """同会话同名文件自动改名（``A.docx`` → ``A(1).docx`` → ``A(2).docx``）。
+
+    同会话内重传同名文件时若直接覆盖磁盘并复用路径，先前轮次消息引用的
+    ``virtual_path`` 会静默指向新内容（元数据旧记录与磁盘真身脱节）。
+    改名让每次上传获得独立路径：物理文件分开，元数据不再出现同三键的
+    多条记录，逐轮历史还原精确到当轮版本。跨会话同名由 workdir 物理
+    隔离，无需去重。占用判定同时看元数据库与磁盘，防止单边残留。
+
+    Raises:
+        `UploadError`: 序号耗尽（极端情况，防御死循环）。
+    """
+    db = get_uploads_db()
+
+    async def _taken(name: str) -> bool:
+        if db.get_by_session_file(user_id, session_id, name):
+            return True
+        return await backend.file_exists(_upload_abs(backend, workdir, name))
+
+    if not await _taken(stored_name):
+        return stored_name
+
+    stem, ext = os.path.splitext(stored_name)
+    for seq in range(1, 1000):
+        candidate = f"{stem}({seq}){ext}"
+        if not await _taken(candidate):
+            return candidate
+    raise UploadError(
+        f"too many same-name uploads for {stored_name!r} in session {session_id!r}",
+    )
+
+
 async def _persist_uploaded_bytes(
     *,
     user_id: str,
@@ -126,23 +165,29 @@ async def _persist_uploaded_bytes(
     data: bytes,
     content_type: str | None,
     stored_name_override: str | None = None,
+    auto_parse: bool = True,
 ) -> UploadedFile:
-    """落盘原始文件 + 图片 base64 固化 / 文档转 .md + 写入 uploads DB。
+    """落盘原始文件 +（可选）内容加工 + 写入 uploads DB。
 
     ``POST /files/upload`` 端点与 ``context.custom_params.additional_urls`` 下载
     共用本函数，保证两条路径的文件元数据与落盘格式完全一致（下游
     ``view_image_tool`` / ``<context name="files">``
     均以 uploads DB 记录为感知通道）。
 
+    Args:
+        auto_parse: 落盘后是否自动加工内容——图片转 base64 固化、文档转 .md。
+            为 ``False`` 时仅落盘 + 写库，不做任何内容加工（解析交由调用方
+            独立完成，例如自定义 skill），避免大文件同步转换拖慢请求。
+
     Raises:
         `UploadError`: 文件名非法 / 落盘失败（调用方按需处理）。
     """
-    # 安全文件名
+    # 安全文件名（stored_name_override 供调用方指定落盘名：URL 下载时
+    # 扩展名与调用方 file_name 冲突，落盘名跟随 URL 保证名与内容一致）
     stored_name = normalize_filename(
         stored_name_override or original_name or "file",
     )
     validate_path_traversal(stored_name)
-    virtual_path = to_virtual_path(stored_name)
 
     # 解析工作区与 backend（沙箱 / 本地统一）
     workspace = await _resolve_workspace(
@@ -150,6 +195,17 @@ async def _persist_uploaded_bytes(
     )
     backend = workspace.get_backend()
     workdir = workspace.workdir
+
+    # 同会话同名自动改名（A.docx → A(1).docx）：每次上传独立路径，
+    # 先前轮次消息引用的 virtual_path 不被后续重传覆盖。
+    stored_name = await _dedupe_session_filename(
+        backend=backend,
+        workdir=workdir,
+        user_id=user_id,
+        session_id=session_id,
+        stored_name=stored_name,
+    )
+    virtual_path = to_virtual_path(stored_name)
 
     # 上传目录由来宾工作区的 _ensure_workspace_layout() 保证存在
     #（user-data/uploads）；backend.write_file 也会自动创建父目录，
@@ -162,7 +218,9 @@ async def _persist_uploaded_bytes(
     except Exception as e:  # noqa: BLE001
         raise UploadError(f"write failed: {e}") from e
 
-    # 转换 .md（host 侧第三方库），并写回工作区
+    # 内容加工（host 侧第三方库）：图片 base64 固化 / 文档转 .md，并写回工作区。
+    # auto_parse=False 时整段跳过——仅落盘 + 写库，解析交由调用方（如自定义
+    # skill）按自己的节奏完成，避免大文件同步转换阻塞请求、触发网关超时。
     converted = False
     convert_format = None
     convert_error = None
@@ -171,7 +229,7 @@ async def _persist_uploaded_bytes(
     mime_type = None
     is_img = is_image(content_type, stored_name)
     try:
-        if is_img:
+        if auto_parse and is_img:
             # 图片：直接固化为 base64 存入元数据，供 view_image_tool
             # 直接解析（不生成 .md，不内联进消息正文）。MIME 以文件头
             # 实测为准（内容优先），实测不到时按扩展名兜底。
@@ -182,7 +240,7 @@ async def _persist_uploaded_bytes(
                 )
             else:
                 base64 = encode_image_base64(data)
-        elif file_conversion.is_supported_format(stored_name):
+        elif auto_parse and file_conversion.is_supported_format(stored_name):
             fmt, md_text = file_conversion.convert_file_bytes(
                 stored_name, data, content_type,
             )
@@ -204,6 +262,9 @@ async def _persist_uploaded_bytes(
             agent_id=agent_id,
             session_id=session_id,
             workspace_id=getattr(workspace, "workspace_id", None),
+            # 落盘名可被 stored_name_override 改写（扩展名冲突时跟随 URL），
+            # 此处必须记调用方的原始名，UploadsMiddleware 据此在提示词中
+            # 说明「原始名 vs 实际文件」的对应关系。
             original_name=original_name or stored_name,
             stored_name=stored_name,
             virtual_path=virtual_path,
@@ -258,6 +319,8 @@ def _name_ext_conflict(original_name: str, url_name: str) -> bool:
     o_ext = _name_ext(original_name)
     u_ext = _name_ext(url_name)
     return bool(o_ext and u_ext and o_ext != u_ext)
+
+
 # ---------------------------------------------------------------------------
 # 工具层依赖注入（run 任务内无 FastAPI Depends，工具须经本入口复用
 # download_urls_to_session 下载文件到会话 uploads 目录）
@@ -314,7 +377,7 @@ async def download_urls_to_session(
             - ``(url, original_name)`` 元组，``original_name`` 为空时回退
               到 URL 推断（保留前端传入的 ``file_name``）。
 
-            同名文件会被 ``normalize_filename`` 归一化；重复文件名直接覆盖。
+            同名文件经 ``_dedupe_session_filename`` 自动改名，互不覆盖。
 
     Returns:
         `list[UploadedFile]`: 成功保存的上传记录（按 URL 顺序）。
@@ -378,10 +441,11 @@ async def download_urls_to_session(
                     session_id=session_id,
                     storage=storage,
                     workspace_manager=workspace_manager,
-                    original_name=original_name,
+                    # 裸 URL 传入（无调用方名）时回退 URL 推断名；
                     # 扩展名冲突时（如 file_name=.xls 而 URL 实际是 .txt）
                     # 落盘名跟随 URL，保证文件名与内容一致；file_name 仅作
                     # original_name 记录，由中间件在提示词中说明对应关系。
+                    original_name=original_name or url_name,
                     stored_name_override=(
                         url_name
                         if _name_ext_conflict(original_name, url_name)
@@ -443,52 +507,68 @@ async def list_uploads(
 
 
 # ---------------------------------------------------------------------------
-# POST /files/upload — 上传单个文件（沙箱 / 本地 统一走 backend）
+# POST /files/upload — 批量上传（同一字段名 file 可携带多个文件；沙箱 / 本地 统一走 backend）
 # ---------------------------------------------------------------------------
-@uploads_router.post("/upload", response_model=UploadedFile)
+@uploads_router.post("/upload", response_model=list[UploadedFile])
 async def upload_file(
     agent_id: str = Form(...),
     session_id: str = Form(...),
-    file: UploadFile = File(...),
+    # 字段名保持 ``file`` 不变：前端（uploads.ts 的 fd.append('file', ...)）
+    # 与历史 curl 均以此名发多值，FastAPI 按参数名绑定表单字段，
+    # 同名多值自动收成列表，前端零改动即可批量上传。
+    file: list[UploadFile] = File(...),
+    # 是否在落盘后自动解析内容：默认 true 保持既有行为（图片 base64 固化 /
+    # 文档转 .md）；false 为纯上传，仅落盘 + 写库，解析交由调用方独立完成
+    # （如自定义 skill）。大文件传 false 可避免同步转换拖慢请求、触发网关超时。
+    auto_parse: bool = Form(True),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
-) -> UploadedFile:
+) -> list[UploadedFile]:
     cfg = get_upload_config()
     if not cfg.enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="upload disabled")
+    if not file:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="no file provided")
 
-    # 限制：单文件大小
-    data = await file.read()
-    if len(data) > cfg.max_file_size_bytes:
-        raise FileSizeExceeded(
-            f"file {len(data)//1024//1024}MB exceeds limit "
-            f"{cfg.max_file_size_mb}MB",
-        )
-
-    # 限制：单会话文件数
+    # 限制：单会话文件数（按"已有数 + 本次批量数"一次性校验，避免逐个插时超量）
     db = get_uploads_db()
-    if db.count_by_session(user_id, agent_id, session_id) >= cfg.max_files_per_session:
-        raise TooManyFiles(
-            f"session {session_id!r} exceeds {cfg.max_files_per_session} files",
-        )
+    existing = db.count_by_session(user_id, agent_id, session_id)
 
-    # 落盘 + 转换 + DB 记录（与 context.custom_params.additional_urls 下载共用
-    # _persist_uploaded_bytes，保证两条路径行为一致）
-    try:
-        return await _persist_uploaded_bytes(
-            user_id=user_id,
-            agent_id=agent_id,
-            session_id=session_id,
-            storage=storage,
-            workspace_manager=workspace_manager,
-            original_name=file.filename or "file",
-            data=data,
-            content_type=file.content_type,
-        )
-    except UploadError as e:
-        _raise_upload_error(e)
-        raise  # pragma: no cover —— _raise_upload_error 必然抛 HTTPException
+    results: list[UploadedFile] = []
+    for upload in file:
+        # 限制：单文件大小
+        data = await upload.read()
+        if len(data) > cfg.max_file_size_bytes:
+            raise FileSizeExceeded(
+                f"file {upload.filename!r} {len(data)//1024//1024}MB exceeds "
+                f"limit {cfg.max_file_size_mb}MB",
+            )
+        if existing + len(results) >= cfg.max_files_per_session:
+            raise TooManyFiles(
+                f"session {session_id!r} exceeds {cfg.max_files_per_session} files",
+            )
+
+        # 落盘 + 转换 + DB 记录（与 context.custom_params.additional_urls 下载共用
+        # _persist_uploaded_bytes，保证两条路径行为一致）
+        try:
+            record = await _persist_uploaded_bytes(
+                user_id=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                storage=storage,
+                workspace_manager=workspace_manager,
+                original_name=upload.filename or "file",
+                data=data,
+                content_type=upload.content_type,
+                auto_parse=auto_parse,
+            )
+        except UploadError as e:
+            _raise_upload_error(e)
+            raise  # pragma: no cover —— _raise_upload_error 必然抛 HTTPException
+        results.append(record)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
