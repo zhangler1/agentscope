@@ -6,7 +6,7 @@
 不绑定任何具体配置段。``summarization`` 等配置段通过本层按不同 ``config_key`` 存取，
 新增配置段只需新增一个 ``config_key``，不改表结构。
 
-存储模式与 ``system_prompt.py`` / ``memory_config.py`` 一致：懒加载独立 async
+存储模式与 ``system_prompt.py`` 等配置段一致：懒加载独立 async
 engine + 幂等建表 + 纯 ``text`` SQL，绕过框架表管理与 Alembic 迁移。payload 以
 JSON 字符串落库 **TEXT 列**（代码层 ``json.dumps/loads`` 序列化；不用原生 JSON
 类型以兼容 OceanBase 3.x / MySQL / PG / SQLite 全场景）。

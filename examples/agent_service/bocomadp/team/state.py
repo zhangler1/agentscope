@@ -31,7 +31,12 @@ NodeStatus = Literal[
     "failed",
 ]
 FlowStatus = Literal["running", "completed", "failed", "cancelled"]
-LeaderPhase = Literal["first", "final", "failed_summary"]
+LeaderPhase = Literal[
+    "first",
+    "worker_failed",
+    "final",
+    "failed_summary",
+]
 
 
 class ResultRef(BaseModel):
@@ -82,6 +87,9 @@ class WorkflowLeaderState(BaseModel):
     last_error: str | None = None
     resume_requested: bool = False
     dispatched: bool = False
+    failed_stage_index: int | None = None
+    failed_nodes: list[str] = Field(default_factory=list)
+    failed_errors: dict[str, str] = Field(default_factory=dict)
 
 
 class WorkflowState(BaseModel):

@@ -1,156 +1,140 @@
 # -*- coding: utf-8 -*-
-"""记忆平台 HTTP 客户端：REQ_MESSAGE 表单信封 + 三接口调用与响应判定。
+"""EUVD 记忆平台 SDK 门面：连接管理与三接口调用。
 
-传输：``x-www-form-urlencoded``，JSON 信封放 ``REQ_MESSAGE`` 字段；请求头
-``Jumpcloud-Env: BASE``；Cookie 不传。平台接口（契约 docs/记忆.txt）：
+职责边界：请求构造唯一经 :mod:`memory.mapping`（单一真源），本层只管
+SDK 客户端生命周期与响应判定——三方法均接收已构造好的请求对象。SDK 为
+同步 requests 实现，调用统一 ``asyncio.to_thread`` 包装，避免阻塞事件循环。
 
-- 注册 ``/registerAgent.do``：TRAN_SUCCESS=="1" 且 result.caller 非空才成功
-- 检索 ``/searchMemory.do``：TRAN_SUCCESS=="1"，返回 result 记忆条目列表
-- 录入 ``/saveMemoriesStandard.do``：RSP_BODY.result == "success"
+异常约定（不引入自定义包装类）：全模块唯一对外异常类型为 SDK 原生的
+:class:`MemoriesSdkError`（经本模块 re-export，调用方
+``from memory.platform import MemoriesSdkError`` 捕获即可）：
 
-接口地址完整 URL（不拼接）来自 ``config.memory.{register,retrieve,extract}_url``
-（config.yaml ``memory:`` 节点，见 Task 6）；本模块通过 ``_get_url`` 选择配置键。
+- SDK 传输/HTTP 层异常（``MemoriesTimeoutError`` / ``MemoriesApiError``
+  等子类）直接向上抛、不二次包装，``raw_response`` / ``status_code``
+  等属性原样保留；
+- ``resp.success`` 为假 → :class:`MemoriesSdkError`（错误信息在
+  ``resp.error``，本模块构造的消息统一 ``memory`` 前缀）；
+- 注册：``resp.result`` 取 ``caller``（驼峰转下划线后键名不变），空则
+  :class:`MemoriesSdkError`；
+- 检索：``resp.result`` 为记忆条目列表（无则空列表）；
+- 录入：``resp.result == "success"``。
 """
 from __future__ import annotations
 
-import json
-import logging
+import asyncio
 from typing import Any
 
-import httpx
+from euvd_memory_pysdk import MemoriesClient, MemoriesClientConfig
+from euvd_memory_pysdk.exceptions import MemoriesSdkError
+from euvd_memory_pysdk.models import (
+    RegisterAgentRequest,
+    SaveMemoriesStandardRequest,
+    SearchMemoryRequest,
+)
 
-from bocomadp.config import get_app_config
+from .settings import MemorySettings, get_settings
 
-logger = logging.getLogger("as")
-
-# 接口名 → AppConfig.memory 中的完整 URL 配置键
-_URL_CONFIG_KEYS = {
-    "register": "register_url",
-    "retrieve": "retrieve_url",
-    "extract": "extract_url",
-}
-
-
-class PlatformError(RuntimeError):
-    """平台接口调用失败（HTTP 错误 / TRAN_SUCCESS!=1 / result!=success / 未配置）。"""
+_client: MemoriesClient | None = None
 
 
-def _get_url(name: str) -> str:
-    """返回平台接口完整 URL；未配置抛 PlatformError（测试中可 monkeypatch）。"""
-    memory_cfg = getattr(get_app_config(), "memory", None)
-    key = _URL_CONFIG_KEYS[name]
-    url = getattr(memory_cfg, key, "") if memory_cfg is not None else ""
-    if not url:
-        raise PlatformError(f"memory.{key} 未配置")
-    return url
+def _client_cfg(settings: MemorySettings | None = None) -> MemoriesClientConfig:
+    """MemorySettings → MemoriesClientConfig。
 
-
-def _timeout_seconds() -> float:
-    """平台请求超时：config.memory.request_timeout_seconds（缺省 30s）。"""
-    memory_cfg = getattr(get_app_config(), "memory", None)
-    timeout = (
-        getattr(memory_cfg, "request_timeout_seconds", None)
-        if memory_cfg is not None
-        else None
-    )
-    return float(timeout or 30)
-
-
-def _headers() -> dict[str, str]:
-    return {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Jumpcloud-Env": "BASE",
-    }
-
-
-async def _post_form(url: str, param: dict[str, Any]) -> dict[str, Any]:
-    """POST REQ_MESSAGE 表单信封，返回响应 JSON。
-
-    信封结构（与项目内 online_search/raw_request 一致）：
-    ``{"REQ_HEAD": {"TRAN_PROCESS": "", "TRAN_ID": ""}, "REQ_BODY": {"param": param}}``
-
-    调试：请求参数与响应**原始报文**（未解析文本）以 DEBUG 级别输出，
-    便于核对平台契约与联调（正式环境日志级别 INFO 时不输出）。
+    ``environment`` 显式传入并由 SDK 校验（合法值 sit/uat/uat2/prd，非法值
+    直接 raise）；超时 / 连接池 / headers 显式 override；凭证等其余项交给
+    ``from_env`` 的 ``EUVD_MEMORIES_*`` 环境变量链。构造失败（缺关键配置
+    或 environment 非法）由 SDK 向上抛——fail-fast。
     """
-    envelope = {
-        "REQ_HEAD": {"TRAN_PROCESS": "", "TRAN_ID": ""},
-        "REQ_BODY": {"param": param},
+    s = settings or get_settings()
+    overrides: dict[str, Any] = {
+        "connect_timeout": s.connect_timeout_seconds,
+        "read_timeout": s.read_timeout_seconds,
+        "pool_connections": s.pool_connections,
+        "pool_maxsize": s.pool_maxsize,
     }
-    request_json = json.dumps(envelope, ensure_ascii=False)
-    try:
-        async with httpx.AsyncClient(timeout=_timeout_seconds()) as client:
-            resp = await client.post(
-                url,
-                data={"REQ_MESSAGE": request_json},
-                headers=_headers(),
-            )
-            # 先读原始报文再 raise：HTTP 错误响应也要能看到原始输出
-            raw_text = resp.text
-            logger.debug(
-                "memory: platform request url=%s envelope=%s",
-                url,
-                request_json,
-            )
-            logger.debug(
-                "memory: platform response url=%s status=%s raw=%s",
-                url,
-                resp.status_code,
-                raw_text,
-            )
-            resp.raise_for_status()
-            try:
-                return json.loads(raw_text)
-            except (json.JSONDecodeError, TypeError):
-                raise PlatformError(
-                    f"platform response not json: status={resp.status_code} "
-                    f"body={raw_text[:500]!r}",
-                ) from None
-    except Exception as exc:  # noqa: BLE001 — 统一转为 PlatformError
-        logger.debug(
-            "memory: platform request failed url=%s param=%s err=%s",
-            url,
-            json.dumps(param, ensure_ascii=False),
-            exc,
+    if s.headers:
+        overrides["headers"] = dict(s.headers)
+    return MemoriesClientConfig.from_env(
+        environment=(s.environment or None), **overrides
+    )
+
+
+def get_client() -> MemoriesClient:
+    """返回已启动的 SDK 客户端；未启动抛 MemoriesSdkError（fail-fast）。"""
+    if _client is None:
+        raise MemoriesSdkError(
+            "memory: SDK client 未启动 — install_memory lifespan 或 start_client()"
         )
-        raise PlatformError(f"platform request failed: {exc}") from exc
+    return _client
 
 
-async def register_agent(param: dict[str, Any]) -> str:
-    """注册接口：TRAN_SUCCESS=="1" 且返回 caller；成功返回 caller。"""
-    resp = await _post_form(_get_url("register"), param)
-    if resp.get("RSP_HEAD", {}).get("TRAN_SUCCESS") != "1":
-        raise PlatformError(f"register failed: {resp}")
-    result = resp.get("RSP_BODY", {}).get("result") or {}
-    if isinstance(result, list):
+async def start_client(settings: MemorySettings | None = None) -> None:
+    """启动 SDK 客户端（幂等：重复调用先关旧再建新）。"""
+    global _client
+    cfg = await asyncio.to_thread(_client_cfg, settings)
+    new_client = await asyncio.to_thread(MemoriesClient, cfg)
+    old = _client
+    _client = new_client
+    if old is not None:
+        old.close()
+
+
+async def close_client() -> None:
+    """关闭 SDK 客户端（幂等）。"""
+    global _client
+    old, _client = _client, None
+    if old is not None:
+        old.close()
+
+
+async def register_agent(request: RegisterAgentRequest) -> str:
+    """注册智能体；成功返回 caller（存 Record.caller，只存不发）。"""
+    resp = await asyncio.to_thread(get_client().register_agent, request)
+    if not resp.success:
+        raise MemoriesSdkError(
+            f"memory register failed: {resp.error} tid={resp.tid}"
+        )
+    result = resp.result or {}
+    if isinstance(result, list):  # 平台可能回 list 包装
         result = result[0] if result else {}
-    caller = result.get("caller") or ""
+    caller = (result.get("caller") or "") if isinstance(result, dict) else ""
     if not caller:
-        raise PlatformError(f"register response missing caller: {resp}")
+        raise MemoriesSdkError(
+            f"memory register response missing caller: {result!r} tid={resp.tid}"
+        )
     return caller
 
 
-async def search_memory(param: dict[str, Any]) -> list[dict[str, Any]]:
-    """检索接口：TRAN_SUCCESS=="1"；返回记忆条目列表（无则空列表）。"""
-    resp = await _post_form(_get_url("retrieve"), param)
-    if resp.get("RSP_HEAD", {}).get("TRAN_SUCCESS") != "1":
-        raise PlatformError(f"search failed: {resp}")
-    result = resp.get("RSP_BODY", {}).get("result") or []
+async def search_memory(request: SearchMemoryRequest) -> list[dict]:
+    """检索记忆；返回记忆条目列表（无则空列表）。"""
+    resp = await asyncio.to_thread(get_client().search_memory, request)
+    if not resp.success:
+        raise MemoriesSdkError(
+            f"memory search failed: {resp.error} tid={resp.tid}"
+        )
+    result = resp.result or []
     return result if isinstance(result, list) else []
 
 
-async def save_memories(param: dict[str, Any]) -> None:
-    """录入接口：RSP_BODY.result == "success" 判定。"""
-    resp = await _post_form(_get_url("extract"), param)
-    result = resp.get("RSP_BODY", {}).get("result")
-    if result != "success":
-        raise PlatformError(f"save failed: {resp}")
+async def save_memories(request: SaveMemoriesStandardRequest) -> None:
+    """录入记忆；``resp.result == "success"`` 判定。"""
+    resp = await asyncio.to_thread(get_client().save_memory_standard, request)
+    if not resp.success:
+        raise MemoriesSdkError(
+            f"memory save failed: {resp.error} tid={resp.tid}"
+        )
+    if resp.result != "success":
+        raise MemoriesSdkError(
+            f"memory save result != success: {resp.result!r} tid={resp.tid}"
+        )
 
 
 __all__ = [
-    "PlatformError",
+    "MemoriesSdkError",
+    "get_client",
+    "start_client",
+    "close_client",
     "register_agent",
     "search_memory",
     "save_memories",
-    "_get_url",
-    "_post_form",
 ]
