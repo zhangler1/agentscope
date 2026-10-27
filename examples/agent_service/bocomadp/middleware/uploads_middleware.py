@@ -27,10 +27,6 @@ except Exception:  # pragma: no cover - agentscope 不可用时降级（如纯�
     class MiddlewareBase:  # type: ignore
         """最小兜底基类：仅在 AgentScope 不可用时使用，保证可导入与单测。"""
 
-        async def on_reply(self, agent, input_kwargs, next_handler):
-            async for event in next_handler():
-                yield event
-
         async def on_model_call(self, agent, input_kwargs, next_handler):
             return await next_handler()
 

@@ -219,20 +219,27 @@ def _row_to_view(
     entry: AgentMarketEntry | None,
     heat: int,
 ) -> MarketAgentView:
-    # payload 存储契约见 _market_agent_rows docstring：名称/提示词嵌在
-    # payload["data"] 下（AgentData.name / AgentData.system_prompt）；
+    # payload 存储契约见 _market_agent_rows docstring：名称/简介/提示词嵌在
+    # payload["data"] 下（AgentData.name / description / system_prompt）；
     # get("data", {}) 兜底防御历史脏数据。
+    #
+    # ``description`` 取**智能体自身**的简介
+    # （``agents.payload.data.description``，创建/编辑时作者填的那份）；
+    # **不取**发布档案里的 ``agent_market.description``——那是审批弹窗的
+    # 用途说明，市场卡片要展示的是智能体作者的介绍。
+    # ``department`` / ``system_name`` 智能体侧没有对应字段，仍取发布档案；
+    # ``tag``（业务条线）同理。
     data = row.payload.get("data", {}) if isinstance(row.payload, dict) else {}
     e = entry or AgentMarketEntry(agent_id=row.id)
     return MarketAgentView(
         id=row.id,
         name=str(data.get("name", "")),
+        description=str(data.get("description", "")),
         system_prompt=str(data.get("system_prompt", "")),
         source=row.source,
         tag=e.tag,  # 名单内必有行；空串 = 未打标（业务条线随发布带入）
         department=e.department,
         system_name=e.system_name,
-        description=e.description,
         heat=heat,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -634,8 +641,9 @@ async def publish_market_agent(
     **不再直接上架**——审批人通过（approve）后才插 ``agent_market``
     名单行。幂等口径：
 
-    - 已在市场（审批通过上架 / 平台内置手动上架）→ 幂等返回 approved，
-      不重复审批（上架后内容锁定，无"变更重审"概念）；
+    - 已在市场（审批通过上架 / 平台内置手动上架）→ 先下架（删市场行）
+      再进 pending：任何配置变更（本体 / 技能 / 工具等）重新发布都走
+      重审，未审核的新配置不继续在市场展示，审过才重新上架；
     - 已 pending → 幂等返回当前申请（前端连点不报错、不建重复记录），
       **表单字段照常覆盖**（改完弹窗再点发布，存的信息要最新）；
     - rejected → 重置回 pending 并清空旧结论（reason/reviewer 作废）；
@@ -653,24 +661,20 @@ async def publish_market_agent(
 
     existing = await get_market_entry(storage, agent_id)
     if existing is not None:
+        # 已在市场：重新发布 = 先下架（市场行移除），再进审批 pending，
+        # 避免未审核的新配置（含技能 / 工具等）继续在市场展示，审过才重新上架。
+        await delete_market_entry(storage, agent_id)
         log_audit(
             user_id,
-            "publish_agent_market",
+            "unpublish_agent_market",
             target=agent_id,
-            detail="重复发布（已在市场，幂等返回 approved）",
-        )
-        return MarketPublishStatusView(
-            agent_id=agent_id,
-            status=STATUS_APPROVED,
-            applicant=record.user_id,
-            created_at=existing.created_at,
-            updated_at=existing.updated_at,
+            detail="重新发布：先下架等待重新审批",
         )
 
     review = await upsert_pending_review(
         storage,
         agent_id,
-        user_id,
+        body.user_name,
         meta={
             "department": body.department.strip(),
             "system_name": body.system_name.strip(),
@@ -765,8 +769,9 @@ async def list_market_reviews(
     keyword: str | None = Query(
         default=None,
         description=(
-            "模糊搜索（单字段双列 OR）：智能体名称 **或** 提交人 "
-            "（applicant user_id）任一包含即命中，大小写不敏感。"
+            "模糊搜索（单字段双列 OR）：智能体名称 **或** 申请人姓名 "
+            "（applicant）任一包含即命中，大小写不敏感；只按姓名匹配，"
+            "不按 user_id 匹配。"
         ),
     ),
     page_num: int = Query(
@@ -790,10 +795,10 @@ async def list_market_reviews(
     - ``status``：不传/传 all = 全部三种状态（按**提交时间倒序**，
       最近的申请在前）；pending = 待办（先到先审，申请时间正序）；
       approved/rejected = 已办（按审批时间倒序，最近处理在前）。
-    - ``keyword``：名称/提交人二选一模糊匹配（SQL 语义
+    - ``keyword``：名称/申请人姓名二选一模糊匹配（SQL 语义
       ``name LIKE %kw% OR applicant LIKE %kw%``）——实现沿用本模块
-      "两步小查询"风格：审批表按提交人过滤 + agents 名称内存过滤，
-      不写 SQL JOIN/OR。
+      "两步小查询"风格：审批表按申请人姓名过滤 + agents 名称内存过滤，
+      不写 SQL JOIN/OR；只按姓名匹配，不按 user_id 匹配。
     - ``status_counts``：各状态全量计数（不随筛选变化），顶部统计卡
       一次拿全，前端不用再调四次。
     """
@@ -841,7 +846,7 @@ async def list_market_reviews(
             else {}
         )
         name = str(data.get("name", ""))
-        # 模糊搜索：名称 OR 提交人任一包含即命中（单字段双列 OR）
+        # 模糊搜索：智能体名称 OR 申请人姓名任一包含即命中（单字段双列 OR）
         if kw and kw not in name.lower() and kw not in e.applicant.lower():
             continue
         items.append(

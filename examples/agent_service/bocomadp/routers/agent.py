@@ -22,7 +22,6 @@ from agentscope.app.deps import (
     get_resource_access_service,
     get_session_service,
     get_storage,
-    get_workspace_manager,
 )
 from bocomadp.routers._schema.agent import (
     AgentSchemaResponse,
@@ -49,6 +48,11 @@ from agentscope.app.storage import (
     AgentData,
     AgentRecord,
     InviteConfig,
+)
+from bocomadp.agent_template_store import get_template_entry
+from bocomadp.agents_extend_store import (
+    delete_agent_extend,
+    ensure_agent_extend_row,
 )
 from bocomadp.team_store import (
     ExpertTeamRelation,
@@ -536,6 +540,11 @@ async def create_agent(
 ) -> CreateAgentResponse:
     """Create and persist a new agent configuration.
 
+    创建成功后**在 ``agents_extend`` 里预置一行**（``payload = {"skills": []}``）：
+    新智能体必定没有已装技能，先落空记录可让 ``GET /workspace/skill`` 直接
+    命中表、不必回源沙箱；该写入是尽力而为（失败只打 warning，读侧会回源
+    并写回），不影响创建结果。
+
     When ``body.parent_agent_id`` is set, the new agent is created as a
     member of that leader's expert team: its ``data.parent_agent_id`` is
     stamped and the leader's ``team_config.member_ids`` is extended with
@@ -620,6 +629,20 @@ async def create_agent(
     record = AgentRecord(user_id=user_id, data=data)
     agent_id = await storage.upsert_agent(user_id, record)
 
+    # 预置一行 agents_extend（payload.skills = []）：新智能体没有任何已装
+    # 技能，先落一条空记录，让 GET /workspace/skill 直接命中表，不必解析
+    # 会话 → 路由 Pod → exec 列举（Pod 不可用时那条路径会失败）。
+    # **尽力而为**：写失败只打 warning —— 读侧找不到记录会自动回源沙箱并
+    # 写回（等同于旧行为），不能为一条缓存把已建好的智能体变成 500。
+    try:
+        await ensure_agent_extend_row(storage, agent_id, source="agent-create")
+    except Exception:  # noqa: BLE001 —— 缓存预置失败不影响创建主流程
+        logger.warning(
+            "create_agent: failed to preset agents_extend row for %s",
+            agent_id,
+            exc_info=True,
+        )
+
     if body.is_team and parent_id is None:
         # Create an empty team "shell" so the agent is already classified
         # as an expert-team leader in listings (is_team=true) before any
@@ -643,7 +666,7 @@ async def create_agent(
     "/{agent_id}/copy",
     response_model=CopyAgentResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Copy an agent (payload + skills)",
+    summary="Copy an agent (payload only)",
 )
 async def copy_agent(
     agent_id: str,
@@ -651,30 +674,34 @@ async def copy_agent(
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     access: ResourceAccessService = Depends(get_resource_access_service),
-    workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
 ) -> CopyAgentResponse:
-    """复制智能体**本体**（``AgentData``）与**已安装技能**。
+    """复制智能体**本体**（``AgentData``）。
 
     复制范围：
 
     - **复制**：``name`` / ``description`` / ``system_prompt`` /
       ``context_config`` / ``react_config`` / ``invite_config``
       （``invite_config`` **原样**复制——``invitable`` 与
-      ``invite_description`` 都保留）；``body.copy_skills=True`` 时，
-      还会把源智能体 workspace 里 ``skills/`` 的**全部技能整包**搬到
-      目标智能体（K8s 沙箱部署下 3 次沙箱往返，与技能数无关）；
-    - **不复制**：工具/MCP 启停白名单、知识库配置、专家团（成员 / 团队
-      档案 / handoff）、市场名单、记忆配置、沙箱并发配置、凭证绑定。
+      ``invite_description`` 都保留）；
+    - **不复制**：已安装技能（技能按会话存在 workspace 里，不属于智能体
+      配置）、工具/MCP 启停白名单、知识库配置、专家团（成员 / 团队档案 /
+      handoff）、市场名单、记忆配置、沙箱并发配置、凭证绑定。
+
+    响应里的 ``skills`` 取自**源**智能体在 ``agent_template`` 名单里的
+    那一行（``agent_template.skills``，元素形如 ``namespace:name``），
+    即"该模板期望安装的技能清单"：本端点只**返回清单**，不代为安装。
+    源不在模板名单内（或存储层不可用）时为空列表——注意这**不是**权限
+    判断，复制本身仍是"可读即可复制"。
 
     因此复制品的默认状态是：``is_team=False``、``parent_agent_id=None``、
-    工具与 MCP 全部启用（新 id 在白名单里没有条目）、无知识库配置 /
-    无记忆、并发走默认值、模型凭证走运行时兜底解析。
+    无技能、工具与 MCP 全部启用（新 id 在白名单里没有条目）、无知识库
+    配置 / 无记忆、并发走默认值、模型凭证走运行时兜底解析。
 
-    技能复制是**尽力而为**：任何失败（沙箱不可用、超时、打包失败…）
-    都不影响本体复制，仍返回 201，失败原因写进服务端日志
-    （``copy_agent: <new_id> warn: ...``）；源智能体没有技能时直接跳过
-    （不会为目标拉起沙箱）。本地模式（``ADP_K8S_ENABLED=false``）技能按
-    会话存储，同样跳过并记日志。
+    复制成功后会像 ``POST /agent/`` 一样**在 ``agents_extend`` 里预置一行**
+    （``payload = {"skills": []}``）：复制品此刻确实没有已装技能，预置空行可
+    让 ``/skills/*`` 查询与 ``GET /workspace/skill`` 不必回源沙箱；随后前端
+    调 ``/skill/ensure`` 装的技能会逐条写穿到这一行。该写入是尽力而为（失败
+    只打 warning，读侧会回源沙箱），不影响复制结果。
 
     权限：可读即可复制（:meth:`ResourceAccessService.resolve_agent`），
     不可见 → 404。命名：``body.name`` 缺省为 ``"<源名> 副本"``，允许与
@@ -684,21 +711,20 @@ async def copy_agent(
         agent_id (`str`):
             源智能体 id。
         body (`CopyAgentRequest`):
-            复制参数（新名字、是否复制技能）。
+            复制参数（新名字）。
         user_id (`str`):
             Injected authenticated user ID（复制品归属该用户）。
         storage (`StorageBase`):
             Injected storage backend.
         access (`ResourceAccessService`):
             Injected resource access service（可见性校验 + 取源记录）。
-        workspace_manager (`WorkspaceManagerBase`):
-            Injected workspace manager（取源 / 目标沙箱句柄搬技能）。
 
     Returns:
         `CopyAgentResponse`:
             新智能体的完整视图——与 ``GET /agent/`` 列表元素、``PATCH``
-            响应**同构**的 :class:`TeamAgentView`，可直接插进前端列表。
-            不返回技能名单 / 告警，那些只进日志。
+            响应**同构**的 :class:`TeamAgentView`，可直接插进前端列表；
+            额外带 ``agent_id``（与 ``id`` 同值）与 ``skills``（源模板行
+            声明的技能清单）。
 
     Raises:
         `HTTPException`:
@@ -719,43 +745,28 @@ async def copy_agent(
         AgentRecord(id=new_id, user_id=user_id, data=AgentData(**payload)),
     )
 
-    copied_skills: list[str] = []
-    warnings: list[str] = []
-
-    # 技能搬运：尽力而为，失败只降级为 warning（本体已经落库，不回收）。
-    if body.copy_skills:
-        from bocomadp.workspace import is_k8s_enabled
-
-        if is_k8s_enabled():
-            from .skill_router import copy_agent_skills
-
-            copied_skills, skill_warnings = await copy_agent_skills(
-                user_id,
-                agent_id,
-                new_id,
-                workspace_manager,
-            )
-            warnings.extend(skill_warnings)
-        else:
-            warnings.append(
-                "skills: 本地模式技能按会话存储，已跳过技能复制。",
-            )
-            logger.info(
-                "copy_agent: skipped skill copy (non-k8s workspace mode)",
-            )
+    # 预置一行 agents_extend（payload.skills = []），与 POST /agent/ 完全一致：
+    # 复制品当前**没有任何已装技能**（响应里的 ``skills`` 只是源模板声明的
+    # 清单，由前端随后调 /skill/ensure 安装；装成后 ensure 会逐条写穿本表，
+    # 见 skill_router._record_installed_skill）。不预置的话，复制品属于
+    # "无记录"，两个 /skills/* 查询每次都要回源沙箱（申请 Pod）。
+    # 尽力而为：写失败只打 warning —— 读侧找不到记录时仍会回源沙箱。
+    try:
+        await ensure_agent_extend_row(storage, new_id, source="agent-copy")
+    except Exception:  # noqa: BLE001 —— 缓存预置失败不影响复制主流程
+        logger.warning(
+            "copy_agent: failed to preset agents_extend row for %s",
+            new_id,
+            exc_info=True,
+        )
 
     logger.info(
-        "copy_agent: %s → %s (by=%s, name=%r, skills=%d, warnings=%d)",
+        "copy_agent: %s → %s (by=%s, name=%r)",
         agent_id,
         new_id,
         user_id,
         payload["name"],
-        len(copied_skills),
-        len(warnings),
     )
-    # 复制过程信息不再随响应返回，只在日志里留痕（便于排障）。
-    for item in warnings:
-        logger.warning("copy_agent: %s warn: %s", new_id, item)
 
     # 响应 = 新智能体的完整视图（与 GET /agent/ 列表元素、PATCH 响应同构），
     # 前端可直接把它当成一个智能体对象插进列表，省一次 GET。
@@ -768,7 +779,18 @@ async def copy_agent(
             detail="Copied agent was not persisted.",
         )
     view = await _to_team_view(storage, user_id, stored)
-    return CopyAgentResponse(**view.model_dump(), agent_id=new_id)
+
+    # 模板声明的技能清单：``agent_template`` 里**源**智能体那一行的
+    # ``skills``（"该模板期望安装的技能"，元素 namespace:name）。只透出
+    # 清单、不代为安装；不在名单内 / 存储层不可用 → 空列表。
+    template = await get_template_entry(storage, agent_id)
+    template_skills = list(template.skills) if template is not None else []
+
+    return CopyAgentResponse(
+        **view.model_dump(),
+        agent_id=new_id,
+        skills=template_skills,
+    )
 
 
 @agent_router.patch(
@@ -887,6 +909,10 @@ async def delete_agent(
     不清理会留下孤儿档案（指向已删智能体的死数据）。团队成员级联删除
     等绕过本接口的路径，由启动时 ``prune_orphan_market_entries`` 兜底。
 
+    同时**级联清理扩展表记录**（``agents_extend`` 行，见
+    :func:`bocomadp.agents_extend_store.delete_agent_extend`），与创建接口
+    预置空记录成对，不留孤儿行；该清理失败只打 warning，不影响删除结果。
+
     Args:
         agent_id (`str`): The agent to delete.
         user_id (`str`): Injected authenticated user ID.
@@ -895,7 +921,7 @@ async def delete_agent(
             to resolve the owning user and enforce the edit permission
             when a shared editor deletes the agent.
         storage (`StorageBase`): Injected storage — used to cascade the
-            agent-market entry.
+            agent-market entry and the ``agents_extend`` row.
 
     Raises:
         `HTTPException`: 404 if the agent is not visible to the caller;
@@ -932,6 +958,17 @@ async def delete_agent(
             "delete_agent_review",
             target=agent_id,
             detail="删除智能体级联清理发布审批记录",
+        )
+    # 扩展表（agents_extend）级联清理：不留指向已删智能体的孤儿行
+    # （读侧只在活智能体上查询，孤儿行无害但会一直占着；同步清理比
+    # 依赖启动扫描更及时）。失败同样不影响删除主流程。
+    try:
+        await delete_agent_extend(storage, agent_id)
+    except Exception:  # noqa: BLE001 —— 缓存清理失败不影响删除结果
+        logger.warning(
+            "delete_agent: failed to drop agents_extend row for %s",
+            agent_id,
+            exc_info=True,
         )
 
 
