@@ -115,6 +115,70 @@ class FakeRedis:
                     removed += 1
         return removed
 
+    async def expire(self, key: str, seconds: int) -> bool:
+        """TTL 不跟踪（测试替身）；真实 Redis 会按 TTL 清理 key。"""
+        del key, seconds
+        return True
+
+    def _decr_floor(self, key: str) -> int:
+        """DECR 并保底 0（与 Lua 的 decr_floor 同语义：计数不会退成负数）。"""
+        self._strings[key] = self._strings.get(key, 0) - 1
+        if self._strings[key] < 0:
+            self._strings[key] = 0
+        return self._strings[key]
+
+    def _pop_hash_field(self, key: str, field: str) -> str | None:
+        """删除哈希字段（hash 空了整体删除，模拟真实 Redis 语义）。"""
+        h = self._hashes.get(key)
+        if h is None or field not in h:
+            return None
+        value = h.pop(field)
+        if not h:
+            del self._hashes[key]
+        return value
+
+    async def _eval_release(self, args: tuple[str, ...]) -> int:
+        """模拟 ``_RELEASE_SESSION_LUA``：run 结束释放名额。
+
+        返回 1=已释放登记名额, 2=登记尚未发生(记提前结束标记), 0=无占位。
+        """
+        key, sid = args[0], args[1]
+        sess_agent_key = "agentscope:running:session_agent"
+        pend_key = f"agentscope:running:pending:{sid}"
+        early_key = f"agentscope:running:early:{sid}"
+        value = (self._hashes.get(key) or {}).get(sid)
+        if value is not None:
+            self._pop_hash_field(key, sid)
+            self._decr_floor("agentscope:running:global")
+            base = value.removesuffix(":seen")
+            m = re.match(r"^(.+):\d+:\w+$", base) or re.match(r"^(.+):\d+$", base)
+            if m:
+                self._decr_floor(f"agentscope:running:user:{m.group(1)}")
+            old_aid = self._pop_hash_field(sess_agent_key, sid)
+            if old_aid:
+                self._decr_floor(f"agentscope:running:agent:{old_aid}")
+            self._strings.pop(pend_key, None)
+            return 1
+        pend = self._strings.get(pend_key)
+        if pend is not None and int(pend) > 0:
+            self._strings[early_key] = "1"
+            return 2
+        return 0
+
+    async def _eval_rollback(self, args: tuple[str, ...]) -> int:
+        """模拟 ``_ROLLBACK_SESSION_LUA``：回滚本轮占位（全量退 + 保底 0）。"""
+        key, sid, user_id, agent_id = args[0], args[1], args[2], args[3]
+        self._decr_floor("agentscope:running:global")
+        if user_id:
+            self._decr_floor(f"agentscope:running:user:{user_id}")
+        if agent_id:
+            self._decr_floor(f"agentscope:running:agent:{agent_id}")
+        self._pop_hash_field(key, sid)
+        self._pop_hash_field("agentscope:running:session_agent", sid)
+        self._strings.pop(f"agentscope:running:pending:{sid}", None)
+        self._strings.pop(f"agentscope:running:early:{sid}", None)
+        return 1
+
     async def zadd(self, key: str, mapping: dict[str, float]) -> int:
         z = self._zsets.setdefault(key, {})
         added = 0
@@ -161,17 +225,47 @@ class FakeRedis:
     async def eval(self, script: str, numkeys: int, *args: str) -> int:
         """模拟 ConcurrencyGuard 使用的 Lua 脚本。
 
+        - ``_RELEASE_SESSION_LUA``:run 结束释放名额——已登记则清登记并退
+          三维计数(返回 1);仅占位未登记则记提前结束标记(返回 2)。
+        - ``_ROLLBACK_SESSION_LUA``:回滚本轮占位——全量退三维计数并清
+          待转正/提前结束标记。
         - ``_REGISTER_LUA``(含 HSET):条件注册——旧条目存在且锁 key 消失
-          则先释放旧名额再覆盖写入,返回 1;否则直接覆盖,返回 0。
+          则先释放旧名额再覆盖写入,返回 1;run 提前结束则退占位不写入,
+          返回 2;否则直接覆盖,返回 0。
         - ``_RECONCILE_LUA``(含 HGETALL,不含 HSET):整体对账——遍历注册表,
           判锁 → 判定候选(seen 立即 / grace 兜底)→ HDEL + DECR global +
           DECR user 原子,返回清理条数。
         无法识别的脚本抛 NotImplementedError。
         """
+        if "ROLLBACK_SESSION" in script:
+            return await self._eval_rollback(args)
+        if "RELEASE_SESSION" in script:
+            return await self._eval_release(args)
         if "HSET" in script:
-            # _REGISTER_LUA:KEYS[1]=注册表, ARGV[1]=sid, ARGV[2]=新value,
-            # ARGV[3]=锁 key 前缀
+            # _REGISTER_LUA:KEYS[1]=注册表, ARGV=[sid, 新value, 锁key前缀,
+            # agent_id, user_id](伴随哈希 session_agent 同步维护 agent 维度计数)
             key, sid, new_value, lock_prefix = args[0], args[1], args[2], args[3]
+            agent_id = args[4] if len(args) > 4 else ""
+            user_id = args[5] if len(args) > 5 else ""
+            sess_agent_key = "agentscope:running:session_agent"
+            pend_key = f"agentscope:running:pending:{sid}"
+            early_key = f"agentscope:running:early:{sid}"
+            # 消费"待转正"计数
+            pend = self._strings.get(pend_key)
+            if pend is not None and int(pend) > 0:
+                if int(pend) <= 1:
+                    self._strings.pop(pend_key, None)
+                else:
+                    self._strings[pend_key] = int(pend) - 1
+            # run 提前结束(释放先于登记到达)→ 退掉本轮占位,不写登记
+            if early_key in self._strings:
+                del self._strings[early_key]
+                self._decr_floor("agentscope:running:global")
+                if user_id:
+                    self._decr_floor(f"agentscope:running:user:{user_id}")
+                if agent_id:
+                    self._decr_floor(f"agentscope:running:agent:{agent_id}")
+                return 2
             h = self._hashes.get(key)
             old = h.get(sid) if h is not None else None
             if old is not None:
@@ -179,9 +273,7 @@ class FakeRedis:
                 if lock_key not in self._strings and lock_key not in self._hashes:
                     # 旧条目存在且旧对话已结束(锁消失)→ 释放旧名额
                     del h[sid]
-                    self._strings["agentscope:running:global"] = (
-                        self._strings.get("agentscope:running:global", 0) - 1
-                    )
+                    self._decr_floor("agentscope:running:global")
                     m = re.match(r"^(.+):\d+:\w+$", old) or re.match(
                         r"^(.+):\d+$",
                         old,
@@ -193,11 +285,18 @@ class FakeRedis:
                             old.removesuffix(":seen"),
                         )
                     if m:
-                        user_key = f"agentscope:running:user:{m.group(1)}"
-                        self._strings[user_key] = self._strings.get(user_key, 0) - 1
+                        self._decr_floor(f"agentscope:running:user:{m.group(1)}")
+                    old_aid = self._pop_hash_field(sess_agent_key, sid)
+                    if old_aid:
+                        self._decr_floor(f"agentscope:running:agent:{old_aid}")
                     self._hashes.setdefault(key, {})[sid] = new_value
                     return 1
             self._hashes.setdefault(key, {})[sid] = new_value
+            sess_agent = self._hashes.setdefault(sess_agent_key, {})
+            if agent_id:
+                sess_agent[sid] = agent_id
+            else:
+                sess_agent.pop(sid, None)
             return 0
         if "HGETALL" not in script:
             raise NotImplementedError(f"unrecognized Lua script: {script!r}")
@@ -225,12 +324,12 @@ class FakeRedis:
             ts = float(m.group(2)) if m else 0.0
             if seen or grace <= 0 or (now - ts) >= grace:
                 del h[sid]
-                self._strings["agentscope:running:global"] = (
-                    self._strings.get("agentscope:running:global", 0) - 1
-                )
+                self._decr_floor("agentscope:running:global")
                 if uid:
-                    user_key = f"agentscope:running:user:{uid}"
-                    self._strings[user_key] = self._strings.get(user_key, 0) - 1
+                    self._decr_floor(f"agentscope:running:user:{uid}")
+                aid = self._pop_hash_field("agentscope:running:session_agent", sid)
+                if aid:
+                    self._decr_floor(f"agentscope:running:agent:{aid}")
                 cleaned += 1
         return cleaned
 

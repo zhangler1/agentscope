@@ -60,6 +60,9 @@ from bocomadp.config import (
     is_trace_correlation_enabled,
 )
 from bocomadp.concurrency.guard import ConcurrencyGuard
+from bocomadp.concurrency.memory_guard import MemoryGuard
+from bocomadp.concurrency.run_release import install_run_release
+from bocomadp import chat_concurrency_config
 from bocomadp.logging.logging_config import configure_logging
 from bocomadp.logging.trace_context import get_current_trace_id
 from bocomadp.logging.trace_middleware import TraceMiddleware
@@ -95,6 +98,7 @@ from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_chat_concurrency import agent_chat_concurrency_router
 from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
@@ -698,10 +702,6 @@ else:
         default_mcps=build_default_mcps(),
     )
 
-# 并发控制仅在生产 Redis 模式生效(InMemory 本地/测试模式零日志噪声)
-from agentscope.app.message_bus import RedisMessageBus as _RedisMessageBus
-
-_concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
@@ -719,18 +719,50 @@ workspace_manager = TeamWorkspaceManager(workspace_manager, storage)
 set_upload_dependencies(storage, workspace_manager)
 
 # ---------------------------------------------------------------------------
-# 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
+# 4.5 /chat 并发控制:三维闸机(用户/全局 + 智能体维度)
 # ---------------------------------------------------------------------------
 # Redis 客户端惰性获取:连接池由框架 lifespan 进入 message_bus 时创建,
 # get_client() 在进入前不可用,中间件运行期调用,失败即 fail-open。
 def _get_redis_client():
     return message_bus.get_client()
 
-concurrency_guard = ConcurrencyGuard(
-    _get_redis_client,
-    max_running=config.run_concurrency.max_running,
-    max_running_per_user=config.run_concurrency.max_running_per_user,
+# 用户/全局两维受平台总开关(run_concurrency.enabled)控制;智能体维度
+# "谁配置谁生效",不受总开关约束(未配置=不限,本身就是天然开关)。
+_base_dims_enabled = config.run_concurrency.enabled and (
+    config.run_concurrency.max_running > 0
+    or config.run_concurrency.max_running_per_user > 0
 )
+
+
+async def _agent_limit_provider(agent_id: str):
+    """智能体并发上限热路径查询:未配置返回 None = 不限。"""
+    return await chat_concurrency_config.runtime_get(agent_id)
+
+
+if isinstance(message_bus, RedisMessageBus):
+    # 生产:Redis 原子占位 + 注册表 + 入口对账(多实例安全)
+    concurrency_guard = ConcurrencyGuard(
+        _get_redis_client,
+        max_running=config.run_concurrency.max_running,
+        max_running_per_user=config.run_concurrency.max_running_per_user,
+        agent_limit_provider=_agent_limit_provider,
+    )
+else:
+    # 本地 InMemory 总线:dict 计数 + 进程内会话锁观察释放(单进程,
+    # 无需 Lua/对账,重启计数随 run 消亡自然归零)
+    from agentscope.app.message_bus import MessageBusKeys
+
+    async def _lock_checker(session_id: str) -> bool:
+        return await message_bus.is_locked(
+            MessageBusKeys.session_lock(session_id),
+        )
+
+    concurrency_guard = MemoryGuard(
+        max_running=config.run_concurrency.max_running,
+        max_running_per_user=config.run_concurrency.max_running_per_user,
+        agent_limit_provider=_agent_limit_provider,
+        lock_checker=_lock_checker,
+    )
 
 # ---------------------------------------------------------------------------
 # 5. 构建 App —— create_app 自动注册 12 个内置路由
@@ -799,12 +831,8 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
             ConcurrencyGuardMiddleware,
             guard=concurrency_guard,
             grace_secs=config.run_concurrency.grace_secs,
-            enabled=config.run_concurrency.enabled
-            and (
-                config.run_concurrency.max_running > 0
-                or config.run_concurrency.max_running_per_user > 0
-            )
-            and _concurrency_active,
+            enabled=_base_dims_enabled,
+            has_agent_config=chat_concurrency_config.has_any_config,
         ),
     ]
 
@@ -1017,6 +1045,12 @@ async def _lifespan_with_builtin_agents(app):
                 logger.info("pool concurrency configs synced to redis: %d", synced)
         except Exception as e:  # noqa: BLE001
             logger.warning("pool concurrency sync skipped: %s", e)
+        # /chat 并发上限配置回填运行时热层(PG → 缓存/Redis),并探测
+        # Redis 可用性;失败仅告警,闸机按"未配置=不限"放行。
+        try:
+            await chat_concurrency_config.load_runtime()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("chat concurrency config load skipped: %s", e)
         await _register_builtin_agents()
         # 专家团工具注入（workflow 严格交接 + AgentInvite 池回填）——
         # 原实现改 src/_service/_toolkit.py 的 get_toolkit，现搬迁到
@@ -1105,6 +1139,10 @@ async def _lifespan_with_builtin_agents(app):
         )
         patch_chat_service_run()
         patch_legacy_team_tools()
+        # /chat 并发名额的释放信号：run 结束（成功/失败/异常）即退名额。
+        # 锁观察只在 run 未走到 finally 时兜底（run 秒失败时锁只存在几毫秒，
+        # 锁观察必然错过，靠对账要等 grace，期间该智能体的新请求会被限流拒）。
+        install_run_release(concurrency_guard)
         yield
 
 
@@ -1177,6 +1215,8 @@ app.include_router(platform_health_router)
 app.include_router(skill_router)
 # 智能体沙箱并发管理（写 PG 真源 + 同步 Redis）
 app.include_router(agent_concurrency_router)
+# 智能体 /chat 并发上限管理（写 PG 真源 + 运行时热层双写）
+app.include_router(agent_chat_concurrency_router)
 # 智能体跨知识搜索配置管理（写 PG 真源，运行时工具直接读 PG）
 app.include_router(agent_cross_search_config_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
