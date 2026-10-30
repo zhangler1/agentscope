@@ -281,18 +281,23 @@ async def list_agents(
             "list stays clean."
         ),
     ),
-    page_num: int = Query(
-        default=1,
+    page_num: int | None = Query(
+        default=None,
         ge=1,
         alias="pageNum",
-        description="Page number, 1-based.",
+        description=(
+            "Page number, 1-based. Omit both pageNum and pageSize to "
+            "return all agents without pagination."
+        ),
     ),
-    page_size: int = Query(
-        default=5,
+    page_size: int | None = Query(
+        default=None,
         ge=1,
-        le=100,
         alias="pageSize",
-        description="Page size (items per page), 1-100.",
+        description=(
+            "Page size (items per page). Omit both pageNum and pageSize "
+            "to return all agents without pagination."
+        ),
     ),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
@@ -375,10 +380,18 @@ async def list_agents(
     if is_team is not None:
         entries = [e for e in entries if getattr(e, "is_team", None) is is_team]
     # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
-    # 直接切片即可，total 用切片前的完整数量，前端可据此算总页数。
+    # total 用切片前的完整数量，前端可据此算总页数。
+    # pageNum / pageSize 都不传 → 不分页全量返回；
+    # 任一传入 → 按入参严格分页（pageSize 无上限），缺省的那个用默认值
+    # 兜底（pageNum 缺省按第 1 页，pageSize 缺省按每页 5 条）。
     total = len(entries)
-    start = (page_num - 1) * page_size
-    page_entries = entries[start : start + page_size]
+    if page_num is None and page_size is None:
+        page_entries = entries
+    else:
+        effective_num = page_num if page_num is not None else 1
+        effective_size = page_size if page_size is not None else 5
+        start = (effective_num - 1) * effective_size
+        page_entries = entries[start : start + effective_size]
     # 框架 list_resource 返回 AgentView，而 schema 需要 TeamAgentView
     # （多出 is_team / parent_agent_id / is_self_built 三个专家团字段），
     # 显式转换以通过 Pydantic 校验。

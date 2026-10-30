@@ -139,6 +139,14 @@ cross_search:
     jumpcloud-ENV: "BASE"
 
 
+# ---------- 空间名称查询（跨知识搜索「引用知识空间」登记时查空间名） ----------
+# 扁平结构：键与 cross_search_space_config.py 字段一一对应。
+
+cross_search_space:
+  api_url: "http://12.244.113.82/EUVD.EUVD-OPENAPI.V-1.0/queryPageKnSpace.do"
+  timeout: 20
+
+
 # ---------- 联网搜索（online_search，含 custom_search 请求逻辑） ----------
 # 扁平结构：键与 online_search_config.py 字段一一对应。
 online_search:
