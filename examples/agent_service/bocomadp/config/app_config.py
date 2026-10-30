@@ -46,6 +46,7 @@ _BUSINESS_KEYS: frozenset[str] = frozenset(
         "audit",
         "contact_search",
         "cross_search",
+        "cross_search_space",
         "online_search",
         "personal_search",
         "personal_knowledge_request",
