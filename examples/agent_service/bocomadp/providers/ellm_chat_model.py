@@ -599,6 +599,60 @@ class EllmChatModel(ChatModelBase):
 
         return [_row_to_card(row) for row in list_model_metas()]
 
+    def _sanitize_tool_calls(self, messages: list[Msg]) -> list[Msg]:
+        """发送前体检历史 ``tool_call`` 参数（覆盖所有模型调用路径）。
+
+        ``ToolCallRepairMiddleware`` 只挂在 ``on_model_call`` 上，而上下文
+        压缩（``Agent._compress_context_impl``）直接调
+        ``generate_structured_output`` → ``_call_api``，不经过该中间件链。
+        历史里被截断的半截 JSON ``arguments`` 会被原样发给网关，被其
+        ``json.loads`` 拒收（400 ``Unterminated string ...``），导致整轮
+        回复失败。此处是全部模型调用的唯一出口，统一做一次体检：
+
+        - 合法参数原样不动（字节一致，护住 prompt cache）；
+        - 可修复的用确定性序列化替换；
+        - 修不了的成对剔除（仅本次发送副本，不改 ``state.context``）。
+
+        体检自身异常只告警，绝不阻断请求。
+
+        Args:
+            messages (`list[Msg]`):
+                待发送的消息列表。
+
+        Returns:
+            `list[Msg]`:
+                可直接发送的消息列表（无改动时原样返回入参）。
+        """
+        if not messages:
+            return messages
+        try:
+            from bocomadp.middleware.tool_call_repair import (
+                sanitize_tool_calls,
+                tool_call_repair_enabled,
+            )
+
+            # 与 ToolCallRepairMiddleware 共用同一个开关，便于统一止血回退。
+            if not tool_call_repair_enabled():
+                return messages
+            sanitized, fixes, dropped, actions = sanitize_tool_calls(messages)
+        except Exception:  # noqa: BLE001 —— 体检绝不影响主流程
+            logger.warning(
+                "ELLM tool-call sanitize skipped (model=%s)",
+                self.model,
+                exc_info=True,
+            )
+            return messages
+
+        if actions:
+            logger.warning(
+                "ELLM_TOOL_CALL_REPAIR model=%s repaired=%d dropped=%d ids=%s",
+                self.model,
+                len(fixes),
+                len(dropped),
+                sorted(set(fixes) | set(dropped)),
+            )
+        return sanitized
+
     async def _call_api(
         self,
         model_name: str,
@@ -627,6 +681,7 @@ class EllmChatModel(ChatModelBase):
                 generator of ``ChatResponse`` objects when streaming is
                 enabled.
         """
+        messages = self._sanitize_tool_calls(messages)
         formatted_messages = await self.formatter.format(messages)
 
         kwargs: dict[str, Any] = {
