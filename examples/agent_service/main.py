@@ -100,6 +100,7 @@ from bocomadp.routers.agent_tools import (
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
 from bocomadp.routers.agent_chat_concurrency import agent_chat_concurrency_router
 from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
+from bocomadp.routers.agent_cross_search_refs import agent_cross_search_refs_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.open_agent_access import (
@@ -1219,6 +1220,8 @@ app.include_router(agent_concurrency_router)
 app.include_router(agent_chat_concurrency_router)
 # 智能体跨知识搜索配置管理（写 PG 真源，运行时工具直接读 PG）
 app.include_router(agent_cross_search_config_router)
+# 智能体跨知识搜索引用管理（引用别人创建的知识空间，写 PG 真源，运行时工具按 owner 分组合并搜索）
+app.include_router(agent_cross_search_refs_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）
