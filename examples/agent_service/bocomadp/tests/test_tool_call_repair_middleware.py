@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
 from agentscope.message import Msg, TextBlock, ToolCallBlock, ToolResultBlock
 
+from bocomadp.credential import ELLMCredential
 from bocomadp.middleware import tool_call_repair as mod
 from bocomadp.middleware.tool_call_repair import (
     ToolCallRepairMiddleware,
     repair_tool_call_input,
     tool_call_repair_enabled,
 )
+from bocomadp.providers.ellm_chat_model import EllmChatModel
 
 
 # ---------------------------------------------------------------------------
@@ -309,3 +312,114 @@ class TestToolCallRepairMiddleware(IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "model-response")
         self.assertEqual(received, [msg])
+
+
+# ---------------------------------------------------------------------------
+# Provider 发送前体检：覆盖压缩等不经过 on_model_call 的路径
+# ---------------------------------------------------------------------------
+class TestProviderSendsSanitizedToolCalls(IsolatedAsyncioTestCase):
+    """``EllmChatModel._call_api`` 是所有模型调用的唯一出口。
+
+    上下文压缩直接调 ``generate_structured_output``，不经过
+    ``on_model_call`` 链；历史里半截 JSON 的 tool_call 参数必须在这里被
+    修掉/剔除，否则网关 ``json.loads`` 失败并返回 400。
+    """
+
+    def setUp(self) -> None:
+        self.model = EllmChatModel(
+            credential=ELLMCredential(
+                api_key="test",
+                base_url="http://localhost",
+                model="Qwen3-235B-A22B",
+            ),
+            model="Qwen3-235B-A22B",
+            stream=False,
+            context_size=128_000,
+        )
+        # formatter / client 都换掉：断言只看「送进 formatter 之前」的
+        # 消息，不依赖具体 formatter 实现，也不发真实请求。
+        self.formatted_inputs: list[list] = []
+        self.create_kwargs: dict = {}
+
+        async def _format(msgs: list) -> list:
+            self.formatted_inputs.append(msgs)
+            return []
+
+        async def _create(**kwargs: object) -> object:
+            self.create_kwargs = kwargs
+            return SimpleNamespace(
+                id="resp-1",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="ok",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                    ),
+                ],
+                usage=None,
+            )
+
+        self.model.formatter = SimpleNamespace(format=_format)  # type: ignore[assignment]
+        self.model.client = SimpleNamespace(  # type: ignore[assignment]
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=_create),
+            ),
+        )
+
+    async def test_truncated_arguments_fixed_before_send(self) -> None:
+        """线上形态：max_tokens 截断的半截 JSON → 发送前修成合法 JSON。"""
+        await self.model._call_api(
+            model_name="Qwen3-235B-A22B",
+            messages=[_pair_msg()],
+        )
+
+        sent = self.formatted_inputs[0]
+        self.assertEqual(len(sent[0].content), 2)
+        fixed = sent[0].content[0].input
+        parsed = json.loads(fixed)  # 必须是合法 JSON
+        self.assertEqual(
+            parsed["file_path"],
+            "/workspace/shared/skills/invoice-extractor/SKILL.md",
+        )
+
+    async def test_unrepairable_call_dropped_with_its_result(self) -> None:
+        """修不了的 tool_call 与其 tool_result 成对剔除，整条消息不再发送。"""
+        msg = _pair_msg(raw="{")
+
+        await self.model._call_api(
+            model_name="Qwen3-235B-A22B",
+            messages=[msg],
+        )
+
+        self.assertEqual(self.formatted_inputs[0], [])
+        # 只改发送副本，原对象保持原样
+        self.assertEqual(msg.content[0].input, "{")
+
+    async def test_valid_arguments_untouched(self) -> None:
+        """合法参数必须字节一致，避免破坏 prompt cache。"""
+        raw = '{"file_path": "/tmp/a.txt"}'
+        msg = _pair_msg(raw=raw)
+
+        await self.model._call_api(
+            model_name="Qwen3-235B-A22B",
+            messages=[msg],
+        )
+
+        sent = self.formatted_inputs[0]
+        self.assertIs(sent[0], msg)
+        self.assertIs(sent[0].content[0].input, raw)
+
+    async def test_disabled_switch_passthrough(self) -> None:
+        """``ADP_TOOL_CALL_REPAIR=0`` 时与其他发送路径一致：纯透传。"""
+        msg = _pair_msg()
+
+        with patch.dict(os.environ, _DISABLED):
+            await self.model._call_api(
+                model_name="Qwen3-235B-A22B",
+                messages=[msg],
+            )
+
+        self.assertIs(self.formatted_inputs[0][0], msg)
+        self.assertEqual(msg.content[0].input, _TRUNCATED_ARGS)
