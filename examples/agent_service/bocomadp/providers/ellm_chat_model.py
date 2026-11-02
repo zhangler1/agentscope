@@ -168,11 +168,20 @@ class EllmChatModel(ChatModelBase):
     type: Literal["ellm_chat"] = "ellm_chat"
     """The type of the chat model."""
 
-    inject_think_tag: bool = False
+    inject_think_tag: bool | None = None
     """Whether to prepend a ``<think>`` tag to the first non-empty text
     delta of streaming responses. The base class ``__init__`` does not
     accept this argument, so it is toggled as an instance attribute
-    (``model.inject_think_tag = True``)."""
+    (``model.inject_think_tag = True``).
+
+    三态：
+
+    - ``None``：未决 —— 模型构建期未拿到会话级依据，由
+      ``EllmKeyRefreshMiddleware`` 按模型库 ``think_tag`` 解析；
+    - ``True`` / ``False``：已定 —— 由模型构建期按会话配置（思考开关 +
+      模型库 ``think_tag``，见 :mod:`bocomadp.deerflow.model_patch`）或
+      请求级 ``custom_params.add_think`` 写入，中间件不得再用模型库覆盖。
+    """
 
     class Parameters(BaseModel):
         """The parameters for the ELLM chat model."""
