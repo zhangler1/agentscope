@@ -6,8 +6,9 @@ apikey（过期判定 + ``MessageBus.acquire_lock`` 并发防抖 + 失败回落�
 再用 ``EllmChatModel.set_api_key`` 把新鲜 key 注入到当前模型实例的
 请求头（``Authorization: Bearer <key>``），并设置 ``inject_think_tag``
 开关——优先级：请求体 ``custom_params.add_think``（deerflow run/stream
-每轮携带）> 模型库 ``model_registry``（按模型名）> 默认
-False。不换类、不重建 client，模型调用链保持不变。
+每轮携带）> 会话级判定（模型构建期按「会话思考开关 + 模型库
+``think_tag``」算好的 True/False）> 模型库 ``model_registry``（按模型
+名）> 默认 False。不换类、不重建 client，模型调用链保持不变。
 
 另外实现 ``on_compress_context``：上下文压缩直接调用 ``agent.model``，
 不经过 ``on_model_call`` 链，因此在压缩前补一次惰性刷新，避免长时间
@@ -87,7 +88,8 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
     - 非 :class:`EllmChatModel` 模型直接透传，不做任何处理；
     - :class:`EllmChatModel` 模型：``EllmKeyRefresher`` 惰性刷新 →
       ``set_api_key`` 注入 → 设置 ``inject_think_tag``（请求体
-      ``custom_params.add_think`` 优先，否则按模型名查模型库）；
+      ``custom_params.add_think`` 优先；已由模型构建期按会话配置定下的
+      不覆盖；仍为 ``None`` 时按模型名查模型库）；
       并注入 401 回调：强制刷新 key 并重试当前调用一次，刷新失败则
       标记凭证 key 过期。
     """
@@ -160,17 +162,20 @@ class EllmKeyRefreshMiddleware(MiddlewareBase):
                 # inject_think_tag 优先级：
                 #   1) 请求体 custom_params.add_think（deerflow run/stream
                 #      每轮携带，第一优先级）；
-                #   2) 模型库 model_registry（按模型名，直读 DB；DB 异常时
+                #   2) 会话级判定（模型构建期已按「会话思考开关 + 模型库
+                #      think_tag」写好的 True/False，见
+                #      bocomadp.deerflow.model_patch）——已定，不再覆盖；
+                #   3) 模型库 model_registry（按模型名，直读 DB；DB 异常时
                 #      回退快照，见 resolve_model_meta）；
-                #   3) 默认 False。
+                #   4) 默认 False。
                 # 原生 /chat/ 或请求未携带 add_think 时，第 1 级返回
-                # None，自动回退到第 2/3 级，行为与之前一致。
+                # None，自动回退到第 2/3/4 级，行为与之前一致。
                 req_think = _parse_add_think(
                     (get_custom_params() or {}).get("add_think"),
                 )
                 if req_think is not None:
                     current_model.inject_think_tag = req_think
-                else:
+                elif current_model.inject_think_tag is None:
                     meta = await resolve_model_meta(current_model.model)
                     current_model.inject_think_tag = (
                         bool(meta["think_tag"]) if meta else False

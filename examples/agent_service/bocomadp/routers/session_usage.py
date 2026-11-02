@@ -783,7 +783,13 @@ class SessionChatModelInput(BaseModel):
     )
     parameters: dict[str, Any] = Field(
         default_factory=dict,
-        description="模型参数（原样写入 ChatModelConfig.parameters）。",
+        description=(
+            "模型参数（原样写入 ChatModelConfig.parameters）。除模型自身参数"
+            "（temperature / top_p / max_tokens / enable_thinking / "
+            "reasoning_effort 等）外，支持会话级 ``add_think``："
+            "``<think>`` 标签注入的显式覆盖（不传则按「模型库 think_tag "
+            "且本会话开启思考」自动判定）。"
+        ),
     )
 
 
