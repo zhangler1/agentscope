@@ -636,12 +636,23 @@ async def delete_upload(
     backend = workspace.get_backend()
     workdir = workspace.workdir
 
+    # 物理删除原始文件 + 转换出的 .md。backend 的删除接口是 ``delete_path``
+    # （``BackendBase.delete_path`` → ``rm -rf``，对不存在的路径静默 no-op），
+    # 不存在 ``remove_file``；此前误调后者抛 AttributeError 又被静默吞掉，
+    # 表现为"接口返回 204、PVC 上文件仍在"，故这里同时改为留痕告警。
     for nm in (filename, f"{os.path.splitext(filename)[0]}.md"):
         abs_path = _upload_abs(backend, workdir, nm)
         try:
-            if await backend.file_exists(abs_path):
-                await backend.remove_file(abs_path)
-        except Exception:  # noqa: BLE001
-            pass
+            await backend.delete_path(abs_path)
+        except Exception as exc:  # noqa: BLE001 —— 单文件失败不阻断元数据清理
+            logger.warning(
+                "delete_upload: failed to remove %s "
+                "(user=%s agent=%s session=%s): %s",
+                abs_path,
+                user_id,
+                agent_id,
+                session_id,
+                exc,
+            )
 
     db.delete(user_id, agent_id, session_id, stored.stored_name)
