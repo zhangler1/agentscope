@@ -13,6 +13,8 @@ briefing before the agent is constructed.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from agentscope.app._service._access import ResourceAccessService
 from agentscope.app._tool._constants import HANDLE_LEN
 from agentscope.app.storage import AgentRecord, StorageBase
@@ -43,16 +45,36 @@ async def _build_leader_system_prompt(
     from bocomadp import team_store
 
     base = agent_record.data.system_prompt
+    owner_id = agent_record.user_id
     rel = await team_store.get_team(
         storage,
-        agent_record.user_id,
+        owner_id,
         agent_record.id,
     )
     if rel is None or not rel.member_ids:
         return base
 
+    if rel.collaboration_mode == "workflow":
+        from bocomadp.team.state import list_states
+
+        state = next(
+            (
+                item
+                for item in await list_states(storage, owner_id)
+                if item.plan.leader_agent_id == agent_record.id
+            ),
+            None,
+        )
+        if state is not None:
+            return base + await _build_orchestrated_prompt(
+                state,
+                storage,
+                owner_id,
+            )
+        # No state row yet (e.g. direct unit test or a run before the
+        # orchestrator initialized): keep the legacy briefing path below.
+
     cfg = rel
-    owner_id = agent_record.user_id
     lines: list[str] = []
     lines.append(
         "\n\n# Expert team briefing\n"
@@ -141,6 +163,11 @@ async def _build_leader_system_prompt(
                 "- If you plan to delegate, do not end your turn until "
                 "the real ``AgentInvite`` / ``TeamSay`` call has been "
                 "sent.\n"
+                "- Immediately after the ``AgentInvite`` / ``TeamSay`` "
+                "call succeeds, END this turn. Do NOT poll workspace "
+                "files or repeatedly check for member output; the member "
+                "will report back via ``TeamSay``. A missing file does "
+                "not mean the member failed.\n"
                 "- Never skip a step: only delegate to the next member "
                 "after the current member has reported back.\n"
                 "- A member MAY be delegated to MORE THAN ONCE. The "
@@ -169,6 +196,101 @@ async def _build_leader_system_prompt(
             )
 
     return base + "".join(lines)
+
+
+async def _build_orchestrated_prompt(
+    state: Any,
+    storage: StorageBase,
+    owner_id: str,
+) -> str:
+    """Prompt for the system-orchestrated workflow.
+
+    Routing is owned by the orchestrator; the leader only produces task
+    content and (for the first phase) downstream handoffs.
+    """
+    lines: list[str] = ["\n\n# Orchestrated workflow"]
+    lines.append(
+        "本流程的路径由用户预先定义，系统编排器负责路由和派发。"
+        "**不要调用 TeamCreate / AgentInvite / AgentCreate / TeamSay**；"
+        "这些工具在编排模式下不存在。",
+    )
+
+    if state.leader.phase == "first":
+        lines.append(
+            f"你是首节点。当前第 {state.stage_index + 1}/"
+            f"{state.plan.stage_count} 阶段，成员如下：",
+        )
+        for member in state.stage_members:
+            record = await storage.get_agent(owner_id, member)
+            if record is None:
+                continue
+            role = (
+                record.data.invite_config.invite_description
+                or "团队成员"
+            )
+            lines.append(
+                f"- {record.data.name}@{member[:HANDLE_LEN]}：{role}",
+            )
+        lines.append(
+            "完成拆解后调用 `SubmitHandoffs`："
+            "`result` 写你的简短汇报（≤500 字），"
+            "`handoffs` 为每个当前成员提供一个 target（只能是上面列出的人）。",
+        )
+        lines.append(
+            "提交成功后本轮必须立即结束：不要调用 Bash/Read/Write 检查"
+            "工作区，不要等待或轮询成员结果。系统会在所有成员完成后"
+            "自动唤醒你。",
+        )
+        lines.append(
+            "以上是内部执行规则，不要向用户复述，也不要在回复中解释"
+            "工作区检查、轮询或唤醒机制。提交后只用一句简短进度说明"
+            "（例如“已派发”），不要输出规则原文。",
+        )
+        lines.append(
+            "提交后系统会自动派发，不要自己调用工具发送任务，"
+            "也不要给 leader 自己派发。",
+        )
+        if state.leader.dispatched:
+            lines.append(
+                "流程已经派发，不要重新拆解；如需新任务请让用户先取消。",
+            )
+        return "\n".join(lines)
+
+    if state.leader.phase == "worker_failed":
+        members = list(state.stage_members)
+        lines.append(
+            f"当前阶段 {state.stage_index + 1}/{state.plan.stage_count} "
+            "有 worker 执行失败。本轮不会自动重试。",
+        )
+        for member in members:
+            node = state.node(member)
+            if node.status == "failed":
+                lines.append(
+                    f"- {member}：failed，错误：{node.error or '未知错误'}",
+                )
+            else:
+                lines.append(f"- {member}：{node.status}")
+        lines.append(
+            "请调用 `SubmitHandoffs` 重新派发当前阶段的失败节点；"
+            f"允许的 target：{members}。"
+            "只提交 failed/pending 节点，已完成节点不会重跑。"
+            "如果决定放弃，请调用 `SubmitHandoffs` 且 handoffs 为空。",
+        )
+        return "\n".join(lines)
+
+    if state.leader.phase == "final":
+        lines.append(
+            "流程已结束。系统已收集各节点的简短汇报，"
+            "请基于这些结果给用户最终答复；需要细节时按结果中的路径读取"
+            "共享工作区文件。不要重新拆解，也不要调用 SubmitHandoffs。",
+        )
+        return "\n".join(lines)
+
+    lines.append(
+        "流程已终止。请基于已有的节点结果和失败原因给用户一个答复，"
+        "不要重新拆解或派发任务。",
+    )
+    return "\n".join(lines)
 
 
 async def _name(

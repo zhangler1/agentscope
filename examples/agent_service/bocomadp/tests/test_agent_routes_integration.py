@@ -25,7 +25,7 @@ from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.storage import AsyncSQLAlchemyStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 
-from bocomadp import team_store
+from bocomadp import market_review_store, market_store, team_store
 from bocomadp.routers.agent import agent_router
 # 框架内置 agent_router 只用于"摘除"（与 main.py 装配一致：专家团能力
 # 由 bocomadp 版 agent_router 覆盖）。
@@ -69,6 +69,10 @@ def client(tmp_path):
     async def _provision():
         async with storage:
             await team_store.ensure_team_tables(storage)
+            # GET /agent/ 列表会附带发布/审批状态（_attach_publish_status），
+            # 依赖市场名单表与审批记录表，需与 main.py 装配一致地建表。
+            await market_store.ensure_market_tables(storage)
+            await market_review_store.ensure_review_tables(storage)
 
     asyncio.run(_provision())
     app = create_app(
@@ -170,8 +174,10 @@ class TestPagination:
     """分页参数 pageNum / pageSize 的行为锁死。
 
     约定（docs/api.md 第三节）：
-    - 不传分页参数 → 默认第 1 页、每页 5 条；
-    - pageNum 从 1 开始（>=1），pageSize 范围 1~100（越界 422）；
+    - pageNum / pageSize 都不传 → 不分页，全量返回；
+    - 任一传入 → 按入参严格分页（pageSize 无上限），缺省的用默认值兜底
+      （pageNum=1 / pageSize=5）；
+    - pageNum 从 1 开始（>=1），pageSize >=1（0 或负数 422）；
     - total 恒为分页前的完整总数（与当前页 agents 数量可不同）。
     """
 
@@ -179,17 +185,26 @@ class TestPagination:
         """建 n 个顶层可见的 agent（leader），返回 id 列表。"""
         return [_create_leader(client) for _ in range(n)]
 
-    def test_default_returns_first_page_of_five(self, client):
+    def test_default_returns_all_without_pagination(self, client):
         ids = self._create_agents(client, 7)
 
         resp = client.get("/agent/", headers=HEADERS)
         assert resp.status_code == 200
         body = resp.json()
-        page_ids = {a["id"] for a in body["agents"]}
-        # 默认每页 5 条，7 个 agent 只有 5 个在第一页
-        assert len(page_ids) == 5
-        assert page_ids.issubset(set(ids))
-        # total 是分页前的完整总数
+        # 不传分页参数 → 全量返回 7 个
+        assert len(body["agents"]) == 7
+        assert {a["id"] for a in body["agents"]} == set(ids)
+        assert body["total"] == 7
+
+    def test_only_page_num_passed_uses_default_page_size(self, client):
+        ids = self._create_agents(client, 7)
+
+        resp = client.get("/agent/?pageNum=1", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        # 只传 pageNum → 按第 1 页、默认每页 5 条严格分页
+        assert len(body["agents"]) == 5
+        assert {a["id"] for a in body["agents"]}.issubset(set(ids))
         assert body["total"] == 7
 
     def test_second_page_returns_remaining(self, client):
@@ -257,12 +272,19 @@ class TestPagination:
         assert resp.status_code == 422
 
     def test_invalid_page_size_rejected(self, client):
-        # pageSize 范围 1~100，0 和 101 都非法 → 422
+        # pageSize 必须 >=1，0 非法 → 422
         assert client.get("/agent/?pageNum=1&pageSize=0", headers=HEADERS).status_code == 422
-        assert (
-            client.get("/agent/?pageNum=1&pageSize=101", headers=HEADERS).status_code
-            == 422
-        )
+
+    def test_page_size_above_100_allowed(self, client):
+        # pageSize 无上限，101 合法 → 全量装进一页
+        ids = self._create_agents(client, 7)
+
+        resp = client.get("/agent/?pageNum=1&pageSize=101", headers=HEADERS)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["agents"]) == 7
+        assert {a["id"] for a in body["agents"]} == set(ids)
+        assert body["total"] == 7
 
 
 class TestSelfBuiltMemberInvitable:

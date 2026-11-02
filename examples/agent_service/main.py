@@ -60,6 +60,9 @@ from bocomadp.config import (
     is_trace_correlation_enabled,
 )
 from bocomadp.concurrency.guard import ConcurrencyGuard
+from bocomadp.concurrency.memory_guard import MemoryGuard
+from bocomadp.concurrency.run_release import install_run_release
+from bocomadp import chat_concurrency_config
 from bocomadp.logging.logging_config import configure_logging
 from bocomadp.logging.trace_context import get_current_trace_id
 from bocomadp.logging.trace_middleware import TraceMiddleware
@@ -95,7 +98,9 @@ from bocomadp.routers.agent_tools import (
     load_tool_whitelists,
 )
 from bocomadp.routers.agent_concurrency import agent_concurrency_router
+from bocomadp.routers.agent_chat_concurrency import agent_chat_concurrency_router
 from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
+from bocomadp.routers.agent_cross_search_refs import agent_cross_search_refs_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.open_agent_access import (
@@ -112,10 +117,6 @@ from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 from bocomadp.tool_catalog import AGENT_CREATOR_ID
 from bocomadp.deerflow.model_patch import patch_get_model
-# 会话默认权限模式：给原生 POST /sessions/ 前插包裹路由（一处配置生效）
-from bocomadp.session_default_mode import (
-    install_create_session_default_mode,
-)
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
     agent_router as _framework_agent_router,
@@ -578,13 +579,10 @@ class _BuiltinAgentStorageProxy:
         ``/agents`` router is unused by the product.
 
         Memory cleanup (best-effort, never blocks the delete result):
-        - DB ``agent_memory_configs`` row: ``memory_store.memory_delete``;
-        - Redis per-session state (``active_sessions`` member / ``turns`` /
-          extract lock): scanned from ``active_sessions`` by agent dimension
-          inside ``cleanup_agent_memory`` — no pre-delete session snapshot
-          needed (the compound key embeds user_id, so cleanup resolves it
-          from the active set instead).
-          Platform-side delete remains a placeholder (local delete only).
+        - ``memory_agent_configs`` row（agent 级配置）；
+        - 该 agent 的全部 ``memory_session_states``（turns / cursor / 心跳）。
+          ``cleanup_agent_memory`` 先删配置（立即停止新装配）、后清状态；
+          平台侧删除仍为占位（仅本地清理）。
         """
         ok = await self._inner.delete_agent(user_id, agent_id)
         if ok:
@@ -702,15 +700,21 @@ else:
         default_mcps=build_default_mcps(),
     )
 
-# 并发控制仅在生产 Redis 模式生效(InMemory 本地/测试模式零日志噪声)
-from agentscope.app.message_bus import RedisMessageBus as _RedisMessageBus
-
-_concurrency_active = isinstance(message_bus, _RedisMessageBus)
 # 包装工作区管理器：框架把 MCP 从 workspace.list_mcps() 直接注入
 # （不经过 extra_agent_tools），因此只能在 get_workspace 这一层按
 # per-agent 白名单过滤（PUT/DELETE /agents/{id}/tools/{name}）。
 # 传入 mcp_registry 使白名单中新启用的 MCP 能自动注册到 workspace。
 workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
+# 团队模式：所有 team worker 共享 leader 当前 session 的 workspace
+# （同 PVC、同 workdir）；不再区分 free_handoff / workflow。
+from bocomadp.team.workspace import TeamWorkspaceManager
+
+workspace_manager = TeamWorkspaceManager(workspace_manager, storage)
+
+# 注册上传依赖（storage / workspace_manager 模块级单例）：run 任务内的
+# personal_knowledge_request 等工具无 FastAPI Depends，经此入口获取依赖后
+# 复用 download_urls_to_session 下载文件到会话 uploads 目录。
+set_upload_dependencies(storage, workspace_manager)
 
 # 注册上传依赖（storage / workspace_manager 模块级单例）：run 任务内的
 # personal_knowledge_request 等工具无 FastAPI Depends，经此入口获取依赖后
@@ -718,18 +722,50 @@ workspace_manager = WhitelistWorkspaceManager(workspace_manager, mcp_registry)
 set_upload_dependencies(storage, workspace_manager)
 
 # ---------------------------------------------------------------------------
-# 4.5 /chat 并发控制:Redis 原子占位 + 注册表 + 入口对账
+# 4.5 /chat 并发控制:三维闸机(用户/全局 + 智能体维度)
 # ---------------------------------------------------------------------------
 # Redis 客户端惰性获取:连接池由框架 lifespan 进入 message_bus 时创建,
 # get_client() 在进入前不可用,中间件运行期调用,失败即 fail-open。
 def _get_redis_client():
     return message_bus.get_client()
 
-concurrency_guard = ConcurrencyGuard(
-    _get_redis_client,
-    max_running=config.run_concurrency.max_running,
-    max_running_per_user=config.run_concurrency.max_running_per_user,
+# 用户/全局两维受平台总开关(run_concurrency.enabled)控制;智能体维度
+# "谁配置谁生效",不受总开关约束(未配置=不限,本身就是天然开关)。
+_base_dims_enabled = config.run_concurrency.enabled and (
+    config.run_concurrency.max_running > 0
+    or config.run_concurrency.max_running_per_user > 0
 )
+
+
+async def _agent_limit_provider(agent_id: str):
+    """智能体并发上限热路径查询:未配置返回 None = 不限。"""
+    return await chat_concurrency_config.runtime_get(agent_id)
+
+
+if isinstance(message_bus, RedisMessageBus):
+    # 生产:Redis 原子占位 + 注册表 + 入口对账(多实例安全)
+    concurrency_guard = ConcurrencyGuard(
+        _get_redis_client,
+        max_running=config.run_concurrency.max_running,
+        max_running_per_user=config.run_concurrency.max_running_per_user,
+        agent_limit_provider=_agent_limit_provider,
+    )
+else:
+    # 本地 InMemory 总线:dict 计数 + 进程内会话锁观察释放(单进程,
+    # 无需 Lua/对账,重启计数随 run 消亡自然归零)
+    from agentscope.app.message_bus import MessageBusKeys
+
+    async def _lock_checker(session_id: str) -> bool:
+        return await message_bus.is_locked(
+            MessageBusKeys.session_lock(session_id),
+        )
+
+    concurrency_guard = MemoryGuard(
+        max_running=config.run_concurrency.max_running,
+        max_running_per_user=config.run_concurrency.max_running_per_user,
+        agent_limit_provider=_agent_limit_provider,
+        lock_checker=_lock_checker,
+    )
 
 # ---------------------------------------------------------------------------
 # 5. 构建 App —— create_app 自动注册 12 个内置路由
@@ -798,12 +834,8 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
             ConcurrencyGuardMiddleware,
             guard=concurrency_guard,
             grace_secs=config.run_concurrency.grace_secs,
-            enabled=config.run_concurrency.enabled
-            and (
-                config.run_concurrency.max_running > 0
-                or config.run_concurrency.max_running_per_user > 0
-            )
-            and _concurrency_active,
+            enabled=_base_dims_enabled,
+            has_agent_config=chat_concurrency_config.has_any_config,
         ),
     ]
 
@@ -831,12 +863,26 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
-# 会话记忆运行时依赖：redis client（供心跳/计数/锁）与 storage（取消息）。
-# InMemory 本地模式 _get_redis_client() 返回 None → 记忆中间件仅检索注入，
-# 计数/提取降级关闭；Redis 模式全量生效。
-memory_module.configure_memory_runtime(
-    redis_client_fn=_get_redis_client,
+# 会话记忆能力装配（bocom SDK 版记忆包）：
+# - 平台连接走 euvd_memory_pysdk（环境由 config.memory.environment 指定）；
+# - 记忆两表（memory_agent_configs / memory_session_states）与框架共用
+#   config.db.url，由 SQLMemoryStorage.ensure_ready 幂等建表；全局参数走
+#   目标项目通用 runtime_configs 表（config_key='memory'）；
+# - storage 传入的是 _BuiltinAgentStorageProxy（带 default 回退），类型判定
+#   无法识别，因此显式注入 memory_storage；
+# - 提取锁走 message_bus（InMemory / Redis 两种总线均支持）。
+memory_module.setup_memory(
+    settings=memory_module.MemorySettings(
+        environment=config.memory.environment,
+        connect_timeout_seconds=config.memory.connect_timeout_seconds,
+        read_timeout_seconds=config.memory.read_timeout_seconds,
+        pool_connections=config.memory.pool_connections,
+        pool_maxsize=config.memory.pool_maxsize,
+        db_url=config.db.url,
+    ),
     storage=storage,
+    message_bus=message_bus,
+    memory_storage=memory_module.SQLMemoryStorage(db_url=config.db.url),
 )
 
 
@@ -848,7 +894,7 @@ async def _build_agent_middlewares_with_ellm(
     mws = await build_agent_middlewares(user_id, agent_id, session_id)
     mws.extend(await _ellm_refresh_mw_factory(user_id, agent_id, session_id))
     mws.append(_summarization_mw)
-    # 会话记忆中间件：memory_enabled 才装配（检索注入 + 轮数/静默触发）
+    # 会话记忆中间件：injection_enabled / extraction_enabled 任一开启才装配
     mws.extend(
         await memory_module.build_memory_middlewares(
             user_id,
@@ -986,6 +1032,10 @@ async def _lifespan_with_builtin_agents(app):
         # 必须早于下面所有读团队档案的补丁挂载。
         from bocomadp import team_store
 
+        # 导入 workflow 状态模型，使其注册到同一 _TeamBase metadata，
+        # 随后 ensure_team_tables 会一并创建 team_workflow_states。
+        from bocomadp.team import state as _team_workflow_state  # noqa: F401
+
         await team_store.ensure_team_tables(storage)
         # 智能体市场扩展表（agent_market）——平台智能体的领域分类档案，
         # 与专家团关系表同一套 bocomadp 自建表模式（热度不落库，实时聚合）。
@@ -1003,14 +1053,6 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import agent_template_store
 
         await agent_template_store.ensure_agent_template_tables(storage)
-        # 智能体扩展表（agents_extend）——一智能体一行，payload 存该
-        # 智能体的扩展数据（当前装已安装技能清单）。存起来是为了让
-        # "查已装技能"不必进沙箱（原先必须解析 workspace → 路由 Pod →
-        # exec 列举，Pod 被回收/容器重启时该查询就失败）。
-        # 与上表同一套自建表模式：启动幂等建表（create_all）+ 列级迁移。
-        from bocomadp import agents_extend_store
-
-        await agents_extend_store.ensure_agents_extend_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -1020,6 +1062,12 @@ async def _lifespan_with_builtin_agents(app):
                 logger.info("pool concurrency configs synced to redis: %d", synced)
         except Exception as e:  # noqa: BLE001
             logger.warning("pool concurrency sync skipped: %s", e)
+        # /chat 并发上限配置回填运行时热层(PG → 缓存/Redis),并探测
+        # Redis 可用性;失败仅告警,闸机按"未配置=不限"放行。
+        try:
+            await chat_concurrency_config.load_runtime()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("chat concurrency config load skipped: %s", e)
         await _register_builtin_agents()
         # 专家团工具注入（workflow 严格交接 + AgentInvite 池回填）——
         # 原实现改 src/_service/_toolkit.py 的 get_toolkit，现搬迁到
@@ -1090,6 +1138,28 @@ async def _lifespan_with_builtin_agents(app):
             chat_service._projectors.append(
                 WorkerFailureNotifier(app.state.storage)
             )
+        # 编排模式：系统编排器 + ChatService.run 钩子 + 内部工具事件过滤。
+        from bocomadp.team.hooks import (
+            patch_chat_service_run,
+            patch_legacy_team_tools,
+            set_orchestrator,
+        )
+        from bocomadp.team.orchestrator import WorkflowOrchestrator
+
+        set_orchestrator(
+            WorkflowOrchestrator(
+                storage=storage,
+                message_bus=message_bus,
+                session_service=app.state.session_service,
+                chat_service=chat_service,
+            ),
+        )
+        patch_chat_service_run()
+        patch_legacy_team_tools()
+        # /chat 并发名额的释放信号：run 结束（成功/失败/异常）即退名额。
+        # 锁观察只在 run 未走到 finally 时兜底（run 秒失败时锁只存在几毫秒，
+        # 锁观察必然错过，靠对账要等 grace，期间该智能体的新请求会被限流拒）。
+        install_run_release(concurrency_guard)
         yield
 
 
@@ -1135,34 +1205,12 @@ app.router.routes[:] = [
     r for r in app.router.routes if not _is_framework_agent_route(r)
 ]
 app.include_router(agent_router)
-# 智能体记忆字段包裹路由（必须后于 include bocomadp agent_router）：
-# 按路径移除 bocomadp agent_router 中被覆盖的 /agent/ 4 条 CRUD 路由
-# （/agent/{id}/team/*、/agent/schema/v2 等专家团端点路径不重叠，不受影响），
-# 前插包裹路由；包裹 handler 内部调用 bocomadp.routers.agent 的端点函数，
-# 因此 /agent/ CRUD = 专家团逻辑 + 记忆字段，两套能力共存（方向 A）。
-# 会话记忆能力装配：/memory/config 路由 + lifespan 启动静默扫描器
-# （create_app 之后、bocomadp agent_router 之后；lifespan 包装须在
-# _lifespan_with_builtin_agents 赋值之后，见下方调用点顺序）
-memory_module.install_memory(app)
-# 会话默认权限模式（create_app 之后、/api 子应用挂载之前）：
-# 原生 POST /sessions/ 与 bocomadp POST /sessions/create 统一取
-# config.yaml 的 default_permission_mode（显式传入时以显式值为准），
-# 见 bocomadp/session_default_mode.py。
-install_create_session_default_mode(app)
-# 已装技能查询（create_app 之后、/api 子应用挂载之前）：
-# GET /workspace/skill 前插为"先查 agents_extend，无记录才回源沙箱并写回"，
-# 使该查询在 Pod 不可用时也能命中缓存；见 bocomadp/routers/skill_router.py
-# 的 install_skill_list_from_table。
-from bocomadp.routers.skill_router import install_skill_list_from_table
-
-install_skill_list_from_table(app)
-# 技能上传 / 卸载写穿（同样在 /api 挂载之前）：
-# 框架的 POST /workspace/skill/upload 与 DELETE /workspace/skill/{name} 只动
-# 沙箱，这里前插同路径包装，成功后再更新 agents_extend（used 标记的数据源）；
-# 状态码 / 响应体 / 异常与框架实现逐字一致，见 bocomadp/skill_write_through.py。
-from bocomadp.skill_write_through import install_skill_write_through
-
-install_skill_write_through(app)
+# 会话记忆能力装配：/memory/config 路由 + lifespan 启停（SDK client /
+# ensure_ready 建表 / 静默扫描器）。删除 agent 后的记忆清理已由
+# _BuiltinAgentStorageProxy.delete_agent 统一调用 cleanup_agent_memory，
+# 故关闭 install_memory 自带的 DELETE 中间件，避免重复清理。
+# 顺序要求：create_app 之后、bocomadp agent_router 之后、lifespan 包装赋值之后。
+memory_module.install_memory(app, cleanup_on_agent_delete=False)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)
@@ -1181,8 +1229,12 @@ app.include_router(platform_health_router)
 app.include_router(skill_router)
 # 智能体沙箱并发管理（写 PG 真源 + 同步 Redis）
 app.include_router(agent_concurrency_router)
+# 智能体 /chat 并发上限管理（写 PG 真源 + 运行时热层双写）
+app.include_router(agent_chat_concurrency_router)
 # 智能体跨知识搜索配置管理（写 PG 真源，运行时工具直接读 PG）
 app.include_router(agent_cross_search_config_router)
+# 智能体跨知识搜索引用管理（引用别人创建的知识空间，写 PG 真源，运行时工具按 owner 分组合并搜索）
+app.include_router(agent_cross_search_refs_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）

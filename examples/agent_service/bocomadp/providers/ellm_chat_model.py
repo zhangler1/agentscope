@@ -24,7 +24,10 @@ fallback. ``inject_think_tag`` 由中间件按模型名**直读 DB** 决定
 （``resolve_model_meta``，异常时回退快照）。
 """
 import copy
+import json
 import logging
+import math
+import re
 from collections import OrderedDict
 from datetime import datetime
 from typing import (
@@ -39,16 +42,31 @@ from typing import (
 )
 
 logger = logging.getLogger(__name__)
+# 应用主 logger：``events.log`` 的 handler 只挂在 "as" 上，本模块 logger
+# 不在该层级下，INFO 会被丢弃（token 计数是观测信息，必须可见）。
+_token_logger = logging.getLogger("as")
 
 from pydantic import BaseModel, Field
 
-from agentscope.model._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
+from agentscope.model._base import (
+    ChatModelBase,
+    _MULTIMODAL_DATA_BLOCK_TOKEN_ESTIMATE,
+    _TOOL_CHOICE_LITERAL_MODES,
+)
 from agentscope.model._model_card import ModelCard
 from agentscope.model._model_response import ChatResponse, StructuredResponse
 from agentscope.model._model_usage import ChatUsage
 from agentscope._utils._common import _generate_id
 from agentscope.formatter import FormatterBase, DeepSeekChatFormatter
-from agentscope.message import Msg, ThinkingBlock, ToolCallBlock, TextBlock
+from agentscope.message import (
+    DataBlock,
+    HintBlock,
+    Msg,
+    ThinkingBlock,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
 from agentscope.tool import ToolChoice
 
 if TYPE_CHECKING:
@@ -86,6 +104,12 @@ def _get_model_context_size(model: str) -> int:
     if row is None:
         return _FALLBACK_CONTEXT_SIZE
     return int(row["context_size"])
+
+
+# 声明 token 估算的字符分类规则：中文（汉字 + 扩展A + 中文标点 + 全角符号）、
+# ASCII 字母数字；剩余的符号、空白、emoji 统一归入 symbol 档。
+_CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
+_ALNUM_RE = re.compile(r"[0-9A-Za-z]")
 
 
 def _build_parameter_schema(
@@ -144,11 +168,20 @@ class EllmChatModel(ChatModelBase):
     type: Literal["ellm_chat"] = "ellm_chat"
     """The type of the chat model."""
 
-    inject_think_tag: bool = False
+    inject_think_tag: bool | None = None
     """Whether to prepend a ``<think>`` tag to the first non-empty text
     delta of streaming responses. The base class ``__init__`` does not
     accept this argument, so it is toggled as an instance attribute
-    (``model.inject_think_tag = True``)."""
+    (``model.inject_think_tag = True``).
+
+    三态：
+
+    - ``None``：未决 —— 模型构建期未拿到会话级依据，由
+      ``EllmKeyRefreshMiddleware`` 按模型库 ``think_tag`` 解析；
+    - ``True`` / ``False``：已定 —— 由模型构建期按会话配置（思考开关 +
+      模型库 ``think_tag``，见 :mod:`bocomadp.deerflow.model_patch`）或
+      请求级 ``custom_params.add_think`` 写入，中间件不得再用模型库覆盖。
+    """
 
     class Parameters(BaseModel):
         """The parameters for the ELLM chat model."""
@@ -248,6 +281,8 @@ class EllmChatModel(ChatModelBase):
             retry_delay=retry_delay,
             context_size=context_size,
         )
+        # Token 估算配置（config.yaml ``token_estimation``）：构造时读一次，
+        # 配置变更后新 run（新模型实例）生效。
         self.formatter = formatter or DeepSeekChatFormatter()
         self.client_kwargs = client_kwargs or {}
         # Request-level api key override, injected per call by the
@@ -377,6 +412,128 @@ class EllmChatModel(ChatModelBase):
         """
         await self.client.close()
 
+    # ------------------------------------------------------------------
+    # Token counting
+    # ------------------------------------------------------------------
+
+    async def count_tokens(
+        self,
+        messages: list[Msg],
+        tools: list[dict] | None,
+    ) -> int:
+        """估算模型输入的 token 数（中英文/符号三类字符加权）。
+
+        公式::
+
+            tokens = 中文字数 / chars_per_chinese_token
+                   + 英文数字字符数 / chars_per_english_token
+                   + 符号空白字符数 / chars_per_symbol_token
+                   + 多模态 block 固定估值
+
+        "全部文本"包含所有消息的可见文本与工具 JSON schema；字符数是
+        ``len(str)`` 而非 UTF-8 字节数。三个系数来自 ``config.yaml`` 的
+        ``token_estimation`` 节点，构造模型实例时读取。压缩触发判定、
+        压缩输入的窗口预算、上下文占用提示、压缩日志四处口径因此同步。
+
+        Args:
+            messages (`list[Msg]`):
+                The messages to send to the model.
+            tools (`list[dict] | None`):
+                The tools available to the model.
+
+        Returns:
+            `int`:
+                The estimated number of tokens in the model input.
+        """
+        from bocomadp.token_estimation import get_token_estimation_config
+
+        rate = await get_token_estimation_config()
+        cjk_per_token = rate.chars_per_chinese_token
+        alnum_per_token = rate.chars_per_english_token
+        symbol_per_token = rate.chars_per_symbol_token
+
+        text_parts: list[str] = []
+        data_block_count = 0
+
+        def _add(text: str) -> None:
+            """收集全部可见文本（末尾统一做字符分类）。"""
+            text_parts.append(text)
+
+        for msg in messages:
+            for block in msg.get_content_blocks():
+                if isinstance(block, TextBlock):
+                    _add(block.text)
+
+                elif isinstance(block, ThinkingBlock):
+                    _add(block.thinking)
+
+                elif isinstance(block, HintBlock):
+                    if isinstance(block.hint, str):
+                        _add(block.hint)
+                    else:
+                        for item in block.hint:
+                            if isinstance(item, TextBlock):
+                                _add(item.text)
+                            elif isinstance(item, DataBlock):
+                                data_block_count += 1
+
+                elif isinstance(block, ToolCallBlock):
+                    _add(block.input)
+
+                elif isinstance(block, ToolResultBlock):
+                    if isinstance(block.output, str):
+                        _add(block.output)
+                    elif isinstance(block.output, list):
+                        for item in block.output:
+                            if isinstance(item, TextBlock):
+                                _add(item.text)
+                            elif isinstance(item, DataBlock):
+                                data_block_count += 1
+
+                elif isinstance(block, DataBlock):
+                    data_block_count += 1
+
+                else:
+                    logger.warning(
+                        "Unknown block type %s in token counting, skipping.",
+                        type(block),
+                    )
+        # 工具 JSON schema 与父类一致计入
+        if tools:
+            text_parts.append(json.dumps(tools, ensure_ascii=False))
+
+        # 按字符类别分别累计：中文 / ASCII 字母数字 / 其余符号与空白
+        text = "".join(text_parts)
+        cjk = len(_CJK_RE.findall(text))
+        alnum = len(_ALNUM_RE.findall(text))
+        symbol = len(text) - cjk - alnum
+
+        # 多模态 block 用固定估值，不按 base64 文本长度计算
+        multimodal = data_block_count * _MULTIMODAL_DATA_BLOCK_TOKEN_ESTIMATE
+
+        cnt = multimodal + math.ceil(
+            cjk / cjk_per_token
+            + alnum / alnum_per_token
+            + symbol / symbol_per_token,
+        )
+
+        _token_logger.info(
+            "ellm count_tokens: model=%s messages=%d chinese=%d alnum=%d "
+            "symbol=%d data_blocks=%d rates=%.2f/%.2f/%.2f est=%d",
+            self.model,
+            len(messages),
+            cjk,
+            alnum,
+            symbol,
+            data_block_count,
+            cjk_per_token,
+            alnum_per_token,
+            symbol_per_token,
+            cnt,
+        )
+
+        return cnt
+
     @staticmethod
     def _is_invalid_key_error(exc: Any) -> bool:
         """Whether an exception is a "key missing/expired" 401.
@@ -451,6 +608,60 @@ class EllmChatModel(ChatModelBase):
 
         return [_row_to_card(row) for row in list_model_metas()]
 
+    def _sanitize_tool_calls(self, messages: list[Msg]) -> list[Msg]:
+        """发送前体检历史 ``tool_call`` 参数（覆盖所有模型调用路径）。
+
+        ``ToolCallRepairMiddleware`` 只挂在 ``on_model_call`` 上，而上下文
+        压缩（``Agent._compress_context_impl``）直接调
+        ``generate_structured_output`` → ``_call_api``，不经过该中间件链。
+        历史里被截断的半截 JSON ``arguments`` 会被原样发给网关，被其
+        ``json.loads`` 拒收（400 ``Unterminated string ...``），导致整轮
+        回复失败。此处是全部模型调用的唯一出口，统一做一次体检：
+
+        - 合法参数原样不动（字节一致，护住 prompt cache）；
+        - 可修复的用确定性序列化替换；
+        - 修不了的成对剔除（仅本次发送副本，不改 ``state.context``）。
+
+        体检自身异常只告警，绝不阻断请求。
+
+        Args:
+            messages (`list[Msg]`):
+                待发送的消息列表。
+
+        Returns:
+            `list[Msg]`:
+                可直接发送的消息列表（无改动时原样返回入参）。
+        """
+        if not messages:
+            return messages
+        try:
+            from bocomadp.middleware.tool_call_repair import (
+                sanitize_tool_calls,
+                tool_call_repair_enabled,
+            )
+
+            # 与 ToolCallRepairMiddleware 共用同一个开关，便于统一止血回退。
+            if not tool_call_repair_enabled():
+                return messages
+            sanitized, fixes, dropped, actions = sanitize_tool_calls(messages)
+        except Exception:  # noqa: BLE001 —— 体检绝不影响主流程
+            logger.warning(
+                "ELLM tool-call sanitize skipped (model=%s)",
+                self.model,
+                exc_info=True,
+            )
+            return messages
+
+        if actions:
+            logger.warning(
+                "ELLM_TOOL_CALL_REPAIR model=%s repaired=%d dropped=%d ids=%s",
+                self.model,
+                len(fixes),
+                len(dropped),
+                sorted(set(fixes) | set(dropped)),
+            )
+        return sanitized
+
     async def _call_api(
         self,
         model_name: str,
@@ -479,6 +690,7 @@ class EllmChatModel(ChatModelBase):
                 generator of ``ChatResponse`` objects when streaming is
                 enabled.
         """
+        messages = self._sanitize_tool_calls(messages)
         formatted_messages = await self.formatter.format(messages)
 
         kwargs: dict[str, Any] = {

@@ -1,29 +1,34 @@
 # -*- coding: utf-8 -*-
-"""记忆提取执行器：增量窗口 → 尾部对齐 → 完整轮切片 → save_memories → 推进游标。
+"""记忆提取执行器：把会话中的完整轮次推给平台落库，并推进提取游标。
 
-提取触发点（调用方先抢好提取锁）：
-- 轮数触发（MemoryMiddleware 达 ``update_rounds`` 倍数，``recheck_active=False``）；
-- 静默扫描（MemorySweeper 判定会话超时静默，``recheck_active=True`` 默认）。
+入口 :func:`confirm_persisted_then_run`（后台任务体）：
 
-窗口取真增量而非按条数近似：``memory:cursor:{member}`` 记录上一批实际发送
-的最后一条消息坐标 ``(created_at, msg_id)``，本批只取游标之后的消息。游标在
-Redis，多实例共享——提取可能由任一实例执行（轮数触发在回复所在实例，静默
-扫描在扫描实例），不能依赖进程内存。
+- 轮数触发——middleware 达 ``update_rounds`` 后 ``create_task``，携带
+  ``reply_id``（本轮回复的消息 id）；
+- 静默扫描——sweeper 对已静默 ``idle_minutes`` 的会话直接调用，
+  ``reply_id=None``（消息必然已入库，跳过确认）。
 
-两处历史缺陷对应的兜底：
+**锁外落库确认**：轮数触发紧跟回复之后，assistant 消息可能尚未
+落库。以「读最新一条」取代轮询：``sleep(dangling_wait_secs)`` → 读会话最新
+消息，其 id == ``reply_id`` 即确认；未中则退避 ×2、×4 再读（共 3 次读、总
+等待 ≤7s）。穷尽后无论是否确认都继续——完整轮切片截掉悬空尾部兜底。
 
-- **尾部悬空**：轮数触发发生在 ChatService 落库 assistant 消息（``_persist``）
-  之前，刚完成的回复可能还没入库，窗口尾部会悬着一条没有回复的 user。这里在
-  读窗口前先等 1 秒宽限（``_DANGLING_WAIT_SECS``）再读；届时仍缺失（回复
-  失败落空 assistant 被过滤、实例崩溃等）则由完整轮切片截掉，该 user 留待
-  下一批。
-- **单边消息**：``_slice_complete_turns`` 保证发给平台的 payload 一定以 user
-  开头、以 assistant 结尾，任何半轮（尾部悬空 user、头部孤立 assistant）都
-  不发出。
+**锁内执行序列**（``message_bus.acquire_lock`` 排队串行化，共 5 步）：
 
-run_extract 全权负责锁的生命周期：成功/失败/放弃都会释放提取锁；成功额外
-推进游标并 ``clear_extract_state``（active_sessions 移除 + turns 计数清零，
-游标保留为下一批起点）；失败则游标与 turns 都不动，下次重试窗口自动扩大。
+1. ``get_memory_session_state`` → ``None`` 退出（sweeper 已清理）；
+2. 读窗口：游标之后（首次无游标取最近），条数 ``_MAX_WINDOW_MESSAGES``
+   与 token 预算双层上限，截断 log warning；空窗口退出（游标去重——
+   排队接续者的空转出口）；
+3. 完整轮切片：payload 必以 user 开头、assistant 结尾；``last_msg_id``
+   = 本批末条被发送 assistant 消息 id（落库幂等锚点）；
+4. ``build_save_request`` + ``save_memories``（重试退避 (1.0, 3.0) 共 3 击）；
+5. 先平台后游标：``set_memory_session_cursor`` → ``reset_memory_session_turns``
+   （游标推进后置 turns 失败仅多触发、不丢不重，log warning）。
+
+「未含本轮回复 → turns 置 1」：确认穷尽（reply_id 未落库）且本批末条
+assistant id != reply_id 时，游标照常推进到本批末条（只结清已落库的
+内容），turns 置 1 而非清零——保证静默扫描（``turns >= 1``）与下一轮
+累计仍会把尾部那一轮补齐。
 """
 from __future__ import annotations
 
@@ -34,33 +39,39 @@ from typing import Any
 
 from agentscope.message import Msg
 
-from bocomadp.memory import platform as pf
-from bocomadp.memory.config import MemoryRuntimeConfig
-from bocomadp.memory.state import (
-    ACTIVE_ZSET,
-    clear_extract_state,
-    encode_member,
-    get_cursor,
-    lock_key,
-    set_cursor,
-    turns_key,
-)
-from bocomadp.memory.store import MemoryConfig
+from . import platform as pf
+from .config import MemoryGlobalConfig
+from .mapping import build_save_request
+from .settings import get_settings
+from .storage._models import MemoryAgentConfigRecord
+from .storage._port import MemoryStorage
 
 logger = logging.getLogger("as")
 
-#: token 粗估：字节数 / 4（中文场景近似 token 数）
-_BYTES_PER_TOKEN = 4
+#: token 粗估：UTF-8 字节数 / 2（汉字 3 字节 → ≈1.5 token/字，偏保守）
+_BYTES_PER_TOKEN = 2
 #: list_messages 单页上限
 _PAGE_SIZE = 50
-#: 保存失败重试退避序列（秒）
-_DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
-#: 无游标（首次提取）时的兼容窗口：每轮按 user+assistant 计，取最近 2×W 条
-_MESSAGES_PER_TURN = 2
-#: 读窗口前的宽限等待（秒）：轮数触发紧跟回复之后，assistant 可能尚未落库
-_DANGLING_WAIT_SECS = 1.0
-#: 有游标时单批增量窗口上限（条）——防长会话一次取爆，token 预算另有截断
-_MAX_WINDOW_MESSAGES = 200
+#: 保存失败重试退避序列（秒）——1 初次 + 2 重试共 3 击
+_DEFAULT_RETRY_DELAYS = (1.0, 3.0)
+#: 单批增量窗口上限（条）——防长会话一次取爆，token 预算另有截断
+_MAX_WINDOW_MESSAGES = 50
+#: 落库确认的窗口读次数（退避 ×2、×4；默认 1s/2s/4s 总等待 ≤7s）
+_CONFIRM_ATTEMPTS = 3
+
+_LOCK_KEY = "agentscope:memory:extract_lock:{user_id}:{agent_id}:{session_id}"
+
+
+def _lock_key(user_id: str, agent_id: str, session_id: str) -> str:
+    """锁键拼接（本模块加锁与 middleware 预检跨模块共用）。"""
+    return _LOCK_KEY.format(
+        user_id=user_id, agent_id=agent_id, session_id=session_id
+    )
+
+
+# ---------------------------------------------------------------------------
+# 纯函数：分页读窗 / 坐标 / 过滤 / 预算 / 轮次切片（签名不变，测试复用）
+# ---------------------------------------------------------------------------
 
 
 async def _load_recent_messages(
@@ -139,7 +150,7 @@ async def _load_messages_after(
 
 
 def _estimate_tokens(text: str) -> int:
-    """粗略 token 估算：UTF-8 字节数 / 4。"""
+    """粗略 token 估算：UTF-8 字节数 / 2。"""
     return max(1, len(text.encode("utf-8", errors="ignore")) // _BYTES_PER_TOKEN)
 
 
@@ -180,17 +191,13 @@ def _slice_complete_turns(
 ) -> tuple[list[dict[str, str]], Msg | None]:
     """把消息裁成完整轮并转成 payload。
 
-    完整轮 = 以 user 开头、以 assistant 结尾的序列（允许一轮含多条 user，
-    例如一次提交多条输入）。头部孤立 assistant（其 user 在游标之前）与尾部
-    悬空 user（assistant 未落库/为空）都被截掉，保证不发单边消息。
-
-    Args:
-        messages (`list[Msg]`): 本批窗口消息（任意序，内部先做 role/文本过滤）。
+    完整轮 = 以 user 开头、以 assistant 结尾的序列（允许一轮含多条 user）。
+    头部孤立 assistant 与尾部悬空 user 都被截掉，保证不发单边消息。
 
     Returns:
-        ``(payload, last_msg)``：payload 为 ``[{role, content}]``；``last_msg``
-        为本批最后一条被发送的消息，用于推进游标。无可发送内容时返回
-        ``([], None)``。
+        ``(payload, last_msg)``：payload 为 ``[{role, content}]``；
+        ``last_msg`` 为本批最后一条被发送的消息（必为 assistant），用于
+        落库 last_msg_id 与游标推进。无可发送内容时返回 ``([], None)``。
     """
     valid = _valid_pairs(messages)
     start = 0
@@ -206,162 +213,351 @@ def _slice_complete_turns(
     return payload, kept[-1][0]
 
 
-async def _is_session_active(
-    redis: Any,
+# ---------------------------------------------------------------------------
+# 落库确认（锁外）与锁内执行序列
+# ---------------------------------------------------------------------------
+
+
+async def _read_window(
+    storage: Any,
     user_id: str,
-    agent_id: str,
     session_id: str,
-    idle_seconds: float,
-    now: float | None = None,
-) -> bool:
-    """会话最后心跳距今 < idle_seconds 视为仍活跃。"""
-    last = await redis.zscore(
-        ACTIVE_ZSET,
-        encode_member(user_id, agent_id, session_id),
+    cursor: tuple[str, str] | None,
+) -> list[Msg]:
+    """读窗口：有游标取增量，无游标（首次）取最近一批。"""
+    if cursor is None:
+        return await _load_recent_messages(
+            storage,
+            user_id,
+            session_id,
+            want=_MAX_WINDOW_MESSAGES,
+        )
+    return await _load_messages_after(
+        storage, user_id, session_id, cursor
     )
-    if last is None:
-        return False
-    return (now if now is not None else time.time()) - float(last) < idle_seconds
 
 
-async def run_extract(
-    redis: Any,
+def _cursor_of(state: Any) -> tuple[str, str] | None:
+    """从会话状态记录取游标坐标（空游标 → None）。"""
+    if state is None or not state.cursor_msg_id:
+        return None
+    return (state.cursor_created_at, state.cursor_msg_id)
+
+
+class _GiveUp:
+    """游标定位放弃哨兵（窗口为空 / 异常，无法确定起点）。"""
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试辅助
+        return "GIVE_UP"
+
+
+GIVE_UP = _GiveUp()
+
+
+async def locate_cursor_before_message(
+    storage: Any,
+    user_id: str,
+    session_id: str,
+    user_msg_id: str | None,
+    *,
+    want: int = 20,
+) -> tuple[str, str] | None:
+    """定位“锚点 user 消息的前一条”游标坐标。
+
+    三态返回：
+
+    - ``(created_at, msg_id)``：正常游标（锚点前一条）——提取窗口从
+      锚点 user 开始；
+    - ``None``：锚点是会话首条 → 空游标（首次提取取最近 50，均为
+      开启期内容，不违背铁律）；
+    - :data:`GIVE_UP`：窗口为空 / 读异常 / 窗口内无 user 消息 → 放弃
+      本次建档或重置（调用方本轮不计不建，下轮重试——安全侧：宁可
+      不提取，绝不回捞）。
+
+    锚点不在窗口内（落库异常等）时退化为保守规则：游标 = 窗口内
+    **最后一条 role=user 本身**——旧 user 全部落在游标之前或等于游标
+    （等于那条之后的孤儿 assistant 会被 ``_slice_complete_turns``
+    丢弃），且后续落库的新消息在游标之后，不会被跳过。
+    """
+    try:
+        msgs = await _load_recent_messages(
+            storage, user_id, session_id, want=want
+        )
+    except Exception:
+        logger.exception(
+            "memory: locate cursor read failed session=%s", session_id
+        )
+        return GIVE_UP
+    if not msgs:
+        return GIVE_UP
+    anchor = None
+    if user_msg_id:
+        for i, msg in enumerate(msgs):
+            if str(msg.id) == str(user_msg_id):
+                anchor = i
+                break
+    if anchor is not None:
+        if anchor == 0:
+            return None  # 锚点是会话首条 → 空游标
+        return _msg_pos(msgs[anchor - 1])
+    # 兜底：锚点不可见 → 游标 = 窗口内最后一条 role=user 本身
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].role == "user":
+            return _msg_pos(msgs[i])
+    return GIVE_UP
+
+
+async def _confirm_reply_persisted(
+    storage: Any,
+    user_id: str,
+    session_id: str,
+    reply_id: str,
+    wait_secs: float,
+) -> bool:
+    """锁外落库确认：会话最新一条消息 id == reply_id 即确认。
+
+    只读最新一条即可——本轮 user 先落库，故"游标之后"必然非空，两种
+    读法（按游标读增量 / 读最新一条）的末条都是全局最新一条。退避 ×2、
+    ×4（共 3 次读、总等待 ≤7s）；穷尽返回 False（调用方继续，完整轮
+    切片兜底）。
+    """
+    delay = wait_secs
+    for _ in range(_CONFIRM_ATTEMPTS):
+        await asyncio.sleep(delay)
+        latest = await _load_recent_messages(
+            storage, user_id, session_id, want=1
+        )
+        if latest and str(latest[-1].id) == reply_id:
+            return True
+        delay *= 2
+    return False
+
+
+async def confirm_persisted_then_run(
+    message_bus: Any,
+    memory_storage: MemoryStorage,
     storage: Any,
     user_id: str,
     agent_id: str,
     session_id: str,
-    cfg: MemoryConfig,
-    rt_cfg: MemoryRuntimeConfig,
+    cfg: MemoryAgentConfigRecord,
+    global_cfg: MemoryGlobalConfig,
     *,
-    recheck_active: bool = True,
+    reply_id: str | None,
+    user_msg_id: str | None = None,
     retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
 ) -> bool:
-    """对会话执行一次记忆提取；返回是否成功保存。
+    """后台提取任务入口（middleware ``create_task`` / sweeper 直接调用）。
 
-    调用方必须先抢提取锁（``try_acquire_lock``）。本函数在退出前统一
-    释放锁；成功路径额外清理状态（active_sessions / turns）。
-
-    ``recheck_active``：拿锁后若会话重新活跃（心跳新于静默窗口）则放弃——
-    默认 True（静默扫描场景）；轮数触发场景传 False（刚完成一轮、心跳最新，
-    但就是要提取这一批）。
+    锁外先做落库确认（``reply_id`` 非空时），再经
+    ``message_bus.acquire_lock`` 排队进入锁内执行序列；返回是否成功保存。
+    ``user_msg_id``（本轮 user 消息 id）仅供锁内 epoch 兜底重置定位
+    游标使用（静默路径为 None）。
     """
-    release = False
-    try:
-        if recheck_active and await _is_session_active(
-            redis,
+    settings = get_settings()
+    confirmed = True
+    if reply_id is not None:
+        confirmed = await _confirm_reply_persisted(
+            storage,
+            user_id,
+            session_id,
+            reply_id,
+            settings.dangling_wait_secs,
+        )
+    async with message_bus.acquire_lock(
+        _lock_key(user_id, agent_id, session_id),
+        ttl_secs=settings.lock_ttl_secs,
+    ):
+        return await _run_extract_locked(
+            memory_storage,
+            storage,
             user_id,
             agent_id,
             session_id,
-            rt_cfg.idle_minutes * 60,
-        ):
-            logger.info(
-                "memory: extract skip (session %s active again)", session_id,
-            )
-            return False
-
-        # turns 仅作触发信号（达阈值才会调到这里）；窗口大小由游标决定
-        turns_raw = await redis.get(turns_key(user_id, agent_id, session_id))
-        turns = int(turns_raw) if turns_raw else 0
-        if turns < 1:
-            return False
-
-        # 「轮数触发」（recheck_active=False）紧跟在一轮回复之后，assistant 消息
-        # 可能还没落库（ChatService 在回复流结束后的 finally 才 upsert）→ 先给
-        # 1 秒宽限再读窗口，避免只读到一条悬空的 user；「静默扫描」
-        # （recheck_active=True）处理的是已静默 idle_minutes 的会话，消息必然
-        # 已入库，无需等待。仍悬空（回复失败的空 assistant、实例崩溃等）由
-        # _slice_complete_turns 截掉该 user，留待下一批。
-        if not recheck_active:
-            await asyncio.sleep(_DANGLING_WAIT_SECS)
-
-        # 增量窗口：有游标 → 取游标之后的消息；首次（无游标）→ 2×turns 兼容窗口
-        cursor = await get_cursor(redis, user_id, agent_id, session_id)
-        want = (
-            turns * _MESSAGES_PER_TURN
-            if cursor is None
-            else _MAX_WINDOW_MESSAGES
+            cfg,
+            global_cfg,
+            reply_id=reply_id,
+            user_msg_id=user_msg_id,
+            confirmed=confirmed,
+            retry_delays=retry_delays,
         )
-        if cursor is None:
-            messages = await _load_recent_messages(
-                storage,
-                user_id,
-                session_id,
-                want=want,
+
+
+async def _run_extract_locked(
+    memory_storage: MemoryStorage,
+    storage: Any,
+    user_id: str,
+    agent_id: str,
+    session_id: str,
+    cfg: MemoryAgentConfigRecord,
+    global_cfg: MemoryGlobalConfig,
+    *,
+    reply_id: str | None,
+    user_msg_id: str | None = None,
+    confirmed: bool,
+    retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
+) -> bool:
+    """锁内执行序列（共 5 步）；返回是否成功保存。
+
+    步骤 1.5 为锁内兜底：锁内重读全局配置——开关关闭 skip；
+    epoch 落后则就地惰性重置（middleware 未及收敛的静默路径 /
+    重置失败 / 在飞快照三类场景）。
+    """
+    # 1. 会话状态——None 即已清理（sweeper 超龄/清理路径）
+    state = await memory_storage.get_memory_session_state(
+        user_id, agent_id, session_id
+    )
+    if state is None:
+        logger.info(
+            "memory: extract skip (session state gone) session=%s", session_id
+        )
+        return False
+
+    # 1.5 锁内兜底：开关 + epoch（实时真源，middleware 快照滞后的补救）
+    cfg_now = await memory_storage.get_memory_config(agent_id)
+    if cfg_now is None:
+        logger.info(
+            "memory: extract skip (config gone) session=%s", session_id
+        )
+        return False
+    cfg = cfg_now
+    if not cfg.extraction_enabled:
+        logger.info(
+            "memory: extract skip (extraction disabled) session=%s",
+            session_id,
+        )
+        return False
+    if state.switch_epoch != cfg.switch_epoch:
+        # epoch 落后 → 惰性重置（对齐点按路径区分）
+        if reply_id is not None:
+            cursor = await locate_cursor_before_message(
+                storage, user_id, session_id, user_msg_id
             )
         else:
-            messages = await _load_messages_after(
-                storage,
-                user_id,
-                session_id,
-                cursor,
-                want=want,
+            # 静默路径：无新 epoch 内容 → 对齐最新消息（窗口空自然 skip）
+            latest = await _load_recent_messages(
+                storage, user_id, session_id, want=1
             )
-        if not messages:
-            return False
-
-        messages = _truncate_to_budget(messages, rt_cfg.max_tokens)
-
-        # 完整轮切片：payload 必以 user 开头、assistant 结尾，不发单边消息
-        payload, last_msg = _slice_complete_turns(messages)
-        if not payload or last_msg is None:
+            cursor = _msg_pos(latest[-1]) if latest else (
+                state.cursor_created_at,
+                state.cursor_msg_id,
+            )
+        if cursor is GIVE_UP:
             logger.info(
-                "memory: no complete turn to extract session=%s "
-                "(turns=%d, window=%d)",
+                "memory: epoch reset cursor locate gave up session=%s",
                 session_id,
-                turns,
-                len(messages),
             )
             return False
-
-        param = {
-            "agentId": agent_id,
-            "userCode": user_id,
-            "agentPlat": cfg.agent_plat,
-            "memoryType": cfg.memory_type,
-            "inferFlag": cfg.infer_flag,
-            "messages": payload,
-        }
-        await _save_with_retry(param, retry_delays)
-
-        # 成功 → 推进游标 + 清理状态（turns 清零，游标保留为下一批起点）
-        last_created, last_id = _msg_pos(last_msg)
-        await set_cursor(
-            redis,
+        empty_cursor = cursor is None
+        cursor_created_at, cursor_msg_id = (
+            ("", "") if empty_cursor else cursor
+        )
+        state = await memory_storage.reset_memory_session_state(
             user_id,
             agent_id,
             session_id,
-            last_created,
-            last_id,
+            cursor_created_at=cursor_created_at,
+            cursor_msg_id=cursor_msg_id,
+            epoch=cfg.switch_epoch,
+            now=time.time(),
         )
-        await clear_extract_state(redis, user_id, agent_id, session_id)
-        release = True
         logger.info(
-            "memory: extracted session=%s turns=%d messages=%d cursor=%s",
+            "memory: epoch reset session=%s epoch=%d empty_cursor=%s",
             session_id,
-            turns,
-            len(payload),
-            last_id,
+            cfg.switch_epoch,
+            empty_cursor,
         )
-        return True
-    finally:
-        # 统一释放提取锁（成功/失败/放弃都释放；失败保留 turns 由
-        # 后续轮数/扫描再试，锁 TTL 兜底防并发）
-        await redis.delete(lock_key(user_id, agent_id, session_id))
+        # 不提前 return——继续步骤 2：轮数路径窗口 = 本轮起；
+        # 静默路径窗口空，由"empty window"分支自然 skip
+
+    # 2. 读窗口（条数 + token 双层上限，截断告警）；空窗口 = 游标已最新
+    messages = await _read_window(
+        storage, user_id, session_id, _cursor_of(state)
+    )
+    if not messages:
+        logger.info(
+            "memory: extract skip (empty window) session=%s", session_id
+        )
+        return False
+    budgeted = _truncate_to_budget(messages, global_cfg.max_tokens)
+    if len(budgeted) < len(messages):
+        logger.warning(
+            "memory: window truncated by token budget session=%s "
+            "dropped=%d/%d",
+            session_id,
+            len(messages) - len(budgeted),
+            len(messages),
+        )
+
+    # 3. 完整轮切片 + last_msg_id（本批末条被发送 assistant 消息 id）
+    payload, last_msg = _slice_complete_turns(budgeted)
+    if not payload or last_msg is None:
+        logger.info(
+            "memory: no complete turn to extract session=%s window=%d",
+            session_id,
+            len(budgeted),
+        )
+        return False
+    last_msg_id = str(last_msg.id)
+
+    # 4. 平台落库（重试退避）
+    request = build_save_request(
+        cfg,
+        user_id,
+        [(m["role"], m["content"]) for m in payload],
+        last_msg_id,
+    )
+    await _save_with_retry(request, retry_delays)
+
+    # 5. 先平台后游标：游标推进到本批末条（与已落库内容严格对齐）。
+    #    本批若未含本轮回复（未确认且末条 != reply_id），说明尾部那一轮
+    #    还没落库、不属于本批 → turns 置 1 而非清零：保留「>= 1」的触发
+    #    动力（静默扫描候选 + 下轮累计），让后续触发把该轮补齐。
+    last_created, last_id = _msg_pos(last_msg)
+    await memory_storage.set_memory_session_cursor(
+        user_id, agent_id, session_id, last_created, last_id
+    )
+    pending = (
+        reply_id is not None and not confirmed and last_msg_id != reply_id
+    )
+    try:
+        await memory_storage.reset_memory_session_turns(
+            user_id, agent_id, session_id, turns=1 if pending else 0
+        )
+    except Exception:
+        logger.warning(
+            "memory: reset turns failed (cursor advanced; re-trigger only) "
+            "session=%s",
+            session_id,
+        )
+    if pending:
+        logger.info(
+            "memory: reply %s not in batch (cursor advanced; turns=1 awaiting "
+            "re-extract) session=%s",
+            reply_id,
+            session_id,
+        )
+    logger.info(
+        "memory: extracted session=%s messages=%d last_msg_id=%s cursor=%s",
+        session_id,
+        len(payload),
+        last_msg_id,
+        last_id,
+    )
+    return True
 
 
 async def _save_with_retry(
-    param: dict[str, Any],
+    request: Any,
     retry_delays: tuple[float, ...],
 ) -> None:
-    """save_memories 失败重试（指数退避：默认 1s/3s/9s，共 3 次）。"""
-    import asyncio
-
+    """save_memories 失败重试（退避默认 1s/3s，共 3 击）。"""
     attempt = 0
     while True:
         try:
-            await pf.save_memories(param)
+            await pf.save_memories(request)
             return
-        except pf.PlatformError:
+        except pf.MemoriesSdkError:
             attempt += 1
             if attempt > len(retry_delays):
                 raise
@@ -375,4 +571,4 @@ async def _save_with_retry(
             )
 
 
-__all__ = ["run_extract"]
+__all__ = ["confirm_persisted_then_run"]

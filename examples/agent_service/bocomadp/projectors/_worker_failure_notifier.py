@@ -45,11 +45,15 @@ _projectors/_worker_failure_notifier.py``（作为框架内置投影器）。
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from agentscope.event import ReplyEndEvent, ReplyFinishedReason
 from agentscope.app._bus_ops import enqueue_run_trigger
 from agentscope.app.message_bus import MessageBusKeys
+
+logger = logging.getLogger("as")
+"""走应用主 logger，确保告警落到 events.log。"""
 
 if TYPE_CHECKING:
     from agentscope.app._service._session_projection import SessionProjection
@@ -280,12 +284,40 @@ class WorkerFailureNotifier:
         #     ``wake`` kind drains the inbox queue on the
         #     next dispatch tick; ``resume`` is reserved for
         #     HITL/HITL-like flows that carry an input event.
+        #
+        #     The dispatcher validates every trigger with
+        #     ``get_session(user_id, agent_id, session_id)``, so the
+        #     agent id MUST be the leader's. Passing the failed worker's
+        #     id (previous behavior) never resolves against the leader
+        #     session: the trigger is dropped as an orphan and the notice
+        #     stays in the inbox until the user's next message.
+        try:
+            leader_session = await self._storage.get_session(
+                user_id,
+                "",
+                leader_sid,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "worker_failure_notice: failed to resolve leader session %r",
+                leader_sid,
+                exc_info=True,
+            )
+            return
+        if leader_session is None:
+            logger.warning(
+                "worker_failure_notice: leader session %r not found for "
+                "user %r; skip wakeup (inbox entry already queued)",
+                leader_sid,
+                user_id,
+            )
+            return
         try:
             await enqueue_run_trigger(
                 bus,
                 user_id=user_id,
                 session_id=leader_sid,
-                agent_id=agent_record.id,  # best-known agent id
+                agent_id=leader_session.agent_id,
             )
         except Exception:  # pylint: disable=broad-except
             pass

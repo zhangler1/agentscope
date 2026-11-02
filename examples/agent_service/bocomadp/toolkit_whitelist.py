@@ -113,4 +113,9 @@ def patch_get_toolkit() -> None:
     )
 
 
+def _keep(tool: Any, allowed: set[str]) -> bool:
+    """Legacy name-based keep predicate (kept for older callers/tests)."""
+    return getattr(tool, "name", "") in allowed
+
+
 __all__ = ["patch_get_toolkit", "set_restricted_tool_names"]

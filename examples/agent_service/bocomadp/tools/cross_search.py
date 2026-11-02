@@ -39,6 +39,7 @@ from ..agent_cross_search_config import (
     AgentCrossSearchConfig,
     cross_search_config_get,
 )
+from ..agent_cross_search_ref import cross_search_ref_list
 from ..config.cross_search_config import CrossSearchConfig, get_cross_search_config
 from ..deerflow.custom_params import get_custom_params
 from ._naming import tool_name
@@ -84,6 +85,8 @@ def _build_req_message(
     config: CrossSearchConfig,
     *,
     agent_config: AgentCrossSearchConfig | None = None,
+    user_code: str | None = None,
+    space_code_list: list[str] | None = None,
 ) -> str:
     if agent_config is not None:
         effective_user_code = agent_config.user_code or config.user_code
@@ -131,6 +134,11 @@ def _build_req_message(
         # effective_psnl_category_id_list = config.psnl_category_id_list
         effective_text_top_n = config.text_top_n
         effective_vector_top_n = config.vector_top_n
+
+    if user_code is not None:
+        effective_user_code = user_code
+    if space_code_list is not None:
+        effective_space_code_list = space_code_list
 
     if not effective_user_code:
         raise ValueError(
@@ -303,27 +311,12 @@ def _extract_results(
     return all_results
 
 
-async def search_cross_backend(
+async def _post_gateway(
+    config: CrossSearchConfig,
+    req_message: str,
     keyword: str,
-    *,
-    agent_config: AgentCrossSearchConfig | None = None,
-) -> str:
-    config = get_cross_search_config()
-    if not config.api_url:
-        raise ValueError(
-            "cross_search.api_url is required. 请在 config.yaml 中配置。",
-        )
-    if not config.caller:
-        raise ValueError(
-            "cross_search.caller is required. 请在 config.yaml 中配置。",
-        )
-
-    req_message = _build_req_message(
-        keyword,
-        config,
-        agent_config=agent_config,
-    )
-
+) -> list[dict[str, Any]]:
+    """向网关发一次 searchKnowledgeStandard 报文，返回解析后的结果列表。"""
     headers = dict(config.headers)
     headers.pop("Content-Type", None)
 
@@ -352,8 +345,77 @@ async def search_cross_backend(
             f"cross search failed (status={process_status}): {detail}",
         )
 
-    results = _extract_results(payload, keyword)
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return _extract_results(payload, keyword)
+
+
+async def search_cross_backend(
+    keyword: str,
+    *,
+    agent_config: AgentCrossSearchConfig | None = None,
+    refs: list[Any] | None = None,
+) -> str:
+    """按 owner 分组多次调网关并合并结果。
+
+    网关报文 ``userCode`` 是单值、``spaceCodeList`` 共用这一个 userCode，
+    因此"自己的空间 + 多个被引用者的空间"无法在单次报文表达。这里把
+    引用按 ``owner_user_code`` 归组，每组用各自的 userCode 调一次网关，
+    结果直接 extend 合并（标签 / rerank 等其余参数各组共用）。
+    """
+    config = get_cross_search_config()
+    if not config.api_url:
+        raise ValueError(
+            "cross_search.api_url is required. 请在 config.yaml 中配置。",
+        )
+    if not config.caller:
+        raise ValueError(
+            "cross_search.caller is required. 请在 config.yaml 中配置。",
+        )
+
+    # 1) 分组：自己的空间 + 引用的空间（按 owner_user_code 归组）
+    groups: list[tuple[str, list[str]]] = []
+    if agent_config is not None and agent_config.space_code_list:
+        self_user_code = agent_config.user_code or config.user_code
+        groups.append((self_user_code, list(agent_config.space_code_list)))
+    by_owner: dict[str, list[str]] = {}
+    for r in (refs or []):
+        by_owner.setdefault(r.owner_user_code, []).append(r.space_code)
+    groups.extend(by_owner.items())
+
+    # 2) 逐个 owner 调一次网关，合并结果
+    all_results: list[dict[str, Any]] = []
+    for user_code, codes in groups:
+        if not codes:
+            continue
+        req_message = _build_req_message(
+            keyword,
+            config,
+            agent_config=agent_config,
+            user_code=user_code,
+            space_code_list=codes,
+        )
+        all_results.extend(
+            await _post_gateway(config, req_message, keyword),
+        )
+
+    return json.dumps(all_results, indent=2, ensure_ascii=False)
+
+
+async def _safe_load_refs() -> list[Any]:
+    """读取当前用户/智能体的引用空间；读失败不影响主搜索（容错）。"""
+    user_id = _current_user_id.get()
+    agent_id = _current_agent_id.get()
+    if not user_id or not agent_id:
+        return []
+    try:
+        return await cross_search_ref_list(user_id, agent_id)
+    except Exception as exc:
+        logger.warning(
+            "CrossSearchRefs: failed to read refs for %s/%s: %s",
+            user_id,
+            agent_id,
+            exc,
+        )
+        return []
 
 
 async def _cross_search_tool_impl(keyword: str) -> str:
@@ -375,6 +437,7 @@ async def _cross_search_tool_impl(keyword: str) -> str:
             必须严格使用用户提供的完整语句。
     """
     agent_config = await _get_agent_cross_search_config()
+    refs = await _safe_load_refs()
 
     if agent_config is not None:
         logger.info(
@@ -389,6 +452,7 @@ async def _cross_search_tool_impl(keyword: str) -> str:
         return await search_cross_backend(
             keyword,
             agent_config=agent_config,
+            refs=refs,
         )
     except httpx.TimeoutException:
         logger.error("Cross search request timed out.", exc_info=True)

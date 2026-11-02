@@ -36,7 +36,7 @@ class _FakeSession:
 
 
 class _FakeBackend:
-    """只实现落盘所需的两个方法（join_path / write_file）。"""
+    """实现落盘与同名占位检查所需方法（join_path / write_file / file_exists）。"""
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
@@ -49,6 +49,10 @@ class _FakeBackend:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+    async def file_exists(self, path: str) -> bool:
+        # 落盘写的是真实临时目录，占位检查按磁盘实况回答（配合 _dedupe_session_filename）
+        return Path(path).exists()
 
 
 class _FakeWorkspace:

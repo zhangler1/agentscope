@@ -124,6 +124,135 @@ def repair_tool_call_input(raw: str | None) -> tuple[str | None, str]:
     return json.dumps(parsed, ensure_ascii=False), "repaired"
 
 
+def drop_tool_call_pairs(
+    messages: list[Any],
+    ids: set[str],
+) -> list[Any]:
+    """按 id 成对剔除 ``tool_call`` 与其 ``tool_result``（返回副本）。
+
+    ``ToolResultBlock.id`` 即对应 ``ToolCallBlock.id``（见
+    ``agentscope.agent._agent._execute_tool_call``），因此一个 id 集合可同时
+    命中两侧。整条消息被剔空时直接不发送（DeepSeek formatter 对空
+    assistant 消息本就会跳过，这里提前收敛更直观）。
+
+    Args:
+        messages (`list[Any]`): 待过滤的消息列表。
+        ids (`set[str]`): 需要成对剔除的 tool_call id 集合。
+
+    Returns:
+        `list[Any]`: 过滤后的新列表；无命中时返回原对象。
+    """
+    if not ids:
+        return messages
+    out: list[Any] = []
+    changed = False
+    for msg in messages:
+        blocks = getattr(msg, "content", None)
+        if not isinstance(blocks, list):
+            out.append(msg)
+            continue
+
+        kept = [
+            block
+            for block in blocks
+            if not (
+                getattr(block, "type", None) in ("tool_call", "tool_result")
+                and getattr(block, "id", None) in ids
+            )
+        ]
+        if len(kept) == len(blocks):
+            out.append(msg)
+            continue
+        changed = True
+        if not kept:
+            continue
+        out.append(msg.model_copy(update={"content": kept}))
+    return out if changed else messages
+
+
+def sanitize_tool_calls(
+    messages: list[Any],
+    *,
+    drop_unrepairable: bool = True,
+) -> tuple[list[Any], dict[str, str], set[str], list[tuple[str, str, str, str]]]:
+    """对消息列表做 tool_call 参数体检（不依赖 agent，任何调用点可复用）。
+
+    与 :class:`ToolCallRepairMiddleware` 同一套判定，供拿不到 ``agent`` 的
+    发送路径使用（例如 provider 的 ``_call_api``：上下文压缩直接调
+    ``generate_structured_output``，不经过 ``on_model_call`` 中间件链）。
+
+    Args:
+        messages (`list[Any]`):
+            待发送的消息列表（框架 ``Msg`` 对象）。
+        drop_unrepairable (`bool`, defaults to ``True``):
+            无法修复时是否成对剔除（仅作用于返回副本）。
+
+    Returns:
+        `tuple[list[Any], dict[str, str], set[str], list[tuple[str, str, str, str]]]`:
+        ``(发送用消息列表, tool_call_id → 修复后的串, 被剔除的 id 集合,
+        处置明细)``；处置明细元素为
+        ``(verdict, tool_call_id, tool_name, raw)``，``verdict`` 取值
+        ``"repaired"`` / ``"empty"`` / ``"unrepairable_kept"`` /
+        ``"unrepairable_dropped"``。无任何改动时原样返回入参。
+    """
+    fixes: dict[str, str] = {}
+    drop_ids: set[str] = set()
+    actions: list[tuple[str, str, str, str]] = []
+    out: list[Any] = []
+    changed = False
+
+    for msg in messages:
+        blocks = getattr(msg, "content", None)
+        if not isinstance(blocks, list):
+            out.append(msg)
+            continue
+
+        new_blocks: list[Any] = []
+        replaced_any = False
+        for block in blocks:
+            if getattr(block, "type", None) != "tool_call":
+                new_blocks.append(block)
+                continue
+
+            raw = block.input or ""
+            fixed, verdict = repair_tool_call_input(raw)
+            if verdict == "ok":
+                new_blocks.append(block)
+                continue
+
+            if verdict == "unrepairable":
+                if not drop_unrepairable:
+                    new_blocks.append(block)
+                    actions.append(
+                        ("unrepairable_kept", block.id, block.name, raw),
+                    )
+                    continue
+                drop_ids.add(block.id)
+                replaced_any = True
+                actions.append(
+                    ("unrepairable_dropped", block.id, block.name, raw),
+                )
+                continue
+
+            # "empty" / "repaired"：这两个分支 repair 必返回字符串
+            assert fixed is not None
+            new_blocks.append(block.model_copy(update={"input": fixed}))
+            replaced_any = True
+            fixes[block.id] = fixed
+            actions.append((verdict, block.id, block.name, raw))
+
+        if replaced_any:
+            changed = True
+            out.append(msg.model_copy(update={"content": new_blocks}))
+        else:
+            out.append(msg)
+
+    if drop_ids:
+        out = drop_tool_call_pairs(out, drop_ids)
+        changed = True
+    return (out if changed else messages), fixes, drop_ids, actions
+
+
 class ToolCallRepairMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
     """见模块 docstring：发送前修复/剔除不可用的工具调用参数。"""
 
@@ -187,122 +316,62 @@ class ToolCallRepairMiddleware(MiddlewareBase):  # pylint: disable=abstract-meth
             ``(发送用消息列表, tool_call_id → 修复后的串, 待剔除的 id 集合)``。
             没有任何改动时**原样返回入参对象**，调用方可据此跳过替换。
         """
+        sanitized, fixes, drop_ids, actions = sanitize_tool_calls(
+            messages,
+            drop_unrepairable=drop_unrepairable,
+        )
+        if not actions:
+            return sanitized, fixes, drop_ids
+
         ctx = ctx_fields(agent)
-        fixes: dict[str, str] = {}
-        drop_ids: set[str] = set()
-        out: list[Any] = []
-        changed = False
-
-        for msg in messages:
-            blocks = getattr(msg, "content", None)
-            if not isinstance(blocks, list):
-                out.append(msg)
-                continue
-
-            new_blocks: list[Any] = []
-            replaced_any = False
-            for block in blocks:
-                if getattr(block, "type", None) != "tool_call":
-                    new_blocks.append(block)
-                    continue
-
-                raw = block.input or ""
-                fixed, verdict = repair_tool_call_input(raw)
-                if verdict == "ok":
-                    new_blocks.append(block)
-                    continue
-
-                if verdict == "unrepairable":
-                    if not drop_unrepairable:
-                        # 保留现场：请求大概率仍被上游拒收，但由运维显式选择。
-                        new_blocks.append(block)
-                        logger.warning(
-                            "TOOL_CALL_REPAIR keep_unrepairable %s tool=%s "
-                            "tool_call_id=%s raw_len=%d raw_head=%r",
-                            ctx,
-                            block.name,
-                            block.id,
-                            len(raw),
-                            raw[:_RAW_HEAD],
-                        )
-                        continue
-                    drop_ids.add(block.id)
-                    replaced_any = True
-                    logger.warning(
-                        "TOOL_CALL_REPAIR drop %s tool=%s tool_call_id=%s "
-                        "raw_len=%d raw_head=%r",
-                        ctx,
-                        block.name,
-                        block.id,
-                        len(raw),
-                        raw[:_RAW_HEAD],
-                    )
-                    continue
-
-                # "empty" / "repaired"
-                new_blocks.append(block.model_copy(update={"input": fixed}))
-                replaced_any = True
-                fixes[block.id] = fixed
-                if verdict == "repaired":
-                    logger.warning(
-                        "TOOL_CALL_REPAIR repaired %s tool=%s "
-                        "tool_call_id=%s raw_len=%d closed=%s raw_tail=%r",
-                        ctx,
-                        block.name,
-                        block.id,
-                        len(raw),
-                        raw.rstrip().endswith("}"),
-                        raw[-_RAW_TAIL:],
-                    )
-                else:
-                    logger.info(
-                        "TOOL_CALL_REPAIR normalized %s tool=%s "
-                        "tool_call_id=%s raw=%r",
-                        ctx,
-                        block.name,
-                        block.id,
-                        raw,
-                    )
-
-            if replaced_any:
-                changed = True
-                out.append(msg.model_copy(update={"content": new_blocks}))
-            else:
-                out.append(msg)
-
-        return (out if changed else messages), fixes, drop_ids
+        for verdict, tool_call_id, tool_name, raw in actions:
+            if verdict == "unrepairable_kept":
+                # 保留现场：请求大概率仍被上游拒收，但由运维显式选择。
+                logger.warning(
+                    "TOOL_CALL_REPAIR keep_unrepairable %s tool=%s "
+                    "tool_call_id=%s raw_len=%d raw_head=%r",
+                    ctx,
+                    tool_name,
+                    tool_call_id,
+                    len(raw),
+                    raw[:_RAW_HEAD],
+                )
+            elif verdict == "unrepairable_dropped":
+                logger.warning(
+                    "TOOL_CALL_REPAIR drop %s tool=%s tool_call_id=%s "
+                    "raw_len=%d raw_head=%r",
+                    ctx,
+                    tool_name,
+                    tool_call_id,
+                    len(raw),
+                    raw[:_RAW_HEAD],
+                )
+            elif verdict == "repaired":
+                logger.warning(
+                    "TOOL_CALL_REPAIR repaired %s tool=%s "
+                    "tool_call_id=%s raw_len=%d closed=%s raw_tail=%r",
+                    ctx,
+                    tool_name,
+                    tool_call_id,
+                    len(raw),
+                    raw.rstrip().endswith("}"),
+                    raw[-_RAW_TAIL:],
+                )
+            else:  # "empty"
+                logger.info(
+                    "TOOL_CALL_REPAIR normalized %s tool=%s "
+                    "tool_call_id=%s raw=%r",
+                    ctx,
+                    tool_name,
+                    tool_call_id,
+                    raw,
+                )
+        return sanitized, fixes, drop_ids
 
     @staticmethod
     def _drop_pairs(messages: list[Any], ids: set[str]) -> list[Any]:
-        """按 id 成对剔除 tool_call 与其 tool_result。
-
-        ``ToolResultBlock.id`` 即对应 ``ToolCallBlock.id``（见
-        ``agentscope.agent._agent._execute_tool_call``），因此一个 id 集合可同时
-        命中两侧。整条消息被剔空时直接不发送（DeepSeek formatter 对空
-        assistant 消息本就会跳过，这里提前收敛更直观）。
-        """
-        out: list[Any] = []
-        for msg in messages:
-            blocks = getattr(msg, "content", None)
-            if not isinstance(blocks, list):
-                out.append(msg)
-                continue
-
-            kept = [
-                block
-                for block in blocks
-                if not (
-                    getattr(block, "type", None) in ("tool_call", "tool_result")
-                    and getattr(block, "id", None) in ids
-                )
-            ]
-            if len(kept) == len(blocks):
-                out.append(msg)
-                continue
-            if not kept:
-                continue
-            out.append(msg.model_copy(update={"content": kept}))
-        return out
+        """按 id 成对剔除 tool_call 与其 tool_result（见模块函数实现）。"""
+        return drop_tool_call_pairs(messages, ids)
 
     @staticmethod
     def _write_back(agent: Any, fixes: dict[str, str]) -> None:
@@ -328,6 +397,8 @@ class ToolCallRepairMiddleware(MiddlewareBase):  # pylint: disable=abstract-meth
 __all__ = [
     "ENABLED_ENV",
     "ToolCallRepairMiddleware",
+    "drop_tool_call_pairs",
     "repair_tool_call_input",
+    "sanitize_tool_calls",
     "tool_call_repair_enabled",
 ]

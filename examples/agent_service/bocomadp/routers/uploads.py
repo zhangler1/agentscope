@@ -165,18 +165,25 @@ async def _persist_uploaded_bytes(
     data: bytes,
     content_type: str | None,
     stored_name_override: str | None = None,
+    auto_parse: bool = True,
 ) -> UploadedFile:
-    """落盘原始文件 + 图片 base64 固化 / 文档转 .md + 写入 uploads DB。
+    """落盘原始文件 +（可选）内容加工 + 写入 uploads DB。
 
     ``POST /files/upload`` 端点与 ``context.custom_params.additional_urls`` 下载
     共用本函数，保证两条路径的文件元数据与落盘格式完全一致（下游
     ``view_image_tool`` / ``<context name="files">``
     均以 uploads DB 记录为感知通道）。
 
+    Args:
+        auto_parse: 落盘后是否自动加工内容——图片转 base64 固化、文档转 .md。
+            为 ``False`` 时仅落盘 + 写库，不做任何内容加工（解析交由调用方
+            独立完成，例如自定义 skill），避免大文件同步转换拖慢请求。
+
     Raises:
         `UploadError`: 文件名非法 / 落盘失败（调用方按需处理）。
     """
-    # 安全文件名
+    # 安全文件名（stored_name_override 供调用方指定落盘名：URL 下载时
+    # 扩展名与调用方 file_name 冲突，落盘名跟随 URL 保证名与内容一致）
     stored_name = normalize_filename(
         stored_name_override or original_name or "file",
     )
@@ -211,7 +218,9 @@ async def _persist_uploaded_bytes(
     except Exception as e:  # noqa: BLE001
         raise UploadError(f"write failed: {e}") from e
 
-    # 转换 .md（host 侧第三方库），并写回工作区
+    # 内容加工（host 侧第三方库）：图片 base64 固化 / 文档转 .md，并写回工作区。
+    # auto_parse=False 时整段跳过——仅落盘 + 写库，解析交由调用方（如自定义
+    # skill）按自己的节奏完成，避免大文件同步转换阻塞请求、触发网关超时。
     converted = False
     convert_format = None
     convert_error = None
@@ -220,7 +229,7 @@ async def _persist_uploaded_bytes(
     mime_type = None
     is_img = is_image(content_type, stored_name)
     try:
-        if is_img:
+        if auto_parse and is_img:
             # 图片：直接固化为 base64 存入元数据，供 view_image_tool
             # 直接解析（不生成 .md，不内联进消息正文）。MIME 以文件头
             # 实测为准（内容优先），实测不到时按扩展名兜底。
@@ -231,7 +240,7 @@ async def _persist_uploaded_bytes(
                 )
             else:
                 base64 = encode_image_base64(data)
-        elif file_conversion.is_supported_format(stored_name):
+        elif auto_parse and file_conversion.is_supported_format(stored_name):
             fmt, md_text = file_conversion.convert_file_bytes(
                 stored_name, data, content_type,
             )
@@ -253,7 +262,10 @@ async def _persist_uploaded_bytes(
             agent_id=agent_id,
             session_id=session_id,
             workspace_id=getattr(workspace, "workspace_id", None),
-            original_name=stored_name,
+            # 落盘名可被 stored_name_override 改写（扩展名冲突时跟随 URL），
+            # 此处必须记调用方的原始名，UploadsMiddleware 据此在提示词中
+            # 说明「原始名 vs 实际文件」的对应关系。
+            original_name=original_name or stored_name,
             stored_name=stored_name,
             virtual_path=virtual_path,
             size_bytes=len(data),
@@ -309,6 +321,39 @@ def _name_ext_conflict(original_name: str, url_name: str) -> bool:
     return bool(o_ext and u_ext and o_ext != u_ext)
 
 
+# ---------------------------------------------------------------------------
+# 工具层依赖注入（run 任务内无 FastAPI Depends，工具须经本入口复用
+# download_urls_to_session 下载文件到会话 uploads 目录）
+# ---------------------------------------------------------------------------
+_upload_deps_storage: StorageBase | None = None
+_upload_deps_workspace_manager: WorkspaceManagerBase | None = None
+
+
+def set_upload_dependencies(
+    storage: StorageBase,
+    workspace_manager: WorkspaceManagerBase,
+) -> None:
+    """注册全局 storage / workspace_manager（main.py 启动时调用一次）。"""
+    global _upload_deps_storage, _upload_deps_workspace_manager
+    _upload_deps_storage = storage
+    _upload_deps_workspace_manager = workspace_manager
+
+
+def get_upload_dependencies() -> tuple[StorageBase, WorkspaceManagerBase]:
+    """读取已注册的 ``(storage, workspace_manager)``。
+
+    Raises:
+        RuntimeError: 尚未注册（main.py 启动序列未执行 / 测试环境未注入）。
+    """
+    if _upload_deps_storage is None or _upload_deps_workspace_manager is None:
+        raise RuntimeError(
+            "upload dependencies not registered; call "
+            "set_upload_dependencies(storage, workspace_manager) "
+            "at startup (main.py)"
+        )
+    return _upload_deps_storage, _upload_deps_workspace_manager
+
+
 async def download_urls_to_session(
     user_id: str,
     agent_id: str,
@@ -332,7 +377,7 @@ async def download_urls_to_session(
             - ``(url, original_name)`` 元组，``original_name`` 为空时回退
               到 URL 推断（保留前端传入的 ``file_name``）。
 
-            同名文件会被 ``normalize_filename`` 归一化；重复文件名直接覆盖。
+            同名文件经 ``_dedupe_session_filename`` 自动改名，互不覆盖。
 
     Returns:
         `list[UploadedFile]`: 成功保存的上传记录（按 URL 顺序）。
@@ -396,10 +441,11 @@ async def download_urls_to_session(
                     session_id=session_id,
                     storage=storage,
                     workspace_manager=workspace_manager,
-                    original_name=original_name,
+                    # 裸 URL 传入（无调用方名）时回退 URL 推断名；
                     # 扩展名冲突时（如 file_name=.xls 而 URL 实际是 .txt）
                     # 落盘名跟随 URL，保证文件名与内容一致；file_name 仅作
                     # original_name 记录，由中间件在提示词中说明对应关系。
+                    original_name=original_name or url_name,
                     stored_name_override=(
                         url_name
                         if _name_ext_conflict(original_name, url_name)
@@ -471,6 +517,10 @@ async def upload_file(
     # 与历史 curl 均以此名发多值，FastAPI 按参数名绑定表单字段，
     # 同名多值自动收成列表，前端零改动即可批量上传。
     file: list[UploadFile] = File(...),
+    # 是否在落盘后自动解析内容：默认 true 保持既有行为（图片 base64 固化 /
+    # 文档转 .md）；false 为纯上传，仅落盘 + 写库，解析交由调用方独立完成
+    # （如自定义 skill）。大文件传 false 可避免同步转换拖慢请求、触发网关超时。
+    auto_parse: bool = Form(True),
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
@@ -511,6 +561,7 @@ async def upload_file(
                 original_name=upload.filename or "file",
                 data=data,
                 content_type=upload.content_type,
+                auto_parse=auto_parse,
             )
         except UploadError as e:
             _raise_upload_error(e)
