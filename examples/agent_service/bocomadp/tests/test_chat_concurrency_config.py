@@ -16,6 +16,7 @@ pytest-asyncio 未安装：异步逻辑用 ``asyncio.run()`` 包裹（与既有�
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import time
 
@@ -56,6 +57,17 @@ class _FakeRedis:
         self.values.pop(key, None)
         return 1
 
+    async def scan(self, cursor: int, match: str | None = None, count: int | None = None):
+        self.calls["scan"] = self.calls.get("scan", 0) + 1
+        if self.fail:
+            raise ConnectionError("redis down")
+        if match:
+            keys = [k for k in self.values if fnmatch.fnmatch(k, match)]
+        else:
+            keys = list(self.values)
+        # 测试数据量小，一次返回全部（cursor=0 表示迭代结束）
+        return 0, keys
+
 
 def _key(agent_id: str) -> str:
     return f"agentscope:chat_concurrency:{agent_id}"
@@ -67,6 +79,7 @@ def _reset_state(monkeypatch):
     monkeypatch.setattr(chat_concurrency_config, "_cache", {})
     monkeypatch.setattr(chat_concurrency_config, "_redis_unavailable_until", 0.0)
     monkeypatch.setattr(chat_concurrency_config, "_has_any", False)
+    monkeypatch.setattr(chat_concurrency_config, "_no_config_until", 0.0)
 
     async def _pg_none(agent_id: str):
         return None
@@ -183,4 +196,33 @@ def test_load_runtime_fills_cache_when_redis_down(monkeypatch):
     _use_redis(monkeypatch, down)
     _run(chat_concurrency_config.load_runtime())
     assert chat_concurrency_config._cache["ag-1"] == 2
-    assert chat_concurrency_config.has_any_config() is True
+    assert _run(chat_concurrency_config.has_any_config()) is True
+
+
+# ── 多副本 _has_any 兜底（核心修复回归） ──────────────────────────────
+
+
+def test_has_any_falls_back_to_redis_when_local_false(monkeypatch):
+    """多副本场景：本进程 _has_any=False（没收到 PUT），但 Redis 热层里
+    有别的副本写入的配置键，has_any_config 应回退查 Redis 返回 True，
+    并修正本地标志（稳态零开销）。这正是多副本漏拦缺口的修复点。"""
+    assert chat_concurrency_config._has_any is False
+    # 模拟副本 A 通过 PUT 写进 Redis 的配置（本进程从未收到该 PUT）
+    fake = _FakeRedis({_key("ag-other"): "1"})
+    _use_redis(monkeypatch, fake)
+    assert _run(chat_concurrency_config.has_any_config()) is True
+    # 命中后修正本地标志，后续不再查 Redis
+    assert chat_concurrency_config._has_any is True
+
+
+def test_has_any_negative_cache_limits_scan_when_no_config(monkeypatch):
+    """无配置时：首次 SCAN 确认无配置并写负缓存，10s 内不再打 Redis。
+
+    对应“不会增加很多损耗”的性能保障——未启用限流的部署不会每请求 SCAN。"""
+    fake = _FakeRedis({})  # 没有任何配置键
+    _use_redis(monkeypatch, fake)
+    assert _run(chat_concurrency_config.has_any_config()) is False
+    assert fake.calls.get("scan", 0) == 1
+    # 负缓存有效期内再调，不应再增加 SCAN 次数
+    assert _run(chat_concurrency_config.has_any_config()) is False
+    assert fake.calls.get("scan", 0) == 1

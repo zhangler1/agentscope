@@ -20,8 +20,11 @@ Redis 不可用时进入短暂冷却（避免每个请求都白等一次连接�
 后自动重试——Redis 恢复即自动回热，无需重启进程。
 
 启动回填：``load_runtime`` 把 PG 全量刷入缓存与 Redis（Redis 回填失败
-仅告警），并维护 ``has_any_config`` 标志
-（闸机启停判定 = ``run_concurrency.enabled`` OR 存在任一智能体配置）。
+仅告警），并维护 ``has_any_config`` 进程内标志。``has_any_config()`` 优先
+读进程内标志（零开销）；多副本下本进程未收到 PUT、且启动时 PG 也无配置
+时，回退查 Redis 共享真相（``SCAN agentscope:chat_concurrency:*``），避免
+闸机空转漏拦。闸机启停判定 = ``run_concurrency.enabled`` OR 存在任一智能体
+配置。
 """
 from __future__ import annotations
 
@@ -328,6 +331,10 @@ _REDIS_COOLDOWN_SECS = 5.0
 _redis_unavailable_until: float = 0.0
 # 启停判定标志：存在任一智能体配置（闸机以此激活，不依赖 run_concurrency.enabled）
 _has_any = False
+# 负缓存：最近确认“无任何配置”的截止时间（monotonic）；有效期内不再 SCAN，
+# 避免未启用限流时每请求都打一次 Redis——多副本正确性 vs 零开销的折中。
+_NEG_TTL_SECS = 10.0
+_no_config_until: float = 0.0
 
 _redis: Any = None
 
@@ -339,9 +346,58 @@ def _config_key(agent_id: str) -> str:
     return f"agentscope:chat_concurrency:{agent_id}"
 
 
-def has_any_config() -> bool:
-    """是否存在任一智能体并发配置（同步读标志，供中间件每请求判定）。"""
-    return _has_any
+async def _redis_has_any() -> bool:
+    """跨进程真相：Redis 中是否存在任一 chat_concurrency 配置键。
+
+    多副本下，本进程可能既没收到过 PUT、启动时 PG 又恰好无配置，
+    此时进程内 ``_has_any`` 为假会令闸机空转漏拦。改查 Redis 共享
+    热层即可拿到“是否有任一智能体配置”的真值。Redis 不可用降级 False。
+    """
+    if _redis_cooling_down():
+        return False
+    try:
+        r = await _get_redis()
+        cursor = 0
+        while True:
+            cursor, keys = await r.scan(
+                cursor, match="agentscope:chat_concurrency:*", count=100,
+            )
+            if keys:
+                return True
+            if cursor == 0:
+                break
+        return False
+    except Exception as e:  # noqa: BLE001 — Redis 故障降级，不阻断
+        _mark_redis_down(e)
+        return False
+
+
+async def has_any_config() -> bool:
+    """是否存在任一智能体并发配置（闸机启停判定）。
+
+    进程内标志优先（零开销热路径）；多副本下本进程未收到 PUT、且启动时
+    PG 也无配置时，回退查 Redis 共享真相，避免闸机空转漏拦。命中后顺手
+    修正本地标志，稳态零开销。
+
+    无配置时并非每请求都查 Redis：确认“无配置”后写入负缓存（默认 10s），
+    有效期内直接返回，把未启用限流场景的额外开销从“每请求一次 SCAN”
+    降到“每 10s 一次”，几乎无感。Redis 不可用降级为进程内标志。
+    """
+    global _has_any, _no_config_until
+    if _has_any:
+        return True
+    # 负缓存：近期已确认无配置且在有效期内，直接返回（不查 Redis）
+    if time.monotonic() < _no_config_until:
+        return False
+    try:
+        if await _redis_has_any():
+            _has_any = True
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    # 确认无配置，写入负缓存（避免每请求 SCAN）
+    _no_config_until = time.monotonic() + _NEG_TTL_SECS
+    return False
 
 
 async def _get_redis() -> Any:
@@ -499,9 +555,16 @@ async def load_runtime() -> None:
 
 
 def mark_has_any(value: bool) -> None:
-    """PUT/DELETE 时翻动启停标志（避免每请求查库）。"""
-    global _has_any
+    """PUT/DELETE 时翻动启停标志（避免每请求查库）。
+
+    PUT 配了任意上限 → True（下次直接返回，零开销且立即可用）；
+    DELETE 删光 → False，同时清负缓存使下一请求立即 SCAN 复核
+    （别的副本可能又配了，避免被旧负缓存挡住而漏拦）。
+    """
+    global _has_any, _no_config_until
     _has_any = value
+    if not value:
+        _no_config_until = 0.0
 
 
 __all__ = [

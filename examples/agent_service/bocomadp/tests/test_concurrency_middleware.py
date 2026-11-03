@@ -379,8 +379,10 @@ def test_disabled_skips_all_guard_calls(fake_redis):
                             "more_body": False})
 
         # enabled=False 且无智能体配置:完全透传,不执行对账/占位/注册
+        async def _no_agent_config() -> bool:
+            return False
         mw = ConcurrencyGuardMiddleware(_OkApp(), _SpyGuard(), enabled=False,
-                                        has_agent_config=lambda: False)
+                                        has_agent_config=_no_agent_config)
         scope = {"type": "http", "method": "POST", "path": "/chat/",
                  "headers": [(b"x-user-id", b"a")]}
         sent = []

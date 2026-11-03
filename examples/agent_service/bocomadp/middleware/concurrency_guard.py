@@ -81,7 +81,7 @@ class ConcurrencyGuardMiddleware:
         guard,
         *,
         enabled: bool = True,
-        has_agent_config: Callable[[], bool] | None = None,
+        has_agent_config: Callable[[], Awaitable[bool]] | None = None,
         grace_secs: float = 6.0,
     ) -> None:
         self.app = app
@@ -113,7 +113,7 @@ class ConcurrencyGuardMiddleware:
 
         # 闸机整体空转(两维开关均未激活)→ 零开销透传
         if not self._enabled and (
-            self._has_agent_config is None or not self._has_agent_config()
+            self._has_agent_config is None or not await self._has_agent_config()
         ):
             await self.app(scope, receive, send)
             return
