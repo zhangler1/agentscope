@@ -231,6 +231,35 @@ class TestInjection:
         # No inject_think in request → model registry value wins.
         assert base.inject_think_tag is True
 
+    def test_session_decided_think_not_overridden(self) -> None:
+        """模型构建期已按会话配置定下的开关，不被模型库覆盖。
+
+        场景：模型库 think_tag=True，但本会话关了思考 → 注入必须保持
+        False，否则 ``<think>`` 标签不闭合，整段回答会被前端当思考。
+        """
+        storage = _FakeStorage(_record("k", time.time() - 1800))
+        mw = EllmKeyRefreshMiddleware(storage, InMemoryMessageBus(), "user-1")
+        base = _base_model()
+        base.client = mock.MagicMock()
+        base.inject_think_tag = False  # 会话级已判定（见 model_patch）
+
+        with mock.patch(
+            "bocomadp.providers.ellm_key.fetch_ellm_key",
+            return_value=("new-key", 1_500_000),
+        ), mock.patch(
+            "bocomadp.middleware.ellm_refresh.resolve_model_meta",
+            new=mock.AsyncMock(return_value={"think_tag": True}),
+        ):
+            asyncio.run(
+                mw.on_model_call(
+                    agent=None,
+                    input_kwargs={"current_model": base},
+                    next_handler=_dummy_next,
+                ),
+            )
+
+        assert base.inject_think_tag is False
+
     def test_non_ellm_model_passes_through(self) -> None:
         """Non-EllmChatModel models are returned untouched."""
         mw = EllmKeyRefreshMiddleware(
@@ -333,8 +362,8 @@ class TestCompressContextHook:
         assert model._api_key_override == "new-key-abc"
         assert model._refresh_key_callback is not None
         assert model._auth_invalidate_callback is not None
-        # 压缩不应改动 think-tag 开关（保持构造默认值）。
-        assert model.inject_think_tag is False
+        # 压缩不应改动 think-tag 开关（保持构造默认值 None = 未决）。
+        assert model.inject_think_tag is None
         assert storage.upsert_calls == 1
 
     def test_compress_reuses_fresh_key_without_gateway(self) -> None:
