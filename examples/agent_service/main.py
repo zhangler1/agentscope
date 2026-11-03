@@ -1016,12 +1016,12 @@ async def _lifespan_with_builtin_agents(app):
     async with _original_lifespan(app):
         # 恢复持久化的工具白名单（内存存储重启会丢）
         load_tool_whitelists()
-        # 市场审批人白名单（JSON 文件持久化 + 接口管理，末位保护：
-        # 名单不可清空）——文件缺失时用 SEED_REVIEWERS 种子名单首次
-        # 播种，之后文件即唯一真相源。
-        from bocomadp import market_reviewers
+        # 角色表（roles / user_roles）——审批人（reviewer
+        # 角色）的名单真源；首次启动建表 + 种子首批审批人，末位保护在接口层。
+        from bocomadp import role_store
 
-        market_reviewers.load_whitelist()
+        role_store.bind_storage(storage)
+        await role_store.ensure_tables()
         # 专家团关系表（expert_team_relations）——团队档案从 AgentData
         # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
         # 必须早于下面所有读团队档案的补丁挂载。

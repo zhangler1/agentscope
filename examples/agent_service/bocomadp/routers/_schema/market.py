@@ -318,3 +318,11 @@ class MarketReviewersUpdateRequest(BaseModel):
             "PUT = 全量覆盖（不可为空，末位保护 409）。"
         ),
     )
+
+
+class MarketMyRoleResponse(BaseModel):
+    """Response body for GET /agent/market/my-role。"""
+
+    roles: list[str] = Field(
+        description="当前用户拥有的角色 key 列表；无角色则为空数组。",
+    )
