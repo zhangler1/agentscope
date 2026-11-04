@@ -23,7 +23,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from agentscope.app.deps import get_current_user_id
@@ -89,6 +89,13 @@ async def set_chat_concurrency(
 ) -> dict:
     await _resolve_agent(request, user_id, body.agent_id)
 
+    # 仅审核通过的智能体允许配置并发上限：未过审直接拒绝、不落库。
+    if not await chat_concurrency_config.is_agent_approved(body.agent_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="未发布的智能体不允许配置并发路数，默认并发为1。",
+        )
+
     # 1. PG 真源（持久化，重启不丢）；名称按 id 关联 agents 表取快照存入，
     #    供列表按名称模糊查询（智能体改名后需重新 PUT 才会刷新）。
     names = await chat_concurrency_config.pg_agent_names([body.agent_id])
@@ -100,9 +107,6 @@ async def set_chat_concurrency(
     runtime_synced = await chat_concurrency_config.set_runtime(
         body.agent_id, body.max_running,
     )
-
-    # 3. 闸机启停标志：存在任一配置即激活（不依赖 run_concurrency.enabled）
-    chat_concurrency_config.mark_has_any(True)
 
     logger.info(
         "agent_chat_concurrency: %s -> max_running=%d (runtime_synced=%s)",
@@ -178,8 +182,6 @@ async def delete_chat_concurrency(
 
     await chat_concurrency_config.pg_delete(agent_id)
     await chat_concurrency_config.delete_runtime(agent_id)
-    if await chat_concurrency_config.pg_count() == 0:
-        chat_concurrency_config.mark_has_any(False)
 
     logger.info("agent_chat_concurrency: %s -> reset to unlimited", agent_id)
     return {

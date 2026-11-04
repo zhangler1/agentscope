@@ -52,6 +52,7 @@ from bocomadp import (
     market_review_store,
     market_reviewers,
     market_store,
+    role_store,
     team_store,
 )
 from bocomadp.routers.agent import agent_router
@@ -126,20 +127,13 @@ def _add_sessions(storage, agent_id: str, count: int) -> None:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    """sqlite 存储 + 团队/市场两张 bocomadp 自建表 + 两个 router。
+def client(tmp_path, tmp_path_factory, monkeypatch):
+    """独立 SQLite storage（角色两表经 bind_storage 复用其连接）+ 两个 router。
 
-    审批人白名单：环境变量指向 tmp 文件并种入 ``reviewer-1`` 一人
-    （模拟"运维手工种入首批名单"的部署动作），加载后整个测试期内
-    生效；收尾清空模块级 set，防止状态泄漏到其他测试文件。
+    审批人（reviewer）身份：Fixture 启动时把 ``reviewer-1`` 授予 reviewer
+    角色（role_store 两表建在 storage 的同一 SQLite 文件内，与 agents / team /
+    market 同库，不污染业务库）；收尾收回，保证状态不泄漏。
     """
-    reviewers_file = tmp_path / "reviewers.json"
-    monkeypatch.setenv("BOCOMADP_MARKET_REVIEWERS_FILE", str(reviewers_file))
-    reviewers_file.write_text(
-        json.dumps(["reviewer-1"]), encoding="utf-8",
-    )
-    market_reviewers.load_whitelist()
-
     storage = AsyncSQLAlchemyStorage(
         f"sqlite+aiosqlite:///{tmp_path / 'market.db'}",
         create_tables=True,
@@ -150,6 +144,9 @@ def client(tmp_path, monkeypatch):
             await team_store.ensure_team_tables(storage)
             await market_store.ensure_market_tables(storage)
             await market_review_store.ensure_review_tables(storage)
+            role_store.bind_storage(storage)
+            await role_store.ensure_tables()
+            await role_store.assign_role("reviewer-1", role_store.REVIEWER_ROLE)
 
     _run(_provision())
 
@@ -167,8 +164,8 @@ def client(tmp_path, monkeypatch):
     with TestClient(app) as test_client:
         yield test_client
 
-    # 收尾：清掉模块级白名单状态（env 由 monkeypatch 自动还原）
-    market_reviewers._reviewers.clear()
+    # 收尾：收回 reviewer-1（env 由 monkeypatch 自动还原）
+    _run(role_store.revoke_role("reviewer-1", role_store.REVIEWER_ROLE))
 
 
 # ---------------------------------------------------------------------------
@@ -757,155 +754,7 @@ def test_published_agent_in_featured(client, market_ids):
 # ---------------------------------------------------------------------------
 
 
-def test_reviewer_whitelist_crud(client):
-    """GET 公开 → POST 批量幂等 → PUT 全量覆盖 → DELETE 单删 → 403/404。"""
-    # GET 公开（无需名单内）：fixture 种入 1 人
-    resp = client.get("/agent/market/reviewers", headers=HDR_USER)
-    assert resp.status_code == 200
-    assert resp.json() == {"reviewers": [{"user_id": "reviewer-1"}]}
 
-    # 非名单内用户写操作 403
-    assert client.post(
-        "/agent/market/reviewers", json={"user_ids": ["x"]}, headers=HDR_USER,
-    ).status_code == 403
-    assert client.delete(
-        "/agent/market/reviewers/reviewer-1", headers=HDR_USER,
-    ).status_code == 403
-
-    # 名单内 POST：批量新增，空白忽略、重复跳过（幂等）
-    resp = client.post(
-        "/agent/market/reviewers",
-        json={"user_ids": ["reviewer-2", "reviewer-3", "", "reviewer-2"]},
-        headers=HDR_REVIEWER,
-    )
-    assert resp.status_code == 200, resp.text
-    assert [r["user_id"] for r in resp.json()["reviewers"]] == [
-        "reviewer-1", "reviewer-2", "reviewer-3",
-    ]
-
-    # PUT 全量覆盖
-    resp = client.put(
-        "/agent/market/reviewers",
-        json={"user_ids": ["reviewer-2", "reviewer-1"]},
-        headers=HDR_REVIEWER,
-    )
-    assert resp.status_code == 200, resp.text
-    assert [r["user_id"] for r in resp.json()["reviewers"]] == [
-        "reviewer-1", "reviewer-2",
-    ]
-
-    # DELETE 在名单内 → 204，立即生效
-    assert client.delete(
-        "/agent/market/reviewers/reviewer-2", headers=HDR_REVIEWER,
-    ).status_code == 204
-    assert [r["user_id"] for r in client.get(
-        "/agent/market/reviewers", headers=HDR_REVIEWER,
-    ).json()["reviewers"]] == ["reviewer-1"]
-
-    # DELETE 不在名单（已删）→ 404
-    assert client.delete(
-        "/agent/market/reviewers/reviewer-2", headers=HDR_REVIEWER,
-    ).status_code == 404
-
-
-def test_reviewer_whitelist_last_one_protection(client):
-    """末位保护：删最后一个 / PUT 清空（含全空白）→ 409，名单保持非空。"""
-    # 删最后一个审批人 → 409
-    resp = client.delete(
-        "/agent/market/reviewers/reviewer-1", headers=HDR_REVIEWER,
-    )
-    assert resp.status_code == 409, resp.text
-    assert "至少保留一个审批人" in resp.json()["detail"]
-
-    # PUT 空清单 → 409
-    assert client.put(
-        "/agent/market/reviewers", json={"user_ids": []}, headers=HDR_REVIEWER,
-    ).status_code == 409
-
-    # PUT 全空白清单同样 409
-    assert client.put(
-        "/agent/market/reviewers",
-        json={"user_ids": ["  ", ""]},
-        headers=HDR_REVIEWER,
-    ).status_code == 409
-
-    # 名单原封不动，审批权还在
-    assert [r["user_id"] for r in client.get(
-        "/agent/market/reviewers", headers=HDR_REVIEWER,
-    ).json()["reviewers"]] == ["reviewer-1"]
-
-
-def test_reviewer_whitelist_persist_and_reload(client, tmp_path):
-    """名单原子落盘（重启不丢）：磁盘 JSON 与内存一致，重载恢复。"""
-    reviewers_file = tmp_path / "reviewers.json"
-    client.post(
-        "/agent/market/reviewers",
-        json={"user_ids": ["reviewer-9"]},
-        headers=HDR_REVIEWER,
-    )
-    on_disk = json.loads(reviewers_file.read_text(encoding="utf-8"))
-    assert sorted(on_disk) == ["reviewer-1", "reviewer-9"]
-
-    # 模拟重启：清内存重载 → 名单从文件恢复
-    market_reviewers._reviewers.clear()
-    market_reviewers.load_whitelist()
-    assert market_reviewers.effective_reviewers() == [
-        "reviewer-1", "reviewer-9",
-    ]
-
-
-def test_review_apis_open_to_all_users(client, market_ids):
-    """审批三件套（列表/通过/拒绝）不校验白名单，普通用户也能调。
-
-    若日后启用审批人白名单，本测试应改回断言 403。
-    """
-    _, _, other_id = market_ids
-    client.post(f"/agent/market/{other_id}/publish", json=_PUB_BODY, headers=HDR_ALICE)
-
-    # 列表 + 拒绝（pending → rejected）普通用户均可调
-    cases = [
-        ("get", "/agent/market/reviews", {}),
-        ("post", f"/agent/market/reviews/{other_id}/reject",
-         {"json": {"reason": "不通过"}}),
-    ]
-    for method, path, kwargs in cases:
-        resp = getattr(client, method)(path, headers=HDR_USER, **kwargs)
-        assert resp.status_code == 200, (method, path, resp.text)
-
-    # rejected 重新 publish 回 pending 后，普通用户也能 approve
-    client.post(f"/agent/market/{other_id}/publish", json=_PUB_BODY, headers=HDR_ALICE)
-    resp = client.post(
-        f"/agent/market/reviews/{other_id}/approve", headers=HDR_USER,
-    )
-    assert resp.status_code == 200, resp.text
-
-
-def test_reviewer_seed_on_missing_file(monkeypatch, tmp_path):
-    """种子名单：仅当名单文件不存在时一次性写入落盘，之后文件为准。"""
-    reviewers_file = tmp_path / "seed.json"
-    monkeypatch.setenv("BOCOMADP_MARKET_REVIEWERS_FILE", str(reviewers_file))
-    monkeypatch.setattr(
-        market_reviewers, "SEED_REVIEWERS", ("seed-b", "seed-a", "  "),
-    )
-    market_reviewers._reviewers.clear()
-    try:
-        # 首次加载：文件缺失 → 种子写入（空白项剔除）+ 落盘
-        market_reviewers.load_whitelist()
-        assert market_reviewers.effective_reviewers() == ["seed-a", "seed-b"]
-        assert json.loads(reviewers_file.read_text(encoding="utf-8")) == [
-            "seed-a", "seed-b",
-        ]
-
-        # 模拟重启：文件已存在 → 直接从文件恢复（不重复播种）
-        market_reviewers.load_whitelist()
-        assert market_reviewers.effective_reviewers() == ["seed-a", "seed-b"]
-
-        # 文件存在但为空数组（运维有意清场）→ 尊重文件，不重新播种
-        reviewers_file.write_text("[]", encoding="utf-8")
-        market_reviewers.load_whitelist()
-        assert market_reviewers.effective_reviewers() == []
-    finally:
-        market_reviewers._reviewers.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -955,8 +804,8 @@ def test_reviews_list_all_and_status_counts(client):
         f"/agent/market/{a_pending}/publish", json=_PUB_BODY, headers=HDR_ALICE,
     ).status_code == 200
 
-    # 不传 status = 全部
-    resp = client.get("/agent/market/reviews", headers=HDR_USER)
+    # 不传 status = 全部（审核列表为管理员专属，用 reviewer 身份查）
+    resp = client.get("/agent/market/reviews", headers=HDR_REVIEWER)
     assert resp.status_code == 200
     body = resp.json()
     assert body["total"] == 2  # a_pending + a_ok（单记录覆盖，a_no 被重发覆盖）
@@ -972,13 +821,13 @@ def test_reviews_list_all_and_status_counts(client):
 
     # status=all 等价于不传
     resp_all = client.get(
-        "/agent/market/reviews", params={"status": "all"}, headers=HDR_USER,
+        "/agent/market/reviews", params={"status": "all"}, headers=HDR_REVIEWER,
     )
     assert resp_all.json()["total"] == 2
 
     # 单状态筛选照常可用（pending 正序先到先审 / 已办按审批时间倒序）
     resp = client.get(
-        "/agent/market/reviews", params={"status": "approved"}, headers=HDR_USER,
+        "/agent/market/reviews", params={"status": "approved"}, headers=HDR_REVIEWER,
     )
     assert [r["agent_id"] for r in resp.json()["reviews"]] == [a_ok]
 
@@ -1003,7 +852,7 @@ def test_reviews_keyword_fuzzy_matches_name_or_applicant(client):
         resp = client.get(
             "/agent/market/reviews",
             params={"keyword": kw, "pageSize": 50},
-            headers=HDR_USER,
+            headers=HDR_REVIEWER,
         )
         assert resp.status_code == 200
         return {r["agent_id"] for r in resp.json()["reviews"]}
@@ -1020,7 +869,7 @@ def test_reviews_keyword_fuzzy_matches_name_or_applicant(client):
     resp = client.get(
         "/agent/market/reviews",
         params={"status": "pending", "keyword": "授信"},
-        headers=HDR_USER,
+        headers=HDR_REVIEWER,
     )
     assert [r["agent_id"] for r in resp.json()["reviews"]] == [hit1]
 

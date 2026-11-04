@@ -725,7 +725,7 @@ def _get_redis_client():
     return message_bus.get_client()
 
 # 用户/全局两维受平台总开关(run_concurrency.enabled)控制;智能体维度
-# "谁配置谁生效",不受总开关约束(未配置=不限,本身就是天然开关)。
+# 常开:未通过发布审批的智能体一律限 1,已通过的按配置生效(未配置=不限)。
 _base_dims_enabled = config.run_concurrency.enabled and (
     config.run_concurrency.max_running > 0
     or config.run_concurrency.max_running_per_user > 0
@@ -733,8 +733,8 @@ _base_dims_enabled = config.run_concurrency.enabled and (
 
 
 async def _agent_limit_provider(agent_id: str):
-    """智能体并发上限热路径查询:未配置返回 None = 不限。"""
-    return await chat_concurrency_config.runtime_get(agent_id)
+    """智能体并发上限热路径查询:非审核通过限 1,审核通过按配置(未配置不限)。"""
+    return await chat_concurrency_config.effective_limit(agent_id)
 
 
 if isinstance(message_bus, RedisMessageBus):
@@ -830,7 +830,6 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
             guard=concurrency_guard,
             grace_secs=config.run_concurrency.grace_secs,
             enabled=_base_dims_enabled,
-            has_agent_config=chat_concurrency_config.has_any_config,
         ),
     ]
 
@@ -1016,12 +1015,12 @@ async def _lifespan_with_builtin_agents(app):
     async with _original_lifespan(app):
         # 恢复持久化的工具白名单（内存存储重启会丢）
         load_tool_whitelists()
-        # 市场审批人白名单（JSON 文件持久化 + 接口管理，末位保护：
-        # 名单不可清空）——文件缺失时用 SEED_REVIEWERS 种子名单首次
-        # 播种，之后文件即唯一真相源。
-        from bocomadp import market_reviewers
+        # 角色表（roles / user_roles）——审批人（reviewer
+        # 角色）的名单真源；首次启动建表 + 种子首批审批人，末位保护在接口层。
+        from bocomadp import role_store
 
-        market_reviewers.load_whitelist()
+        role_store.bind_storage(storage)
+        await role_store.ensure_tables()
         # 专家团关系表（expert_team_relations）——团队档案从 AgentData
         # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
         # 必须早于下面所有读团队档案的补丁挂载。

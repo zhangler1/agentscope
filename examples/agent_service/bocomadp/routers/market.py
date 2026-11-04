@@ -110,6 +110,7 @@ from bocomadp.routers._schema.market import (
     MarketReviewersUpdateRequest,
     MarketReviewItemView,
     MarketUpsertRequest,
+    MarketMyRoleResponse,
 )
 
 market_router = APIRouter(
@@ -396,20 +397,19 @@ async def list_market_tag_options(
 # ---------------------------------------------------------------------------
 
 
-def _require_whitelist_manager(user_id: str) -> None:
+async def _require_whitelist_manager(user_id: str) -> None:
     """白名单写操作公共前置：不在生效名单内 → 403。"""
-    if not is_reviewer(user_id):
+    if not await is_reviewer(user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有审批人白名单内的用户可以修改审批人名单。",
         )
 
 
-def _reviewers_response() -> MarketReviewersResponse:
+async def _reviewers_response() -> MarketReviewersResponse:
+    reviewers = await effective_reviewers()
     return MarketReviewersResponse(
-        reviewers=[
-            MarketReviewerView(user_id=uid) for uid in effective_reviewers()
-        ],
+        reviewers=[MarketReviewerView(user_id=uid) for uid in reviewers],
     )
 
 
@@ -425,7 +425,7 @@ async def list_market_reviewers(
 
     首次部署文件为空 → 返回空名单（等待运维手工种入第一批审批人）。
     """
-    return _reviewers_response()
+    return await _reviewers_response()
 
 
 @market_router.post(
@@ -441,16 +441,16 @@ async def add_market_reviewers(
 
     写盘原子化，改完立即生效。
     """
-    _require_whitelist_manager(user_id)
+    await _require_whitelist_manager(user_id)
     from bocomadp.market_reviewers import add_reviewers
 
-    added = add_reviewers(body.user_ids)
+    added = await add_reviewers(body.user_ids)
     log_audit(
         user_id,
         "add_market_reviewers",
         detail=f"新增 {added} 人：{[u for u in body.user_ids if u.strip()]}",
     )
-    return _reviewers_response()
+    return await _reviewers_response()
 
 
 @market_router.put(
@@ -467,10 +467,10 @@ async def overwrite_market_reviewers(
     末位保护：清单为空 / 全空白 → 409"至少保留一个审批人"——无锚点
     模型下这是唯一的防自锁防线。
     """
-    _require_whitelist_manager(user_id)
+    await _require_whitelist_manager(user_id)
     from bocomadp.market_reviewers import overwrite_reviewers
 
-    result = overwrite_reviewers(body.user_ids)
+    result = await overwrite_reviewers(body.user_ids)
     if result == "empty":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -479,9 +479,9 @@ async def overwrite_market_reviewers(
     log_audit(
         user_id,
         "overwrite_market_reviewers",
-        detail=f"全量覆盖，现有 {len(effective_reviewers())} 人",
+        detail=f"全量覆盖，现有 {len(await effective_reviewers())} 人",
     )
-    return _reviewers_response()
+    return await _reviewers_response()
 
 
 @market_router.delete(
@@ -499,10 +499,10 @@ async def remove_market_reviewer(
     - 不在名单（从未加过 / 已删）→ 404；
     - 成功 → 204，立即生效。
     """
-    _require_whitelist_manager(user_id)
+    await _require_whitelist_manager(user_id)
     from bocomadp.market_reviewers import remove_reviewer
 
-    result = remove_reviewer(target_user_id)
+    result = await remove_reviewer(target_user_id)
     if result == "last_one":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -519,6 +519,26 @@ async def remove_market_reviewer(
         target=target_user_id,
         detail="移出审批人白名单",
     )
+
+
+@market_router.get(
+    "/my-role",
+    response_model=MarketMyRoleResponse,
+    summary="查询当前用户角色（前端据此判断是否展示审批入口）",
+)
+async def get_my_role(
+    user_id: str = Depends(get_current_user_id),
+) -> MarketMyRoleResponse:
+    """返回当前 X-User-ID 拥有的角色 key 列表。
+
+    管理员（reviewer 角色）返回 ["reviewer"]，普通用户返回 []。前端
+    拿到后自行判断是否渲染审批页面；后端审批接口仍会对非 reviewer
+    返回 403 兜底。
+    """
+    from bocomadp import role_store
+
+    roles = await role_store.list_my_roles(user_id)
+    return MarketMyRoleResponse(roles=roles)
 
 
 # ---------------------------------------------------------------------------
@@ -738,14 +758,18 @@ async def unpublish_market_agent(
 # ---------------------------------------------------------------------------
 
 
-def _require_reviewer(user_id: str) -> None:
-    """审批侧公共前置：只要求带 X-User-ID 的登录用户，不校验审批人
-    白名单。
+async def _require_reviewer(user_id: str) -> None:
+    """审批侧公共前置：仅 reviewer 角色可审批。
 
-    要启用审批人白名单时，把这里换成 ``is_reviewer(user_id)`` 校验
-    （不在名单内抛 403）即可，调用方无需改动。
+    普通用户（无 reviewer 角色）调用审批接口（GET /reviews、approve、
+    reject）一律 403；前端应先用 GET /agent/market/my-role 判断角色、
+    不渲染审批入口，此处仅作后端兜底。
     """
-    return
+    if not await is_reviewer(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有审批人（reviewer 角色）可以执行审批操作。",
+        )
 
 
 @market_router.get(
@@ -797,7 +821,7 @@ async def list_market_reviews(
     - ``status_counts``：各状态全量计数（不随筛选变化），顶部统计卡
       一次拿全，前端不用再调四次。
     """
-    _require_reviewer(user_id)
+    await _require_reviewer(user_id)
     if status_filter not in (
         None,
         "all",
@@ -956,7 +980,7 @@ async def approve_market_review(
     仅 pending 状态可审批（已办结 409）；智能体不存在 404。
     审批自己的申请允许，靠审计日志留痕。
     """
-    _require_reviewer(user_id)
+    await _require_reviewer(user_id)
     approve_reason = (body.reason or "").strip() if body is not None else ""
     record = await _find_agent_row(storage, agent_id)
     if record is None:
@@ -1027,7 +1051,7 @@ async def reject_market_review(
     仅 pending 状态可审批（已办结 409）；不存在 404；非白名单 403；
     理由必填 1~200 字符（422）。
     """
-    _require_reviewer(user_id)
+    await _require_reviewer(user_id)
     record = await _find_agent_row(storage, agent_id)
     if record is None:
         raise HTTPException(
