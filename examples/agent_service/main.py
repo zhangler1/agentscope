@@ -725,7 +725,7 @@ def _get_redis_client():
     return message_bus.get_client()
 
 # 用户/全局两维受平台总开关(run_concurrency.enabled)控制;智能体维度
-# "谁配置谁生效",不受总开关约束(未配置=不限,本身就是天然开关)。
+# 常开:未通过发布审批的智能体一律限 1,已通过的按配置生效(未配置=不限)。
 _base_dims_enabled = config.run_concurrency.enabled and (
     config.run_concurrency.max_running > 0
     or config.run_concurrency.max_running_per_user > 0
@@ -733,8 +733,8 @@ _base_dims_enabled = config.run_concurrency.enabled and (
 
 
 async def _agent_limit_provider(agent_id: str):
-    """智能体并发上限热路径查询:未配置返回 None = 不限。"""
-    return await chat_concurrency_config.runtime_get(agent_id)
+    """智能体并发上限热路径查询:非审核通过限 1,审核通过按配置(未配置不限)。"""
+    return await chat_concurrency_config.effective_limit(agent_id)
 
 
 if isinstance(message_bus, RedisMessageBus):
@@ -830,7 +830,6 @@ def build_asgi_middlewares(trace_enabled: bool) -> list[Middleware]:
             guard=concurrency_guard,
             grace_secs=config.run_concurrency.grace_secs,
             enabled=_base_dims_enabled,
-            has_agent_config=chat_concurrency_config.has_any_config,
         ),
     ]
 

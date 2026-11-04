@@ -333,7 +333,7 @@ def test_reserve_called_after_successful_acquire(fake_redis):
     asyncio.run(_scenario())
 
 
-def test_disabled_skips_all_guard_calls(fake_redis):
+def test_gate_always_runs_when_disabled(fake_redis):
     import asyncio
 
     async def _scenario() -> None:
@@ -378,11 +378,9 @@ def test_disabled_skips_all_guard_calls(fake_redis):
                             "body": b'{"status": "started", "session_id": "sid-1"}',
                             "more_body": False})
 
-        # enabled=False 且无智能体配置:完全透传,不执行对账/占位/注册
-        async def _no_agent_config() -> bool:
-            return False
-        mw = ConcurrencyGuardMiddleware(_OkApp(), _SpyGuard(), enabled=False,
-                                        has_agent_config=_no_agent_config)
+        # 闸机常开:enabled=False(用户/全局两维不占位)也不再短路,
+        # 对账/占位/登记照常执行(智能体维度由上限查询结果驱动)
+        mw = ConcurrencyGuardMiddleware(_OkApp(), _SpyGuard(), enabled=False)
         scope = {"type": "http", "method": "POST", "path": "/chat/",
                  "headers": [(b"x-user-id", b"a")]}
         sent = []
@@ -395,7 +393,10 @@ def test_disabled_skips_all_guard_calls(fake_redis):
 
         await mw(scope, receive, send)
 
-        assert sent[0]["status"] == 200          # 请求透传成功
-        assert calls == []                        # spy 上 3 个方法均未被调用
+        assert sent[0]["status"] == 200           # 请求正常受理
+        assert "reconcile" in calls               # 入口对账执行了
+        assert "try_acquire_ex" in calls          # 占位执行了(无 agent_id,各维跳过)
+        assert "register" in calls                # 响应后登记执行了
+        assert "reserve" not in calls             # 请求体无 session_id,无待转正
 
     asyncio.run(_scenario())

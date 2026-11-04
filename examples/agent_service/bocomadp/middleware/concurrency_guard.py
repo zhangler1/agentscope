@@ -13,8 +13,9 @@
 - 占位成功后记"待转正"(``reserve``),登记在响应之后(``register``):
   两步之间 run 可能已经结束(run 秒失败),``release_session`` 先到会记
   提前结束标记,``register`` 见到标记即退掉占位、不再登记;
-- 启停判定:``enabled``(平台总开关,管用户/全局两维)与智能体配置
-  (``has_agent_config`` 标志)任一激活,闸机才运转;两者皆无 → 零开销透传。
+- 闸机对每个发消息请求常开:``enabled``(平台总开关)只决定用户/全局
+  两维是否占位;智能体维度由上限查询结果驱动(无 agent_id 或未配置
+  时该维跳过),未通过发布审批的智能体由配置层直接限 1。
 响应方向:
 - 2xx → 从响应体解析 session_id 并登记(值带 user:ts:token + 伴随哈希
   sid→agent_id);
@@ -81,14 +82,13 @@ class ConcurrencyGuardMiddleware:
         guard,
         *,
         enabled: bool = True,
-        has_agent_config: Callable[[], Awaitable[bool]] | None = None,
         grace_secs: float = 6.0,
     ) -> None:
         self.app = app
         self._guard = guard
-        # 平台总开关:只管用户/全局两维;智能体维度由配置存在性独立驱动
+        # 平台总开关:只决定用户/全局两维是否占位;智能体维度始终参与
+        # (由上限查询结果驱动)
         self._enabled = enabled
-        self._has_agent_config = has_agent_config
         self._grace_secs = grace_secs
         self._startup_reconciled = False
 
@@ -107,13 +107,6 @@ class ConcurrencyGuardMiddleware:
             scope["type"] != "http"
             or scope["method"] != "POST"
             or not _is_chat_request(scope)
-        ):
-            await self.app(scope, receive, send)
-            return
-
-        # 闸机整体空转(两维开关均未激活)→ 零开销透传
-        if not self._enabled and (
-            self._has_agent_config is None or not await self._has_agent_config()
         ):
             await self.app(scope, receive, send)
             return

@@ -19,18 +19,19 @@
 Redis 不可用时进入短暂冷却（避免每个请求都白等一次连接超时），冷却结束
 后自动重试——Redis 恢复即自动回热，无需重启进程。
 
-启动回填：``load_runtime`` 把 PG 全量刷入缓存与 Redis（Redis 回填失败
-仅告警），并维护 ``has_any_config`` 进程内标志。``has_any_config()`` 优先
-读进程内标志（零开销）；多副本下本进程未收到 PUT、且启动时 PG 也无配置
-时，回退查 Redis 共享真相（``SCAN agentscope:chat_concurrency:*``），避免
-闸机空转漏拦。闸机启停判定 = ``run_concurrency.enabled`` OR 存在任一智能体
-配置。
+启动回填：``load_runtime`` 把 PG 全量刷入进程内缓存与 Redis（Redis 回填失败
+仅告警）。
+
+生效上限（``effective_limit``）带审核状态门禁：只有已通过发布审批
+（``agent_market`` 名单有行）的智能体才应用其配置值（未配置 = 不限），
+其余状态一律硬上限 1；状态查询带 TTL 缓存，失败按宽口径视为已通过。
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
+from collections import OrderedDict
 from typing import Any
 
 from bocomadp.config import get_app_config
@@ -256,24 +257,6 @@ async def pg_set_name(agent_id: str, agent_name: str) -> None:
         )
 
 
-async def pg_count() -> int:
-    """当前配置条数（判定 has_any 用）。"""
-    try:
-        engine = await _get_engine()
-        from sqlalchemy import text
-
-        async with engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    text("SELECT COUNT(*) FROM agent_chat_concurrency"),
-                )
-            ).first()
-        return int(row[0]) if row is not None else 0
-    except Exception as e:  # noqa: BLE001
-        logger.warning("chat_concurrency_config: pg_count failed: %s", e)
-        return 0
-
-
 async def pg_agent_names(agent_ids: list[str]) -> dict[str, str]:
     """批量取智能体名称（``agents`` 表 ``payload`` JSON 里的 ``name``）。
 
@@ -329,13 +312,6 @@ _cache: dict[str, int] = {}
 # 冷却结束后自动再试——Redis 恢复即自动回热，无需重启进程。
 _REDIS_COOLDOWN_SECS = 5.0
 _redis_unavailable_until: float = 0.0
-# 启停判定标志：存在任一智能体配置（闸机以此激活，不依赖 run_concurrency.enabled）
-_has_any = False
-# 负缓存：最近确认“无任何配置”的截止时间（monotonic）；有效期内不再 SCAN，
-# 避免未启用限流时每请求都打一次 Redis——多副本正确性 vs 零开销的折中。
-_NEG_TTL_SECS = 10.0
-_no_config_until: float = 0.0
-
 _redis: Any = None
 
 # 哨兵：本次 Redis 不可用（区别于"Redis 可用但无记录" = None）
@@ -344,60 +320,6 @@ _UNAVAILABLE = object()
 
 def _config_key(agent_id: str) -> str:
     return f"agentscope:chat_concurrency:{agent_id}"
-
-
-async def _redis_has_any() -> bool:
-    """跨进程真相：Redis 中是否存在任一 chat_concurrency 配置键。
-
-    多副本下，本进程可能既没收到过 PUT、启动时 PG 又恰好无配置，
-    此时进程内 ``_has_any`` 为假会令闸机空转漏拦。改查 Redis 共享
-    热层即可拿到“是否有任一智能体配置”的真值。Redis 不可用降级 False。
-    """
-    if _redis_cooling_down():
-        return False
-    try:
-        r = await _get_redis()
-        cursor = 0
-        while True:
-            cursor, keys = await r.scan(
-                cursor, match="agentscope:chat_concurrency:*", count=100,
-            )
-            if keys:
-                return True
-            if cursor == 0:
-                break
-        return False
-    except Exception as e:  # noqa: BLE001 — Redis 故障降级，不阻断
-        _mark_redis_down(e)
-        return False
-
-
-async def has_any_config() -> bool:
-    """是否存在任一智能体并发配置（闸机启停判定）。
-
-    进程内标志优先（零开销热路径）；多副本下本进程未收到 PUT、且启动时
-    PG 也无配置时，回退查 Redis 共享真相，避免闸机空转漏拦。命中后顺手
-    修正本地标志，稳态零开销。
-
-    无配置时并非每请求都查 Redis：确认“无配置”后写入负缓存（默认 10s），
-    有效期内直接返回，把未启用限流场景的额外开销从“每请求一次 SCAN”
-    降到“每 10s 一次”，几乎无感。Redis 不可用降级为进程内标志。
-    """
-    global _has_any, _no_config_until
-    if _has_any:
-        return True
-    # 负缓存：近期已确认无配置且在有效期内，直接返回（不查 Redis）
-    if time.monotonic() < _no_config_until:
-        return False
-    try:
-        if await _redis_has_any():
-            _has_any = True
-            return True
-    except Exception:  # noqa: BLE001
-        return False
-    # 确认无配置，写入负缓存（避免每请求 SCAN）
-    _no_config_until = time.monotonic() + _NEG_TTL_SECS
-    return False
 
 
 async def _get_redis() -> Any:
@@ -504,6 +426,110 @@ async def runtime_get(agent_id: str) -> int | None:
     return val
 
 
+# ── 审核状态门禁（agent_market 名单 + 有上限 TTL 缓存） ───────────────
+
+# 状态缓存保质期（秒）：审核状态变更最多延迟一个 TTL 生效，
+# 换来闸机热路径几乎零查库。
+_APPROVED_TTL_SECS = 30.0
+# 缓存上限：智能体平台智能体会很多，用有上限的 TTL 缓存，
+# TTL 过期 + 超上限按 LRU 淘汰，避免长生命周期进程里字典无限增长。
+_APPROVED_MAXSIZE = 50000
+
+
+class _ApprovedCache:
+    """agent_id → 是否过审 的有上限 TTL 便签（纯内存、每副本独立）。
+
+    与配置热层无关：这里只缓存“是否过审”，真源是共享库 ``agent_market``，
+    各副本各自懒加载，有效期内复用，过期或超上限后回源重查。
+    """
+
+    def __init__(self, maxsize: int, ttl: float) -> None:
+        self._maxsize = maxsize
+        self._ttl = ttl
+        self._data: "OrderedDict[str, tuple[bool, float]]" = OrderedDict()
+
+    def get(self, agent_id: str) -> bool | None:
+        """命中且在有效期内返回值；未命中/过期返回 None。"""
+        item = self._data.get(agent_id)
+        if item is None:
+            return None
+        approved, expire = item
+        if expire <= time.monotonic():
+            del self._data[agent_id]
+            return None
+        self._data.move_to_end(agent_id)
+        return approved
+
+    def set(self, agent_id: str, approved: bool) -> None:
+        """写入并刷新 LRU 位置；超上限淘汰最久未用者。"""
+        self._data[agent_id] = (approved, time.monotonic() + self._ttl)
+        self._data.move_to_end(agent_id)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
+_approved_cache = _ApprovedCache(_APPROVED_MAXSIZE, _APPROVED_TTL_SECS)
+
+
+async def pg_agent_on_market(agent_id: str) -> bool:
+    """查 ``agent_market`` 名单是否有该智能体的行（= 已通过发布审批）。
+
+    审批通过的唯一残留凭证：approve 时插入名单行，unpublish 时删除，
+    状态自动回落。查询失败向上抛异常，由 ``is_agent_approved`` 统一兜底。
+    """
+    engine = await _get_engine()
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM agent_market "
+                    "WHERE agent_id = :agent_id LIMIT 1",
+                ),
+                {"agent_id": agent_id},
+            )
+        ).first()
+    return row is not None
+
+
+async def is_agent_approved(agent_id: str) -> bool:
+    """智能体是否已通过发布审批（``agent_market`` 名单有行）。
+
+    结果带 TTL 缓存（有上限，详见 ``_ApprovedCache``）：有效期内直接读进程内
+    便签，零查库；过期或淘汰后重新查询。查询失败按 fail-open 宽口径处理——
+    视为已通过（走原配置逻辑），绝不因状态查询异常阻断正常对话。
+    """
+    hit = _approved_cache.get(agent_id)
+    if hit is not None:
+        return hit
+    try:
+        approved = await pg_agent_on_market(agent_id)
+    except Exception as e:  # noqa: BLE001 — 宽口径：查不到状态不当拦路虎
+        logger.warning(
+            "chat_concurrency_config: is_agent_approved(%s) failed, "
+            "treat as approved: %s",
+            agent_id, e,
+        )
+        approved = True
+    _approved_cache.set(agent_id, approved)
+    return approved
+
+
+async def effective_limit(agent_id: str) -> int | None:
+    """闸机 agent 维度的生效上限（含审核状态门禁）。
+
+    - 已通过审批：应用配置值（未配置 = ``None`` = 不限）；
+    - 未通过（not_submitted / pending / rejected）：硬上限 1。
+    """
+    if not await is_agent_approved(agent_id):
+        return 1
+    return await runtime_get(agent_id)
+
+
 async def get_effective(agent_id: str) -> tuple[int | None, str]:
     """接口查询用生效值解析链，返回 ``(value, source)``。
 
@@ -522,12 +548,11 @@ async def get_effective(agent_id: str) -> tuple[int | None, str]:
 
 
 async def load_runtime() -> None:
-    """启动回填：PG 全量 → 进程内缓存；再尽力回填 Redis；维护 has_any 标志。
+    """启动回填：PG 全量 → 进程内缓存；再尽力回填 Redis。
 
     缓存始终回填（闸机热路径零网络开销读它）；Redis 回填失败仅告警，
     Redis 恢复后由热路径自动重试并回热。失败不阻断启动。
     """
-    global _has_any
     try:
         configs = await pg_list_all()
     except Exception as e:  # noqa: BLE001
@@ -536,7 +561,6 @@ async def load_runtime() -> None:
     _cache.clear()
     for agent_id, (size, _ts, _name) in configs.items():
         _cache[agent_id] = size
-    _has_any = bool(configs)
     logger.info(
         "chat_concurrency configs loaded: %d (in-process cache ready)", len(configs),
     )
@@ -554,19 +578,6 @@ async def load_runtime() -> None:
             break
 
 
-def mark_has_any(value: bool) -> None:
-    """PUT/DELETE 时翻动启停标志（避免每请求查库）。
-
-    PUT 配了任意上限 → True（下次直接返回，零开销且立即可用）；
-    DELETE 删光 → False，同时清负缓存使下一请求立即 SCAN 复核
-    （别的副本可能又配了，避免被旧负缓存挡住而漏拦）。
-    """
-    global _has_any, _no_config_until
-    _has_any = value
-    if not value:
-        _no_config_until = 0.0
-
-
 __all__ = [
     "pg_get_full",
     "pg_upsert",
@@ -574,13 +585,13 @@ __all__ = [
     "pg_list_all",
     "pg_list_filtered",
     "pg_set_name",
-    "pg_count",
     "pg_agent_names",
-    "has_any_config",
-    "mark_has_any",
     "set_runtime",
     "delete_runtime",
     "runtime_get",
+    "pg_agent_on_market",
+    "is_agent_approved",
+    "effective_limit",
     "get_effective",
     "load_runtime",
 ]

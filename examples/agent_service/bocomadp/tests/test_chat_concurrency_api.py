@@ -41,10 +41,9 @@ class _FakeStorage:
 
 @pytest.fixture
 def env(monkeypatch):
-    """内存桩：PG 表 db、运行时缓存 cache、has_any 标志盒。"""
+    """内存桩：PG 表 db、运行时缓存 cache。"""
     db: dict[str, tuple[int, float]] = {}
     cache: dict[str, int] = {}
-    has_any = {"v": False}
 
     async def pg_upsert(agent_id: str, max_running: int, agent_name="") -> None:
         db[agent_id] = (max_running, time.time(), agent_name)
@@ -57,9 +56,6 @@ def env(monkeypatch):
 
     async def pg_list_all() -> dict[str, tuple[int, float, str]]:
         return dict(db)
-
-    async def pg_count() -> int:
-        return len(db)
 
     async def pg_list_filtered(agent_name, page_num, page_size):
         rows = []
@@ -90,18 +86,21 @@ def env(monkeypatch):
             return db[agent_id][0], "pg"
         return None, "default"
 
+    # 默认所有智能体均视为已审核通过；未过审场景由单测临时覆盖
+    async def is_agent_approved(agent_id: str) -> bool:
+        return True
+
     for name, fn in [
         ("pg_upsert", pg_upsert),
         ("pg_get_full", pg_get_full),
         ("pg_delete", pg_delete),
         ("pg_list_all", pg_list_all),
         ("pg_list_filtered", pg_list_filtered),
-        ("pg_count", pg_count),
         ("pg_agent_names", pg_agent_names),
         ("set_runtime", set_runtime),
         ("delete_runtime", delete_runtime),
         ("get_effective", get_effective),
-        ("mark_has_any", lambda v: has_any.__setitem__("v", v)),
+        ("is_agent_approved", is_agent_approved),
     ]:
         monkeypatch.setattr(chat_concurrency_config, name, fn)
 
@@ -109,7 +108,7 @@ def env(monkeypatch):
     app.include_router(agent_chat_concurrency_router)
     app.state.storage = _FakeStorage()
     with TestClient(app) as test_client:
-        yield test_client, db, cache, has_any
+        yield test_client, db, cache
 
 
 def _run(coro):
@@ -120,7 +119,7 @@ def _run(coro):
 
 
 def test_put_sets_limit(env):
-    client, db, cache, has_any = env
+    client, db, cache = env
     resp = client.put(
         "/agents/chat-concurrency",
         json={"agent_id": "ag-1", "max_running": 5},
@@ -134,11 +133,10 @@ def test_put_sets_limit(env):
     }
     assert db["ag-1"][0] == 5
     assert cache["ag-1"] == 5
-    assert has_any["v"] is True
 
 
 def test_put_allows_zero_as_explicit_unlimited(env):
-    client, db, cache, has_any = env
+    client, db, cache = env
     resp = client.put(
         "/agents/chat-concurrency",
         json={"agent_id": "ag-2", "max_running": 0},
@@ -158,6 +156,31 @@ def test_put_agent_not_found(env):
     )
     assert resp.status_code == 404
     assert resp.json() == {"detail": "Agent not found"}
+
+
+def test_put_rejects_unapproved_agent(env, monkeypatch):
+    """未过审智能体调配置接口 → 403 拒绝、配置不落库。
+
+    前端配置页已屏蔽未过审智能体，此拦截兜底层直连接口绕过前端的场景，
+    避免未过审时存的配置在审核通过后悄悄生效。
+    """
+    client, db, cache = env
+
+    async def _unapproved(agent_id: str) -> bool:
+        return agent_id != "ag-2"
+
+    monkeypatch.setattr(chat_concurrency_config, "is_agent_approved", _unapproved)
+
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-2", "max_running": 5},
+        headers=HDR,
+    )
+    assert resp.status_code == 403
+    assert "未发布" in resp.json()["detail"]
+    # 既不写 PG 也不写运行时缓存
+    assert "ag-2" not in db
+    assert "ag-2" not in cache
 
 
 def test_put_validation_errors(env):
@@ -190,7 +213,7 @@ def _seed_three(db: dict) -> None:
 
 
 def test_list_pagination_and_order(env):
-    client, db, _, _ = env
+    client, db, _ = env
     _seed_three(db)
     resp = client.get(
         "/agents/chat-concurrency",
@@ -248,7 +271,7 @@ def test_list_empty_when_nothing_configured(env):
 
 def test_list_agent_name_filter(env):
     """按 agent_name 模糊查询：只返回名称命中的配置，分页 total 也按过滤后计算。"""
-    client, db, _, _ = env
+    client, db, _ = env
     _seed_three(db)
     resp = client.get(
         "/agents/chat-concurrency",
@@ -283,7 +306,7 @@ def test_list_agent_name_filter(env):
 
 
 def test_delete_resets_to_unlimited(env):
-    client, db, cache, has_any = env
+    client, db, cache = env
     db["ag-1"] = (5, time.time(), _AGENTS["ag-1"])
     cache["ag-1"] = 5
     resp = client.delete(
@@ -295,8 +318,8 @@ def test_delete_resets_to_unlimited(env):
     assert resp.json() == {"agent_id": "ag-1", "max_running": None}
     assert "ag-1" not in db
     assert "ag-1" not in cache
-    # 最后一条被清 → has_any 翻回 False
-    assert has_any["v"] is False
+    # 最后一条被清 → PG 与运行时缓存均已删除
+
 
 
 def test_delete_idempotent(env):
