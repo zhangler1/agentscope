@@ -7,7 +7,7 @@ GET    /agents/chat-concurrency                — 查询：不传 agent_id = �
                                                  单条详情。两者都只返回配置
                                                  信息（上限值、来源、设置时间），
                                                  不含实时并发数
-DELETE /agents/chat-concurrency?agent_id=xxx   — 恢复不限（agent_id 走查询参数）
+DELETE /agents/chat-concurrency?agent_id=xxx   — 删除配置，回到默认 1 路（agent_id 走查询参数）
 
 真源为 PG（``agent_chat_concurrency`` 表，重启不丢），运行时热层
 （进程内缓存 + Redis）由 ``chat_concurrency_config`` 双写维护，
@@ -105,11 +105,12 @@ async def set_chat_concurrency(
     await _require_admin(user_id)
     await _resolve_agent(request, user_id, body.agent_id)
 
-    # 仅审核通过的智能体允许配置并发上限：未过审直接拒绝、不落库。
+    # 仅审核通过的智能体允许配置并发上限：未过审或审批状态暂不可用
+    # 一律拒绝、不落库（后者防库抖动窗口内脏配置写入）。
     if not await chat_concurrency_config.is_agent_approved(body.agent_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="未发布的智能体不允许配置并发路数，默认并发为1。",
+            detail="仅审核通过的智能体可配置并发路数；审批状态暂不可用时请稍后重试。",
         )
 
     # 1. PG 真源（持久化，重启不丢）；名称按 id 关联 agents 表取快照存入，
@@ -188,7 +189,7 @@ async def _list_all(
 
 @agent_chat_concurrency_router.delete(
     "/chat-concurrency",
-    summary="恢复不限（删 PG 真源 + 删运行时热层）",
+    summary="删除配置，回到默认 1 路（删 PG 真源 + 删运行时热层）",
 )
 async def delete_chat_concurrency(
     request: Request,
@@ -201,10 +202,10 @@ async def delete_chat_concurrency(
     await chat_concurrency_config.pg_delete(agent_id)
     await chat_concurrency_config.delete_runtime(agent_id)
 
-    logger.info("agent_chat_concurrency: %s -> reset to unlimited", agent_id)
+    logger.info("agent_chat_concurrency: %s -> reset to default limit 1", agent_id)
     return {
         "agent_id": agent_id,
-        "max_running": None,
+        "max_running": None,  # 无显式配置，闸机按默认 1 路处理
     }
 
 

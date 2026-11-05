@@ -733,7 +733,7 @@ _base_dims_enabled = config.run_concurrency.enabled and (
 
 
 async def _agent_limit_provider(agent_id: str):
-    """智能体并发上限热路径查询:非审核通过限 1,审核通过按配置(未配置不限)。"""
+    """智能体并发上限热路径查询:未过审/状态未知限 1,过审按配置(未配置默认 1)。"""
     return await chat_concurrency_config.effective_limit(agent_id)
 
 

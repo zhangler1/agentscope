@@ -184,10 +184,34 @@ def test_put_rejects_unapproved_agent(env, monkeypatch):
         headers=HDR,
     )
     assert resp.status_code == 403
-    assert "未发布" in resp.json()["detail"]
+    assert "仅审核通过" in resp.json()["detail"]
     # 既不写 PG 也不写运行时缓存
     assert "ag-2" not in db
     assert "ag-2" not in cache
+
+
+def test_put_rejects_when_approval_state_unknown(env, monkeypatch):
+    """审批状态暂不可用（查库失败）→ PUT 403 拒绝、配置不落库。
+
+    is_agent_approved 在状态未知时按 fail-closed 返回 False，接口层据此
+    挡住故障窗口内绕过前端的配置写入。
+    """
+    client, db, cache = env
+
+    async def _unknown(agent_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(chat_concurrency_config, "is_agent_approved", _unknown)
+
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-1", "max_running": 5},
+        headers=HDR,
+    )
+    assert resp.status_code == 403
+    assert "审批状态暂不可用" in resp.json()["detail"]
+    assert "ag-1" not in db
+    assert "ag-1" not in cache
 
 
 def test_put_validation_errors(env):

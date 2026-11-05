@@ -226,7 +226,7 @@ def test_effective_limit_non_approved_capped_at_one(monkeypatch):
 
 
 def test_effective_limit_approved_uses_config(monkeypatch):
-    """已通过审批 → 配置值生效；未配置 = 不限（None）。"""
+    """已通过审批 → 有配置按配置；无配置默认 1 路。"""
     _use_market(monkeypatch, {"ag-1": True})
     fake = _FakeRedis({_key("ag-1"): "5"})
     _use_redis(monkeypatch, fake)
@@ -234,7 +234,24 @@ def test_effective_limit_approved_uses_config(monkeypatch):
 
     empty = _FakeRedis({})
     _use_redis(monkeypatch, empty)
-    assert _run(chat_concurrency_config.effective_limit("ag-1")) is None
+    assert _run(chat_concurrency_config.effective_limit("ag-1")) == 1
+
+
+def test_effective_limit_approved_zero_stays_unlimited(monkeypatch):
+    """已通过审批 + 显式配置 0 → 显式不限（闸机见 0 不占位）。"""
+    _use_market(monkeypatch, {"ag-1": True})
+    _use_redis(monkeypatch, _FakeRedis({_key("ag-1"): "0"}))
+    assert _run(chat_concurrency_config.effective_limit("ag-1")) == 0
+
+
+def test_effective_limit_unknown_status_capped_at_one(monkeypatch):
+    """名单查询失败 → fail-closed 限 1；状态不写缓存，库恢复后下次重查。"""
+    calls = _use_market(monkeypatch, error=ConnectionError("db down"))
+    _use_redis(monkeypatch, _FakeRedis({}))
+    assert _run(chat_concurrency_config.effective_limit("ag-1")) == 1
+    assert _run(chat_concurrency_config.effective_limit("ag-1")) == 1
+    assert calls["n"] == 2
+    assert _run(chat_concurrency_config.is_agent_approved("ag-1")) is False
 
 
 def test_is_agent_approved_caches_within_ttl(monkeypatch):
@@ -250,10 +267,14 @@ def test_is_agent_approved_caches_within_ttl(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_is_agent_approved_fail_open_on_db_error(monkeypatch, caplog):
-    """名单查询异常 → 宽口径视为已通过（不因状态查询阻断对话）。"""
+def test_is_agent_approved_denies_on_db_error(monkeypatch, caplog):
+    """名单查询异常 → fail-closed 拒绝配置写入（防未过审配置落库）。"""
     calls = _use_market(monkeypatch, error=ConnectionError("db down"))
     with caplog.at_level(logging.WARNING):
-        assert _run(chat_concurrency_config.is_agent_approved("ag-1")) is True
+        assert _run(chat_concurrency_config.is_agent_approved("ag-1")) is False
     assert calls["n"] == 1
-    assert "treat as approved" in caplog.text
+    assert "approval_state(ag-1) failed" in caplog.text
+    assert "ConnectionError: db down" in caplog.text
+    assert "effective_limit -> limit 1 (fail-closed)" in caplog.text
+    assert "is_agent_approved -> denied" in caplog.text
+    assert "state NOT cached" in caplog.text
