@@ -13,9 +13,11 @@ DELETE /agents/chat-concurrency?agent_id=xxx   — 恢复不限（agent_id 走�
 （进程内缓存 + Redis）由 ``chat_concurrency_config`` 双写维护，
 PUT 后下一个 ``POST /chat/`` 请求即按新上限拦截，无需重启。
 
-鉴权与 404 口径同 ``agent_concurrency.py``（``get_current_user_id`` +
-``storage.get_agent``）。列表不做可见性过滤（配置页由前端权限屏蔽，
-仅管理员入口）。
+鉴权：三个接口均限 ``reviewer`` 角色（与审批页面、智能体全量列表同一
+判据），非管理员 403；``user_id`` 取自请求头 ``X-User-ID``。前端按
+``GET /agent/market/my-role`` 的结果决定是否展示配置入口，此处作后端
+兜底。列表不做可见性过滤（跨用户全量，仅管理员可见）；404 口径同
+``agent_concurrency.py``（``storage.get_agent``）。
 """
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ from pydantic import BaseModel, Field
 
 from agentscope.app.deps import get_current_user_id
 
-from bocomadp import chat_concurrency_config
+from bocomadp import chat_concurrency_config, role_store
 
 logger = logging.getLogger("bocomadp.agent_chat_concurrency")
 
@@ -49,6 +51,19 @@ class ChatConcurrencyRequest(BaseModel):
         ge=0,
         description="同时对话数上限；0 = 显式不限",
     )
+
+
+async def _require_admin(user_id: str) -> None:
+    """并发配置的管理员门禁：无 reviewer 角色 → 403。
+
+    判据与审核页面、智能体全量列表一致（role_store 的 reviewer 角色），
+    user_id 取自 X-User-ID；前端按 my-role 结果控制入口，此处兜底。
+    """
+    if not await role_store.has_role(user_id, role_store.REVIEWER_ROLE):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员（reviewer 角色）可以配置智能体并发路数。",
+        )
 
 
 async def _resolve_agent(
@@ -87,6 +102,7 @@ async def set_chat_concurrency(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
+    await _require_admin(user_id)
     await _resolve_agent(request, user_id, body.agent_id)
 
     # 仅审核通过的智能体允许配置并发上限：未过审直接拒绝、不落库。
@@ -132,6 +148,7 @@ async def get_chat_concurrency(
     pageSize: int = Query(default=10, ge=1, le=100),
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
+    await _require_admin(user_id)
     return await _list_all(pageNum, pageSize, agent_name)
 
 
@@ -178,6 +195,7 @@ async def delete_chat_concurrency(
     agent_id: str = Query(min_length=1),
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
+    await _require_admin(user_id)
     await _resolve_agent(request, user_id, agent_id)
 
     await chat_concurrency_config.pg_delete(agent_id)

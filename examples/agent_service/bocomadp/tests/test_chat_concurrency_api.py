@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """智能体 /chat 并发上限管理接口测试（PUT/GET列表分页/GET单条/DELETE）。
 
-轻量装配：FastAPI 直挂 ``agent_chat_concurrency_router``，PG 读写与
-运行时热层函数全部 monkeypatch（不碰真库），storage/guard 用桩对象；
-依赖 ``get_current_user_id`` 只读 ``X-User-ID`` header 的特性。
+轻量装配：FastAPI 直挂 ``agent_chat_concurrency_router``，PG 读写、
+运行时热层与角色判据全部 monkeypatch（不碰真库）；依赖
+``get_current_user_id`` 只读 ``X-User-ID`` header 的特性。
 
 pytest-asyncio 未安装：异步逻辑用 asyncio.run() 包裹（与既有测试一致）。
 """
@@ -17,12 +17,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from bocomadp import chat_concurrency_config
+from bocomadp import chat_concurrency_config, role_store
 from bocomadp.routers.agent_chat_concurrency import (
     agent_chat_concurrency_router,
 )
 
-HDR = {"X-User-ID": "admin"}
+ADMIN = "reviewer-1"
+HDR = {"X-User-ID": ADMIN}
+HDR_USER = {"X-User-ID": "test-user"}
 
 # 桩 storage 里的智能体名册（agent_id → name）
 _AGENTS = {
@@ -89,6 +91,11 @@ def env(monkeypatch):
     # 默认所有智能体均视为已审核通过；未过审场景由单测临时覆盖
     async def is_agent_approved(agent_id: str) -> bool:
         return True
+
+    async def has_role(user_id: str, role_key: str) -> bool:
+        return user_id == ADMIN and role_key == role_store.REVIEWER_ROLE
+
+    monkeypatch.setattr(role_store, "has_role", has_role)
 
     for name, fn in [
         ("pg_upsert", pg_upsert),
@@ -342,3 +349,81 @@ def test_delete_agent_not_found(env):
     )
     assert resp.status_code == 404
     assert resp.json() == {"detail": "Agent not found"}
+
+
+# ── 管理员门禁（三个接口统一 403） ────────────────────────────────
+
+
+def test_non_admin_blocked_on_all_three_endpoints(env):
+    """非管理员 PUT / GET / DELETE 一律 403，配置不落库、列表不泄露。"""
+    client, db, cache = env
+    db["ag-1"] = (5, time.time(), _AGENTS["ag-1"])
+
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-2", "max_running": 5},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+    assert "管理员" in resp.json()["detail"]
+    assert "ag-2" not in db and "ag-2" not in cache
+
+    resp = client.get("/agents/chat-concurrency", headers=HDR_USER)
+    assert resp.status_code == 403
+    assert "管理员" in resp.json()["detail"]
+
+    resp = client.delete(
+        "/agents/chat-concurrency",
+        params={"agent_id": "ag-1"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+    assert "管理员" in resp.json()["detail"]
+    assert "ag-1" in db
+
+
+def test_gate_runs_before_agent_lookup(env):
+    """门禁先于智能体存在性校验：非管理员传不存在的 id 也是 403，不是 404。"""
+    client, *_ = env
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ghost", "max_running": 5},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+    resp = client.delete(
+        "/agents/chat-concurrency",
+        params={"agent_id": "ghost"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_full_flow_with_role_gate(env):
+    """管理员 PUT → GET → DELETE → GET 全链路 200；非管理员读仍 403。"""
+    client, db, cache = env
+    put = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-1", "max_running": 5},
+        headers=HDR,
+    )
+    assert put.status_code == 200
+    assert cache["ag-1"] == 5
+
+    listed = client.get("/agents/chat-concurrency", headers=HDR)
+    assert listed.status_code == 200
+    assert [it["agent_id"] for it in listed.json()["items"]] == ["ag-1"]
+    assert client.get(
+        "/agents/chat-concurrency", headers=HDR_USER,
+    ).status_code == 403
+
+    deleted = client.delete(
+        "/agents/chat-concurrency",
+        params={"agent_id": "ag-1"},
+        headers=HDR,
+    )
+    assert deleted.status_code == 200
+    assert "ag-1" not in db and "ag-1" not in cache
+    assert client.get(
+        "/agents/chat-concurrency", headers=HDR,
+    ).json()["items"] == []
