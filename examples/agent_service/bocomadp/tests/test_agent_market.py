@@ -308,6 +308,58 @@ def test_market_default_sort_updated_at_desc(client, market_ids):
     assert ids == [worker_id, platform_user]
 
 
+def test_market_page_size_unbounded_can_fetch_all(client):
+    """pageSize 不设上限：传大值一次取回全量；默认/校验/筛选口径不变。"""
+    storage = client.app.state.storage
+    count = 105
+    records = [
+        AgentRecord(
+            user_id="seed-user",
+            source="user",
+            data=_agent_data(f"批量{i}"),
+        )
+        for i in range(count)
+    ]
+
+    async def _seed() -> None:
+        for i, record in enumerate(records):
+            await storage.upsert_agent("seed-user", record)
+            await market_store.insert_market_entry(
+                storage, record.id, tag="批量" if i % 2 == 0 else "",
+            )
+
+    _run(_seed())
+
+    # 不传参数：仍是默认第 1 页 10 条，total 为筛后总数
+    default = client.get("/agent/market").json()
+    assert default["total"] == count
+    assert len(default["agents"]) == 10
+
+    # 原上限边界：pageSize=101 不再 422
+    over = client.get("/agent/market", params={"pageSize": 101})
+    assert over.status_code == 200
+    assert len(over.json()["agents"]) == 101
+
+    # 大值一次取全量（pageNum 默认 1）
+    full = client.get("/agent/market", params={"pageSize": 10000}).json()
+    assert len(full["agents"]) == full["total"] == count
+
+    # 与 tag 筛选叠加：total 是筛选后的总数，仍能一次取全
+    tagged = client.get(
+        "/agent/market", params={"pageSize": 10000, "tag": "批量"},
+    ).json()
+    assert tagged["total"] == 53
+    assert len(tagged["agents"]) == tagged["total"]
+
+    # 边界：ge=1 仍在；pageNum=2 配超大 pageSize 返回空但 total 不变
+    assert client.get("/agent/market", params={"pageSize": 0}).status_code == 422
+    second = client.get(
+        "/agent/market", params={"pageNum": 2, "pageSize": 10000},
+    ).json()
+    assert second["total"] == count
+    assert second["agents"] == []
+
+
 # ---------------------------------------------------------------------------
 # 3) GET /agent/market/featured —— 实时热度聚合
 # ---------------------------------------------------------------------------

@@ -295,9 +295,8 @@ async def list_market_agents(
     page_size: int = Query(
         default=10,
         ge=1,
-        le=100,
         alias="pageSize",
-        description="Page size (items per page), 1-100.",
+        description="Page size (items per page), >=1; no upper bound.",
     ),
     storage: StorageBase = Depends(get_storage),
 ) -> MarketListResponse:
@@ -305,6 +304,8 @@ async def list_market_agents(
 
     默认按 ``updated_at`` 倒序（最近更新/上架在前）——热度排序是精选
     推荐接口的专职，本接口不掺和。附带实时热度与标签供前端展示。
+    ``pageSize`` 不设上限：调用方传足够大的值即可一次取回全量，用
+    ``total`` 核对是否取全；不传仍按默认 10 条分页。
     """
     rows = await _market_agent_rows(storage)
     entries = await _entry_map(storage)
