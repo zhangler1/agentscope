@@ -554,6 +554,29 @@ async def effective_limit(agent_id: str) -> int | None:
     return 1 if limit is None else limit
 
 
+async def batch_effective_limits(
+    agent_ids: list[str],
+    approved_ids: set[str],
+) -> dict[str, int]:
+    """一次批量算生效上限，供列表接口展示，规则与 ``effective_limit`` 一致。
+
+    配置取 PG 全量（``pg_list_all``，一次查询）：PUT 必写 PG 真源、DELETE
+    必删，多副本共享，与闸机热层同源；名单由调用方把已查到的市场名单
+    传进来（``approved_ids``），避免列表为同一份数据再查一次库。
+    ``pg_list_all`` 失败会回落空字典，表现为"无显式配置"→ 1 路
+    （fail-closed，与闸机状态未知的取向一致）。
+    """
+    configs = await pg_list_all()
+    limits: dict[str, int] = {}
+    for agent_id in agent_ids:
+        if agent_id not in approved_ids:
+            limits[agent_id] = 1
+            continue
+        row = configs.get(agent_id)
+        limits[agent_id] = 1 if row is None else int(row[0])
+    return limits
+
+
 async def get_effective(agent_id: str) -> tuple[int | None, str]:
     """接口查询用生效值解析链，返回 ``(value, source)``。
 
@@ -616,6 +639,7 @@ __all__ = [
     "pg_agent_on_market",
     "is_agent_approved",
     "effective_limit",
+    "batch_effective_limits",
     "get_effective",
     "load_runtime",
 ]

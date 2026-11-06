@@ -246,6 +246,39 @@ async def _attach_publish_status(
             item.review_reason = review.reason
         item.reviewer = review.reviewer
         item.reviewed_at = review.reviewed_at
+    # 并发路数：复用上面已查到的市场名单判过审，配置一次全量查，
+    # 不逐条查库；查询异常整批回落 1，不拖累列表接口。
+    await _attach_concurrency_limits(items, set(market_map))
+
+
+async def _attach_concurrency_limits(
+    items: list[TeamAgentView],
+    approved_ids: set[str],
+) -> None:
+    """批量给列表项附上「当前生效的并发路数」（in-place）。
+
+    规则与闸机 ``chat_concurrency_config.effective_limit`` 一致：
+    未过审（名单里没有）/ 过审但无显式配置 → 1；过审有配置 → 配置值
+    原样（显式 0 = 不限也返回 0）。名单是调用方已查好的市场名单，
+    配置走一次全量查询，避免当前页 N 条各查一次库。
+    任何查询异常都不抛：整批保持 schema 默认值 1，列表照常返回。
+    """
+    if not items:
+        return
+    from bocomadp import chat_concurrency_config
+
+    try:
+        limits = await chat_concurrency_config.batch_effective_limits(
+            [item.id for item in items], approved_ids,
+        )
+    except Exception as e:  # noqa: BLE001 — 展示字段失败不影响列表可用
+        logger.warning(
+            "attach concurrency_limit failed: %s: %s; fallback to 1",
+            type(e).__name__, e,
+        )
+        return
+    for item in items:
+        item.concurrency_limit = limits.get(item.id, 1)
 
 
 def _fill_publish_archive(
@@ -350,6 +383,23 @@ async def _global_team_members_and_leaders(
     return member_ids, leader_ids
 
 
+def _agent_name(entry: Any) -> str:
+    """取智能体名称（``data.name``，列表项顶层没有 name）。
+
+    普通用户走框架 ``AgentView``（data 是模型），管理员全量视图是从
+    ``agents.payload`` 构造的 ``TeamAgentView``（data 可能是 dict），
+    两种形态都要能取到名称。
+    """
+    data = getattr(entry, "data", None)
+    if isinstance(data, dict):
+        value = data.get("name", "")
+    elif data is not None:
+        value = getattr(data, "name", "")
+    else:
+        value = ""
+    return str(value or "")
+
+
 @agent_router.get(
     "/",
     response_model=ListAgentsResponse,
@@ -389,6 +439,14 @@ async def list_agents(
         description=(
             "Optional top-level filter: `true` returns only expert-team "
             "leaders, `false` only plain agents. Omit to list all."
+        ),
+    ),
+    name: str | None = Query(
+        default=None,
+        description=(
+            "Optional case-insensitive substring filter on the agent "
+            "name (``data.name``). Omit, empty or blank to skip filtering; "
+            "``total`` counts the filtered result."
         ),
     ),
     access: ResourceAccessService = Depends(get_resource_access_service),
@@ -486,8 +544,16 @@ async def list_agents(
     # getattr 兜底为 None，此时两种过滤都筛空（语义合理：无团队概念）。
     if is_team is not None:
         entries = [e for e in entries if getattr(e, "is_team", None) is is_team]
+    # 名称模糊查询：放在可见性/团队/is_team 全部筛完之后、分页之前，
+    # 保证 total 是过滤后的总数、pageNum/pageSize 作用在过滤结果上。
+    if name and name.strip():
+        keyword = name.strip().casefold()
+        entries = [
+            e for e in entries
+            if keyword in _agent_name(e).casefold()
+        ]
     # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
-    # total 用切片前的完整数量，前端可据此算总页数。
+    # total 用过滤后、切片前的数量，前端可据此算总页数。
     # pageNum / pageSize 都不传 → 不分页全量返回；
     # 任一传入 → 按入参严格分页（pageSize 无上限），缺省的那个用默认值
     # 兜底（pageNum 缺省按第 1 页，pageSize 缺省按每页 5 条）。
