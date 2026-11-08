@@ -151,7 +151,7 @@ async def pg_upsert(
 
 
 async def pg_delete(agent_id: str) -> None:
-    """删除 PG 中的配置（恢复不限）。"""
+    """删除 PG 中的配置（无显式配置，闸机按默认 1 路处理）。"""
     engine = await _get_engine()
     from sqlalchemy import text
 
@@ -475,6 +475,10 @@ class _ApprovedCache:
         while len(self._data) > self._maxsize:
             self._data.popitem(last=False)
 
+    def invalidate(self, agent_id: str) -> None:
+        """丢弃单个智能体的便签（发布状态变更后立即回源）。"""
+        self._data.pop(agent_id, None)
+
     def clear(self) -> None:
         self._data.clear()
 
@@ -625,7 +629,42 @@ async def load_runtime() -> None:
             break
 
 
+# ── 状态变更配套 ──────────────────────────────────────────────────
+
+def invalidate_approval(agent_id: str) -> None:
+    """发布状态变更后丢弃该智能体的状态便签，下次请求回源重查。
+
+    发布/通过/驳回/下架都会改变"是否过审"，便签留着最长 30s 会让
+    配置接口与闸机按旧状态判断（下架后仍能配、重新上架后配不了）。
+    """
+    _approved_cache.invalidate(agent_id)
+
+
+async def clear_agent_config(agent_id: str) -> None:
+    """清空该智能体的并发配置：PG 真源 + 运行时热层 + 审核状态便签。
+
+    下架时调用：重新上架需管理员重新配置。三处都要清——只删 PG 会
+    留下热层旧值，重新过审后旧上限悄悄恢复；状态便签不清则 30s 内
+    仍按"已过审"读配置。三步独立执行，单步失败其余照清，最后抛错
+    让调用方决定是报错还是仅告警（下架不阻断，DELETE 接口要报错）。
+    """
+    errors: list[str] = []
+    try:
+        await pg_delete(agent_id)
+    except Exception as e:  # noqa: BLE001 — 收集后统一上报
+        errors.append(f"pg_delete: {type(e).__name__}: {e}")
+    try:
+        await delete_runtime(agent_id)
+    except Exception as e:  # noqa: BLE001 — 同上
+        errors.append(f"delete_runtime: {type(e).__name__}: {e}")
+    invalidate_approval(agent_id)
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 __all__ = [
+    "clear_agent_config",
+    "invalidate_approval",
     "pg_get_full",
     "pg_upsert",
     "pg_delete",

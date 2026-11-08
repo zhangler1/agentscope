@@ -127,6 +127,49 @@ def test_runtime_get_unlimited_when_no_source(monkeypatch):
     assert _run(chat_concurrency_config.runtime_get("ag-1")) is None
 
 
+# ── 下架清配置（PG 真源 + 运行时热层 + 审核状态便签） ──────────────
+
+
+def test_clear_agent_config_purges_all_three_places(monkeypatch):
+    """下架三清：PG 真源、进程缓存 + Redis、审核状态便签一处不落。"""
+    deleted: list[str] = []
+
+    async def _pg_delete(agent_id: str) -> None:
+        deleted.append(agent_id)
+
+    monkeypatch.setattr(chat_concurrency_config, "pg_delete", _pg_delete)
+    fake = _FakeRedis({_key("ag-1"): "5"})
+    _use_redis(monkeypatch, fake)
+    chat_concurrency_config._cache["ag-1"] = 5
+    chat_concurrency_config._approved_cache.set("ag-1", True)
+
+    _run(chat_concurrency_config.clear_agent_config("ag-1"))
+
+    assert deleted == ["ag-1"]
+    assert "ag-1" not in chat_concurrency_config._cache
+    assert "ag-1" not in fake.values
+    assert chat_concurrency_config._approved_cache.get("ag-1") is None
+
+
+def test_clear_agent_config_keeps_clearing_when_pg_fails(monkeypatch):
+    """PG 删除失败：热层与状态便签照清，最后抛错让调用方决定口径。"""
+    async def _pg_delete(agent_id: str) -> None:
+        raise ConnectionError("pg down")
+
+    monkeypatch.setattr(chat_concurrency_config, "pg_delete", _pg_delete)
+    fake = _FakeRedis({_key("ag-1"): "5"})
+    _use_redis(monkeypatch, fake)
+    chat_concurrency_config._cache["ag-1"] = 5
+    chat_concurrency_config._approved_cache.set("ag-1", True)
+
+    with pytest.raises(RuntimeError, match="pg_delete"):
+        _run(chat_concurrency_config.clear_agent_config("ag-1"))
+
+    assert "ag-1" not in chat_concurrency_config._cache
+    assert "ag-1" not in fake.values
+    assert chat_concurrency_config._approved_cache.get("ag-1") is None
+
+
 # ── 故障冷却与自动回热 ────────────────────────────────────────────
 
 

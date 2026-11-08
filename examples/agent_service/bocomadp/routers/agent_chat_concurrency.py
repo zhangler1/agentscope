@@ -2,11 +2,10 @@
 """Per-agent /chat 并发上限管理 API。
 
 PUT    /agents/chat-concurrency                — 设置上限（agent_id 在请求体）
-GET    /agents/chat-concurrency                — 查询：不传 agent_id = 全部
-                                                 已配置分页列表；传 agent_id =
-                                                 单条详情。两者都只返回配置
-                                                 信息（上限值、来源、设置时间），
-                                                 不含实时并发数
+GET    /agents/chat-concurrency                — 已配置智能体的分页列表，
+                                                 支持 agent_name 模糊查询；
+                                                 只返回配置信息（上限值、
+                                                 来源、设置时间），不含实时并发数
 DELETE /agents/chat-concurrency?agent_id=xxx   — 删除配置，回到默认 1 路（agent_id 走查询参数）
 
 真源为 PG（``agent_chat_concurrency`` 表，重启不丢），运行时热层
@@ -16,8 +15,9 @@ PUT 后下一个 ``POST /chat/`` 请求即按新上限拦截，无需重启。
 鉴权：三个接口均限 ``reviewer`` 角色（与审批页面、智能体全量列表同一
 判据），非管理员 403；``user_id`` 取自请求头 ``X-User-ID``。前端按
 ``GET /agent/market/my-role`` 的结果决定是否展示配置入口，此处作后端
-兜底。列表不做可见性过滤（跨用户全量，仅管理员可见）；404 口径同
-``agent_concurrency.py``（``storage.get_agent``）。
+兜底。列表不做可见性过滤（跨用户全量，仅管理员可见）；PUT/DELETE 的
+存在性校验也跨用户（按 agent_id 直查 ``agents`` 表，不带归属过滤），
+管理员可配置所有已通过审批的智能体，不受智能体归属限制。
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from agentscope.app.deps import get_current_user_id
@@ -66,22 +66,16 @@ async def _require_admin(user_id: str) -> None:
         )
 
 
-async def _resolve_agent(
-    request: Request,
-    user_id: str,
-    agent_id: str,
-) -> Any:
-    """按调用者 scope 解析 agent（与 agent_concurrency 一致）；不存在 → 404。"""
-    storage = getattr(request.app.state, "storage", None)
-    if storage is None:
+async def _resolve_agent(agent_id: str) -> str:
+    """跨用户按 agent_id 取智能体名称（管理员可管理所有人的智能体）。
+
+    直接查 ``agents`` 表按主键取名称，不带 user_id 过滤——与管理员的
+    智能体全量列表同口径。查不到或查库失败一律 404，不泄露归属信息。
+    """
+    names = await chat_concurrency_config.pg_agent_names([agent_id])
+    if agent_id not in names:
         raise HTTPException(status_code=404, detail="Agent not found")
-    try:
-        agent = await storage.get_agent(user_id, agent_id)
-    except Exception:  # noqa: BLE001
-        agent = None
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return agent
+    return names[agent_id]
 
 
 def _fmt_ts(ts: float | None) -> str | None:
@@ -99,11 +93,10 @@ def _fmt_ts(ts: float | None) -> str | None:
 )
 async def set_chat_concurrency(
     body: ChatConcurrencyRequest,
-    request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
     await _require_admin(user_id)
-    await _resolve_agent(request, user_id, body.agent_id)
+    agent_name = await _resolve_agent(body.agent_id)
 
     # 仅审核通过的智能体允许配置并发上限：未过审或审批状态暂不可用
     # 一律拒绝、不落库（后者防库抖动窗口内脏配置写入）。
@@ -113,11 +106,10 @@ async def set_chat_concurrency(
             detail="仅审核通过的智能体可配置并发路数；审批状态暂不可用时请稍后重试。",
         )
 
-    # 1. PG 真源（持久化，重启不丢）；名称按 id 关联 agents 表取快照存入，
-    #    供列表按名称模糊查询（智能体改名后需重新 PUT 才会刷新）。
-    names = await chat_concurrency_config.pg_agent_names([body.agent_id])
+    # 1. PG 真源（持久化，重启不丢）；名称由 _resolve_agent 关联 agents
+    #    表取快照存入，供列表按名称模糊查询（改名后需重新 PUT 才刷新）。
     await chat_concurrency_config.pg_upsert(
-        body.agent_id, body.max_running, names.get(body.agent_id, ""),
+        body.agent_id, body.max_running, agent_name,
     )
 
     # 2. 运行时热层（缓存必写，Redis 尽力而为；热路径直接读它）
@@ -143,7 +135,6 @@ async def set_chat_concurrency(
     summary="查询并发配置：分页列表，按 agent_name 模糊查询（agent_name 为空=全部）",
 )
 async def get_chat_concurrency(
-    request: Request,
     agent_name: str | None = Query(default=None),
     pageNum: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10, ge=1, le=100),
@@ -192,15 +183,13 @@ async def _list_all(
     summary="删除配置，回到默认 1 路（删 PG 真源 + 删运行时热层）",
 )
 async def delete_chat_concurrency(
-    request: Request,
     agent_id: str = Query(min_length=1),
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
     await _require_admin(user_id)
-    await _resolve_agent(request, user_id, agent_id)
+    await _resolve_agent(agent_id)
 
-    await chat_concurrency_config.pg_delete(agent_id)
-    await chat_concurrency_config.delete_runtime(agent_id)
+    await chat_concurrency_config.clear_agent_config(agent_id)
 
     logger.info("agent_chat_concurrency: %s -> reset to default limit 1", agent_id)
     return {

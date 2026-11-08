@@ -15,15 +15,15 @@
 3. GET /agent/market/featured —— 精选推荐（实时聚合 sessions）：
    - 按会话数倒序取前 N；0 热度是合法状态，不过滤；
 4. POST /agent/market/{agent_id}/publish|unpublish —— 发布走审批流：
-   - publish = 写审批表 pending（幂等，**不再直接上架**）；审批人
-     approve 后才插名单行；unpublish = 删市场行 + 清审批记录，幂等；
-   - 仅智能体 owner（X-User-ID = agents.user_id）可发布/撤回，
-     智能体不存在 404；
+   - publish = 写审批表 pending（幂等，**不再直接上架**，仅 owner）；
+     approve 后才插名单行；unpublish = 删市场行 + 清审批记录
+     + 清并发配置，幂等，不做角色校验；
+   - 智能体不存在 404；
 5. PUT/DELETE /agent/market/{agent_id} —— 标签管理（全开放无权限
    门槛，**仅市场名单内智能体可打标**；撕标 = tag 置空）；
-6. GET/POST/PUT/DELETE /agent/market/reviewers —— 审批人白名单管理
-   （JSON 文件 + 末位保护：PUT 传空 / 删最后一个 → 409；无锚点，
-   生效名单 = 环境变量指向的 JSON 文件内容）。
+6. GET/POST/PUT/DELETE /agent/market/reviewers —— 审批人名单管理
+   （真源 role_store 的 roles / user_roles 两表 + 末位保护：PUT 传空
+   / 删最后一个 → 409；生效名单 = reviewer 角色成员，写操作仅 reviewer）。
 
 pytest-asyncio 未安装：异步逻辑用 asyncio.run() 包裹（与
 test_expert_team.py 一致）。
@@ -49,6 +49,7 @@ from agentscope.app.storage._sql._tables import SessionRow
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 
 from bocomadp import (
+    chat_concurrency_config,
     market_review_store,
     market_reviewers,
     market_store,
@@ -150,6 +151,17 @@ def client(tmp_path, tmp_path_factory, monkeypatch):
 
     _run(_provision())
 
+    # 下架会调配置层清 PG/热层；测试用独立 SQLite，这里换成记录调用的桩，
+    # 既不碰真实业务库，也能断言"下架确实清了配置"。
+    cleared: list[str] = []
+
+    async def _record_clear(agent_id: str) -> None:
+        cleared.append(agent_id)
+
+    monkeypatch.setattr(
+        chat_concurrency_config, "clear_agent_config", _record_clear,
+    )
+
     # 完整 app 装配（与 test_agent_routes_integration 一致）：create_app
     # 会填好 state.resource_access_service 等全部依赖，POST /agent/ 才能用。
     app = create_app(
@@ -161,6 +173,7 @@ def client(tmp_path, tmp_path_factory, monkeypatch):
     _remove_framework_agent_routes(app)
     app.include_router(agent_router)
     app.include_router(market_router)
+    app.state.cleared_config_agents = cleared
     with TestClient(app) as test_client:
         yield test_client
 
@@ -709,6 +722,51 @@ def test_publish_unpublish_flow(client, market_ids):
     resp = client.post(f"/agent/market/{other_id}/publish", json=_PUB_BODY, headers=HDR_ALICE)
     assert resp.status_code == 200
     assert resp.json()["status"] == "pending"
+
+
+def test_unpublish_clears_chat_concurrency_config(client):
+    """下架 = 退回待发布：并发配置同步清空，重新上架需管理员重配。"""
+    agent_id = _create(client, HDR_ALICE, name="待下架智能体")
+    _publish_and_decide(client, agent_id, HDR_ALICE, "approve")
+    cleared = client.app.state.cleared_config_agents
+    cleared.clear()
+
+    resp = client.post(
+        f"/agent/market/{agent_id}/unpublish", headers=HDR_ALICE,
+    )
+    assert resp.status_code == 204
+    assert cleared == [agent_id]
+
+    # 状态自动回落 not_submitted（无名单行、无审批记录）
+    resp = client.get("/agent/owned", headers=HDR_ALICE)
+    by_id = {a["id"]: a for a in resp.json()["agents"]}
+    assert by_id[agent_id]["publish_status"] == "not_submitted"
+
+
+def test_unpublish_idempotent_config_clear_and_failure_is_nonblocking(
+    client, monkeypatch,
+):
+    """重复下架仍 204（清配置幂等）；清配置失败只告警、不阻断下架。"""
+    agent_id = _create(client, HDR_ALICE, name="重复下架智能体")
+    _publish_and_decide(client, agent_id, HDR_ALICE, "approve")
+    cleared = client.app.state.cleared_config_agents
+    cleared.clear()
+
+    for _ in range(2):
+        assert client.post(
+            f"/agent/market/{agent_id}/unpublish", headers=HDR_ALICE,
+        ).status_code == 204
+    assert cleared == [agent_id, agent_id]
+
+    async def _broken(agent_id: str) -> None:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(
+        chat_concurrency_config, "clear_agent_config", _broken,
+    )
+    assert client.post(
+        f"/agent/market/{agent_id}/unpublish", headers=HDR_ALICE,
+    ).status_code == 204
 
 
 def test_publish_owner_only(client, market_ids):
