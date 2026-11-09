@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger("bocomadp.concurrency.run_release")
@@ -40,6 +41,7 @@ def _wrap_run(
         input_msg: Any = None,
         run_id: str | None = None,
     ) -> Any:
+        started = time.perf_counter()
         try:
             return await original_run(
                 self,
@@ -52,6 +54,16 @@ def _wrap_run(
         finally:
             try:
                 await guard.release_session(session_id)
+                # 耗时很有诊断价值:零点几秒就结束通常说明 run 一开局就失败
+                # (模型没配、凭证失效、会话不存在),不是"跑得慢还在占名额"。
+                # 但这属于每轮都有的常规收尾,用 DEBUG,INFO 只留给异常路径。
+                logger.debug(
+                    "chat run finished in %.2fs, concurrency slot released: "
+                    "session=%s agent=%s",
+                    time.perf_counter() - started,
+                    session_id,
+                    agent_id,
+                )
             except Exception:  # noqa: BLE001 — 释放失败不阻断 run 收尾
                 logger.exception(
                     "concurrency release failed for session %s",
