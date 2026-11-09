@@ -725,7 +725,7 @@ def _get_redis_client():
     return message_bus.get_client()
 
 # 用户/全局两维受平台总开关(run_concurrency.enabled)控制;智能体维度
-# 常开:未通过发布审批的智能体一律限 1,已通过的按配置生效(未配置=不限)。
+# 常开:未通过发布审批/状态未知一律限 1,已通过的按配置生效(未配置默认 1)。
 _base_dims_enabled = config.run_concurrency.enabled and (
     config.run_concurrency.max_running > 0
     or config.run_concurrency.max_running_per_user > 0
@@ -733,7 +733,7 @@ _base_dims_enabled = config.run_concurrency.enabled and (
 
 
 async def _agent_limit_provider(agent_id: str):
-    """智能体并发上限热路径查询:非审核通过限 1,审核通过按配置(未配置不限)。"""
+    """智能体并发上限热路径查询:未过审/状态未知限 1,过审按配置(未配置默认 1)。"""
     return await chat_concurrency_config.effective_limit(agent_id)
 
 
@@ -1057,7 +1057,8 @@ async def _lifespan_with_builtin_agents(app):
         except Exception as e:  # noqa: BLE001
             logger.warning("pool concurrency sync skipped: %s", e)
         # /chat 并发上限配置回填运行时热层(PG → 缓存/Redis),并探测
-        # Redis 可用性;失败仅告警,闸机按"未配置=不限"放行。
+        # Redis 可用性;失败仅告警,闸机仍按审核状态门禁取生效上限
+        # (未过审/状态未知一律 1 路,过审无配置默认 1 路)。
         try:
             await chat_concurrency_config.load_runtime()
         except Exception as e:  # noqa: BLE001

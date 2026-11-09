@@ -20,20 +20,22 @@
                                        倒序取前 N，同分按 updated_at 倒序兜底。
 
 上架/审批（**发布走审批流**，approve 后才插名单行，市场查询类接口零变化）：
-- ``POST /agent/market/{agent_id}/publish``        发布：写审批表 pending（幂等）；
-- ``POST /agent/market/{agent_id}/unpublish``      撤回：删市场行 + 清审批记录；
-- ``GET  /agent/market/reviews``                   审批列表（默认待办，任何登录用户）；
-- ``POST /agent/market/reviews/{id}/approve``      通过：插名单行上架（任何登录用户）；
-- ``POST /agent/market/reviews/{id}/reject``       拒绝：带理由（任何登录用户）。
+- ``POST /agent/market/{agent_id}/publish``        发布：写审批表 pending（幂等，仅 owner）；
+- ``POST /agent/market/{agent_id}/unpublish``      下架：删市场行 + 清审批记录
+                                                       + 清并发配置（重新上架需重配）；
+- ``GET  /agent/market/reviews``                   审批列表（status 不传 = 全部，仅 reviewer）；
+- ``POST /agent/market/reviews/{id}/approve``      通过：插名单行上架（仅 reviewer）；
+- ``POST /agent/market/reviews/{id}/reject``       拒绝：带理由（仅 reviewer）；
+- ``GET  /agent/market/reviews/{id}``              审核详情（人人可查）。
 
-审批三件套不校验审批人名单，任何登录用户都可审批；白名单管理接口
-保留、行为不变。
+审批列表 / 通过 / 拒绝 / 名单写操作统一校 ``reviewer`` 角色，非管理员
+一律 403；publish 仅校 owner，unpublish 与审核详情不做角色校验。
 
-审批人白名单（JSON 文件持久化 + 接口管理 + 末位保护；写操作仅
-名单内用户）：
+审批人名单（真源 ``role_store`` 的 roles / user_roles 两表，写操作仅
+reviewer）：
 - ``GET/POST/PUT /agent/market/reviewers``、
   ``DELETE /agent/market/reviewers/{target_user_id}``；
-- 生效名单 = JSON 文件内容（无写死账号，纯数据驱动）；末位保护：
+- 生效名单 = ``reviewer`` 角色成员（冷启动种子由 role_store 写入）；末位保护：
   PUT 传空 / 删最后一个审批人 → 409"至少保留一个审批人"；详见
   :mod:`bocomadp.market_reviewers`。
 
@@ -73,6 +75,7 @@ from agentscope.app.deps import get_current_user_id, get_storage
 from agentscope.app.storage import StorageBase
 from agentscope.app.storage._sql._tables import AgentRow, SessionRow
 
+from bocomadp import chat_concurrency_config
 from bocomadp.market_audit import log_audit
 from bocomadp.market_review_store import (
     STATUS_APPROVED,
@@ -295,9 +298,8 @@ async def list_market_agents(
     page_size: int = Query(
         default=10,
         ge=1,
-        le=100,
         alias="pageSize",
-        description="Page size (items per page), 1-100.",
+        description="Page size (items per page), >=1; no upper bound.",
     ),
     storage: StorageBase = Depends(get_storage),
 ) -> MarketListResponse:
@@ -305,6 +307,8 @@ async def list_market_agents(
 
     默认按 ``updated_at`` 倒序（最近更新/上架在前）——热度排序是精选
     推荐接口的专职，本接口不掺和。附带实时热度与标签供前端展示。
+    ``pageSize`` 不设上限：调用方传足够大的值即可一次取回全量，用
+    ``total`` 核对是否取全；不传仍按默认 10 条分页。
     """
     rows = await _market_agent_rows(storage)
     entries = await _entry_map(storage)
@@ -614,7 +618,7 @@ async def delete_market_agent(
 
 
 # ---------------------------------------------------------------------------
-# 上架管理（仅智能体 owner）
+# 上架/下架管理（publish 仅 owner；unpublish 不做角色校验）
 # ---------------------------------------------------------------------------
 
 
@@ -623,9 +627,10 @@ def _publish_guard(
     record: AgentRow,
     user_id: str,
 ) -> None:
-    """上架/撤回的公共前置校验，失败直接抛 HTTPException。
+    """发布的 owner 前置校验，失败直接抛 HTTPException。
 
-    - 非 owner（X-User-ID ≠ agents.user_id）→ 403。
+    仅 publish 调用（unpublish 不做角色/归属校验）；非 owner
+    （X-User-ID ≠ agents.user_id）→ 403。
     """
     if record.user_id != user_id:
         raise HTTPException(
@@ -698,6 +703,7 @@ async def publish_market_agent(
             "description": body.description.strip(),
         },
     )
+    chat_concurrency_config.invalidate_approval(agent_id)
     log_audit(
         user_id,
         "publish_agent_market",
@@ -710,25 +716,29 @@ async def publish_market_agent(
 @market_router.post(
     "/{agent_id}/unpublish",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="下架/撤回（**人人可操作**，设计阶段市场操作全放开）",
+    summary="下架/撤回（不做角色校验，任何登录用户可操作）",
 )
 async def unpublish_market_agent(
     agent_id: str,
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
 ) -> None:
-    """下架 = 移出市场（若有）+ 清审批记录（若有），一条接口全覆盖：
+    """下架 = 移出市场（若有）+ 清审批记录 + 清并发配置，一条接口全覆盖：
 
     - pending：撤回申请（删审批行，回到"未提交"）；
     - approved：从市场下架（删 ``agent_market`` 行，**标签随行消失**，
       重新发布需重走审批、重打标签）——创建者的 ``/agent/owned``
       列表里状态自动回落为 ``not_submitted``（待发布）；
     - rejected：清掉拒绝记录（改完直接重新 publish）；
+    - 并发配置（PG 真源 + 运行时热层 + 审核状态便签）同步清空，
+      重新审核上架后需管理员重新配置，旧上限不会自动恢复；
     - 幂等：什么都没有也 204。
 
-    **权限全放开**：智能体市场的任何操作人人都有权限——任何登录用户
-    （带 X-User-ID）都可下架/撤回，包括非 owner 撤别人的待审申请；
-    操作人记入审计日志留痕。智能体不存在 404。
+    本接口不做角色/归属校验：任何登录用户（带 X-User-ID）都可下架/
+    撤回，包括非 owner 撤别人的待审申请；操作人记入审计日志留痕。
+    智能体不存在 404。清配置失败只告警，不阻断下架（下架后闸机按
+    未过审强制 1 路，残留配置不生效）。审批与名单管理接口另有
+    ``reviewer`` 角色门禁。
     """
     record = await _find_agent_row(storage, agent_id)
     if record is None:
@@ -739,19 +749,26 @@ async def unpublish_market_agent(
 
     await delete_review_record(storage, agent_id)
     await delete_market_entry(storage, agent_id)
+    try:
+        await chat_concurrency_config.clear_agent_config(agent_id)
+    except Exception as e:  # noqa: BLE001 — 清配置失败不阻断下架
+        logger.warning(
+            "unpublish: clear chat concurrency config failed for %s: %s: %s",
+            agent_id, type(e).__name__, e,
+        )
     log_audit(
         user_id,
         "unpublish_agent_market",
         target=agent_id,
         detail=(
-            f"下架/撤回发布（删市场行 + 清审批记录），"
+            f"下架/撤回发布（删市场行 + 清审批记录 + 清并发配置），"
             f"owner={record.user_id}"
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# 发布审批（审批列表 + 通过/拒绝，操作侧不校验审批人白名单）
+# 发布审批（审批列表 + 通过/拒绝 + 审核详情；写操作仅 reviewer 角色）
 # 单查发布状态不再单独提供：owner 视角走 GET /agent/owned 与
 # GET /agent/（publish_status / publish_info / review_reason / reviewer /
 # reviewed_at），审核人视角走 GET /agent/market/reviews/{agent_id}。
@@ -910,7 +927,7 @@ async def list_market_reviews(
 @market_router.get(
     "/reviews/{agent_id}",
     response_model=MarketReviewItemView,
-    summary="审核详情（发布表单 + 审核概况；设计阶段人人可查）",
+    summary="审核详情（发布表单 + 审核概况；人人可查）",
 )
 async def get_market_review_detail(
     agent_id: str,
@@ -927,7 +944,7 @@ async def get_market_review_detail(
       审批时间——已通过/已驳回的"查看"复用本接口。
 
     待审核（pending）时审核概况字段为空串/null。无审批记录 404；
-    设计阶段人人可查（带 X-User-ID 即可）。
+    本接口为查询接口，不做角色校验（带 X-User-ID 即可）。
     """
     review = await get_review_record(storage, agent_id)
     if review is None:
@@ -962,7 +979,7 @@ async def get_market_review_detail(
 @market_router.post(
     "/reviews/{agent_id}/approve",
     response_model=MarketPublishStatusView,
-    summary="审批通过（审批意见选填；设计阶段人人可审批）",
+    summary="审批通过（审批意见选填；仅 reviewer 角色）",
 )
 async def approve_market_review(
     agent_id: str,
@@ -1021,6 +1038,7 @@ async def approve_market_review(
                 "description": review.description,
             },
         )
+    chat_concurrency_config.invalidate_approval(agent_id)
     log_audit(
         user_id,
         "approve_agent_publish",
@@ -1036,7 +1054,7 @@ async def approve_market_review(
 @market_router.post(
     "/reviews/{agent_id}/reject",
     response_model=MarketPublishStatusView,
-    summary="审批拒绝（任何登录用户均可操作，理由必填）",
+    summary="审批拒绝（仅 reviewer 角色，理由必填）",
 )
 async def reject_market_review(
     agent_id: str,
@@ -1048,7 +1066,7 @@ async def reject_market_review(
     ``/agent/`` / ``/agent/owned`` 的 ``review_reason`` 看到理由，修改后
     重新 publish（旧结论被清空，回到 pending）。
 
-    仅 pending 状态可审批（已办结 409）；不存在 404；非白名单 403；
+    仅 pending 状态可审批（已办结 409）；不存在 404；非 reviewer 角色 403；
     理由必填 1~200 字符（422）。
     """
     await _require_reviewer(user_id)
@@ -1082,6 +1100,7 @@ async def reject_market_review(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"该申请已办结（{existing.status}），仅待审批可操作。",
         )
+    chat_concurrency_config.invalidate_approval(agent_id)
     log_audit(
         user_id,
         "reject_agent_publish",

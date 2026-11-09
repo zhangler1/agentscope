@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""智能体 /chat 并发上限管理接口测试（PUT/GET列表分页/GET单条/DELETE）。
+"""智能体 /chat 并发上限管理接口测试（PUT/GET分页列表/DELETE）。
 
-轻量装配：FastAPI 直挂 ``agent_chat_concurrency_router``，PG 读写与
-运行时热层函数全部 monkeypatch（不碰真库），storage/guard 用桩对象；
-依赖 ``get_current_user_id`` 只读 ``X-User-ID`` header 的特性。
+轻量装配：FastAPI 直挂 ``agent_chat_concurrency_router``，PG 读写、
+运行时热层与角色判据全部 monkeypatch（不碰真库）；依赖
+``get_current_user_id`` 只读 ``X-User-ID`` header 的特性。
 
 pytest-asyncio 未安装：异步逻辑用 asyncio.run() 包裹（与既有测试一致）。
 """
@@ -17,12 +17,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from bocomadp import chat_concurrency_config
+from bocomadp import chat_concurrency_config, role_store
 from bocomadp.routers.agent_chat_concurrency import (
     agent_chat_concurrency_router,
 )
 
-HDR = {"X-User-ID": "admin"}
+ADMIN = "reviewer-1"
+HDR = {"X-User-ID": ADMIN}
+HDR_USER = {"X-User-ID": "test-user"}
 
 # 桩 storage 里的智能体名册（agent_id → name）
 _AGENTS = {
@@ -30,11 +32,15 @@ _AGENTS = {
     "ag-2": "周报生成器",
     "ag-3": "翻译官",
 }
+# 归属者：管理员 reviewer-1 不是任何智能体的 owner
+_OWNERS = {"ag-1": "alice", "ag-2": "bob", "ag-3": "carol"}
 
 
 class _FakeStorage:
+    """按 owner 严格隔离的桩（与框架 storage.get_agent 同语义）。"""
+
     async def get_agent(self, user_id: str, agent_id: str):
-        if agent_id in _AGENTS:
+        if _OWNERS.get(agent_id) == user_id and agent_id in _AGENTS:
             return SimpleNamespace(name=_AGENTS[agent_id])
         return None
 
@@ -89,6 +95,11 @@ def env(monkeypatch):
     # 默认所有智能体均视为已审核通过；未过审场景由单测临时覆盖
     async def is_agent_approved(agent_id: str) -> bool:
         return True
+
+    async def has_role(user_id: str, role_key: str) -> bool:
+        return user_id == ADMIN and role_key == role_store.REVIEWER_ROLE
+
+    monkeypatch.setattr(role_store, "has_role", has_role)
 
     for name, fn in [
         ("pg_upsert", pg_upsert),
@@ -177,10 +188,34 @@ def test_put_rejects_unapproved_agent(env, monkeypatch):
         headers=HDR,
     )
     assert resp.status_code == 403
-    assert "未发布" in resp.json()["detail"]
+    assert "仅审核通过" in resp.json()["detail"]
     # 既不写 PG 也不写运行时缓存
     assert "ag-2" not in db
     assert "ag-2" not in cache
+
+
+def test_put_rejects_when_approval_state_unknown(env, monkeypatch):
+    """审批状态暂不可用（查库失败）→ PUT 403 拒绝、配置不落库。
+
+    is_agent_approved 在状态未知时按 fail-closed 返回 False，接口层据此
+    挡住故障窗口内绕过前端的配置写入。
+    """
+    client, db, cache = env
+
+    async def _unknown(agent_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(chat_concurrency_config, "is_agent_approved", _unknown)
+
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-1", "max_running": 5},
+        headers=HDR,
+    )
+    assert resp.status_code == 403
+    assert "审批状态暂不可用" in resp.json()["detail"]
+    assert "ag-1" not in db
+    assert "ag-1" not in cache
 
 
 def test_put_validation_errors(env):
@@ -302,10 +337,10 @@ def test_list_agent_name_filter(env):
     assert resp.json()["total"] == 3
 
 
-# ── DELETE 恢复不限 ──────────────────────────────────────────────
+# ── DELETE 后回到默认 1 路 ────────────────────────────────────────
 
 
-def test_delete_resets_to_unlimited(env):
+def test_delete_resets_to_default_one(env):
     client, db, cache = env
     db["ag-1"] = (5, time.time(), _AGENTS["ag-1"])
     cache["ag-1"] = 5
@@ -342,3 +377,134 @@ def test_delete_agent_not_found(env):
     )
     assert resp.status_code == 404
     assert resp.json() == {"detail": "Agent not found"}
+
+
+# ── 管理员门禁（三个接口统一 403） ────────────────────────────────
+
+
+def test_non_admin_blocked_on_all_three_endpoints(env):
+    """非管理员 PUT / GET / DELETE 一律 403，配置不落库、列表不泄露。"""
+    client, db, cache = env
+    db["ag-1"] = (5, time.time(), _AGENTS["ag-1"])
+
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-2", "max_running": 5},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+    assert "管理员" in resp.json()["detail"]
+    assert "ag-2" not in db and "ag-2" not in cache
+
+    resp = client.get("/agents/chat-concurrency", headers=HDR_USER)
+    assert resp.status_code == 403
+    assert "管理员" in resp.json()["detail"]
+
+    resp = client.delete(
+        "/agents/chat-concurrency",
+        params={"agent_id": "ag-1"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+    assert "管理员" in resp.json()["detail"]
+    assert "ag-1" in db
+
+
+def test_gate_runs_before_agent_lookup(env):
+    """门禁先于智能体存在性校验：非管理员传不存在的 id 也是 403，不是 404。"""
+    client, *_ = env
+    resp = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ghost", "max_running": 5},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+    resp = client.delete(
+        "/agents/chat-concurrency",
+        params={"agent_id": "ghost"},
+        headers=HDR_USER,
+    )
+    assert resp.status_code == 403
+
+
+def test_admin_can_manage_agents_owned_by_other_users(env):
+    """管理员可配置/删除别人名下已过审智能体（跨用户按 agent_id 查）。
+
+    桩 storage 严格按 owner 隔离：用旧口径 ``get_agent(调用者, id)``
+    查必然落空，此用例回归保护"不能退回按调用者隔离"。
+    """
+    client, db, cache = env
+    assert _run(client.app.state.storage.get_agent(ADMIN, "ag-2")) is None
+
+    put = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-2", "max_running": 7},
+        headers=HDR,
+    )
+    assert put.status_code == 200, put.text
+    assert db["ag-2"][0] == 7
+    assert db["ag-2"][2] == "周报生成器"  # 名称快照来自跨用户查库
+    assert cache["ag-2"] == 7
+
+    listed = client.get("/agents/chat-concurrency", headers=HDR)
+    assert "ag-2" in [it["agent_id"] for it in listed.json()["items"]]
+
+    deleted = client.delete(
+        "/agents/chat-concurrency", params={"agent_id": "ag-2"}, headers=HDR,
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert "ag-2" not in db and "ag-2" not in cache
+
+
+def test_agent_lookup_failure_yields_404(env, monkeypatch):
+    """按 id 查不到智能体（含查库失败）→ PUT/DELETE 均 404，不落库。"""
+    client, db, cache = env
+
+    async def _empty(ids: list[str]) -> dict[str, str]:
+        return {}
+
+    monkeypatch.setattr(chat_concurrency_config, "pg_agent_names", _empty)
+
+    for resp in (
+        client.put(
+            "/agents/chat-concurrency",
+            json={"agent_id": "ag-1", "max_running": 5},
+            headers=HDR,
+        ),
+        client.delete(
+            "/agents/chat-concurrency", params={"agent_id": "ag-1"}, headers=HDR,
+        ),
+    ):
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "Agent not found"}
+    assert "ag-1" not in db and "ag-1" not in cache
+
+
+def test_admin_full_flow_with_role_gate(env):
+    """管理员 PUT → GET → DELETE → GET 全链路 200；非管理员读仍 403。"""
+    client, db, cache = env
+    put = client.put(
+        "/agents/chat-concurrency",
+        json={"agent_id": "ag-1", "max_running": 5},
+        headers=HDR,
+    )
+    assert put.status_code == 200
+    assert cache["ag-1"] == 5
+
+    listed = client.get("/agents/chat-concurrency", headers=HDR)
+    assert listed.status_code == 200
+    assert [it["agent_id"] for it in listed.json()["items"]] == ["ag-1"]
+    assert client.get(
+        "/agents/chat-concurrency", headers=HDR_USER,
+    ).status_code == 403
+
+    deleted = client.delete(
+        "/agents/chat-concurrency",
+        params={"agent_id": "ag-1"},
+        headers=HDR,
+    )
+    assert deleted.status_code == 200
+    assert "ag-1" not in db and "ag-1" not in cache
+    assert client.get(
+        "/agents/chat-concurrency", headers=HDR,
+    ).json()["items"] == []
