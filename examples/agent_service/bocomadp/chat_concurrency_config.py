@@ -553,9 +553,25 @@ async def effective_limit(agent_id: str) -> int | None:
     """
     state = await _approval_state(agent_id)
     if state is not True:
+        logger.debug(
+            "effective_limit(%s) -> 1 (approval_state=%s, hard cap)",
+            agent_id,
+            state,
+        )
         return 1
     limit = await runtime_get(agent_id)
-    return 1 if limit is None else limit
+    if limit is None:
+        logger.debug(
+            "effective_limit(%s) -> 1 (approved, no explicit config)",
+            agent_id,
+        )
+        return 1
+    logger.debug(
+        "effective_limit(%s) -> %s (approved, configured)",
+        agent_id,
+        limit,
+    )
+    return limit
 
 
 async def batch_effective_limits(

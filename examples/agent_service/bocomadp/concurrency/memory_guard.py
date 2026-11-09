@@ -100,10 +100,17 @@ class MemoryGuard:
             except Exception:  # noqa: BLE001 — fail-open：配置查询失败视为不限
                 logger.exception("agent_limit_provider failed; treat as unlimited")
                 limit = None
+            logger.debug("agent limit resolved: agent=%s limit=%s", agent_id, limit)
             if limit is not None and limit > 0:
                 cur = self._agent.get(agent_id, 0) + 1
                 if cur > limit:
                     self._release_occupied(occupied)
+                    logger.debug(
+                        "agent dim rejected: agent=%s running=%s limit=%s",
+                        agent_id,
+                        cur,
+                        limit,
+                    )
                     return REASON_AGENT
                 self._agent[agent_id] = cur
                 occupied.append((self._agent, agent_id))

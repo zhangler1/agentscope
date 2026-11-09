@@ -400,3 +400,75 @@ def test_gate_always_runs_when_disabled(fake_redis):
         assert "reserve" not in calls             # 请求体无 session_id,无待转正
 
     asyncio.run(_scenario())
+
+
+def test_throttled_request_logs_reason_and_identity(fake_redis, caplog):
+    """被限流时必须能从日志一眼看出维度/用户/智能体/会话。"""
+    import logging as _logging
+
+    # 用户维放开(0=不占位),只留全局上限 1 → 第二次必被全局维拒
+    client, _ = _build_app(fake_redis, max_running=1, max_running_per_user=0)
+    body = {"agent_id": "ag-1", "session_id": "s1"}
+    with caplog.at_level(_logging.INFO, logger="bocomadp.concurrency.guard"):
+        assert client.post("/chat/", json=body,
+                           headers={"X-User-ID": "alice"}).status_code == 200
+        assert client.post("/chat/", json=body,
+                           headers={"X-User-ID": "alice"}).status_code == 200
+
+    throttled = [r for r in caplog.records if "chat throttled" in r.getMessage()]
+    assert len(throttled) == 1
+    line = throttled[0].getMessage()
+    assert "reason=global" in line
+    assert "user=alice" in line
+    assert "agent=ag-1" in line
+    assert "session=s1" in line
+    assert throttled[0].levelno == _logging.WARNING
+
+
+def test_failed_request_logs_status_and_slot_release(fake_redis, caplog):
+    """下游非 2xx 时日志要写明状态码,与"被限流"区分开。"""
+    import asyncio
+    import logging as _logging
+
+    async def _scenario() -> None:
+        guard = ConcurrencyGuard(lambda: fake_redis, max_running=1,
+                                 max_running_per_user=1)
+
+        class _FailApp:
+            async def __call__(self, scope, receive, send):
+                await send({"type": "http.response.start", "status": 500,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body",
+                            "body": b'{"detail":"boom"}',
+                            "more_body": False})
+
+        mw = ConcurrencyGuardMiddleware(_FailApp(), guard)
+        scope = {"type": "http", "method": "POST", "path": "/chat/",
+                 "headers": [(b"x-user-id", b"alice")]}
+        sent = []
+
+        async def receive():
+            return {"type": "http.request",
+                    "body": b'{"agent_id":"ag-1","session_id":"s1"}',
+                    "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        with caplog.at_level(_logging.INFO,
+                            logger="bocomadp.concurrency.guard"):
+            await mw(scope, receive, send)
+
+        assert sent[0]["status"] == 500
+        assert await guard.try_acquire("alice") is True   # 名额已回滚
+
+    asyncio.run(_scenario())
+
+    failed = [r for r in caplog.records if "chat failed" in r.getMessage()]
+    assert len(failed) == 1
+    line = failed[0].getMessage()
+    assert "status=500" in line
+    assert "agent=ag-1" in line
+    assert "session=s1" in line
+    assert "boom" in line                       # 响应片段带进日志
+    assert failed[0].levelno == _logging.WARNING
