@@ -321,12 +321,19 @@ class ConcurrencyGuard:
             except Exception:  # noqa: BLE001 — fail-open:配置查询失败视为不限
                 logger.exception("agent_limit_provider failed; treat as unlimited")
                 limit = None
+            logger.debug("agent limit resolved: agent=%s limit=%s", agent_id, limit)
             if limit is not None and limit > 0:
                 cur_agent = await redis.incr(_agent_key(agent_id))
                 if cur_agent > limit:
                     await redis.decr(_agent_key(agent_id))
                     for key in occupied:
                         await redis.decr(key)
+                    logger.debug(
+                        "agent dim rejected: agent=%s running=%s limit=%s",
+                        agent_id,
+                        cur_agent,
+                        limit,
+                    )
                     return REASON_AGENT
                 occupied.append(_agent_key(agent_id))
 

@@ -23,6 +23,7 @@ from agentscope.app.deps import (
     get_session_service,
     get_storage,
 )
+from bocomadp import role_store
 from bocomadp.routers._schema.agent import (
     AgentSchemaResponse,
     AgentSchemaV2Response,
@@ -249,6 +250,39 @@ async def _attach_publish_status(
             item.review_reason = review.reason
         item.reviewer = review.reviewer
         item.reviewed_at = review.reviewed_at
+    # 并发路数：复用上面已查到的市场名单判过审，配置一次全量查，
+    # 不逐条查库；查询异常整批回落 1，不拖累列表接口。
+    await _attach_concurrency_limits(items, set(market_map))
+
+
+async def _attach_concurrency_limits(
+    items: list[TeamAgentView],
+    approved_ids: set[str],
+) -> None:
+    """批量给列表项附上「当前生效的并发路数」（in-place）。
+
+    规则与闸机 ``chat_concurrency_config.effective_limit`` 一致：
+    未过审（名单里没有）/ 过审但无显式配置 → 1；过审有配置 → 配置值
+    原样（显式 0 = 不限也返回 0）。名单是调用方已查好的市场名单，
+    配置走一次全量查询，避免当前页 N 条各查一次库。
+    任何查询异常都不抛：整批保持 schema 默认值 1，列表照常返回。
+    """
+    if not items:
+        return
+    from bocomadp import chat_concurrency_config
+
+    try:
+        limits = await chat_concurrency_config.batch_effective_limits(
+            [item.id for item in items], approved_ids,
+        )
+    except Exception as e:  # noqa: BLE001 — 展示字段失败不影响列表可用
+        logger.warning(
+            "attach concurrency_limit failed: %s: %s; fallback to 1",
+            type(e).__name__, e,
+        )
+        return
+    for item in items:
+        item.concurrency_limit = limits.get(item.id, 1)
 
 
 def _fill_publish_archive(
@@ -269,6 +303,105 @@ def _fill_publish_archive(
         tag=tag or "",
         description=description or "",
     )
+
+
+async def _list_all_agent_views(
+    storage: Any,
+    viewer_user_id: str,
+) -> list[TeamAgentView]:
+    """跨用户全量查询（管理员视角）：绕过框架按 viewer 隔离的 list_resource。
+
+    返回所有 ``source='user'`` 的智能体，构造为 TeamAgentView（仅自己
+    创建的 editable=True）。成员隐藏 / is_team 标记由调用方按全局团队
+    关系补全。
+    """
+    engine = getattr(storage, "_engine", None)
+    if engine is None:
+        return []
+    import json
+
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT id, user_id, source, payload, created_at, updated_at "
+                    "FROM agents WHERE source = 'user'",
+                ),
+            )
+        ).mappings().all()
+    views: list[TeamAgentView] = []
+    for r in rows:
+        payload = r["payload"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (ValueError, TypeError):
+                payload = {}
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        views.append(
+            TeamAgentView(
+                id=r["id"],
+                user_id=r["user_id"],
+                source=r["source"],
+                data=data,
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+                editable=(r["user_id"] == viewer_user_id),
+            ),
+        )
+    return views
+
+
+async def _global_team_members_and_leaders(
+    storage: Any,
+) -> tuple[set[str], set[str]]:
+    """全局团队关系：返回 (所有自建成员 id, 所有团长 leader id)。
+
+    管理员全量视图用它隐藏成员 + 标记团长，避免逐个用户查团队。
+    """
+    session_factory = getattr(storage, "_session_factory", None)
+    if session_factory is None:
+        return set(), set()
+    from bocomadp.team_store import ExpertTeamRelationRow
+
+    async with session_factory() as session:
+        from sqlalchemy import select
+
+        rows = (
+            await session.execute(select(ExpertTeamRelationRow))
+        ).scalars().all()
+    member_ids: set[str] = set()
+    leader_ids: set[str] = set()
+    for r in rows:
+        leader_ids.add(r.leader_agent_id)
+        for m in (r.members or []):
+            aid = (
+                m.get("agent_id")
+                if isinstance(m, dict)
+                else getattr(m, "agent_id", None)
+            )
+            if aid:
+                member_ids.add(aid)
+    return member_ids, leader_ids
+
+
+def _agent_name(entry: Any) -> str:
+    """取智能体名称（``data.name``，列表项顶层没有 name）。
+
+    普通用户走框架 ``AgentView``（data 是模型），管理员全量视图是从
+    ``agents.payload`` 构造的 ``TeamAgentView``（data 可能是 dict），
+    两种形态都要能取到名称。
+    """
+    data = getattr(entry, "data", None)
+    if isinstance(data, dict):
+        value = data.get("name", "")
+    elif data is not None:
+        value = getattr(data, "name", "")
+    else:
+        value = ""
+    return str(value or "")
 
 
 @agent_router.get(
@@ -312,6 +445,14 @@ async def list_agents(
             "leaders, `false` only plain agents. Omit to list all."
         ),
     ),
+    name: str | None = Query(
+        default=None,
+        description=(
+            "Optional case-insensitive substring filter on the agent "
+            "name (``data.name``). Omit, empty or blank to skip filtering; "
+            "``total`` counts the filtered result."
+        ),
+    ),
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> ListAgentsResponse:
     """Return all agent records visible to the authenticated user.
@@ -348,27 +489,42 @@ async def list_agents(
     # 否则真实环境永远走顶层分支，带 parent 的名册查询就缺自建成员。
     # 未 patch 的环境（纯单元测试）签名是 (viewer_id, kind)，透传会
     # TypeError，此时回退到自行按团队关系表过滤（行为等价）。
+    reviewer = await role_store.has_role(user_id, role_store.REVIEWER_ROLE)
     try:
-        entries = await access.list_resource(
-            user_id,
-            ResourceKind.AGENT,
-            parent_agent_id=parent_agent_id,
-        )
+        if parent_agent_id is not None:
+            # 成员名册查询：reviewer 也走现有访问层（沿用可见性语义）。
+            entries = await access.list_resource(
+                user_id, ResourceKind.AGENT, parent_agent_id=parent_agent_id,
+            )
+            member_ids, leader_ids = set(), set()
+        else:
+            if reviewer:
+                # 管理员：跨用户全量（绕过框架按 viewer 隔离的 list_resource）。
+                entries = await _list_all_agent_views(storage, user_id)
+                member_ids, leader_ids = await _global_team_members_and_leaders(
+                    storage,
+                )
+            else:
+                entries = await access.list_resource(user_id, ResourceKind.AGENT)
+                teams = await list_teams(storage, user_id)
+                member_ids = {
+                    m.agent_id
+                    for team in teams
+                    for m in team.members
+                    if team.is_self_built(m.agent_id)
+                }
+                leader_ids = {team.leader_agent_id for team in teams}
     except TypeError:
+        # 未 patch 的环境（纯单元测试）：access 不支持 parent_agent_id。
         entries = await access.list_resource(user_id, ResourceKind.AGENT)
         if parent_agent_id is not None:
-            # The framework access layer has no team concept; member filtering
-            # is re-derived from the expert-team relation table here.
             team = await get_team(storage, user_id, parent_agent_id)
-            member_ids = set(team.member_ids) if team is not None else set()
-            entries = [e for e in entries if e.id in member_ids]
+            entries = [
+                e for e in entries
+                if e.id in (set(team.member_ids) if team is not None else set())
+            ]
+            member_ids, leader_ids = set(), set()
         else:
-            # Top-level list stays clean: *self-built* team members are hidden
-            # here and reachable only via parent_agent_id=<leader> (matches
-            # the docstring above, docs/expert-team-api.md, and the
-            # access-layer patch in team_access.py). Under scheme B there are
-            # no invited-by-reference members, so this set is exactly the
-            # self-built membership.
             teams = await list_teams(storage, user_id)
             member_ids = {
                 m.agent_id
@@ -376,15 +532,32 @@ async def list_agents(
                 for m in team.members
                 if team.is_self_built(m.agent_id)
             }
-            if member_ids:
-                entries = [e for e in entries if e.id not in member_ids]
+            leader_ids = {team.leader_agent_id for team in teams}
+    # 顶层列表隐藏自建成员（归团长）；管理员全量视图额外补 is_team 标记。
+    if parent_agent_id is None and reviewer:
+        entries = [e for e in entries if e.id not in member_ids]
+        entries = [
+            e.model_copy(update={"is_team": (e.id in leader_ids)})
+            for e in entries
+        ]
+    elif parent_agent_id is None:
+        if member_ids:
+            entries = [e for e in entries if e.id not in member_ids]
     # is_team 筛选：生产环境顶层分支已在 TeamAgentView 上标记 is_team
     # （True=团长，False=普通成员）。未 patch 的环境没有该字段，
     # getattr 兜底为 None，此时两种过滤都筛空（语义合理：无团队概念）。
     if is_team is not None:
         entries = [e for e in entries if getattr(e, "is_team", None) is is_team]
+    # 名称模糊查询：放在可见性/团队/is_team 全部筛完之后、分页之前，
+    # 保证 total 是过滤后的总数、pageNum/pageSize 作用在过滤结果上。
+    if name and name.strip():
+        keyword = name.strip().casefold()
+        entries = [
+            e for e in entries
+            if keyword in _agent_name(e).casefold()
+        ]
     # 分页：entries 已按 updated_at 倒序（框架 list_resource 的排序逻辑），
-    # total 用切片前的完整数量，前端可据此算总页数。
+    # total 用过滤后、切片前的数量，前端可据此算总页数。
     # pageNum / pageSize 都不传 → 不分页全量返回；
     # 任一传入 → 按入参严格分页（pageSize 无上限），缺省的那个用默认值
     # 兜底（pageNum 缺省按第 1 页，pageSize 缺省按每页 5 条）。

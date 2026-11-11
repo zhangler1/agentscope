@@ -198,6 +198,15 @@ class TeamAgentView(AgentView):
         default=None,
         description="审批时间（ISO 8601）；未审批为 null。",
     )
+    concurrency_limit: int = Field(
+        default=1,
+        description=(
+            "当前生效的同时对话并发路数（GET /agent/ 列表批量附带）。"
+            "未通过发布审批 / 已过审但无显式配置 / 审批状态不可用，均为 1；"
+            "已过审则按 PUT /agents/chat-concurrency 的配置值原样展示"
+            "（显式配 0 = 不限，也展示 0）。"
+        ),
+    )
 
 
 class CopyAgentResponse(TeamAgentView):

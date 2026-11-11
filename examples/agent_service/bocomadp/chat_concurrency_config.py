@@ -13,21 +13,30 @@
 读取路径（闸机热路径 ``ConcurrencyGuard.try_acquire_ex`` /
 ``MemoryGuard.try_acquire_ex`` 的 ``agent_limit_provider``）::
 
-    Redis 可用：以 Redis 为准（多副本共享的新值）→ 无记录 = 未配置 = 不限
-    Redis 不可用：回落进程内缓存 → 无记录 = 不限
+    Redis 可用：以 Redis 为准（多副本共享的新值）→ 无记录 = 未配置
+    Redis 不可用：回落进程内缓存 → 无记录 = 未配置
+
+"未配置" = 配置表里没给这个智能体写过上限值，只描述数据状态，不等于
+"不限"：最终几路由 ``effective_limit`` 结合审核状态决定（过审未配置 =
+默认 1 路，状态未知 = 1 路，未过审不看配置直接 1 路）。
 
 Redis 不可用时进入短暂冷却（避免每个请求都白等一次连接超时），冷却结束
 后自动重试——Redis 恢复即自动回热，无需重启进程。
 
-启动回填：``load_runtime`` 把 PG 全量刷入缓存与 Redis（Redis 回填失败
-仅告警），并维护 ``has_any_config`` 标志
-（闸机启停判定 = ``run_concurrency.enabled`` OR 存在任一智能体配置）。
+启动回填：``load_runtime`` 把 PG 全量刷入进程内缓存与 Redis（Redis 回填失败
+仅告警）。
+
+生效上限（``effective_limit``）带审核状态门禁：状态未知（名单查询失败）
+按 1 路 fail-closed 处理，沙箱资源优先；未过审一律 1 路；已过审有配置
+按配置（显式 ``0`` = 不限），无配置默认 1 路。状态查询带 TTL 缓存，失败时
+不写缓存，且配置接口同步拒绝写入，避免未过审智能体的配置落库。
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
+from collections import OrderedDict
 from typing import Any
 
 from bocomadp.config import get_app_config
@@ -142,7 +151,7 @@ async def pg_upsert(
 
 
 async def pg_delete(agent_id: str) -> None:
-    """删除 PG 中的配置（恢复不限）。"""
+    """删除 PG 中的配置（无显式配置，闸机按默认 1 路处理）。"""
     engine = await _get_engine()
     from sqlalchemy import text
 
@@ -253,24 +262,6 @@ async def pg_set_name(agent_id: str, agent_name: str) -> None:
         )
 
 
-async def pg_count() -> int:
-    """当前配置条数（判定 has_any 用）。"""
-    try:
-        engine = await _get_engine()
-        from sqlalchemy import text
-
-        async with engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    text("SELECT COUNT(*) FROM agent_chat_concurrency"),
-                )
-            ).first()
-        return int(row[0]) if row is not None else 0
-    except Exception as e:  # noqa: BLE001
-        logger.warning("chat_concurrency_config: pg_count failed: %s", e)
-        return 0
-
-
 async def pg_agent_names(agent_ids: list[str]) -> dict[str, str]:
     """批量取智能体名称（``agents`` 表 ``payload`` JSON 里的 ``name``）。
 
@@ -326,9 +317,6 @@ _cache: dict[str, int] = {}
 # 冷却结束后自动再试——Redis 恢复即自动回热，无需重启进程。
 _REDIS_COOLDOWN_SECS = 5.0
 _redis_unavailable_until: float = 0.0
-# 启停判定标志：存在任一智能体配置（闸机以此激活，不依赖 run_concurrency.enabled）
-_has_any = False
-
 _redis: Any = None
 
 # 哨兵：本次 Redis 不可用（区别于"Redis 可用但无记录" = None）
@@ -337,11 +325,6 @@ _UNAVAILABLE = object()
 
 def _config_key(agent_id: str) -> str:
     return f"agentscope:chat_concurrency:{agent_id}"
-
-
-def has_any_config() -> bool:
-    """是否存在任一智能体并发配置（同步读标志，供中间件每请求判定）。"""
-    return _has_any
 
 
 async def _get_redis() -> Any:
@@ -431,16 +414,19 @@ async def set_runtime(agent_id: str, max_running: int) -> bool:
 
 
 async def delete_runtime(agent_id: str) -> None:
-    """删运行时层配置（恢复不限）。"""
+    """删运行时层配置（回到默认 1 路）。"""
     _cache.pop(agent_id, None)
     await _redis_hdel(agent_id)
 
 
 async def runtime_get(agent_id: str) -> int | None:
-    """闸机热路径读配置；无记录 = ``None`` = 不限。
+    """闸机热路径读配置本；无记录 = ``None`` = 该智能体没有显式配置。
 
     Redis 可用时以 Redis 为准（多副本共享的新值）；Redis 不可用时回落
-    进程内缓存（限流继续生效，只是副本间不共享），缓存也没有则不限。
+    进程内缓存（限流继续生效，只是副本间不共享），缓存里也没有就是
+    "配置本里查无此行"。这里的"无配置"只描述数据状态，不代表不限：
+    最终几路由 ``effective_limit`` 结合审核状态决定（过审且无配置 =
+    默认 1 路，状态未知 = 1 路，未过审连配置都不看直接 1 路）。
     """
     val = await _redis_hget(agent_id)
     if val is _UNAVAILABLE:
@@ -448,11 +434,174 @@ async def runtime_get(agent_id: str) -> int | None:
     return val
 
 
+# ── 审核状态门禁（agent_market 名单 + 有上限 TTL 缓存） ───────────────
+
+# 状态缓存保质期（秒）：审核状态变更最多延迟一个 TTL 生效，
+# 换来闸机热路径几乎零查库。
+_APPROVED_TTL_SECS = 30.0
+# 缓存上限：智能体平台智能体会很多，用有上限的 TTL 缓存，
+# TTL 过期 + 超上限按 LRU 淘汰，避免长生命周期进程里字典无限增长。
+_APPROVED_MAXSIZE = 50000
+
+
+class _ApprovedCache:
+    """agent_id → 是否过审 的有上限 TTL 便签（纯内存、每副本独立）。
+
+    与配置热层无关：这里只缓存“是否过审”，真源是共享库 ``agent_market``，
+    各副本各自懒加载，有效期内复用，过期或超上限后回源重查。
+    """
+
+    def __init__(self, maxsize: int, ttl: float) -> None:
+        self._maxsize = maxsize
+        self._ttl = ttl
+        self._data: "OrderedDict[str, tuple[bool, float]]" = OrderedDict()
+
+    def get(self, agent_id: str) -> bool | None:
+        """命中且在有效期内返回值；未命中/过期返回 None。"""
+        item = self._data.get(agent_id)
+        if item is None:
+            return None
+        approved, expire = item
+        if expire <= time.monotonic():
+            del self._data[agent_id]
+            return None
+        self._data.move_to_end(agent_id)
+        return approved
+
+    def set(self, agent_id: str, approved: bool) -> None:
+        """写入并刷新 LRU 位置；超上限淘汰最久未用者。"""
+        self._data[agent_id] = (approved, time.monotonic() + self._ttl)
+        self._data.move_to_end(agent_id)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+    def invalidate(self, agent_id: str) -> None:
+        """丢弃单个智能体的便签（发布状态变更后立即回源）。"""
+        self._data.pop(agent_id, None)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
+_approved_cache = _ApprovedCache(_APPROVED_MAXSIZE, _APPROVED_TTL_SECS)
+
+
+async def pg_agent_on_market(agent_id: str) -> bool:
+    """查 ``agent_market`` 名单是否有该智能体的行（= 已通过发布审批）。
+
+    审批通过的唯一残留凭证：approve 时插入名单行，unpublish 时删除，
+    状态自动回落。查询失败向上抛异常，由 ``_approval_state`` 统一兜底。
+    """
+    engine = await _get_engine()
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM agent_market "
+                    "WHERE agent_id = :agent_id LIMIT 1",
+                ),
+                {"agent_id": agent_id},
+            )
+        ).first()
+    return row is not None
+
+
+async def _approval_state(agent_id: str) -> bool | None:
+    """审核状态三态：True=已过审 / False=未过审 / None=状态未知。
+
+    TTL 内直接读便签；查库失败返回 None 且不写便签，库恢复后下一次请求
+    就能重新取到真实状态，不把故障期间的保守口径固化一个 TTL。
+    """
+    hit = _approved_cache.get(agent_id)
+    if hit is not None:
+        return hit
+    try:
+        approved = await pg_agent_on_market(agent_id)
+    except Exception as e:  # noqa: BLE001 — 状态未知按 fail-closed 处理
+        logger.warning(
+            "chat_concurrency_config: approval_state(%s) failed: %s: %s; "
+            "effective_limit -> limit 1 (fail-closed), "
+            "is_agent_approved -> denied (config writes blocked); "
+            "state NOT cached, next request retries the query",
+            agent_id, type(e).__name__, e,
+            exc_info=True,
+        )
+        return None
+    _approved_cache.set(agent_id, approved)
+    return approved
+
+
+async def is_agent_approved(agent_id: str) -> bool:
+    """智能体是否已通过发布审批（``agent_market`` 名单有行）。
+
+    状态未知（查库失败）按 fail-closed 拒绝，避免未过审智能体的
+    并发配置在故障窗口内落库。
+    """
+    state = await _approval_state(agent_id)
+    return state is True
+
+
+async def effective_limit(agent_id: str) -> int | None:
+    """闸机 agent 维度的生效上限（含审核状态门禁）。
+
+    - 状态未知（名单查询失败）：1 路 fail-closed，库抖动时优先保住
+      有限的沙箱资源；
+    - 未通过（not_submitted / pending / rejected）：硬上限 1；
+    - 已通过审批：有配置按配置（``0`` = 显式不限），无配置默认 1 路。
+    """
+    state = await _approval_state(agent_id)
+    if state is not True:
+        logger.debug(
+            "effective_limit(%s) -> 1 (approval_state=%s, hard cap)",
+            agent_id,
+            state,
+        )
+        return 1
+    limit = await runtime_get(agent_id)
+    if limit is None:
+        logger.debug(
+            "effective_limit(%s) -> 1 (approved, no explicit config)",
+            agent_id,
+        )
+        return 1
+    logger.debug(
+        "effective_limit(%s) -> %s (approved, configured)",
+        agent_id,
+        limit,
+    )
+    return limit
+
+
+async def batch_effective_limits(
+    agent_ids: list[str],
+    approved_ids: set[str],
+) -> dict[str, int]:
+    """一次批量算生效上限，供列表接口展示，规则与 ``effective_limit`` 一致。
+
+    配置取 PG 全量（``pg_list_all``，一次查询）：PUT 必写 PG 真源、DELETE
+    必删，多副本共享，与闸机热层同源；名单由调用方把已查到的市场名单
+    传进来（``approved_ids``），避免列表为同一份数据再查一次库。
+    ``pg_list_all`` 失败会回落空字典，表现为"无显式配置"→ 1 路
+    （fail-closed，与闸机状态未知的取向一致）。
+    """
+    configs = await pg_list_all()
+    limits: dict[str, int] = {}
+    for agent_id in agent_ids:
+        if agent_id not in approved_ids:
+            limits[agent_id] = 1
+            continue
+        row = configs.get(agent_id)
+        limits[agent_id] = 1 if row is None else int(row[0])
+    return limits
+
+
 async def get_effective(agent_id: str) -> tuple[int | None, str]:
     """接口查询用生效值解析链，返回 ``(value, source)``。
 
     Redis 有值 →（"redis"）；否则进程内缓存 / PG 真源 →（"pg"）；
-    都没有 →（"default"，不限）。
+    都没有 →（``None``, "default"，即无显式配置，闸机按默认 1 路处理）。
     """
     val = await _redis_hget(agent_id)
     if val is not _UNAVAILABLE and val is not None:
@@ -466,12 +615,11 @@ async def get_effective(agent_id: str) -> tuple[int | None, str]:
 
 
 async def load_runtime() -> None:
-    """启动回填：PG 全量 → 进程内缓存；再尽力回填 Redis；维护 has_any 标志。
+    """启动回填：PG 全量 → 进程内缓存；再尽力回填 Redis。
 
     缓存始终回填（闸机热路径零网络开销读它）；Redis 回填失败仅告警，
     Redis 恢复后由热路径自动重试并回热。失败不阻断启动。
     """
-    global _has_any
     try:
         configs = await pg_list_all()
     except Exception as e:  # noqa: BLE001
@@ -480,7 +628,6 @@ async def load_runtime() -> None:
     _cache.clear()
     for agent_id, (size, _ts, _name) in configs.items():
         _cache[agent_id] = size
-    _has_any = bool(configs)
     logger.info(
         "chat_concurrency configs loaded: %d (in-process cache ready)", len(configs),
     )
@@ -498,26 +645,56 @@ async def load_runtime() -> None:
             break
 
 
-def mark_has_any(value: bool) -> None:
-    """PUT/DELETE 时翻动启停标志（避免每请求查库）。"""
-    global _has_any
-    _has_any = value
+# ── 状态变更配套 ──────────────────────────────────────────────────
+
+def invalidate_approval(agent_id: str) -> None:
+    """发布状态变更后丢弃该智能体的状态便签，下次请求回源重查。
+
+    发布/通过/驳回/下架都会改变"是否过审"，便签留着最长 30s 会让
+    配置接口与闸机按旧状态判断（下架后仍能配、重新上架后配不了）。
+    """
+    _approved_cache.invalidate(agent_id)
+
+
+async def clear_agent_config(agent_id: str) -> None:
+    """清空该智能体的并发配置：PG 真源 + 运行时热层 + 审核状态便签。
+
+    下架时调用：重新上架需管理员重新配置。三处都要清——只删 PG 会
+    留下热层旧值，重新过审后旧上限悄悄恢复；状态便签不清则 30s 内
+    仍按"已过审"读配置。三步独立执行，单步失败其余照清，最后抛错
+    让调用方决定是报错还是仅告警（下架不阻断，DELETE 接口要报错）。
+    """
+    errors: list[str] = []
+    try:
+        await pg_delete(agent_id)
+    except Exception as e:  # noqa: BLE001 — 收集后统一上报
+        errors.append(f"pg_delete: {type(e).__name__}: {e}")
+    try:
+        await delete_runtime(agent_id)
+    except Exception as e:  # noqa: BLE001 — 同上
+        errors.append(f"delete_runtime: {type(e).__name__}: {e}")
+    invalidate_approval(agent_id)
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 __all__ = [
+    "clear_agent_config",
+    "invalidate_approval",
     "pg_get_full",
     "pg_upsert",
     "pg_delete",
     "pg_list_all",
     "pg_list_filtered",
     "pg_set_name",
-    "pg_count",
     "pg_agent_names",
-    "has_any_config",
-    "mark_has_any",
     "set_runtime",
     "delete_runtime",
     "runtime_get",
+    "pg_agent_on_market",
+    "is_agent_approved",
+    "effective_limit",
+    "batch_effective_limits",
     "get_effective",
     "load_runtime",
 ]

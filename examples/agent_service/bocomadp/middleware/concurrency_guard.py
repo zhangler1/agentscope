@@ -13,8 +13,9 @@
 - 占位成功后记"待转正"(``reserve``),登记在响应之后(``register``):
   两步之间 run 可能已经结束(run 秒失败),``release_session`` 先到会记
   提前结束标记,``register`` 见到标记即退掉占位、不再登记;
-- 启停判定:``enabled``(平台总开关,管用户/全局两维)与智能体配置
-  (``has_agent_config`` 标志)任一激活,闸机才运转;两者皆无 → 零开销透传。
+- 闸机对每个发消息请求常开:``enabled``(平台总开关)只决定用户/全局
+  两维是否占位;智能体维度由上限查询结果驱动(无 agent_id 或未配置
+  时该维跳过),未通过发布审批的智能体由配置层直接限 1。
 响应方向:
 - 2xx → 从响应体解析 session_id 并登记(值带 user:ts:token + 伴随哈希
   sid→agent_id);
@@ -81,14 +82,13 @@ class ConcurrencyGuardMiddleware:
         guard,
         *,
         enabled: bool = True,
-        has_agent_config: Callable[[], bool] | None = None,
         grace_secs: float = 6.0,
     ) -> None:
         self.app = app
         self._guard = guard
-        # 平台总开关:只管用户/全局两维;智能体维度由配置存在性独立驱动
+        # 平台总开关:只决定用户/全局两维是否占位;智能体维度始终参与
+        # (由上限查询结果驱动)
         self._enabled = enabled
-        self._has_agent_config = has_agent_config
         self._grace_secs = grace_secs
         self._startup_reconciled = False
 
@@ -107,13 +107,6 @@ class ConcurrencyGuardMiddleware:
             scope["type"] != "http"
             or scope["method"] != "POST"
             or not _is_chat_request(scope)
-        ):
-            await self.app(scope, receive, send)
-            return
-
-        # 闸机整体空转(两维开关均未激活)→ 零开销透传
-        if not self._enabled and (
-            self._has_agent_config is None or not self._has_agent_config()
         ):
             await self.app(scope, receive, send)
             return
@@ -155,14 +148,35 @@ class ConcurrencyGuardMiddleware:
                 )
 
         if reason is not None:
+            # 被拒是正常业务分支(响应 200 + status=throttled),但排查"对话
+            # 没反应/报错"时必须能从日志一眼分辨是限流还是下游故障,故用
+            # WARNING 单行留痕:维度 + 谁 + 哪个智能体 + 哪个会话。
+            logger.warning(
+                "chat throttled: reason=%s user=%s agent=%s session=%s",
+                reason,
+                user_id,
+                agent_id or "-",
+                session_id or "-",
+            )
             headers = [(b"content-type", b"application/json")]
             body = _throttled_body(reason)
             await send({"type": "http.response.start", "status": 200, "headers": headers})
             await send({"type": "http.response.body", "body": body, "more_body": False})
             return
 
+        # 放行留痕:与"chat throttled"成对出现,一次发消息必有一条,便于确认
+        # 本次请求确实穿过了闸机(而不是被别的中间件/路由挡掉)。常规成功
+        # 路径用 DEBUG,INFO 级只保留异常与拒绝,避免生产日志被每次请求刷屏。
+        logger.debug(
+            "chat acquired: user=%s agent=%s session=%s base_dims=%s",
+            user_id,
+            agent_id or "-",
+            session_id or "-",
+            self._enabled,
+        )
+
         await self._pass_through_and_finalize(
-            scope, replay_receive, send, user_id, agent_id,
+            scope, replay_receive, send, user_id, agent_id, session_id,
         )
 
     @staticmethod
@@ -214,8 +228,13 @@ class ConcurrencyGuardMiddleware:
         send: Send,
         user_id: str,
         agent_id: str,
+        req_session_id: str = "",
     ) -> None:
-        """转发下游,缓冲 JSON 响应体,结束时注册或回滚。"""
+        """转发下游,缓冲 JSON 响应体,结束时注册或回滚。
+
+        ``req_session_id`` 是请求体里的会话 id:下游报错时响应体里没有
+        session_id,日志与回滚仍要能定位到是哪个会话。
+        """
         status = 200
         content_type = ""
         body_parts: list[bytes] = []
@@ -233,7 +252,9 @@ class ConcurrencyGuardMiddleware:
                 if buffer:
                     body_parts.append(message.get("body", b""))
                     if not message.get("more_body", False):
-                        await self._finalize(status, body_parts, user_id, agent_id)
+                        await self._finalize(
+                            status, body_parts, user_id, agent_id, req_session_id,
+                        )
                 await send(message)
             else:
                 await send(message)
@@ -242,7 +263,7 @@ class ConcurrencyGuardMiddleware:
             await self.app(scope, receive, send_wrapper)
         except Exception:  # noqa: BLE001 — fail-open:回滚后上抛,由外层中间件统一处理
             logger.exception("concurrency guard downstream failed; rolling back")
-            await self._rollback(session_id, user_id, agent_id)
+            await self._rollback(req_session_id, user_id, agent_id)
             raise
 
     async def _finalize(
@@ -251,6 +272,7 @@ class ConcurrencyGuardMiddleware:
         body_parts: list[bytes],
         user_id: str,
         agent_id: str,
+        req_session_id: str = "",
     ) -> None:
         body = b"".join(body_parts)
         session_id = ""
@@ -259,15 +281,40 @@ class ConcurrencyGuardMiddleware:
             session_id = str(payload.get("session_id", ""))
         except Exception:  # noqa: BLE001
             session_id = ""
+        # 登记只认响应体确认的 session_id;日志/回滚可退用请求体里的那个
+        log_session = session_id or req_session_id
         if status >= 200 and status < 300:
             if session_id:
                 try:
                     await self._guard.register(session_id, user_id, agent_id)
+                    logger.debug(
+                        "chat concurrency registered: session=%s agent=%s",
+                        session_id,
+                        agent_id or "-",
+                    )
                     return
                 except Exception:  # noqa: BLE001 — 登记失败必须回滚,避免计数泄漏
                     logger.exception("concurrency guard register failed; rolling back")
             await self._rollback(session_id, user_id, agent_id)
+            logger.debug(
+                "chat concurrency released before registration: "
+                "user=%s agent=%s session=%s",
+                user_id,
+                agent_id or "-",
+                log_session or "-",
+            )
         else:
+            # 非 2xx 时名额已回滚。这条日志把"下游报错"与"被限流"分开:
+            # 报错一定有 status/响应片段,限流只有 chat throttled。
+            logger.warning(
+                "chat failed (status=%s), concurrency slot released: "
+                "user=%s agent=%s session=%s body=%s",
+                status,
+                user_id,
+                agent_id or "-",
+                log_session or "-",
+                body[:200].decode("utf-8", "replace"),
+            )
             await self._rollback(session_id, user_id, agent_id)
 
     async def _rollback(
