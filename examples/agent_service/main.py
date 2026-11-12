@@ -117,6 +117,10 @@ from bocomadp.team_toolkit import patch_team_toolkit
 from bocomadp.toolkit_whitelist import patch_get_toolkit
 from bocomadp.tool_catalog import AGENT_CREATOR_ID
 from bocomadp.deerflow.model_patch import patch_get_model
+# 会话默认权限模式：给原生 POST /sessions/ 前插包裹路由（一处配置生效）
+from bocomadp.session_default_mode import (
+    install_create_session_default_mode,
+)
 # 框架内置 agent_router 只用于"摘除"（专家团能力由 bocomadp 版覆盖）
 from agentscope.app._router._agent import (
     agent_router as _framework_agent_router,
@@ -857,6 +861,16 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
+# 记忆工具（custom/memory_tools.py：记忆检索 / 记忆提取）运行时依赖：
+# 工具在 ToolRegistry 扫描阶段即被注册（早于 storage 创建），故此处注入。
+# 延迟导入 + 兜底：记忆包依赖（euvd_memory_pysdk 等）缺失时不阻断启动。
+try:
+    from bocomadp.tools.custom.memory_tools import set_memory_tool_storage
+
+    set_memory_tool_storage(storage)
+except Exception:  # noqa: BLE001 —— 记忆工具不可用不阻断服务启动
+    logger.exception("memory tools: failed to inject storage")
+
 # 会话记忆能力装配（bocom SDK 版记忆包）：
 # - 平台连接走 euvd_memory_pysdk（环境由 config.memory.environment 指定）；
 # - 记忆两表（memory_agent_configs / memory_session_states）与框架共用
@@ -1047,6 +1061,14 @@ async def _lifespan_with_builtin_agents(app):
         from bocomadp import agent_template_store
 
         await agent_template_store.ensure_agent_template_tables(storage)
+        # 智能体扩展表（agents_extend）——一智能体一行，payload 存该
+        # 智能体的扩展数据（当前装已安装技能清单）。存起来是为了让
+        # "查已装技能"不必进沙箱（原先必须解析 workspace → 路由 Pod →
+        # exec 列举，Pod 被回收/容器重启时该查询就失败）。
+        # 与上表同一套自建表模式：启动幂等建表（create_all）+ 列级迁移。
+        from bocomadp import agents_extend_store
+
+        await agents_extend_store.ensure_agents_extend_tables(storage)
         # 池并发配置：PG 真源回填 Redis（Redis 重启/清空后 per-agent 配置不丢）
         try:
             from bocomadp.pool_config import sync_all_to_redis
@@ -1206,6 +1228,25 @@ app.include_router(agent_router)
 # 故关闭 install_memory 自带的 DELETE 中间件，避免重复清理。
 # 顺序要求：create_app 之后、bocomadp agent_router 之后、lifespan 包装赋值之后。
 memory_module.install_memory(app, cleanup_on_agent_delete=False)
+# 会话默认权限模式（create_app 之后、/api 子应用挂载之前）：
+# 原生 POST /sessions/ 与 bocomadp POST /sessions/create 统一取
+# config.yaml 的 default_permission_mode（显式传入时以显式值为准），
+# 见 bocomadp/session_default_mode.py。
+install_create_session_default_mode(app)
+# 已装技能查询（create_app 之后、/api 子应用挂载之前）：
+# GET /workspace/skill 前插为"先查 agents_extend，无记录才回源沙箱并写回"，
+# 使该查询在 Pod 不可用时也能命中缓存；见 bocomadp/routers/skill_router.py
+# 的 install_skill_list_from_table。
+from bocomadp.routers.skill_router import install_skill_list_from_table
+
+install_skill_list_from_table(app)
+# 技能上传 / 卸载写穿（同样在 /api 挂载之前）：
+# 框架的 POST /workspace/skill/upload 与 DELETE /workspace/skill/{name} 只动
+# 沙箱，这里前插同路径包装，成功后再更新 agents_extend（used 标记的数据源）；
+# 状态码 / 响应体 / 异常与框架实现逐字一致，见 bocomadp/skill_write_through.py。
+from bocomadp.skill_write_through import install_skill_write_through
+
+install_skill_write_through(app)
 app.include_router(health_router)
 app.include_router(stats_router)
 app.include_router(session_usage_router)

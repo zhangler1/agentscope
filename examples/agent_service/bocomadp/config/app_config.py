@@ -357,6 +357,57 @@ class MemoryConfig(BaseModel):
         description="SDK 连接池最大连接数。",
     )
 
+    # ---- 记忆工具：HTTP 直连平台（普通 POST JSON-RPC，不是 MCP 客户端） ----
+    mcp_search_url: str = Field(
+        default="",
+        description="记忆检索接口地址（含 packageKey 查询串）；空表示工具不可用。",
+    )
+    mcp_save_url: str = Field(
+        default="",
+        description="记忆提取（落库）接口地址（含 packageKey 查询串）；空表示工具不可用。",
+    )
+    mcp_agent_key: str = Field(
+        default="",
+        description="平台侧 agent-key 请求头。",
+    )
+    mcp_search_tool: str = Field(
+        default="EUVDsearchMemory",
+        description="检索接口的 tools/call 工具名。",
+    )
+    mcp_save_tool: str = Field(
+        default="EUVDsaveMemoriesStandard",
+        description="提取接口的 tools/call 工具名。",
+    )
+    mcp_protocol_version: str = Field(
+        default="2025-03-26",
+        description="mcp-protocol-version 请求头。",
+    )
+    mcp_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="记忆工具单次 HTTP 调用超时（秒）。",
+    )
+    search_default_top_k: int = Field(
+        default=5,
+        ge=1,
+        description="记忆检索工具默认返回条数（模型未传 topK 时使用）。",
+    )
+    search_max_top_k: int = Field(
+        default=20,
+        ge=1,
+        description="记忆检索工具可传入的最大条数（模型传入超限时截断）。",
+    )
+    extract_default_rounds: int = Field(
+        default=5,
+        ge=1,
+        description="记忆提取工具默认回溯对话轮数。",
+    )
+    extract_max_rounds: int = Field(
+        default=20,
+        ge=1,
+        description="记忆提取工具可传入的最大对话轮数（模型传入超限时截断）。",
+    )
+
 
 class DbConfig(BaseModel):
     """AgentScope 持久化存储后端（AsyncSQLAlchemyStorage）。

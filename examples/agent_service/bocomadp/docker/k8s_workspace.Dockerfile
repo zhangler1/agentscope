@@ -41,11 +41,17 @@ RUN curl -LsSf https://astral.sh/uv/install.sh \
 ENV GATEWAY_HOME=/root/.agentscope
 
 # ---- 4. 创建 Gateway 虚拟环境并安装运行时依赖 ----
-# 与 agentscope.workspace._utils._GATEWAY_BASE_REQUIREMENTS 保持一致
+# 前 4 项与 agentscope.workspace._utils._GATEWAY_BASE_REQUIREMENTS 一致。
+# 后 6 个包供 agentscope.tool 树使用：MCPClient.get_tool() 调用工具时
+# 会导入该树，而 agentscope 以 --no-deps 安装，缺包会在调用时抛
+# ImportError。本镜像命中 fast-path 跳过 bootstrap（extra_pip 在此
+# 路径不生效），因此必须在此显式补齐，勿删。
 RUN mkdir -p "${GATEWAY_HOME}" \
  && uv venv "${GATEWAY_HOME}/.venv" \
  && uv pip install --python "${GATEWAY_HOME}/.venv/bin/python" \
-        'mcp<2.0.0' uvicorn fastapi httpx
+        'mcp<2.0.0' uvicorn fastapi httpx \
+        docstring_parser aiofiles jinja2 python-frontmatter \
+        tree_sitter tree_sitter_bash
 
 # ---- 5. 安装 agentscope（仅 mcp 模块，--no-deps 避免重复拉依赖） ----
 # 构建上下文为仓库根目录，pyproject.toml + src/ 可被 COPY
