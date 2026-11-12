@@ -357,14 +357,13 @@ class MemoryConfig(BaseModel):
         description="SDK 连接池最大连接数。",
     )
 
-    # ---- 记忆工具：HTTP 直连平台（普通 POST JSON-RPC，不是 MCP 客户端） ----
-    mcp_search_url: str = Field(
+    # ---- 记忆 MCP：检索与提取共用同一个平台地址 ----
+    mcp_url: str = Field(
         default="",
-        description="记忆检索接口地址（含 packageKey 查询串）；空表示工具不可用。",
-    )
-    mcp_save_url: str = Field(
-        default="",
-        description="记忆提取（落库）接口地址（含 packageKey 查询串）；空表示工具不可用。",
+        description=(
+            "记忆平台 MCP 地址（含 packageKey 查询串）；"
+            "检索与提取共用，空表示记忆工具不可用。"
+        ),
     )
     mcp_agent_key: str = Field(
         default="",

@@ -57,19 +57,20 @@ memory:
   pool_connections: 10
   pool_maxsize: 20
 
-  # ---- 记忆工具：HTTP 直连（普通 POST JSON-RPC，不经 MCP 客户端） ----
-  # 检索 / 提取两个接口地址（含 packageKey 查询串）；留空则对应工具不挂载。
-  mcp_search_url: "http://12.244.131.228/EAGP.EAGP-AGENT.V-1.0/mcp?packageKey=30e3ab352e0243f4acd4b681177fe576"
-  mcp_save_url: "http://12.244.131.228/EAGP.EAGP-AGENT.V-1.0/mcp?packageKey=30e3ab352e0243f4acd4b681177fe576"
+  # ---- 记忆 MCP：检索与提取共用同一个平台地址 ----
+  # 地址含 packageKey 查询串；留空则记忆工具不挂载。
+  mcp_url: "http://12.244.131.228/EAGP.EAGP-AGENT.V-1.0/mcp?packageKey=30e3ab352e0243f4acd4b681177fe576"
   mcp_agent_key: "9505639f-9c9a-44d2-ba3c-b4e673a99099"
   mcp_search_tool: "EUVDsearchMemory"
   mcp_save_tool: "EUVDsaveMemoriesStandard"
   mcp_protocol_version: "2025-03-26"
   mcp_timeout_seconds: 30
   # 记忆检索工具：默认返回条数 / 可传入的最大条数
+  # 平台 schema 对 topK 的硬上限是 20，配置大于 20 时按 20 处理。
   search_default_top_k: 5
   search_max_top_k: 20
   # 记忆提取工具：默认回溯轮数 / 可传入的最大轮数
+  # 提取窗口最多回溯 800 条消息，轮数配置过大时实际可用轮数可能不足。
   extract_default_rounds: 5
   extract_max_rounds: 20
 

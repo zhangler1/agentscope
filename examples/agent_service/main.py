@@ -355,12 +355,15 @@ async def build_agent_tools(
 ):
     # Set user_id context var so agent-factory tools know the caller.
     from bocomadp.tools.agent_factory_tools import (
+        _current_agent_id,
         _current_user_id,
         _current_token,
         _current_session_id,
     )
     _current_user_id.set(user_id)
     _current_session_id.set(session_id)
+    # 记忆 MCP 的动态 agentId 请求头从这里取（每个 run 重设一次）。
+    _current_agent_id.set(agent_id)
 
     # Session-scoped token: fresh value from the request context wins
     # and refreshes the store; the resume path falls back to the store.
@@ -861,15 +864,15 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
-# 记忆工具（custom/memory_tools.py：记忆检索 / 记忆提取）运行时依赖：
-# 工具在 ToolRegistry 扫描阶段即被注册（早于 storage 创建），故此处注入。
-# 延迟导入 + 兜底：记忆包依赖（euvd_memory_pysdk 等）缺失时不阻断启动。
+# 记忆 MCP 工具中间件（记忆检索 / 记忆提取）运行时依赖：
+# 参数规范化需要查 message 表，工具在 ToolRegistry 扫描阶段即注册，
+# 早于 storage 创建，故此处注入。失败不阻断服务启动。
 try:
-    from bocomadp.tools.custom.memory_tools import set_memory_tool_storage
+    from bocomadp.memory.mcp_tool_middleware import set_memory_tool_storage
 
     set_memory_tool_storage(storage)
 except Exception:  # noqa: BLE001 —— 记忆工具不可用不阻断服务启动
-    logger.exception("memory tools: failed to inject storage")
+    logger.exception("memory mcp tools: failed to inject storage")
 
 # 会话记忆能力装配（bocom SDK 版记忆包）：
 # - 平台连接走 euvd_memory_pysdk（环境由 config.memory.environment 指定）；
