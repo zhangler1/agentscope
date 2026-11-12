@@ -280,6 +280,46 @@ def test_materialize_moves_tools_and_drops_client(monkeypatch):
     assert group.mcps == []
 
 
+def test_materialize_uses_registry_client_when_gateway_wrapped(monkeypatch):
+    """沙箱 gateway client 只带静态头；应换回注册表的原始 client。"""
+    calls = {"gateway": 0, "original": 0}
+
+    class _GatewayClient:
+        name = "euvd-memory"
+
+        async def list_tools(self):
+            calls["gateway"] += 1
+            return []
+
+    class _OriginalClient:
+        name = "euvd-memory"
+
+        async def list_tools(self):
+            calls["original"] += 1
+            return [
+                _FakeMCPTool("EUVDsearchMemory"),
+                _FakeMCPTool("EUVDsaveMemoriesStandard"),
+            ]
+
+    original = _OriginalClient()
+    registry = SimpleNamespace(list_mcps=lambda: [original])
+    gateway = _GatewayClient()
+    group = SimpleNamespace(tools=[], mcps=[gateway])
+    toolkit = SimpleNamespace(tool_groups=[group])
+
+    monkeypatch.setattr(
+        "bocomadp.config.get_app_config",
+        lambda: SimpleNamespace(memory=_memory_cfg()),
+    )
+    monkeypatch.setattr(tw, "_mcp_registry", registry)
+
+    _run(tw._materialize_memory_mcp(toolkit))
+
+    assert calls == {"gateway": 0, "original": 1}
+    assert len(group.tools) == 2
+    assert group.mcps == []
+
+
 def test_materialize_keeps_client_on_list_failure(monkeypatch):
     class _Client:
         name = "euvd-memory"

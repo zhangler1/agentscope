@@ -18,9 +18,12 @@ immediately.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from agentscope.workspace import WorkspaceBase
+
+logger = logging.getLogger("bocomadp.workspace.whitelist")
 
 
 class _WhitelistWorkspaceProxy(WorkspaceBase):
@@ -123,11 +126,22 @@ class _WhitelistWorkspaceProxy(WorkspaceBase):
                     continue
                 try:
                     await self._workspace.add_mcp(spec)
-                except (ValueError, RuntimeError):
-                    pass
+                    logger.info("whitelist: add_mcp %r ok", name)
+                except (ValueError, RuntimeError) as exc:
+                    # 记忆 MCP 在沙箱模式下的常见失败点：gateway 不可用 /
+                    # 注册被拒。此处必须留痕，否则工具“静默消失”。
+                    logger.warning("whitelist: add_mcp %r failed: %s", name, exc)
             mcps = await self._workspace.list_mcps()
 
-        return [m for m in mcps if getattr(m, "name", "") in allowed]
+        result = [m for m in mcps if getattr(m, "name", "") in allowed]
+        logger.info(
+            "whitelist: list_mcps agent=%s allowed=%s workspace=%s -> %s",
+            self._agent_id,
+            sorted(allowed),
+            [getattr(m, "name", "") for m in mcps],
+            [getattr(m, "name", "") for m in result],
+        )
+        return result
 
     def __getattr__(self, item: str) -> Any:
         # Everything else (list_tools / list_skills / get_backend /

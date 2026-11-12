@@ -119,12 +119,41 @@ def _decorate_memory_tool(tool: Any, memory_cfg: Any) -> None:
     tool.is_read_only = True
 
 
+#: MCP 注册表（main.py 启动时注入），用于取原始 client 绕过沙箱 gateway。
+_mcp_registry: Any = None
+
+
+def set_mcp_registry(registry: Any) -> None:
+    """注入 MCP 注册表（main.py 启动时调用一次）。"""
+    global _mcp_registry
+    _mcp_registry = registry
+
+
+def _registry_mcp(name: str) -> Any:
+    """按名称取注册表里的原始 MCPClient（沙箱模式下带动态头逻辑）。"""
+    if _mcp_registry is None:
+        return None
+    try:
+        for mcp in _mcp_registry.list_mcps():
+            if getattr(mcp, "name", "") == name:
+                return mcp
+    except Exception:  # noqa: BLE001 —— 注册表异常不影响对话
+        logger.warning("memory mcp: registry lookup failed", exc_info=True)
+    return None
+
+
 async def _materialize_memory_mcp(toolkit: Any) -> None:
     """把记忆 MCP 的工具展开到 ``group.tools`` 并做展示层装饰。
 
     框架的 ``Toolkit._get_available_tools`` 每轮会自己 ``list_tools``；
     这里提前展开并清空 ``group.mcps``，避免同一轮重复请求。失败时保留
     client，交给框架原有兜底（list 失败只跳过该 MCP）。
+
+    **沙箱模式下** workspace 里的 client 是 ``GatewayMCPClient``，其请求
+    由沙箱内 gateway 转发、只带注册时的静态 headers，每请求动态注入的
+    ``guwp-token / agentId / runId`` 会丢失。因此这里优先换成注册表里的
+    原始 ``MemoryMCPClient``（应用进程内直连记忆平台），保证发现与执行
+    两个阶段都能带上动态头。
     """
     from bocomadp.config import get_app_config
 
@@ -137,8 +166,27 @@ async def _materialize_memory_mcp(toolkit: Any) -> None:
             if name != MEMORY_MCP_NAME:
                 remaining.append(client)
                 continue
+            original = _registry_mcp(name)
+            if original is not None and original is not client:
+                logger.info(
+                    "memory mcp: using registry client for %r "
+                    "(bypass sandbox gateway)",
+                    name,
+                )
+                client = original
             try:
                 tools = await client.list_tools()
+                logger.info(
+                    "memory mcp: %s list_tools -> %d tools",
+                    name,
+                    len(tools),
+                )
+                if not tools:
+                    logger.warning(
+                        "memory mcp: %s returned 0 tools "
+                        "(check guwp-token / agentId headers)",
+                        name,
+                    )
             except Exception:  # noqa: BLE001 —— 记忆服务不可用不阻断对话
                 logger.warning(
                     "memory mcp: list_tools failed for %s; "

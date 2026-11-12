@@ -260,6 +260,13 @@ if config.mcp.enabled:
     if config.mcp.load_custom:
         mcp_registry.load_custom()
 
+# 记忆 MCP 直连支持：沙箱模式下 workspace 会把 MCP 包装成 gateway client
+# （静态 spec 会丢失 guwp-token / agentId / runId），因此工具层改用注册表
+# 里的原始 client，从应用容器直接访问记忆平台。这里把注册表交给包装层。
+from bocomadp.toolkit_whitelist import set_mcp_registry
+
+set_mcp_registry(mcp_registry)
+
 # ── 内置智能体：智能体工厂（agent-creator） ──
 # 专门用于对话式创建/修改智能体：除工厂工具（build_agent_tools
 # 按 agent_id 运行时注入）外，它也可以像普通智能体一样配置可配置集合
@@ -1180,6 +1187,13 @@ async def _lifespan_with_builtin_agents(app):
         # 锁观察只在 run 未走到 finally 时兜底（run 秒失败时锁只存在几毫秒，
         # 锁观察必然错过，靠对账要等 grace，期间该智能体的新请求会被限流拒）。
         install_run_release(concurrency_guard)
+        # 原生 /chat 与 wakeup 触发的 run 绑定 run_id ContextVar，
+        # 供记忆 MCP 的 runId 请求头（提取接口必需）与事件日志使用。
+        from bocomadp.logging.run_context_patch import (
+            install_run_id_context,
+        )
+
+        install_run_id_context()
         yield
 
 
