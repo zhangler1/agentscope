@@ -861,6 +861,16 @@ from bocomadp.tools.builtin_tools import set_tool_runtime_deps
 
 set_tool_runtime_deps(storage, message_bus)
 
+# 记忆工具（custom/memory_tools.py：记忆检索 / 记忆提取）运行时依赖：
+# 工具在 ToolRegistry 扫描阶段即被注册（早于 storage 创建），故此处注入。
+# 延迟导入 + 兜底：记忆包依赖（euvd_memory_pysdk 等）缺失时不阻断启动。
+try:
+    from bocomadp.tools.custom.memory_tools import set_memory_tool_storage
+
+    set_memory_tool_storage(storage)
+except Exception:  # noqa: BLE001 —— 记忆工具不可用不阻断服务启动
+    logger.exception("memory tools: failed to inject storage")
+
 # 会话记忆能力装配（bocom SDK 版记忆包）：
 # - 平台连接走 euvd_memory_pysdk（环境由 config.memory.environment 指定）；
 # - 记忆两表（memory_agent_configs / memory_session_states）与框架共用

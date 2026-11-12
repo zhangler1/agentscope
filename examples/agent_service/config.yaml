@@ -49,10 +49,29 @@ ellm_key_refresh:
   refresh_ahead_secs: 120
 
 memory:
-  register_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/registerAgent.do"
-  retrieve_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/searchMemory.do"
-  extract_url: "http://12.244.113.82/EUVD.EUVD-MEMORIES.V-1.0/saveMemoriesStandard.do"
-  request_timeout_seconds: 30
+  # EUVD 记忆平台 SDK 环境：sit / uat / uat2 / prd（决定 SDK base_url）。
+  # 当前平台地址 12.244.113.82 对应 SDK 的 uat；切生产域名时改为 prd。
+  environment: "uat"
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 10
+  pool_connections: 10
+  pool_maxsize: 20
+
+  # ---- 记忆工具：HTTP 直连（普通 POST JSON-RPC，不经 MCP 客户端） ----
+  # 检索 / 提取两个接口地址（含 packageKey 查询串）；留空则对应工具不挂载。
+  mcp_search_url: "http://12.244.131.228/EAGP.EAGP-AGENT.V-1.0/mcp?packageKey=30e3ab352e0243f4acd4b681177fe576"
+  mcp_save_url: "http://12.244.131.228/EAGP.EAGP-AGENT.V-1.0/mcp?packageKey=30e3ab352e0243f4acd4b681177fe576"
+  mcp_agent_key: "9505639f-9c9a-44d2-ba3c-b4e673a99099"
+  mcp_search_tool: "EUVDsearchMemory"
+  mcp_save_tool: "EUVDsaveMemoriesStandard"
+  mcp_protocol_version: "2025-03-26"
+  mcp_timeout_seconds: 30
+  # 记忆检索工具：默认返回条数 / 可传入的最大条数
+  search_default_top_k: 5
+  search_max_top_k: 20
+  # 记忆提取工具：默认回溯轮数 / 可传入的最大轮数
+  extract_default_rounds: 5
+  extract_max_rounds: 20
 
 # ---------- Redis（消息总线 / 分布式锁 / 缓存） ----------
 # 存储后端已迁至上方 db（AsyncSQLAlchemyStorage）；Redis 仅保留给
@@ -188,6 +207,15 @@ raw_request:
 rate_currency:
   api_url: "http://12.244.113.82"
   timeout: 30
+
+
+# ---------- 个人知识库全文检索（personal_knowledge_request） ----------
+# 扁平结构：键与 personal_knowledge_request_config.py 字段一一对应。
+# 根地址与原 deerflow 工程一致，生产环境可用 $PK_REQUEST_API_URL 切换；
+# 2 个接口路径固定（工具文件 DEFAULT_API_PATHS），仅域名跨环境可切。
+# personal_knowledge_request:
+#   api_url: "http://12.244.167.46"
+#   timeout: 30
 
 
 # ---------- 通讯录查询（contact_search） ----------
