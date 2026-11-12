@@ -91,6 +91,14 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "agent_factory_session_id", default="",
 )
 
+# Current agent id — set by ``build_agent_tools`` (main.py) on each chat run.
+# Consumed by the memory MCP client (dynamic ``agentId`` request header) and
+# by other tools that need to address the running agent without a storage
+# round-trip.
+_current_agent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "agent_factory_agent_id", default="",
+)
+
 
 def resolve_session_context(
     user_id: str = "",
@@ -999,5 +1007,6 @@ __all__ = [
     "list_available_skills",
     "enable_skill_for_agent",
     "_current_session_id",
+    "_current_agent_id",
     "resolve_session_context",
 ]

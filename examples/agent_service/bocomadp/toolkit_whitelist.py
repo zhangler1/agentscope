@@ -31,7 +31,127 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from bocomadp.mcp import MEMORY_MCP_NAME
+
 logger = logging.getLogger("bocomadp.toolkit_whitelist")
+
+#: 平台 schema 对 topK 的硬上限。
+_PLATFORM_MAX_TOP_K = 20
+
+
+def _memory_search_schema(memory_cfg: Any) -> dict[str, Any]:
+    """检索工具展示 schema：平铺 keyword / topK（隐藏 param 包装）。"""
+    max_top_k = min(memory_cfg.search_max_top_k, _PLATFORM_MAX_TOP_K)
+    default_top_k = min(memory_cfg.search_default_top_k, max_top_k)
+    return {
+        "type": "object",
+        "properties": {
+            "keyword": {
+                "type": "string",
+                "title": "检索词",
+                "description": "检索关键词，贴近用户原话的核心主题。",
+            },
+            "topK": {
+                "type": "integer",
+                "title": "返回条数",
+                "description": "返回的记忆条数；不传使用系统默认值。",
+                "default": default_top_k,
+                "minimum": 1,
+                "maximum": max_top_k,
+            },
+        },
+        "required": ["keyword"],
+    }
+
+
+def _memory_save_schema(memory_cfg: Any) -> dict[str, Any]:
+    """提取工具展示 schema：只暴露对话轮数。"""
+    max_rounds = memory_cfg.extract_max_rounds
+    default_rounds = min(memory_cfg.extract_default_rounds, max_rounds)
+    return {
+        "type": "object",
+        "properties": {
+            "rounds": {
+                "type": "integer",
+                "title": "对话轮数",
+                "description": (
+                    "回溯最近多少轮对话用于提取记忆；"
+                    "不传使用系统默认值，超出上限自动截断。"
+                ),
+                "default": default_rounds,
+                "minimum": 1,
+                "maximum": max_rounds,
+            },
+        },
+        "required": [],
+    }
+
+
+def _decorate_memory_tool(tool: Any, memory_cfg: Any) -> None:
+    """改写记忆 MCP 工具的 schema / 权限，并挂参数中间件。
+
+    工具名保持 MCP 原名（``mcp__euvd-memory__EUVDxxx``）；底层
+    ``MCPTool.call`` 用的是服务端原始名，改名与否不影响调用。
+    """
+    from bocomadp.memory.mcp_tool_middleware import (
+        MemoryMCPToolMiddleware,
+    )
+
+    raw_tool = getattr(tool, "_tool", None)
+    server_name = str(getattr(raw_tool, "name", "") or "")
+    if server_name == memory_cfg.mcp_search_tool:
+        tool.input_schema = _memory_search_schema(memory_cfg)
+    elif server_name == memory_cfg.mcp_save_tool:
+        tool.input_schema = _memory_save_schema(memory_cfg)
+    else:
+        return
+
+    middlewares = getattr(tool, "_middlewares", None)
+    if middlewares is None:
+        middlewares = []
+        tool._middlewares = middlewares
+    if not any(
+        isinstance(mw, MemoryMCPToolMiddleware) for mw in middlewares
+    ):
+        middlewares.append(MemoryMCPToolMiddleware())
+
+    # 记忆工具不需要人工确认（平台 readOnly 字段非标准，框架读不到）。
+    tool.is_read_only = True
+
+
+async def _materialize_memory_mcp(toolkit: Any) -> None:
+    """把记忆 MCP 的工具展开到 ``group.tools`` 并做展示层装饰。
+
+    框架的 ``Toolkit._get_available_tools`` 每轮会自己 ``list_tools``；
+    这里提前展开并清空 ``group.mcps``，避免同一轮重复请求。失败时保留
+    client，交给框架原有兜底（list 失败只跳过该 MCP）。
+    """
+    from bocomadp.config import get_app_config
+
+    memory_cfg = get_app_config().memory
+    for group in getattr(toolkit, "tool_groups", None) or []:
+        clients = getattr(group, "mcps", None) or []
+        remaining = []
+        for client in clients:
+            name = str(getattr(client, "name", "") or "")
+            if name != MEMORY_MCP_NAME:
+                remaining.append(client)
+                continue
+            try:
+                tools = await client.list_tools()
+            except Exception:  # noqa: BLE001 —— 记忆服务不可用不阻断对话
+                logger.warning(
+                    "memory mcp: list_tools failed for %s; "
+                    "falling back to framework handling",
+                    name,
+                    exc_info=True,
+                )
+                remaining.append(client)
+                continue
+            for tool in tools:
+                _decorate_memory_tool(tool, memory_cfg)
+                group.tools.append(tool)
+        group.mcps = remaining
 
 _original_get_toolkit: Any = None
 
@@ -70,6 +190,13 @@ async def _whitelisted_get_toolkit(*args: Any, **kwargs: Any):
     - whitelist empty + usableTools empty → restricted tools all removed
     """
     toolkit = await _original_get_toolkit(*args, **kwargs)
+
+    # 记忆 MCP：提前展开工具（改写 schema / 挂参数中间件 / 免确认），
+    # 并清空对应 client，避免框架本轮再 list 一次。
+    try:
+        await _materialize_memory_mcp(toolkit)
+    except Exception:  # noqa: BLE001 —— 记忆工具缺席不阻断对话
+        logger.exception("memory mcp: materialize failed")
 
     agent_record = kwargs.get("agent_record")
     agent_id = getattr(agent_record, "id", "") or ""
