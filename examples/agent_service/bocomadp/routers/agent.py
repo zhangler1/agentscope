@@ -383,6 +383,40 @@ async def _global_team_members_and_leaders(
     return member_ids, leader_ids
 
 
+async def _reviewer_resolve_agent(
+    storage: Any,
+    agent_id: str,
+) -> tuple[str, Any] | None:
+    """reviewer 管理员按 agent_id 反查真实 owner（绕过框架按 viewer 隔离）。
+
+    框架 ``resolve_for_edit`` 不认 reviewer 角色，无法让管理员编辑 / 删除
+    他人智能体；这里用与 ``_list_all_agent_views`` 相同的直查 agents 表方式
+    拿到 (owner_id, 记录)，再以其真实 owner 身份写回 / 删除。
+    """
+    engine = getattr(storage, "_engine", None)
+    if engine is None:
+        return None
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT user_id FROM agents "
+                    "WHERE id = :aid AND source = 'user'",
+                ),
+                {"aid": agent_id},
+            )
+        ).first()
+    if row is None:
+        return None
+    owner_id = row[0]
+    record = await storage.get_agent(owner_id, agent_id)
+    if record is None:
+        return None
+    return owner_id, record
+
+
 def _agent_name(entry: Any) -> str:
     """取智能体名称（``data.name``，列表项顶层没有 name）。
 
@@ -533,7 +567,9 @@ async def list_agents(
     if parent_agent_id is None and reviewer:
         entries = [e for e in entries if e.id not in member_ids]
         entries = [
-            e.model_copy(update={"is_team": (e.id in leader_ids)})
+            e.model_copy(
+                update={"is_team": (e.id in leader_ids), "editable": True}
+            )
             for e in entries
         ]
     elif parent_agent_id is None:
@@ -975,11 +1011,21 @@ async def update_agent(
         `HTTPException`: 404 if the agent is not visible to the caller;
             403 if visible but only readable.
     """
-    owner_id, existing = await access.resolve_for_edit(
-        user_id,
-        ResourceKind.AGENT,
-        agent_id,
-    )
+    is_reviewer = await role_store.has_role(user_id, role_store.REVIEWER_ROLE)
+    if is_reviewer:
+        resolved = await _reviewer_resolve_agent(storage, agent_id)
+        if resolved is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Agent '{agent_id}' not found.",
+            )
+        owner_id, existing = resolved
+    else:
+        owner_id, existing = await access.resolve_for_edit(
+            user_id,
+            ResourceKind.AGENT,
+            agent_id,
+        )
 
     updates = body.model_dump(exclude_none=True)
 
@@ -1033,8 +1079,16 @@ async def update_agent(
         update={"data": updated_data, "updated_at": datetime.now()},
     )
     await storage.upsert_agent(owner_id, updated_agent)
-    # Only reachable via ``resolve_for_edit``, so the caller has edit
-    # permission by construction.
+    # 管理员越权编辑他人智能体留痕（普通用户 owner_id 即本人，无需特别标注）。
+    if is_reviewer:
+        from bocomadp.market_audit import log_audit
+
+        log_audit(
+            user_id,
+            "update_agent_by_admin",
+            target=agent_id,
+            detail=f"管理员编辑智能体(owner={owner_id})",
+        )
     return await _to_team_view(storage, owner_id, updated_agent)
 
 
@@ -1074,11 +1128,29 @@ async def delete_agent(
         `HTTPException`: 404 if the agent is not visible to the caller;
             403 if visible but only readable.
     """
-    owner_id, _ = await access.resolve_for_edit(
-        user_id,
-        ResourceKind.AGENT,
-        agent_id,
-    )
+    is_reviewer = await role_store.has_role(user_id, role_store.REVIEWER_ROLE)
+    if is_reviewer:
+        resolved = await _reviewer_resolve_agent(storage, agent_id)
+        if resolved is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Agent '{agent_id}' not found.",
+            )
+        owner_id, _ = resolved
+        from bocomadp.market_audit import log_audit
+
+        log_audit(
+            user_id,
+            "delete_agent_by_admin",
+            target=agent_id,
+            detail=f"管理员删除智能体(owner={owner_id})",
+        )
+    else:
+        owner_id, _ = await access.resolve_for_edit(
+            user_id,
+            ResourceKind.AGENT,
+            agent_id,
+        )
     deleted = await session_service.delete_agent(owner_id, agent_id)
     if not deleted:
         raise HTTPException(
