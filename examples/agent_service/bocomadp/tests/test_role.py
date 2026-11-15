@@ -275,3 +275,68 @@ def test_role_overwrite_empty_protection(client):
 def test_role_last_one_protection(client):
     _run(role_store.overwrite_role_members("test_role", ["solo"]))
     assert _run(role_store.revoke_role("solo", "test_role")) == "last_one"
+
+
+# ---------------------------------------------------------------------------
+# 6) 管理员（reviewer）改 / 删他人名下的智能体（本次新功能）
+# ---------------------------------------------------------------------------
+
+
+def _agent_by_id(client, headers, agent_id):
+    """从可见列表里按 id 取智能体（GET /agent/ 默认不分页全量）。"""
+    resp = client.get("/agent/", headers=headers)
+    assert resp.status_code == 200
+    for a in resp.json()["agents"]:
+        if a["id"] == agent_id:
+            return a
+    return None
+
+
+def test_reviewer_can_update_others_agent(client, caplog):
+    """reviewer 可 PATCH 他人智能体：以真实 owner 写回 + 审计留痕。"""
+    alice_agent = _create(client, HDR_ALICE, name="alice-original")
+
+    # 普通用户改别人的 → 404（原行为不变）
+    resp = client.patch(
+        f"/agent/{alice_agent}", json={"name": "hacked"}, headers=HDR_USER,
+    )
+    assert resp.status_code == 404
+
+    # reviewer 改别人的 → 200
+    with caplog.at_level("INFO", logger="bocomadp.market_audit"):
+        resp = client.patch(
+            f"/agent/{alice_agent}",
+            json={"name": "alice-edited-by-admin"},
+            headers=HDR_REVIEWER,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["name"] == "alice-edited-by-admin"
+
+    # 审计日志落地（控制台 [AGENT_MARKET_AUDIT]）
+    assert any("update_agent_by_admin" in r.message for r in caplog.records)
+
+    # 以 alice(真实 owner) 视角确认改到了 alice 名下，而非 reviewer 名下
+    edited = _agent_by_id(client, HDR_ALICE, alice_agent)
+    assert edited is not None
+    assert edited["data"]["name"] == "alice-edited-by-admin"
+
+
+def test_reviewer_can_delete_others_agent(client, caplog):
+    """reviewer 可 DELETE 他人智能体：级联清理 + 审计留痕。"""
+    alice_agent = _create(client, HDR_ALICE, name="alice-to-delete")
+
+    # 普通用户删别人的 → 404（原行为不变）
+    assert client.delete(
+        f"/agent/{alice_agent}", headers=HDR_USER,
+    ).status_code == 404
+
+    # reviewer 删别人的 → 204
+    with caplog.at_level("INFO", logger="bocomadp.market_audit"):
+        resp = client.delete(
+            f"/agent/{alice_agent}", headers=HDR_REVIEWER,
+        )
+    assert resp.status_code == 204, resp.text
+    assert any("delete_agent_by_admin" in r.message for r in caplog.records)
+
+    # 以 alice(真实 owner) 视角确认已删除（落到 alice 名下）
+    assert _agent_by_id(client, HDR_ALICE, alice_agent) is None
