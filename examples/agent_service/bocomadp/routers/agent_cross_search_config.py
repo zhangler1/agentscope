@@ -26,6 +26,8 @@ from bocomadp.agent_cross_search_config import (
     cross_search_config_get,
     cross_search_config_upsert,
 )
+from bocomadp.market_audit import log_audit
+from bocomadp.reviewer_access import reviewer_resolve_agent
 
 logger = logging.getLogger("bocomadp.agent_cross_search_config")
 
@@ -40,13 +42,10 @@ async def _resolve_agent(
     user_id: str,
     agent_id: str,
 ) -> Any:
-    storage = getattr(request.app.state, "storage", None)
-    if storage is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         return None
-    try:
-        return await storage.get_agent(user_id, agent_id)
-    except Exception:  # noqa: BLE001
-        return None
+    return resolved[1]
 
 
 @agent_cross_search_config_router.get(
@@ -58,11 +57,12 @@ async def get_agent_cross_search_config(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    agent = await _resolve_agent(request, user_id, agent_id)
-    if agent is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = resolved
 
-    config = await cross_search_config_get(user_id, agent_id)
+    config = await cross_search_config_get(owner_id, agent_id)
     if config is None:
         return {
             "agent_id": agent_id,
@@ -86,11 +86,19 @@ async def set_agent_cross_search_config(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    agent = await _resolve_agent(request, user_id, agent_id)
-    if agent is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = resolved
 
-    await cross_search_config_upsert(user_id, agent_id, body)
+    await cross_search_config_upsert(owner_id, agent_id, body)
+    # 管理员代他人配置跨知识搜索留痕
+    log_audit(
+        user_id,
+        "cross_search_config_set_by_admin",
+        target=agent_id,
+        detail=f"管理员配置跨知识搜索(owner={owner_id})",
+    )
 
     logger.info(
         "agent_cross_search_config: %s configured (user_code=%s, space_codes=%s)",
@@ -114,11 +122,19 @@ async def reset_agent_cross_search_config(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    agent = await _resolve_agent(request, user_id, agent_id)
-    if agent is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = resolved
 
-    deleted = await cross_search_config_delete(user_id, agent_id)
+    deleted = await cross_search_config_delete(owner_id, agent_id)
+    # 管理员代他人重置跨知识搜索留痕
+    log_audit(
+        user_id,
+        "cross_search_config_reset_by_admin",
+        target=agent_id,
+        detail=f"管理员重置跨知识搜索(owner={owner_id})",
+    )
 
     logger.info(
         "agent_cross_search_config: %s reset to default (deleted=%s)",

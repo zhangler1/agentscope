@@ -79,7 +79,12 @@ async def _assert_agent_owner(user_id: str, agent_id: str) -> None:
     if storage is None:
         # 未装配（install_memory 前 / 纯本地脚本）：无归属依据，放行
         return
-    agent = await storage.get_agent(user_id, agent_id)
+    # reviewer 借用创作者身份：直查真实 owner 后按 owner 校验归属，
+    # 否则 reviewer 名下无该 agent → 404。普通用户原样返回自身 user_id。
+    from ..reviewer_access import reviewer_resolve_owner_id
+
+    owner_id = await reviewer_resolve_owner_id(storage, user_id, agent_id)
+    agent = await storage.get_agent(owner_id, agent_id)
     if agent is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

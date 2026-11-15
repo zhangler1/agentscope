@@ -115,15 +115,23 @@ async def _resolve_workspace(
 
     从 DB 读取会话持久化的 ``config.workspace_id``，而非现算——
     沙箱后端据此定位对应会话的工作目录。
+
+    reviewer 借用创作者身份：会话归属创作者，reviewer 名下没有该会话，
+    因此按真实 owner 解析会话；普通用户原样以自身 user_id 解析。
     """
-    session_record = await storage.get_session(user_id, agent_id, session_id)
+    from ..reviewer_access import reviewer_resolve_owner_id
+
+    effective_user_id = await reviewer_resolve_owner_id(storage, user_id, agent_id)
+    session_record = await storage.get_session(
+        effective_user_id, agent_id, session_id,
+    )
     if session_record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id!r} not found.",
         )
     return await workspace_manager.get_workspace(
-        user_id,
+        effective_user_id,
         agent_id,
         session_id,
         session_record.config.workspace_id,

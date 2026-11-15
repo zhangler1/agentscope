@@ -27,6 +27,8 @@ from bocomadp.agent_cross_search_ref import (
     cross_search_ref_sync,
     fetch_space_names,
 )
+from bocomadp.market_audit import log_audit
+from bocomadp.reviewer_access import reviewer_resolve_agent
 
 logger = logging.getLogger("bocomadp.agent_cross_search_refs")
 
@@ -38,13 +40,10 @@ agent_cross_search_refs_router = APIRouter(
 
 async def _resolve_agent(request: Request, user_id: str, agent_id: str) -> Any:
     """复用 cross-search-config 路由的鉴权：智能体不存在则 None。"""
-    storage = getattr(request.app.state, "storage", None)
-    if storage is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         return None
-    try:
-        return await storage.get_agent(user_id, agent_id)
-    except Exception:  # noqa: BLE001
-        return None
+    return resolved[1]
 
 
 async def _resolve_space_names(
@@ -102,11 +101,12 @@ async def list_cross_search_refs(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> list[dict]:
-    agent = await _resolve_agent(request, user_id, agent_id)
-    if agent is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = resolved
 
-    items = await cross_search_ref_list(user_id, agent_id)
+    items = await cross_search_ref_list(owner_id, agent_id)
     return [_item_view(it) for it in items]
 
 
@@ -120,18 +120,26 @@ async def set_cross_search_refs(
     request: Request,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    agent = await _resolve_agent(request, user_id, agent_id)
-    if agent is None:
+    resolved = await reviewer_resolve_agent(request, user_id, agent_id)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = resolved
 
     names = await _resolve_space_names(body)
     refs = [
         (it.owner_user_code, it.space_code, names[(it.owner_user_code, it.space_code)])
         for it in body
     ]
-    await cross_search_ref_sync(user_id, agent_id, refs)
+    await cross_search_ref_sync(owner_id, agent_id, refs)
+    # 管理员代他人同步引用知识空间留痕
+    log_audit(
+        user_id,
+        "cross_search_refs_sync_by_admin",
+        target=agent_id,
+        detail=f"管理员同步引用知识空间(owner={owner_id}, n={len(refs)})",
+    )
 
-    items = await cross_search_ref_list(user_id, agent_id)
+    items = await cross_search_ref_list(owner_id, agent_id)
     logger.info(
         "agent_cross_search_refs: %s synced %d ref(s) (user=%s)",
         agent_id,
