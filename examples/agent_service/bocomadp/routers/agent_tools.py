@@ -201,14 +201,22 @@ async def _resolve_framework_agent(
     Scoped by the authenticated caller *user_id* so the tool config
     APIs work for every user, not just ``default``.
 
+    reviewer 管理员会绕过按 viewer 隔离，按真实 owner 解析（与智能体改 / 删
+    同构），使其能管理他人智能体的工具。
+
     Returns:
-        The :class:`AgentRecord` if found, ``None`` otherwise.
+        ``(owner_id, AgentRecord)`` if found, ``None`` otherwise.
     """
     storage = getattr(request.app.state, "storage", None)
     if storage is None:
         return None
+    from bocomadp.reviewer_access import reviewer_resolve_owner_id
+
+    owner_id = await reviewer_resolve_owner_id(storage, user_id, agent_id)
+    if owner_id is None:
+        return None
     try:
-        return await storage.get_agent(user_id, agent_id)
+        record = await storage.get_agent(owner_id, agent_id)
     except Exception:
         logger.debug(
             "agent_tools: storage lookup failed for %s",
@@ -216,6 +224,9 @@ async def _resolve_framework_agent(
             exc_info=True,
         )
         return None
+    if record is None:
+        return None
+    return owner_id, record
 
 
 def _get_enabled_tools(agent_id: str) -> list[str]:
@@ -327,8 +338,8 @@ async def list_agent_tools(
           ]
         }
     """
-    agent = await _resolve_framework_agent(request, user_id, agent_id)
-    if agent is None:
+    agent_resolved = await _resolve_framework_agent(request, user_id, agent_id)
+    if agent_resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
     whitelist = set(_get_enabled_tools(agent_id))
@@ -452,9 +463,10 @@ async def enable_agent_tool(
     toggled.  Both Chinese and English names are accepted (e.g.
     ``"利率查询"`` and ``"interest_rate"``).
     """
-    agent = await _resolve_framework_agent(request, user_id, agent_id)
-    if agent is None:
+    agent_resolved = await _resolve_framework_agent(request, user_id, agent_id)
+    if agent_resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = agent_resolved
 
     configurable = _configurable_tool_names(request)
     resolved = _resolve_configurable_name(tool_name, configurable)
@@ -478,6 +490,15 @@ async def enable_agent_tool(
 
     current.append(resolved)
     _set_enabled_tools(agent_id, current)
+    # 管理员代他人启停工具留痕
+    from bocomadp.market_audit import log_audit
+
+    log_audit(
+        user_id,
+        "agent_tool_enable_by_admin",
+        target=agent_id,
+        detail=f"管理员开启工具(tool={resolved}, owner={owner_id})",
+    )
     logger.info("agent_tools: %s add %s → whitelist=%s", agent_id, resolved, current)
     return {"ok": True}
 
@@ -503,9 +524,10 @@ async def disable_agent_tool(
     Default tools (builtins / framework / project) cannot be removed.
     Both Chinese and English names are accepted.
     """
-    agent = await _resolve_framework_agent(request, user_id, agent_id)
-    if agent is None:
+    agent_resolved = await _resolve_framework_agent(request, user_id, agent_id)
+    if agent_resolved is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    owner_id, _ = agent_resolved
 
     configurable = _configurable_tool_names(request)
     resolved = _resolve_configurable_name(tool_name, configurable)
@@ -523,6 +545,15 @@ async def disable_agent_tool(
 
     current.remove(resolved)
     _set_enabled_tools(agent_id, current)
+    # 管理员代他人启停工具留痕
+    from bocomadp.market_audit import log_audit
+
+    log_audit(
+        user_id,
+        "agent_tool_disable_by_admin",
+        target=agent_id,
+        detail=f"管理员关闭工具(tool={resolved}, owner={owner_id})",
+    )
     logger.info("agent_tools: %s remove %s → whitelist=%s", agent_id, resolved, current)
     return {"ok": True}
 
