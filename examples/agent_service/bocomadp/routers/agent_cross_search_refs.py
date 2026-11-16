@@ -9,8 +9,8 @@ PUT    /agents/{agent_id}/cross-search-refs                                — �
 按 owner_user_code 分组多次调网关并合并结果。
 
 space_name 由后端在 PUT 时调网关（queryPageKnSpace.do）按 owner 查企业
-知识空间列表、用 space_code 匹配 spaceId 解析而来；查不到或网关异常存
-空串，GET/PUT 响应原样返回，前端以"名字为空"识别手填的 space_code 有问题。
+知识空间列表、用 space_code 匹配 spaceId 解析而来；查不到或网关异常时
+用 space_code 兜底，保证 GET/PUT 响应里的 space_name 不为空。
 """
 from __future__ import annotations
 
@@ -53,7 +53,8 @@ async def _resolve_space_names(
 
     查名网关没有单查接口，只能按 userCode + spaceCategory 拉某 owner 的全部
     空间列表；同一 owner 无论引用几个空间都只调一次网关，再用 spaceId 逐个
-    匹配名字。返回 ``{(owner_user_code, space_code): space_name}``，查不到为 ""。
+    匹配名字。返回 ``{(owner_user_code, space_code): space_name}``，查不到时
+    用 space_code 兜底，保证名字非空。
     """
     if not refs:
         return {}
@@ -62,8 +63,8 @@ async def _resolve_space_names(
         space_map = await fetch_space_names(owner_user_code)
         for r in refs:
             if r.owner_user_code == owner_user_code:
-                names[(owner_user_code, r.space_code)] = space_map.get(
-                    r.space_code, ""
+                names[(owner_user_code, r.space_code)] = (
+                    space_map.get(r.space_code) or r.space_code
                 )
     return names
 
@@ -87,7 +88,7 @@ def _item_view(it: Any) -> dict:
     return {
         "owner_user_code": it.owner_user_code,
         "space_code": it.space_code,
-        "space_name": it.space_name,
+        "space_name": it.space_name or it.space_code,
         "created_at": it.created_at.strftime("%Y-%m-%d %H:%M:%S"),
     }
 

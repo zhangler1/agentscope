@@ -11,8 +11,8 @@ cross_search 工具按 owner 分组、多次调网关合并结果。
 
 空间名称（space_name）：引用登记时后端调网关 queryPageKnSpace.do 按
 owner 查其创建的企业知识空间（spaceCategory=2）列表，用 space_code 匹配
-响应里的 spaceId 取 spaceName 落库。查不到或网关异常一律存空串——空名字
-是前端识别"用户手填的 space_code 有问题"的信号，不阻断登记。
+响应里的 spaceId 取 spaceName 落库。查不到或网关异常时本模块返回空映射，
+由路由层用 space_code 兜底落库，不阻断登记。
 """
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ async def fetch_space_names(owner_user_code: str) -> dict[str, str]:
 
     网关没有"按单个 spaceId 查名"的接口，只能按 userCode + spaceCategory=2
     拉全量再自己匹配。任何异常（网络/超时/TRAN_SUCCESS!=1）都吞掉返回
-    空映射——名字缺失只影响展示，不应阻断引用登记。
+    空映射；路由层拿到空值后用 space_code 兜底，不阻断引用登记。
     """
     req_message = {
         "REQ_HEAD": {"TRAN_PROCESS": "", "TRAN_ID": ""},
