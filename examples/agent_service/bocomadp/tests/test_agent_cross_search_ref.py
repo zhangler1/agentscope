@@ -34,7 +34,7 @@ def _run(coro):
 
 
 async def _mock_resolve_ok(*a, **k):
-    return object()
+    return "owner_u", object()
 
 
 async def _mock_resolve_none(*a, **k):
@@ -503,7 +503,7 @@ def test_router_list(_fake_db, monkeypatch):
             )
         ]
 
-    monkeypatch.setattr(refs_module, "_resolve_agent", _mock_resolve_ok)
+    monkeypatch.setattr(refs_module, "reviewer_resolve_agent", _mock_resolve_ok)
     monkeypatch.setattr(refs_module, "cross_search_ref_list", _list)
     req = SimpleNamespace()
     out = _run(refs_module.list_cross_search_refs("a1", request=req, user_id="u1"))
@@ -534,7 +534,7 @@ def test_router_put_sync(_fake_db, monkeypatch):
     async def _names(owner):
         return {"SA": "场景A"}
 
-    monkeypatch.setattr(refs_module, "_resolve_agent", _mock_resolve_ok)
+    monkeypatch.setattr(refs_module, "reviewer_resolve_agent", _mock_resolve_ok)
     monkeypatch.setattr(refs_module, "cross_search_ref_sync", _sync)
     monkeypatch.setattr(refs_module, "cross_search_ref_list", _list)
     monkeypatch.setattr(refs_module, "fetch_space_names", _names)
@@ -554,7 +554,7 @@ def test_router_put_sync(_fake_db, monkeypatch):
     assert out["items"][0]["owner_user_code"] == "A"
     assert out["items"][0]["space_name"] == "场景A"
 
-    # 批量（数组长度 2）：SB 网关没查到 → 名字落空串
+    # 批量（数组长度 2）：SB 网关没查到 → 用 space_code 兜底
     _run(
         refs_module.set_cross_search_refs(
             "a1",
@@ -566,7 +566,7 @@ def test_router_put_sync(_fake_db, monkeypatch):
             user_id="u1",
         )
     )
-    assert captured[-1] == [("A", "SA", "场景A"), ("B", "SB", "")]
+    assert captured[-1] == [("A", "SA", "场景A"), ("B", "SB", "SB")]
 
     # 空数组 = 清空（不触发网关查询）
     _run(
@@ -577,8 +577,63 @@ def test_router_put_sync(_fake_db, monkeypatch):
     assert captured[-1] == []
 
 
+def test_router_put_falls_back_to_space_code(monkeypatch):
+    """网关异常导致查不到名字时，space_name 用 space_code 兜底，登记照常成功。"""
+    captured = []
+
+    async def _sync(uid, aid, refs):
+        captured.append(list(refs))
+
+    async def _list(uid, aid):
+        return []
+
+    async def _names(owner):
+        return {}
+
+    monkeypatch.setattr(refs_module, "reviewer_resolve_agent", _mock_resolve_ok)
+    monkeypatch.setattr(refs_module, "cross_search_ref_sync", _sync)
+    monkeypatch.setattr(refs_module, "cross_search_ref_list", _list)
+    monkeypatch.setattr(refs_module, "fetch_space_names", _names)
+    req = SimpleNamespace()
+    out = _run(
+        refs_module.set_cross_search_refs(
+            "a1",
+            body=[
+                refs_module.RefSpaceCreate(
+                    owner_user_code="X", space_code="SPACE_TYPED_BY_HAND"
+                )
+            ],
+            request=req,
+            user_id="u1",
+        )
+    )
+    assert captured == [[("X", "SPACE_TYPED_BY_HAND", "SPACE_TYPED_BY_HAND")]]
+    assert out["agent_id"] == "a1"
+
+
+def test_router_list_falls_back_to_space_code(_fake_db, monkeypatch):
+    """历史记录 space_name 为空时，GET 也返回 space_code，前端空校验不会拦。"""
+    async def _list(uid, aid):
+        return [
+            RefSpaceItem(
+                user_id=uid,
+                agent_id=aid,
+                owner_user_code="A",
+                space_code="SA",
+                space_name="",
+                created_at=datetime.now(),
+            )
+        ]
+
+    monkeypatch.setattr(refs_module, "reviewer_resolve_agent", _mock_resolve_ok)
+    monkeypatch.setattr(refs_module, "cross_search_ref_list", _list)
+    req = SimpleNamespace()
+    out = _run(refs_module.list_cross_search_refs("a1", request=req, user_id="u1"))
+    assert out[0]["space_name"] == "SA"
+
+
 def test_router_404_when_agent_missing(monkeypatch):
-    monkeypatch.setattr(refs_module, "_resolve_agent", _mock_resolve_none)
+    monkeypatch.setattr(refs_module, "reviewer_resolve_agent", _mock_resolve_none)
     req = SimpleNamespace()
     with pytest.raises(HTTPException) as exc:
         _run(refs_module.list_cross_search_refs("a1", request=req, user_id="u1"))
