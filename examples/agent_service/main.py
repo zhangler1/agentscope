@@ -101,6 +101,7 @@ from bocomadp.routers.agent_concurrency import agent_concurrency_router
 from bocomadp.routers.agent_chat_concurrency import agent_chat_concurrency_router
 from bocomadp.routers.agent_cross_search_config import agent_cross_search_config_router
 from bocomadp.routers.agent_cross_search_refs import agent_cross_search_refs_router
+from bocomadp.routers.user_info import user_info_router
 from bocomadp.routers.agent import agent_router
 from bocomadp.agent_list_sort import patch_agent_list_sort
 from bocomadp.open_agent_access import (
@@ -1045,6 +1046,11 @@ async def _lifespan_with_builtin_agents(app):
 
         role_store.bind_storage(storage)
         await role_store.ensure_tables()
+        # OA 用户信息查询（ap_user）：与业务表同库，复用框架 storage 连接池，
+        # 不另开引擎（未绑定时模块内部回退到业务库自建引擎）。
+        from bocomadp import user_directory
+
+        user_directory.bind_storage(storage)
         # 专家团关系表（expert_team_relations）——团队档案从 AgentData
         # 内嵌字段（team_config / parent_agent_id）迁出后的新家。
         # 必须早于下面所有读团队档案的补丁挂载。
@@ -1288,6 +1294,8 @@ app.include_router(agent_chat_concurrency_router)
 app.include_router(agent_cross_search_config_router)
 # 智能体跨知识搜索引用管理（引用别人创建的知识空间，写 PG 真源，运行时工具按 owner 分组合并搜索）
 app.include_router(agent_cross_search_refs_router)
+# OA 用户信息查询（只读 ap_user：按 OA 登录名查用户主数据，只返回生效用户）
+app.include_router(user_info_router)
 # 工作区文件列表 / 下载（/workspace/files、/workspace/files/download）
 app.include_router(workspace_files_router)
 # OSS 打包下载（/workspace/file-download）
